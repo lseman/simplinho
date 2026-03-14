@@ -1,0 +1,18 @@
+# Build artifacts
+*.o
+*.obj
+*.so
+*.a
+*.lib
+
+# Build folders
+build/
+dist/
+bin/
+obj/
+build-local/
+build-verify/
+
+# IDE files
+.vscode/
+.idea/
