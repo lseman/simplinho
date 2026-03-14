@@ -71,5 +71,5 @@ target_include_directories(simplex_core INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(simplex_core INTERFACE Eigen3::Eigen)
 
-pybind11_add_module(simplex bindings/simplex_bindings.cpp)
-target_link_libraries(simplex PRIVATE simplex_core pybind11::module)
+pybind11_add_module(simplinho bindings/simplex_bindings.cpp)
+target_link_libraries(simplinho PRIVATE simplex_core pybind11::module)

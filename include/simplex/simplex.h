@@ -309,7 +309,9 @@ class RevisedSimplex {
             auto sol = make_solution_(std_sol.status, std::move(x), obj,
                                       std::move(basis_out), std_sol.iters,
                                       std::move(info), std_sol.farkas_y,
-                                      std_sol.farkas_has_cert);
+                                      std_sol.farkas_has_cert,
+                                      std_sol.primal_ray,
+                                      std_sol.primal_ray_has_cert);
             sol.basis_internal = std_sol.basis_internal;
             sol.nonbasis_internal = std_sol.nonbasis_internal;
             sol.internal_column_labels = std_sol.internal_column_labels;
@@ -323,6 +325,27 @@ class RevisedSimplex {
             }
             sol.dual_values_internal = std_sol.dual_values_internal;
             sol.shadow_prices_internal = std_sol.shadow_prices_internal;
+            sol.farkas_y_internal = std_sol.farkas_y_internal;
+            sol.primal_ray_internal = std_sol.primal_ray_internal;
+            if (std_sol.primal_ray_has_cert &&
+                std_sol.primal_ray.size() == n_total) {
+                Eigen::VectorXd ray = Eigen::VectorXd::Zero(n);
+                for (int j = 0; j < n; ++j) {
+                    if (map[j].uses_single_var) {
+                        ray(j) = static_cast<double>(map[j].sign) *
+                                 std_sol.primal_ray(map[j].y);
+                    } else {
+                        const double pos = (map[j].y_pos >= 0)
+                                               ? std_sol.primal_ray(map[j].y_pos)
+                                               : 0.0;
+                        const double neg = (map[j].y_neg >= 0)
+                                               ? std_sol.primal_ray(map[j].y_neg)
+                                               : 0.0;
+                        ray(j) = pos - neg;
+                    }
+                }
+                sol.primal_ray = clip_small_(ray);
+            }
             sol.has_internal_tableau = std_sol.has_internal_tableau;
             return finalize_solution_(std::move(sol));
         }
@@ -543,6 +566,27 @@ class RevisedSimplex {
                 return info;
             };
 
+        const auto parse_serialized_vec =
+            [](const std::unordered_map<std::string, std::string>& info,
+               const char* key, int expected_dim)
+            -> std::optional<Eigen::VectorXd> {
+            auto it = info.find(key);
+            if (it == info.end()) return std::nullopt;
+            std::vector<double> vals;
+            std::stringstream ss(it->second);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                if (!tok.empty()) vals.push_back(std::stod(tok));
+            }
+            if (expected_dim >= 0 && (int)vals.size() != expected_dim) {
+                return std::nullopt;
+            }
+            if (vals.empty() && expected_dim == 0) return Eigen::VectorXd::Zero(0);
+            if (vals.empty()) return std::nullopt;
+            return Eigen::Map<const Eigen::VectorXd>(vals.data(),
+                                                    static_cast<int>(vals.size()));
+        };
+
         const bool basis_valid =
             ((int)basis_guess.size() == m_eff) && basis_choice.quality.valid;
         const bool allow_direct_primal =
@@ -603,6 +647,13 @@ class RevisedSimplex {
                 auto [z_full, obj_corr] = postsolve_primal(v2);
                 Eigen::VectorXd x_full = anchor + sign.cwiseProduct(z_full);
                 const double total_obj = c_in.dot(x_full);
+                const bool has_primal_ray =
+                    info2.count("primal_ray_has_cert") &&
+                    info2.at("primal_ray_has_cert") == "1";
+                const auto primal_ray_internal =
+                    has_primal_ray
+                        ? parse_serialized_vec(info2, "primal_ray", n_eff)
+                        : std::nullopt;
 
                 std::vector<int> basis_full;
                 basis_full.reserve(red_basis2.size());
@@ -623,13 +674,21 @@ class RevisedSimplex {
                                        it2, std::move(info)),
                         red_basis2, internal_column_labels));
                 }
-                return finalize_solution_(attach_postsolved_row_duals_(
-                    attach_internal_tableau_(
-                        make_solution_(st, std::move(x_full), total_obj,
-                                       basis_full, it2, std::move(info)),
-                        Ared, bred, cred, red_basis2, internal_column_labels,
-                        internal_row_labels, opt_.tol),
-                    P, opt_.tol));
+                return finalize_solution_(attach_mapped_primal_ray_(
+                    attach_postsolved_farkas_(
+                        attach_postsolved_row_duals_(
+                            attach_internal_tableau_(
+                                make_solution_(
+                                    st, std::move(x_full), total_obj, basis_full,
+                                    it2, std::move(info), std::nullopt,
+                                    std::nullopt, primal_ray_internal,
+                                    has_primal_ray),
+                                Ared, bred, cred, red_basis2,
+                                internal_column_labels, internal_row_labels,
+                                opt_.tol),
+                            P, opt_.tol),
+                        P, opt_.tol),
+                    col_orig_map, sign, A_model.cols(), opt_.tol));
             }
             if (st == LPSolution::Status::Singular) {
                 auto info = add_info({});
@@ -746,25 +805,16 @@ class RevisedSimplex {
                 if (status2 == LPSolution::Status::Infeasible) {
                     auto it = info2.find("farkas_has_cert");
                     if (it != info2.end() && it->second == "1") {
-                        // parse CSV into a vector
-                        Eigen::VectorXd yF(m_eff);
-                        {
-                            std::vector<double> vals;
-                            vals.reserve(m_eff);
-                            std::stringstream ss(info2["farkas_y"]);
-                            std::string tok;
-                            while (std::getline(ss, tok, ','))
-                                vals.push_back(std::stod(tok));
-                            yF = Eigen::Map<const Eigen::VectorXd>(
-                                vals.data(), (int)vals.size());
-                        }
-                        return finalize_solution_(attach_internal_basis_(
-                            make_solution_(
-                            LPSolution::Status::Infeasible,
-                            Eigen::VectorXd::Zero(n),
-                            std::numeric_limits<double>::infinity(), {}, it2,
-                            add_info(std::move(info2)), yF, true),
-                            red_basis_out, internal_column_labels));
+                        auto yF = parse_serialized_vec(info2, "farkas_y", m_eff);
+                        return finalize_solution_(attach_postsolved_farkas_(
+                            attach_internal_basis_(
+                                make_solution_(
+                                    LPSolution::Status::Infeasible,
+                                    Eigen::VectorXd::Zero(n),
+                                    std::numeric_limits<double>::infinity(), {},
+                                    it2, add_info(std::move(info2)), yF, true),
+                                red_basis_out, internal_column_labels),
+                            P, opt_.tol));
                     }
                 }
 
@@ -795,6 +845,13 @@ class RevisedSimplex {
         const int total_iters = it1 + it2;
         auto merged_info = add_info(std::move(info2));
         merged_info.insert({"phase1_iters", std::to_string(it1)});
+        const bool has_primal_ray =
+            merged_info.count("primal_ray_has_cert") &&
+            merged_info.at("primal_ray_has_cert") == "1";
+        const auto primal_ray_internal =
+            has_primal_ray
+                ? parse_serialized_vec(merged_info, "primal_ray", n_eff)
+                : std::nullopt;
 
         auto [z_full, obj_correction] = postsolve_primal(v2);
         Eigen::VectorXd x_full = anchor + sign.cwiseProduct(z_full);
@@ -812,49 +869,76 @@ class RevisedSimplex {
         if (status2 == LPSolution::Status::Optimal &&
             !primal_feasible_(A_in, b_in, x_full, l_in, u_in, opt_.tol)) {
             merged_info["reason"] = "invalid_returned_primal";
-            return finalize_solution_(attach_postsolved_row_duals_(
-                attach_internal_tableau_(
-                    make_solution_(LPSolution::Status::Singular, x_full,
-                                   total_obj, basis_full, total_iters,
-                                   std::move(merged_info)),
-                    Ared, bred, cred, red_basis_out, internal_column_labels,
-                    internal_row_labels, opt_.tol),
-                P, opt_.tol));
+            return finalize_solution_(attach_mapped_primal_ray_(
+                attach_postsolved_farkas_(
+                    attach_postsolved_row_duals_(
+                        attach_internal_tableau_(
+                            make_solution_(LPSolution::Status::Singular, x_full,
+                                           total_obj, basis_full, total_iters,
+                                           std::move(merged_info), std::nullopt,
+                                           std::nullopt, primal_ray_internal,
+                                           has_primal_ray),
+                            Ared, bred, cred, red_basis_out,
+                            internal_column_labels, internal_row_labels,
+                            opt_.tol),
+                        P, opt_.tol),
+                    P, opt_.tol),
+                col_orig_map, sign, A_model.cols(), opt_.tol));
         }
 
         if (status2 == LPSolution::Status::Optimal) {
-            return finalize_solution_(attach_postsolved_row_duals_(
-                attach_internal_tableau_(
-                    make_solution_(LPSolution::Status::Optimal, x_full,
-                                   total_obj, basis_full, total_iters,
-                                   std::move(merged_info)),
-                    Ared, bred, cred, red_basis_out, internal_column_labels,
-                    internal_row_labels, opt_.tol),
-                P, opt_.tol));
+            return finalize_solution_(attach_mapped_primal_ray_(
+                attach_postsolved_farkas_(
+                    attach_postsolved_row_duals_(
+                        attach_internal_tableau_(
+                            make_solution_(LPSolution::Status::Optimal, x_full,
+                                           total_obj, basis_full, total_iters,
+                                           std::move(merged_info), std::nullopt,
+                                           std::nullopt, primal_ray_internal,
+                                           has_primal_ray),
+                            Ared, bred, cred, red_basis_out,
+                            internal_column_labels, internal_row_labels,
+                            opt_.tol),
+                        P, opt_.tol),
+                    P, opt_.tol),
+                col_orig_map, sign, A_model.cols(), opt_.tol));
         }
         if (status2 == LPSolution::Status::Unbounded) {
-            return finalize_solution_(attach_postsolved_row_duals_(
-                attach_internal_tableau_(
-                    make_solution_(LPSolution::Status::Unbounded, x_full,
-                                   -std::numeric_limits<double>::infinity(),
-                                   basis_full, total_iters,
-                                   std::move(merged_info)),
-                    Ared, bred, cred, red_basis_out, internal_column_labels,
-                    internal_row_labels, opt_.tol),
-                P, opt_.tol));
+            return finalize_solution_(attach_mapped_primal_ray_(
+                attach_postsolved_farkas_(
+                    attach_postsolved_row_duals_(
+                        attach_internal_tableau_(
+                            make_solution_(
+                                LPSolution::Status::Unbounded, x_full,
+                                -std::numeric_limits<double>::infinity(),
+                                basis_full, total_iters, std::move(merged_info),
+                                std::nullopt, std::nullopt, primal_ray_internal,
+                                has_primal_ray),
+                            Ared, bred, cred, red_basis_out,
+                            internal_column_labels, internal_row_labels,
+                            opt_.tol),
+                        P, opt_.tol),
+                    P, opt_.tol),
+                col_orig_map, sign, A_model.cols(), opt_.tol));
         }
 
         const double obj_fallback =
             x_full.array().isFinite().all()
                 ? total_obj
                 : std::numeric_limits<double>::quiet_NaN();
-        return finalize_solution_(attach_postsolved_row_duals_(
-            attach_internal_tableau_(
-                make_solution_(status2, x_full, obj_fallback, basis_full,
-                               total_iters, std::move(merged_info)),
-                Ared, bred, cred, red_basis_out, internal_column_labels,
-                internal_row_labels, opt_.tol),
-            P, opt_.tol));
+        return finalize_solution_(attach_mapped_primal_ray_(
+            attach_postsolved_farkas_(
+                attach_postsolved_row_duals_(
+                    attach_internal_tableau_(
+                        make_solution_(status2, x_full, obj_fallback, basis_full,
+                                       total_iters, std::move(merged_info),
+                                       std::nullopt, std::nullopt,
+                                       primal_ray_internal, has_primal_ray),
+                        Ared, bred, cred, red_basis_out, internal_column_labels,
+                        internal_row_labels, opt_.tol),
+                    P, opt_.tol),
+                P, opt_.tol),
+            col_orig_map, sign, A_model.cols(), opt_.tol));
     }
 
    private:
@@ -1025,6 +1109,33 @@ class RevisedSimplex {
         Eigen::VectorXd y = P.postsolve_dual(sol.dual_values_internal);
         sol.dual_values = clip_small_vec_(std::move(y), tol);
         sol.shadow_prices = sol.dual_values;
+        return sol;
+    }
+
+    static LPSolution attach_postsolved_farkas_(
+        LPSolution sol, const presolve::Presolver& P, double tol) {
+        if (!sol.farkas_has_cert) return sol;
+        if (sol.farkas_y.size() != P.result().reduced.A.rows()) return sol;
+        sol.farkas_y_internal = sol.farkas_y;
+        sol.farkas_y = clip_small_vec_(P.postsolve_dual(sol.farkas_y_internal), tol);
+        return sol;
+    }
+
+    static LPSolution attach_mapped_primal_ray_(
+        LPSolution sol, const std::vector<int>& col_orig_map,
+        const Eigen::VectorXd& sign, int original_num_cols, double tol) {
+        if (!sol.primal_ray_has_cert) return sol;
+        if (sol.primal_ray.size() != (int)col_orig_map.size()) return sol;
+        sol.primal_ray_internal = sol.primal_ray;
+        Eigen::VectorXd mapped = Eigen::VectorXd::Zero(original_num_cols);
+        for (int jr = 0; jr < (int)col_orig_map.size(); ++jr) {
+            const int jorig = col_orig_map[jr];
+            if (jorig < 0 || jorig >= original_num_cols || jorig >= sign.size()) {
+                continue;
+            }
+            mapped(jorig) += sign(jorig) * sol.primal_ray_internal(jr);
+        }
+        sol.primal_ray = clip_small_vec_(std::move(mapped), tol);
         return sol;
     }
 
@@ -2128,7 +2239,9 @@ class RevisedSimplex {
         std::vector<int> basis, int iters,
         std::unordered_map<std::string, std::string> info,
         std::optional<Eigen::VectorXd> farkas_y = std::nullopt,
-        std::optional<bool> farkas_has_cert = std::nullopt) {
+        std::optional<bool> farkas_has_cert = std::nullopt,
+        std::optional<Eigen::VectorXd> primal_ray = std::nullopt,
+        std::optional<bool> primal_ray_has_cert = std::nullopt) {
         LPSolution sol;
         sol.status = st;
         sol.x = std::move(x);
@@ -2139,6 +2252,9 @@ class RevisedSimplex {
         sol.farkas_y =
             farkas_y ? std::move(*farkas_y) : Eigen::VectorXd{};
         sol.farkas_has_cert = farkas_has_cert.value_or(false);
+        sol.primal_ray =
+            primal_ray ? std::move(*primal_ray) : Eigen::VectorXd{};
+        sol.primal_ray_has_cert = primal_ray_has_cert.value_or(false);
         return sol;
     }
 
@@ -2150,7 +2266,7 @@ class RevisedSimplex {
     // Degeneracy + pricing
     DegeneracyManager degen_;
     AdaptivePricer adaptive_pricer_{1};
-    std::unique_ptr<DegeneracyPricerBridge<AdaptivePricer>> bridge_;
+    std::unique_ptr<PrimalPricingBridge<AdaptivePricer>> bridge_;
     mutable std::vector<std::string> trace_;
     mutable int solve_depth_ = 0;
 };

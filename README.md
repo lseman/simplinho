@@ -1,8 +1,12 @@
+<p align="center">
+  <img src="assets/simplinho-logo.svg" alt="simplinho logo" width="720">
+</p>
+
 # simplinho
 
 `simplinho` is a standalone revised simplex LP solver with a Python extension module and a small modeling API.
 
-The core solver is header-only C++ in `include/simplex/`, the Python bindings live in `bindings/`, and the top-level build produces a `simplex` module via `pybind11`.
+The core solver is header-only C++ in `include/simplex/`, the Python bindings live in `bindings/`, and the top-level build produces a `simplinho` module via `pybind11`.
 
 ## Highlights
 
@@ -27,11 +31,11 @@ The core solver is header-only C++ in `include/simplex/`, the Python bindings li
 
 There are two main ways to use the solver:
 
-1. `simplex.RevisedSimplex`
+1. `simplinho.RevisedSimplex`
    Use the low-level matrix API directly:
    `solve(A, b, c, l, u)` for `min c^T x` subject to `Ax = b` and `l <= x <= u`.
 
-2. `simplex.Model`
+2. `simplinho.Model`
    Use the modeling API with variables, expressions, constraints, and `minimize(...)` / `maximize(...)`.
 
 The Python module also exposes:
@@ -82,7 +86,7 @@ The Python module also exposes:
 
 ## Build
 
-The CMake project currently builds a Python extension named `simplex`.
+The CMake project currently builds a Python extension named `simplinho`.
 
 ### Requirements
 
@@ -99,7 +103,7 @@ cmake -S . -B build-local
 cmake --build build-local -j
 ```
 
-That produces a shared object like `build-local/simplex.cpython-313-...so`.
+That produces a shared object like `build-local/simplinho.cpython-313-...so`.
 
 ## Low-Level Example
 
@@ -111,7 +115,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path("build-local").resolve()))
 
-import simplex
+import simplinho as simplex
 
 A = np.array([
     [1.0, 1.0],
@@ -132,6 +136,8 @@ print(simplex.status_to_string(solution.status))
 print("objective:", solution.obj)
 print("x:", solution.x)
 print("iterations:", solution.iters)
+print("stats:", solution.stats.as_dict())
+print("log:", solution.log)
 print("dual values:", solution.dual_values_internal)
 print("reduced costs:", solution.reduced_costs_internal)
 ```
@@ -144,7 +150,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path("build-local").resolve()))
 
-import simplex
+import simplinho as simplex
 
 model = simplex.Model()
 
@@ -163,9 +169,25 @@ print("objective:", solution.obj)
 print("x        :", solution.value(x))
 print("y        :", solution.value("y"))
 print("all vars :", solution.values)
+print("stats    :", solution.stats.as_dict())
+print("log      :", solution.log)
 print("dual c1  :", c1.pi)
 print("dual c2  :", c2.pi)
 print("dual c3  :", c3.pi)
+```
+
+The modeling layer also supports live edits after construction:
+
+```python
+x.obj = 3.0
+c3.rhs = 5.0
+c3.set_coeff(y, 2.0)
+
+solution = model.reoptimize()
+
+model.deleteConstr(c1)
+model.deleteVar(x)
+solution = model.reoptimize()
 ```
 
 ## Useful Outputs
@@ -173,6 +195,8 @@ print("dual c3  :", c3.pi)
 The low-level `LPSolution` object includes more than just the primal vector:
 
 - `status`, `obj`, `x`, `iters`
+- `stats` with typed solve telemetry and `as_dict()`
+- `log_lines` and `log` for verbose solver traces
 - `basis`, `basis_internal`, `nonbasis_internal`
 - `tableau`, `tableau_rhs`, `has_internal_tableau`
 - `reduced_costs_internal`
@@ -180,7 +204,8 @@ The low-level `LPSolution` object includes more than just the primal vector:
 - `shadow_prices_internal`
 - `trace`
 - `info`
-- `farkas_y`, `farkas_has_cert`
+- `farkas_y`, `farkas_y_internal`, `farkas_has_cert`
+- `primal_ray`, `primal_ray_internal`, `primal_ray_has_cert`
 
 The modeling layer wraps that in `ModelSolution`, while still exposing the raw solve result as `solution.raw`.
 

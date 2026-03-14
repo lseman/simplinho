@@ -145,11 +145,32 @@ class RevisedSimplexPrimalEngine {
             popts.steepest_reset_freq = self.opt_.adaptive_reset_freq;
             popts.devex_reset_freq = self.opt_.devex_reset;
             self.adaptive_pricer_ = AdaptivePricer(n, popts);
-            self.adaptive_pricer_.build_pools(B, A, N);
+            self.adaptive_pricer_.build_primal_pools(B, A, N);
             self.bridge_ =
-                std::make_unique<DegeneracyPricerBridge<AdaptivePricer>>(
+                std::make_unique<PrimalPricingBridge<AdaptivePricer>>(
                     self.degen_, self.adaptive_pricer_);
         }
+
+        auto serialize_vec = [](const Eigen::VectorXd& v) {
+            std::ostringstream oss;
+            oss.setf(std::ios::scientific);
+            oss << std::setprecision(17);
+            for (int i = 0; i < v.size(); ++i) {
+                if (i) oss << ",";
+                oss << v(i);
+            }
+            return oss.str();
+        };
+
+        auto unbounded_ray = [&](int entering_abs, const Eigen::VectorXd& dB) {
+            Eigen::VectorXd ray = Eigen::VectorXd::Zero(n);
+            if (entering_abs >= 0 && entering_abs < n) ray(entering_abs) = 1.0;
+            for (int i = 0; i < m && i < dB.size(); ++i) {
+                const int j = basis[i];
+                if (j >= 0 && j < n) ray(j) = -dB(i);
+            }
+            return self.clip_small_(ray);
+        };
 
         int rebuild_attempts = 0;
 
@@ -166,7 +187,7 @@ class RevisedSimplexPrimalEngine {
                                      " refactor after solve_B failure");
                     B.refactor();
                     if (self.opt_.pricing_rule == "adaptive") {
-                        self.adaptive_pricer_.build_pools(B, A, N);
+                        self.adaptive_pricer_.build_primal_pools(B, A, N);
                         self.adaptive_pricer_.clear_rebuild_flag();
                     }
                     continue;
@@ -201,7 +222,7 @@ class RevisedSimplexPrimalEngine {
                 B.refactor();
                 y = B.solve_BT(cB);
                 if (self.opt_.pricing_rule == "adaptive") {
-                    self.adaptive_pricer_.build_pools(B, A, N);
+                    self.adaptive_pricer_.build_primal_pools(B, A, N);
                     self.adaptive_pricer_.clear_rebuild_flag();
                 }
             }
@@ -240,7 +261,7 @@ class RevisedSimplexPrimalEngine {
                     Eigen::VectorXd xcur =
                         self.assemble_primal_(n, basis, xB, l, u);
                     const double current_obj = c.dot(xcur);
-                    e_rel = self.bridge_->choose_entering(
+                    e_rel = self.bridge_->choose_primal_entering(
                         rN_select, N, self.opt_.tol, iters, current_obj, B, A);
                 } else {
                     int idx = -1;
@@ -275,7 +296,7 @@ class RevisedSimplexPrimalEngine {
                 B.refactor();
                 dB = B.solve_B(aE);
                 if (self.opt_.pricing_rule == "adaptive") {
-                    self.adaptive_pricer_.build_pools(B, A, N);
+                    self.adaptive_pricer_.build_primal_pools(B, A, N);
                     self.adaptive_pricer_.clear_rebuild_flag();
                 }
             }
@@ -296,11 +317,17 @@ class RevisedSimplexPrimalEngine {
             if (!std::isfinite(step)) {
                 Eigen::VectorXd x = Eigen::VectorXd::Constant(
                     n, std::numeric_limits<double>::quiet_NaN());
+                Eigen::VectorXd ray = unbounded_ray(e, dB);
                 self.trace_line_("[primal] unbounded iter=" +
                                  std::to_string(iters) +
                                  " entering=" + std::to_string(e));
+                auto info = dm_stats_to_map(self.degen_.get_stats());
+                info["certificate"] = "primal_ray";
+                info["primal_ray_has_cert"] = "1";
+                info["primal_ray_dim"] = std::to_string(n);
+                info["primal_ray"] = serialize_vec(ray);
                 return {LPSolution::Status::Unbounded, x, basis, iters,
-                        dm_stats_to_map(self.degen_.get_stats())};
+                        std::move(info)};
             }
 
             const bool flip_entering = (bfrt.theta_e + 1e-14 < theta_B);
@@ -312,12 +339,18 @@ class RevisedSimplexPrimalEngine {
             if (!leave_rel_opt) {
                 Eigen::VectorXd x = Eigen::VectorXd::Constant(
                     n, std::numeric_limits<double>::quiet_NaN());
+                Eigen::VectorXd ray = unbounded_ray(e, dB);
                 self.trace_line_("[primal] unbounded iter=" +
                                  std::to_string(iters) +
                                  " entering=" + std::to_string(e) +
                                  " no leaving variable");
+                auto info = dm_stats_to_map(self.degen_.get_stats());
+                info["certificate"] = "primal_ray";
+                info["primal_ray_has_cert"] = "1";
+                info["primal_ray_dim"] = std::to_string(n);
+                info["primal_ray"] = serialize_vec(ray);
                 return {LPSolution::Status::Unbounded, x, basis, iters,
-                        dm_stats_to_map(self.degen_.get_stats())};
+                        std::move(info)};
             }
 
             const int r = *leave_rel_opt;
@@ -339,8 +372,8 @@ class RevisedSimplexPrimalEngine {
 
             if (self.opt_.pricing_rule == "adaptive") {
                 const double rc_impr = -rN(idxN);
-                self.bridge_->after_pivot(r, eAbs, oldAbs, dB, alpha, step, A, N,
-                                          rc_impr);
+                self.bridge_->after_primal_pivot(r, eAbs, oldAbs, dB, alpha, step,
+                                                 A, N, rc_impr);
             }
 
             if (self.should_trace_iter_(iters)) {
@@ -368,7 +401,7 @@ class RevisedSimplexPrimalEngine {
                                  " refactor after replace_column failure");
                 B.refactor();
                 if (self.opt_.pricing_rule == "adaptive") {
-                    self.adaptive_pricer_.build_pools(B, A, N);
+                    self.adaptive_pricer_.build_primal_pools(B, A, N);
                     self.adaptive_pricer_.clear_rebuild_flag();
                 }
             }
@@ -381,7 +414,7 @@ class RevisedSimplexPrimalEngine {
 
             if (self.opt_.pricing_rule == "adaptive" &&
                 self.adaptive_pricer_.needs_rebuild()) {
-                self.adaptive_pricer_.build_pools(B, A, N);
+                self.adaptive_pricer_.build_primal_pools(B, A, N);
                 self.adaptive_pricer_.clear_rebuild_flag();
             }
         }

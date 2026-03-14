@@ -40,7 +40,11 @@ struct LPSolution {
     std::unordered_map<std::string, std::string> info;  // telemetry
     std::vector<std::string> trace;  // verbose trace, if enabled
     Eigen::VectorXd farkas_y;  // Farkas certificate of infeasibility (if any)
+    Eigen::VectorXd farkas_y_internal;  // Farkas certificate on internal rows
     bool farkas_has_cert = false;  // whether farkas_y is valid
+    Eigen::VectorXd primal_ray;  // primal unbounded ray (original space)
+    Eigen::VectorXd primal_ray_internal;  // primal unbounded ray (internal cols)
+    bool primal_ray_has_cert = false;  // whether primal_ray is valid
 };
 
 inline const char* to_string(LPSolution::Status s) {

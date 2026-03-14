@@ -35,12 +35,14 @@ struct LinearExprData {
 struct ModelState;
 
 struct VarData {
+    std::uint64_t id = 0;
     std::string name;
     double lb = 0.0;
     double ub = std::numeric_limits<double>::infinity();
 };
 
 struct ConstraintData {
+    std::uint64_t id = 0;
     LinearExprData expr;
     ConstraintSense sense = ConstraintSense::Equal;
     std::string name;
@@ -56,6 +58,8 @@ struct ModelState {
     std::vector<double> last_constraint_pi;
     std::uint64_t revision = 0;
     std::uint64_t solved_revision = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t next_var_id = 1;
+    std::uint64_t next_constraint_id = 1;
 };
 
 class Var;
@@ -87,6 +91,27 @@ void add_coeff(LinearExprData& data, int index, double delta) {
     } else {
         it->second = updated;
     }
+}
+
+void set_coeff_value(LinearExprData& data, int index, double value) {
+    value = normalized_coeff(value);
+    if (value == 0.0) {
+        data.coeffs.erase(index);
+        return;
+    }
+    data.coeffs[index] = value;
+}
+
+void erase_and_reindex_coeffs(LinearExprData& data, int removed_index) {
+    std::unordered_map<int, double> updated;
+    updated.reserve(data.coeffs.size());
+    for (const auto& [index, coeff] : data.coeffs) {
+        if (index == removed_index) {
+            continue;
+        }
+        updated.emplace(index > removed_index ? index - 1 : index, coeff);
+    }
+    data.coeffs = std::move(updated);
 }
 
 std::shared_ptr<ModelState> merge_model_state(
@@ -175,64 +200,279 @@ std::string expr_repr(const LinearExprData& data,
     return oss.str();
 }
 
+std::string join_trace_lines(const std::vector<std::string>& trace) {
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < trace.size(); ++i) {
+        if (i > 0) {
+            oss << '\n';
+        }
+        oss << trace[i];
+    }
+    return oss.str();
+}
+
+std::optional<std::string> find_info_string(
+    const std::unordered_map<std::string, std::string>& info,
+    const char* key) {
+    const auto it = info.find(key);
+    if (it == info.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+std::optional<int> find_info_int(
+    const std::unordered_map<std::string, std::string>& info, const char* key) {
+    const auto it = info.find(key);
+    if (it == info.end()) {
+        return std::nullopt;
+    }
+    try {
+        return std::stoi(it->second);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<double> find_info_double(
+    const std::unordered_map<std::string, std::string>& info, const char* key) {
+    const auto it = info.find(key);
+    if (it == info.end()) {
+        return std::nullopt;
+    }
+    try {
+        return std::stod(it->second);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<bool> find_info_bool(
+    const std::unordered_map<std::string, std::string>& info, const char* key) {
+    const auto it = info.find(key);
+    if (it == info.end()) {
+        return std::nullopt;
+    }
+    if (it->second == "1" || it->second == "true" || it->second == "True") {
+        return true;
+    }
+    if (it->second == "0" || it->second == "false" || it->second == "False") {
+        return false;
+    }
+    return std::nullopt;
+}
+
+struct SolveStats {
+    std::string status;
+    int iterations = 0;
+    int phase2_iterations = 0;
+    std::optional<int> phase1_iterations;
+    std::optional<int> presolve_actions;
+    std::optional<int> reduced_rows;
+    std::optional<int> reduced_cols;
+    std::optional<double> objective_shift;
+    std::optional<int> input_upper_bounds_relaxed;
+    std::optional<int> input_lower_bounds_relaxed;
+    std::optional<std::string> basis_start;
+    std::optional<std::string> basis_start_style;
+    std::optional<int> basis_start_attempt;
+    std::optional<bool> basis_start_primal_feasible;
+    std::optional<bool> basis_start_dual_feasible;
+    std::optional<double> basis_start_primal_violation;
+    std::optional<double> basis_start_dual_violation;
+    std::optional<std::string> phase1_status;
+    std::optional<std::string> reason;
+    std::optional<std::string> note;
+    std::optional<std::string> certificate;
+    std::optional<std::string> dual_pricing;
+    std::optional<int> dual_bfrt_flips;
+    std::optional<int> degeneracy_streak;
+    std::optional<int> degeneracy_total;
+    std::optional<int> suspected_cycle_length;
+    std::optional<double> condition_estimate;
+    std::optional<double> degeneracy_threshold;
+    std::optional<int> degeneracy_epoch;
+    bool farkas_has_cert = false;
+    bool primal_ray_has_cert = false;
+    int trace_lines = 0;
+    std::unordered_map<std::string, std::string> raw_info;
+
+    py::dict as_dict() const {
+        py::dict out;
+        out["status"] = status;
+        out["iterations"] = iterations;
+        out["phase2_iterations"] = phase2_iterations;
+        out["phase1_iterations"] =
+            phase1_iterations ? py::cast(*phase1_iterations) : py::none();
+        out["presolve_actions"] =
+            presolve_actions ? py::cast(*presolve_actions) : py::none();
+        out["reduced_rows"] = reduced_rows ? py::cast(*reduced_rows) : py::none();
+        out["reduced_cols"] = reduced_cols ? py::cast(*reduced_cols) : py::none();
+        out["objective_shift"] =
+            objective_shift ? py::cast(*objective_shift) : py::none();
+        out["input_upper_bounds_relaxed"] = input_upper_bounds_relaxed
+                                                ? py::cast(*input_upper_bounds_relaxed)
+                                                : py::none();
+        out["input_lower_bounds_relaxed"] = input_lower_bounds_relaxed
+                                                ? py::cast(*input_lower_bounds_relaxed)
+                                                : py::none();
+        out["basis_start"] = basis_start ? py::cast(*basis_start) : py::none();
+        out["basis_start_style"] =
+            basis_start_style ? py::cast(*basis_start_style) : py::none();
+        out["basis_start_attempt"] =
+            basis_start_attempt ? py::cast(*basis_start_attempt) : py::none();
+        out["basis_start_primal_feasible"] = basis_start_primal_feasible
+                                                 ? py::cast(*basis_start_primal_feasible)
+                                                 : py::none();
+        out["basis_start_dual_feasible"] = basis_start_dual_feasible
+                                               ? py::cast(*basis_start_dual_feasible)
+                                               : py::none();
+        out["basis_start_primal_violation"] = basis_start_primal_violation
+                                                  ? py::cast(*basis_start_primal_violation)
+                                                  : py::none();
+        out["basis_start_dual_violation"] = basis_start_dual_violation
+                                                ? py::cast(*basis_start_dual_violation)
+                                                : py::none();
+        out["phase1_status"] = phase1_status ? py::cast(*phase1_status) : py::none();
+        out["reason"] = reason ? py::cast(*reason) : py::none();
+        out["note"] = note ? py::cast(*note) : py::none();
+        out["certificate"] = certificate ? py::cast(*certificate) : py::none();
+        out["dual_pricing"] = dual_pricing ? py::cast(*dual_pricing) : py::none();
+        out["dual_bfrt_flips"] =
+            dual_bfrt_flips ? py::cast(*dual_bfrt_flips) : py::none();
+        out["degeneracy_streak"] =
+            degeneracy_streak ? py::cast(*degeneracy_streak) : py::none();
+        out["degeneracy_total"] =
+            degeneracy_total ? py::cast(*degeneracy_total) : py::none();
+        out["suspected_cycle_length"] =
+            suspected_cycle_length ? py::cast(*suspected_cycle_length) : py::none();
+        out["condition_estimate"] =
+            condition_estimate ? py::cast(*condition_estimate) : py::none();
+        out["degeneracy_threshold"] =
+            degeneracy_threshold ? py::cast(*degeneracy_threshold) : py::none();
+        out["degeneracy_epoch"] =
+            degeneracy_epoch ? py::cast(*degeneracy_epoch) : py::none();
+        out["farkas_has_cert"] = farkas_has_cert;
+        out["primal_ray_has_cert"] = primal_ray_has_cert;
+        out["trace_lines"] = trace_lines;
+        out["raw_info"] = raw_info;
+        return out;
+    }
+};
+
+SolveStats build_solve_stats(const LPSolution& sol) {
+    SolveStats stats;
+    stats.status = to_string(sol.status);
+    stats.iterations = sol.iters;
+    stats.phase1_iterations = find_info_int(sol.info, "phase1_iters");
+    stats.phase2_iterations =
+        sol.iters - stats.phase1_iterations.value_or(0);
+    stats.presolve_actions = find_info_int(sol.info, "presolve_actions");
+    stats.reduced_rows = find_info_int(sol.info, "reduced_m");
+    stats.reduced_cols = find_info_int(sol.info, "reduced_n");
+    stats.objective_shift = find_info_double(sol.info, "obj_shift");
+    stats.input_upper_bounds_relaxed =
+        find_info_int(sol.info, "input_upper_bounds_relaxed");
+    stats.input_lower_bounds_relaxed =
+        find_info_int(sol.info, "input_lower_bounds_relaxed");
+    stats.basis_start = find_info_string(sol.info, "basis_start");
+    stats.basis_start_style = find_info_string(sol.info, "basis_start_style");
+    stats.basis_start_attempt = find_info_int(sol.info, "basis_start_attempt");
+    stats.basis_start_primal_feasible =
+        find_info_bool(sol.info, "basis_start_primal_feasible");
+    stats.basis_start_dual_feasible =
+        find_info_bool(sol.info, "basis_start_dual_feasible");
+    stats.basis_start_primal_violation =
+        find_info_double(sol.info, "basis_start_primal_violation");
+    stats.basis_start_dual_violation =
+        find_info_double(sol.info, "basis_start_dual_violation");
+    stats.phase1_status = find_info_string(sol.info, "phase1_status");
+    stats.reason = find_info_string(sol.info, "reason");
+    stats.note = find_info_string(sol.info, "note");
+    stats.certificate = find_info_string(sol.info, "certificate");
+    stats.dual_pricing = find_info_string(sol.info, "dual_pricing");
+    stats.dual_bfrt_flips = find_info_int(sol.info, "dual_bfrt_flips");
+    stats.degeneracy_streak = find_info_int(sol.info, "deg_streak");
+    stats.degeneracy_total = find_info_int(sol.info, "deg_total");
+    stats.suspected_cycle_length = find_info_int(sol.info, "cycle_len");
+    stats.condition_estimate = find_info_double(sol.info, "cond_est");
+    stats.degeneracy_threshold = find_info_double(sol.info, "deg_thresh");
+    stats.degeneracy_epoch = find_info_int(sol.info, "deg_epoch");
+    stats.farkas_has_cert = sol.farkas_has_cert;
+    stats.primal_ray_has_cert = sol.primal_ray_has_cert;
+    stats.trace_lines = static_cast<int>(sol.trace.size());
+    stats.raw_info = sol.info;
+    return stats;
+}
+
 class Var {
    public:
     Var() = default;
 
-    Var(std::shared_ptr<ModelState> state, int index)
-        : state_(std::move(state)), index_(index) {}
+    Var(std::shared_ptr<ModelState> state, int index, std::uint64_t id)
+        : state_(std::move(state)), index_(index), id_(id) {}
 
     const std::shared_ptr<ModelState>& state() const { return state_; }
-    int index() const { return index_; }
+    int index() const { return resolve_index_("index"); }
 
     std::string name() const {
-        ensure_valid_("name");
-        return state_->vars[index_].name;
+        const int index = resolve_index_("name");
+        return state_->vars[index].name;
     }
 
     double lower_bound() const {
-        ensure_valid_("lower_bound");
-        return state_->vars[index_].lb;
+        const int index = resolve_index_("lower_bound");
+        return state_->vars[index].lb;
     }
 
     void set_lower_bound(double value) {
-        ensure_valid_("set_lower_bound");
-        if (std::isfinite(state_->vars[index_].ub) &&
-            value > state_->vars[index_].ub) {
+        const int index = resolve_index_("set_lower_bound");
+        if (std::isfinite(state_->vars[index].ub) && value > state_->vars[index].ub) {
             throw std::invalid_argument(
                 "simplex: variable lower bound cannot exceed upper bound");
         }
         touch_state_();
-        state_->vars[index_].lb = value;
+        state_->vars[index].lb = value;
     }
 
     double upper_bound() const {
-        ensure_valid_("upper_bound");
-        return state_->vars[index_].ub;
+        const int index = resolve_index_("upper_bound");
+        return state_->vars[index].ub;
     }
 
     void set_upper_bound(double value) {
-        ensure_valid_("set_upper_bound");
-        if (std::isfinite(state_->vars[index_].lb) &&
-            value < state_->vars[index_].lb) {
+        const int index = resolve_index_("set_upper_bound");
+        if (std::isfinite(state_->vars[index].lb) && value < state_->vars[index].lb) {
             throw std::invalid_argument(
                 "simplex: variable upper bound cannot be below lower bound");
         }
         touch_state_();
-        state_->vars[index_].ub = value;
+        state_->vars[index].ub = value;
+    }
+
+    double objective_coefficient() const {
+        const int index = resolve_index_("objective_coefficient");
+        const auto it = state_->objective.coeffs.find(index);
+        return it == state_->objective.coeffs.end() ? 0.0 : it->second;
+    }
+
+    void set_objective_coefficient(double value) {
+        const int index = resolve_index_("set_objective_coefficient");
+        touch_state_();
+        set_coeff_value(state_->objective, index, value);
     }
 
     std::string repr() const {
-        ensure_valid_("repr");
+        const int index = resolve_index_("repr");
         std::ostringstream oss;
-        oss << "Var(name='" << state_->vars[index_].name << "', lb="
-            << format_number(state_->vars[index_].lb) << ", ub=";
-        if (std::isfinite(state_->vars[index_].ub)) {
-            oss << format_number(state_->vars[index_].ub);
+        oss << "Var(name='" << state_->vars[index].name << "', lb="
+            << format_number(state_->vars[index].lb) << ", ub=";
+        if (std::isfinite(state_->vars[index].ub)) {
+            oss << format_number(state_->vars[index].ub);
         } else {
             oss << "inf";
         }
-        oss << ")";
+        oss << ", obj=" << format_number(objective_coefficient()) << ")";
         return oss.str();
     }
 
@@ -243,16 +483,28 @@ class Var {
         state_->last_constraint_pi.clear();
     }
 
-    void ensure_valid_(const char* context) const {
-        if (!state_ || index_ < 0 ||
-            index_ >= static_cast<int>(state_->vars.size())) {
+    int resolve_index_(const char* context) const {
+        if (!state_) {
             throw std::invalid_argument(
                 std::string("simplex: invalid variable in ") + context);
         }
+        if (index_ >= 0 && index_ < static_cast<int>(state_->vars.size()) &&
+            state_->vars[index_].id == id_) {
+            return index_;
+        }
+        for (int i = 0; i < static_cast<int>(state_->vars.size()); ++i) {
+            if (state_->vars[i].id == id_) {
+                index_ = i;
+                return index_;
+            }
+        }
+        throw std::invalid_argument(
+            std::string("simplex: invalid variable in ") + context);
     }
 
     std::shared_ptr<ModelState> state_;
-    int index_ = -1;
+    mutable int index_ = -1;
+    std::uint64_t id_ = 0;
 };
 
 class LinearExpr {
@@ -400,50 +652,112 @@ class ConstraintHandle {
    public:
     ConstraintHandle() = default;
 
-    ConstraintHandle(std::shared_ptr<ModelState> state, int index)
-        : state_(std::move(state)), index_(index) {}
+    ConstraintHandle(std::shared_ptr<ModelState> state, int index, std::uint64_t id)
+        : state_(std::move(state)), index_(index), id_(id) {}
+
+    const std::shared_ptr<ModelState>& state() const { return state_; }
 
     double pi() const {
-        ensure_valid_("pi");
+        const int index = resolve_index_("pi");
         if (state_->solved_revision != state_->revision) {
             throw std::runtime_error(
                 "simplex: constraint duals are unavailable until the model is solved");
         }
-        if (index_ < 0 || index_ >= static_cast<int>(state_->last_constraint_pi.size())) {
+        if (index < 0 || index >= static_cast<int>(state_->last_constraint_pi.size())) {
             throw std::out_of_range("simplex: constraint index out of range");
         }
-        return state_->last_constraint_pi[index_];
+        return state_->last_constraint_pi[index];
     }
 
     std::string name() const {
-        ensure_valid_("name");
-        return state_->constraints[index_].name;
+        const int index = resolve_index_("name");
+        return state_->constraints[index].name;
     }
 
-    int index() const { return index_; }
+    double rhs() const {
+        const int index = resolve_index_("rhs");
+        return -state_->constraints[index].expr.constant;
+    }
+
+    void set_rhs(double value) {
+        const int index = resolve_index_("set_rhs");
+        touch_state_();
+        state_->constraints[index].expr.constant = -value;
+    }
+
+    ConstraintSense sense() const {
+        const int index = resolve_index_("sense");
+        return state_->constraints[index].sense;
+    }
+
+    void set_sense(ConstraintSense value) {
+        const int index = resolve_index_("set_sense");
+        touch_state_();
+        state_->constraints[index].sense = value;
+    }
+
+    double coefficient(const Var& var) const {
+        const int index = resolve_index_("coefficient");
+        if (!var.state() || var.state().get() != state_.get()) {
+            throw std::invalid_argument(
+                "simplex: variable does not belong to this constraint's model");
+        }
+        const auto it = state_->constraints[index].expr.coeffs.find(var.index());
+        return it == state_->constraints[index].expr.coeffs.end() ? 0.0 : it->second;
+    }
+
+    void set_coefficient(const Var& var, double value) {
+        const int index = resolve_index_("set_coefficient");
+        if (!var.state() || var.state().get() != state_.get()) {
+            throw std::invalid_argument(
+                "simplex: variable does not belong to this constraint's model");
+        }
+        touch_state_();
+        set_coeff_value(state_->constraints[index].expr, var.index(), value);
+    }
+
+    int index() const { return resolve_index_("index"); }
 
     std::string repr() const {
-        ensure_valid_("repr");
+        const int index = resolve_index_("repr");
         std::ostringstream oss;
-        oss << "ConstraintHandle(index=" << index_;
-        if (!state_->constraints[index_].name.empty()) {
-            oss << ", name='" << state_->constraints[index_].name << "'";
+        oss << "ConstraintHandle(index=" << index;
+        if (!state_->constraints[index].name.empty()) {
+            oss << ", name='" << state_->constraints[index].name << "'";
         }
         oss << ")";
         return oss.str();
     }
 
    private:
-    void ensure_valid_(const char* context) const {
-        if (!state_ || index_ < 0 ||
-            index_ >= static_cast<int>(state_->constraints.size())) {
+    void touch_state_() const {
+        ++state_->revision;
+        state_->solved_revision = std::numeric_limits<std::uint64_t>::max();
+        state_->last_constraint_pi.clear();
+    }
+
+    int resolve_index_(const char* context) const {
+        if (!state_) {
             throw std::invalid_argument(
                 std::string("simplex: invalid constraint handle in ") + context);
         }
+        if (index_ >= 0 && index_ < static_cast<int>(state_->constraints.size()) &&
+            state_->constraints[index_].id == id_) {
+            return index_;
+        }
+        for (int i = 0; i < static_cast<int>(state_->constraints.size()); ++i) {
+            if (state_->constraints[i].id == id_) {
+                index_ = i;
+                return index_;
+            }
+        }
+        throw std::invalid_argument(
+            std::string("simplex: invalid constraint handle in ") + context);
     }
 
     std::shared_ptr<ModelState> state_;
-    int index_ = -1;
+    mutable int index_ = -1;
+    std::uint64_t id_ = 0;
 };
 
 class ModelSolution {
@@ -470,6 +784,9 @@ class ModelSolution {
     double objective() const { return objective_; }
     int iterations() const { return raw_.iters; }
     const std::unordered_map<std::string, double>& values() const { return values_; }
+    const std::vector<std::string>& log_lines() const { return raw_.trace; }
+    std::string log() const { return join_trace_lines(raw_.trace); }
+    SolveStats stats() const { return build_solve_stats(raw_); }
 
     double value(const Var& var) const {
         if (!state_ || !var.state() || state_.get() != var.state().get()) {
@@ -534,13 +851,14 @@ class Model {
         }
 
         const int index = static_cast<int>(state_->vars.size());
-        state_->vars.push_back(VarData{resolved_name, lb, ub});
+        const std::uint64_t id = state_->next_var_id++;
+        state_->vars.push_back(VarData{id, resolved_name, lb, ub});
         state_->name_to_index.emplace(resolved_name, index);
         if (std::abs(obj) > kCoeffTol) {
             add_coeff(state_->objective, index, obj);
         }
 
-        return Var(state_, index);
+        return Var(state_, index, id);
     }
 
     ConstraintHandle add_constr(const ConstraintSpec& constr,
@@ -551,9 +869,11 @@ class Model {
                 "simplex: constraint does not belong to this model");
         }
 
-        ConstraintData data{constr.expr(), constr.sense(), name.value_or("")};
+        const std::uint64_t id = state_->next_constraint_id++;
+        ConstraintData data{id, constr.expr(), constr.sense(), name.value_or("")};
         state_->constraints.push_back(std::move(data));
-        return ConstraintHandle(state_, static_cast<int>(state_->constraints.size()) - 1);
+        return ConstraintHandle(state_, static_cast<int>(state_->constraints.size()) - 1,
+                                id);
     }
 
     void set_objective(const LinearExpr& expr, const std::string& sense = "min") {
@@ -583,7 +903,7 @@ class Model {
         if (it == state_->name_to_index.end()) {
             throw std::out_of_range("simplex: unknown variable name '" + name + "'");
         }
-        return Var(state_, it->second);
+        return Var(state_, it->second, state_->vars[it->second].id);
     }
 
     int num_vars() const { return static_cast<int>(state_->vars.size()); }
@@ -591,6 +911,56 @@ class Model {
 
     RevisedSimplexOptions& options() { return state_->options; }
     const RevisedSimplexOptions& options() const { return state_->options; }
+
+    double get_obj_coeff(const Var& var) const {
+        ensure_same_model_(var.state(), "get_obj_coeff");
+        return var.objective_coefficient();
+    }
+
+    void set_obj_coeff(const Var& var, double value) {
+        ensure_same_model_(var.state(), "set_obj_coeff");
+        touch_();
+        set_coeff_value(state_->objective, var.index(), value);
+    }
+
+    double get_coeff(const ConstraintHandle& constr, const Var& var) const {
+        ensure_same_model_(constr.state(), "get_coeff");
+        ensure_same_model_(var.state(), "get_coeff");
+        return constr.coefficient(var);
+    }
+
+    void set_coeff(const ConstraintHandle& constr, const Var& var, double value) {
+        ensure_same_model_(constr.state(), "set_coeff");
+        ensure_same_model_(var.state(), "set_coeff");
+        touch_();
+        set_coeff_value(state_->constraints[constr.index()].expr, var.index(), value);
+    }
+
+    void set_rhs(const ConstraintHandle& constr, double rhs) {
+        ensure_same_model_(constr.state(), "set_rhs");
+        touch_();
+        state_->constraints[constr.index()].expr.constant = -rhs;
+    }
+
+    void delete_var(const Var& var) {
+        ensure_same_model_(var.state(), "delete_var");
+        const int removed_index = var.index();
+        touch_();
+        state_->vars.erase(state_->vars.begin() + removed_index);
+        rebuild_name_to_index_();
+        erase_and_reindex_coeffs(state_->objective, removed_index);
+        for (auto& constr : state_->constraints) {
+            erase_and_reindex_coeffs(constr.expr, removed_index);
+        }
+    }
+
+    void delete_constr(const ConstraintHandle& constr) {
+        ensure_same_model_(constr.state(), "delete_constr");
+        touch_();
+        state_->constraints.erase(state_->constraints.begin() + constr.index());
+    }
+
+    ModelSolution reoptimize() const { return solve(); }
 
     ModelSolution solve() const {
         const int n = static_cast<int>(state_->vars.size());
@@ -668,6 +1038,22 @@ class Model {
     }
 
    private:
+    void ensure_same_model_(const std::shared_ptr<ModelState>& other,
+                            const char* context) const {
+        if (!other || other.get() != state_.get()) {
+            throw std::invalid_argument(std::string("simplex: object does not belong to "
+                                                    "this model in ") +
+                                        context);
+        }
+    }
+
+    void rebuild_name_to_index_() {
+        state_->name_to_index.clear();
+        for (int i = 0; i < static_cast<int>(state_->vars.size()); ++i) {
+            state_->name_to_index.emplace(state_->vars[i].name, i);
+        }
+    }
+
     std::string next_auto_name_() const {
         std::string candidate;
         int next_index = static_cast<int>(state_->vars.size());
@@ -688,7 +1074,7 @@ class Model {
 
 }  // namespace
 
-PYBIND11_MODULE(simplex, m) {
+PYBIND11_MODULE(simplinho, m) {
     m.doc() = "Bindings for the revised simplex solver";
 
     py::enum_<LPSolution::Status>(m, "LPStatus")
@@ -698,6 +1084,97 @@ PYBIND11_MODULE(simplex, m) {
         .value("IterLimit", LPSolution::Status::IterLimit)
         .value("Singular", LPSolution::Status::Singular)
         .value("NeedPhase1", LPSolution::Status::NeedPhase1);
+
+    py::class_<SolveStats>(m, "SolveStats")
+        .def_property_readonly("status", [](const SolveStats& self) { return self.status; })
+        .def_property_readonly("iterations",
+                               [](const SolveStats& self) { return self.iterations; })
+        .def_property_readonly("phase1_iterations",
+                               [](const SolveStats& self) { return self.phase1_iterations; })
+        .def_property_readonly("phase2_iterations",
+                               [](const SolveStats& self) { return self.phase2_iterations; })
+        .def_property_readonly("presolve_actions",
+                               [](const SolveStats& self) { return self.presolve_actions; })
+        .def_property_readonly("reduced_rows",
+                               [](const SolveStats& self) { return self.reduced_rows; })
+        .def_property_readonly("reduced_cols",
+                               [](const SolveStats& self) { return self.reduced_cols; })
+        .def_property_readonly("objective_shift",
+                               [](const SolveStats& self) { return self.objective_shift; })
+        .def_property_readonly("input_upper_bounds_relaxed", [](const SolveStats& self) {
+            return self.input_upper_bounds_relaxed;
+        })
+        .def_property_readonly("input_lower_bounds_relaxed", [](const SolveStats& self) {
+            return self.input_lower_bounds_relaxed;
+        })
+        .def_property_readonly("basis_start",
+                               [](const SolveStats& self) { return self.basis_start; })
+        .def_property_readonly("basis_start_style", [](const SolveStats& self) {
+            return self.basis_start_style;
+        })
+        .def_property_readonly("basis_start_attempt", [](const SolveStats& self) {
+            return self.basis_start_attempt;
+        })
+        .def_property_readonly("basis_start_primal_feasible",
+                               [](const SolveStats& self) {
+                                   return self.basis_start_primal_feasible;
+                               })
+        .def_property_readonly("basis_start_dual_feasible",
+                               [](const SolveStats& self) {
+                                   return self.basis_start_dual_feasible;
+                               })
+        .def_property_readonly("basis_start_primal_violation",
+                               [](const SolveStats& self) {
+                                   return self.basis_start_primal_violation;
+                               })
+        .def_property_readonly("basis_start_dual_violation",
+                               [](const SolveStats& self) {
+                                   return self.basis_start_dual_violation;
+                               })
+        .def_property_readonly("phase1_status",
+                               [](const SolveStats& self) { return self.phase1_status; })
+        .def_property_readonly("reason",
+                               [](const SolveStats& self) { return self.reason; })
+        .def_property_readonly("note", [](const SolveStats& self) { return self.note; })
+        .def_property_readonly("certificate",
+                               [](const SolveStats& self) { return self.certificate; })
+        .def_property_readonly("dual_pricing",
+                               [](const SolveStats& self) { return self.dual_pricing; })
+        .def_property_readonly("dual_bfrt_flips",
+                               [](const SolveStats& self) { return self.dual_bfrt_flips; })
+        .def_property_readonly("degeneracy_streak", [](const SolveStats& self) {
+            return self.degeneracy_streak;
+        })
+        .def_property_readonly("degeneracy_total", [](const SolveStats& self) {
+            return self.degeneracy_total;
+        })
+        .def_property_readonly("suspected_cycle_length", [](const SolveStats& self) {
+            return self.suspected_cycle_length;
+        })
+        .def_property_readonly("condition_estimate", [](const SolveStats& self) {
+            return self.condition_estimate;
+        })
+        .def_property_readonly("degeneracy_threshold", [](const SolveStats& self) {
+            return self.degeneracy_threshold;
+        })
+        .def_property_readonly("degeneracy_epoch",
+                               [](const SolveStats& self) { return self.degeneracy_epoch; })
+        .def_property_readonly("farkas_has_cert",
+                               [](const SolveStats& self) { return self.farkas_has_cert; })
+        .def_property_readonly("primal_ray_has_cert", [](const SolveStats& self) {
+            return self.primal_ray_has_cert;
+        })
+        .def_property_readonly("trace_lines",
+                               [](const SolveStats& self) { return self.trace_lines; })
+        .def_property_readonly("raw_info",
+                               [](const SolveStats& self) { return self.raw_info; })
+        .def("as_dict", &SolveStats::as_dict)
+        .def("__repr__", [](const SolveStats& self) {
+            std::ostringstream oss;
+            oss << "SolveStats(status='" << self.status << "', iterations="
+                << self.iterations << ", trace_lines=" << self.trace_lines << ")";
+            return oss.str();
+        });
 
     py::class_<LPSolution>(m, "LPSolution")
         .def_readonly("status", &LPSolution::status)
@@ -719,8 +1196,21 @@ PYBIND11_MODULE(simplex, m) {
         .def_readonly("iters", &LPSolution::iters)
         .def_readonly("info", &LPSolution::info)
         .def_readonly("trace", &LPSolution::trace)
+        .def_property_readonly("stats", [](const LPSolution& self) {
+            return build_solve_stats(self);
+        })
+        .def_property_readonly("log_lines", [](const LPSolution& self) {
+            return self.trace;
+        })
+        .def_property_readonly("log", [](const LPSolution& self) {
+            return join_trace_lines(self.trace);
+        })
         .def_readonly("farkas_y", &LPSolution::farkas_y)
-        .def_readonly("farkas_has_cert", &LPSolution::farkas_has_cert);
+        .def_readonly("farkas_y_internal", &LPSolution::farkas_y_internal)
+        .def_readonly("farkas_has_cert", &LPSolution::farkas_has_cert)
+        .def_readonly("primal_ray", &LPSolution::primal_ray)
+        .def_readonly("primal_ray_internal", &LPSolution::primal_ray_internal)
+        .def_readonly("primal_ray_has_cert", &LPSolution::primal_ray_has_cert);
 
     py::class_<RevisedSimplexOptions>(m, "RevisedSimplexOptions")
         .def(py::init<>())
@@ -773,6 +1263,8 @@ PYBIND11_MODULE(simplex, m) {
         .def_property_readonly("name", &Var::name)
         .def_property("lb", &Var::lower_bound, &Var::set_lower_bound)
         .def_property("ub", &Var::upper_bound, &Var::set_upper_bound)
+        .def_property("obj", &Var::objective_coefficient,
+                      &Var::set_objective_coefficient)
         .def("__repr__", &Var::repr)
         .def("__add__", [](const Var& self, const Var& other) {
             return add_expr(to_expr(self), to_expr(other));
@@ -919,7 +1411,15 @@ PYBIND11_MODULE(simplex, m) {
     py::class_<ConstraintHandle>(m, "ConstraintHandle")
         .def_property_readonly("pi", &ConstraintHandle::pi)
         .def_property_readonly("name", &ConstraintHandle::name)
+        .def_property("rhs", &ConstraintHandle::rhs, &ConstraintHandle::set_rhs)
+        .def_property("sense", &ConstraintHandle::sense, &ConstraintHandle::set_sense)
         .def_property_readonly("index", &ConstraintHandle::index)
+        .def("get_coeff", &ConstraintHandle::coefficient, py::arg("var"))
+        .def("getCoeff", &ConstraintHandle::coefficient, py::arg("var"))
+        .def("set_coeff", &ConstraintHandle::set_coefficient, py::arg("var"),
+             py::arg("value"))
+        .def("setCoeff", &ConstraintHandle::set_coefficient, py::arg("var"),
+             py::arg("value"))
         .def("__repr__", &ConstraintHandle::repr);
 
     py::class_<ModelSolution>(m, "ModelSolution")
@@ -933,6 +1433,10 @@ PYBIND11_MODULE(simplex, m) {
         .def_property_readonly("iters", &ModelSolution::iterations)
         .def_property_readonly("values", &ModelSolution::values,
                                py::return_value_policy::reference_internal)
+        .def_property_readonly("stats", &ModelSolution::stats)
+        .def_property_readonly("log_lines", &ModelSolution::log_lines,
+                               py::return_value_policy::reference_internal)
+        .def_property_readonly("log", &ModelSolution::log)
         .def("value", py::overload_cast<const Var&>(&ModelSolution::value, py::const_),
              py::arg("var"))
         .def("value",
@@ -983,6 +1487,30 @@ PYBIND11_MODULE(simplex, m) {
              py::arg("expr"))
         .def("get_var", &Model::get_var, py::arg("name"))
         .def("getVar", &Model::get_var, py::arg("name"))
+        .def("get_obj_coeff", &Model::get_obj_coeff, py::arg("var"))
+        .def("getObjCoeff", &Model::get_obj_coeff, py::arg("var"))
+        .def("set_obj_coeff", &Model::set_obj_coeff, py::arg("var"),
+             py::arg("value"))
+        .def("setObjCoeff", &Model::set_obj_coeff, py::arg("var"),
+             py::arg("value"))
+        .def("get_coeff", &Model::get_coeff, py::arg("constraint"),
+             py::arg("var"))
+        .def("getCoeff", &Model::get_coeff, py::arg("constraint"),
+             py::arg("var"))
+        .def("set_coeff", &Model::set_coeff, py::arg("constraint"),
+             py::arg("var"), py::arg("value"))
+        .def("setCoeff", &Model::set_coeff, py::arg("constraint"),
+             py::arg("var"), py::arg("value"))
+        .def("set_rhs", &Model::set_rhs, py::arg("constraint"), py::arg("rhs"))
+        .def("setRhs", &Model::set_rhs, py::arg("constraint"), py::arg("rhs"))
+        .def("delete_var", &Model::delete_var, py::arg("var"))
+        .def("deleteVar", &Model::delete_var, py::arg("var"))
+        .def("remove_var", &Model::delete_var, py::arg("var"))
+        .def("removeVar", &Model::delete_var, py::arg("var"))
+        .def("delete_constr", &Model::delete_constr, py::arg("constraint"))
+        .def("deleteConstr", &Model::delete_constr, py::arg("constraint"))
+        .def("remove_constr", &Model::delete_constr, py::arg("constraint"))
+        .def("removeConstr", &Model::delete_constr, py::arg("constraint"))
         .def_property_readonly("num_vars", &Model::num_vars)
         .def_property_readonly("num_constraints", &Model::num_constraints)
         .def_property_readonly(
@@ -990,6 +1518,7 @@ PYBIND11_MODULE(simplex, m) {
             [](Model& self) -> RevisedSimplexOptions& { return self.options(); },
             py::return_value_policy::reference_internal)
         .def("solve", &Model::solve)
+        .def("reoptimize", &Model::reoptimize)
         .def("__repr__", &Model::repr);
 
     py::class_<RevisedSimplex>(m, "RevisedSimplex")

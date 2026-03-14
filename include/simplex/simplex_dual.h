@@ -314,7 +314,7 @@ class RevisedSimplexDualEngine {
             }
         }
         B.refactor();
-        dual_pricer.build_pool(B, Ahat, N);
+        dual_pricer.build_dual_pool(B, Ahat, N);
         self.trace_line_("[dual] start basis=" + self.format_basis_(basis));
 
         int rebuild_attempts = 0;
@@ -356,7 +356,7 @@ class RevisedSimplexDualEngine {
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after solve_B failure");
                         B.refactor();
-                        dual_pricer.build_pool(B, Ahat, N);
+                        dual_pricer.build_dual_pool(B, Ahat, N);
                         continue;
                     }
                     return {LPSolution::Status::Singular,
@@ -373,18 +373,18 @@ class RevisedSimplexDualEngine {
                     self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                      " refactor after solve_BT failure");
                     B.refactor();
-                    dual_pricer.build_pool(B, Ahat, N);
+                    dual_pricer.build_dual_pool(B, Ahat, N);
                     ydual = B.solve_BT(cB);
                 }
 
                 if (apply_views_to_nonbasics(ydual)) {
                     rhs_eff = b - transformed_rhs(A, view, l, u);
-                    dual_pricer.build_pool(B, Ahat, N);
+                    dual_pricer.build_dual_pool(B, Ahat, N);
                     continue;
                 }
 
                 const auto leaving =
-                    dual_pricer.choose_leaving(B, yB, self.opt_.tol);
+                    dual_pricer.choose_dual_leaving(B, yB, self.opt_.tol);
                 r_leave = leaving.row;
                 if (r_leave < 0) {
                     rN.resize(N.size());
@@ -439,7 +439,7 @@ class RevisedSimplexDualEngine {
                             "[dual] iter=" + std::to_string(iters) +
                             " refactor after no eligible entering");
                         B.refactor();
-                        dual_pricer.build_pool(B, Ahat, N);
+                        dual_pricer.build_dual_pool(B, Ahat, N);
                         continue;
                     }
                     return {LPSolution::Status::Singular,
@@ -475,7 +475,7 @@ class RevisedSimplexDualEngine {
                         ++flips_this_iter;
                         ++total_flips;
                     }
-                    dual_pricer.build_pool(B, Ahat, N);
+                    dual_pricer.build_dual_pool(B, Ahat, N);
                     continue;
                 }
 
@@ -490,7 +490,7 @@ class RevisedSimplexDualEngine {
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after solve(B,a_e) failure");
                         B.refactor();
-                        dual_pricer.build_pool(B, Ahat, N);
+                        dual_pricer.build_dual_pool(B, Ahat, N);
                         continue;
                     }
                     return {LPSolution::Status::Singular,
@@ -511,6 +511,7 @@ class RevisedSimplexDualEngine {
                 info_map["where"] = "dual: infinite step";
                 info_map["dual_pricing"] = dual_pricer.current_strategy_name();
                 info_map["dual_bfrt_flips"] = std::to_string(total_flips);
+                info_map["certificate"] = "farkas";
                 info_map["farkas_has_cert"] = "1";
                 info_map["farkas_dim"] = std::to_string(m);
                 info_map["farkas_y"] = serialize_vec(yF);
@@ -558,13 +559,14 @@ class RevisedSimplexDualEngine {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
                 B.refactor();
-                dual_pricer.build_pool(B, Ahat, N);
+                dual_pricer.build_dual_pool(B, Ahat, N);
             }
 
-            dual_pricer.update_after_pivot(r_leave, eAbs, oldAbs, s_enter,
-                                           s_enter(r_leave), Ahat, N, &w, true);
+            dual_pricer.update_after_dual_pivot(r_leave, eAbs, oldAbs, s_enter,
+                                                s_enter(r_leave), Ahat, N, w,
+                                                true);
             if (dual_pricer.needs_rebuild()) {
-                dual_pricer.build_pool(B, Ahat, N);
+                dual_pricer.build_dual_pool(B, Ahat, N);
                 dual_pricer.clear_rebuild_flag();
             }
             if (self.should_trace_iter_(iters) &&

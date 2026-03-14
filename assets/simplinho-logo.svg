@@ -1,0 +1,70 @@
+<svg width="960" height="320" viewBox="0 0 960 320" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="logo-title logo-desc">
+  <title id="logo-title">simplinho logo</title>
+  <desc id="logo-desc">A geometric logo for the simplinho simplex solver with a simplex-inspired triangular mark and a lowercase wordmark.</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="48" y1="28" x2="294" y2="292" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFF6E8"/>
+      <stop offset="1" stop-color="#F7E2C4"/>
+    </linearGradient>
+    <linearGradient id="triangle" x1="92" y1="74" x2="239" y2="226" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FF8E5A"/>
+      <stop offset="1" stop-color="#D95B43"/>
+    </linearGradient>
+    <linearGradient id="pathGlow" x1="108" y1="206" x2="246" y2="95" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0F7B7B"/>
+      <stop offset="1" stop-color="#35B6A8"/>
+    </linearGradient>
+    <filter id="softShadow" x="-20" y="-20" width="340" height="340" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="14" flood-color="#5B3B1A" flood-opacity="0.14"/>
+    </filter>
+  </defs>
+
+  <rect width="960" height="320" rx="32" fill="#FFFDF9"/>
+
+  <g filter="url(#softShadow)">
+    <rect x="48" y="28" width="246" height="264" rx="34" fill="url(#bg)"/>
+  </g>
+
+  <g opacity="0.55" stroke="#C79C73" stroke-width="2">
+    <path d="M84 87H258"/>
+    <path d="M84 127H258"/>
+    <path d="M84 167H258"/>
+    <path d="M84 207H258"/>
+    <path d="M84 247H258"/>
+    <path d="M104 68V252"/>
+    <path d="M154 68V252"/>
+    <path d="M204 68V252"/>
+    <path d="M254 68V252"/>
+  </g>
+
+  <path d="M94 224L173 78L248 224H94Z" fill="url(#triangle)"/>
+  <path d="M94 224L173 78L248 224H94Z" stroke="#8A3729" stroke-width="7" stroke-linejoin="round"/>
+
+  <path d="M113 206L171 160L226 111" stroke="url(#pathGlow)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M113 206L171 160L226 111" stroke="#083B45" stroke-opacity="0.2" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <circle cx="113" cy="206" r="15" fill="#FFF8ED" stroke="#0C5459" stroke-width="6"/>
+  <circle cx="171" cy="160" r="15" fill="#FFF8ED" stroke="#0C5459" stroke-width="6"/>
+  <circle cx="226" cy="111" r="15" fill="#FFF8ED" stroke="#0C5459" stroke-width="6"/>
+
+  <path d="M128 239C150 218 178 206 211 202" stroke="#FFE4B8" stroke-width="5" stroke-linecap="round" opacity="0.8"/>
+
+  <g fill="#19323C">
+    <text x="342" y="152" font-family="'Avenir Next', 'Montserrat', 'Trebuchet MS', sans-serif" font-size="82" font-weight="800" letter-spacing="-2.5">simplinho</text>
+    <text x="346" y="198" font-family="'Avenir Next', 'Montserrat', 'Trebuchet MS', sans-serif" font-size="26" font-weight="600" letter-spacing="4.2" fill="#0F7B7B">REVISED SIMPLEX SOLVER</text>
+  </g>
+
+  <g fill="#B96A43">
+    <circle cx="815" cy="88" r="10"/>
+    <circle cx="852" cy="88" r="10"/>
+    <circle cx="889" cy="88" r="10"/>
+  </g>
+
+  <path d="M785 232H907" stroke="#D9C4A1" stroke-width="8" stroke-linecap="round"/>
+  <path d="M785 252H872" stroke="#E8D6BB" stroke-width="8" stroke-linecap="round"/>
+  <path d="M785 232L833 186L889 220" stroke="#0F7B7B" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="785" cy="232" r="8" fill="#FFFDF9" stroke="#0F7B7B" stroke-width="5"/>
+  <circle cx="833" cy="186" r="8" fill="#FFFDF9" stroke="#0F7B7B" stroke-width="5"/>
+  <circle cx="889" cy="220" r="8" fill="#FFFDF9" stroke="#0F7B7B" stroke-width="5"/>
+</svg>

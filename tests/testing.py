@@ -2,7 +2,7 @@
 """Compare the local simplex solver against HiGHS on a batch of LPs.
 
 The script:
-1. Loads the locally built `simplex` extension from `build*/`.
+1. Loads the locally built extension from `build*/`.
 2. Loads `highspy` from the repo virtualenv when available.
 3. Solves a mix of fixed and random LP instances with both solvers.
 4. Compares solve status, objective value, and basic feasibility metrics.
@@ -25,7 +25,7 @@ from typing import Iterable
 import numpy as np
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def add_repo_venv_to_path() -> None:
@@ -43,12 +43,21 @@ def import_simplex_module():
         ROOT / "build",
         ROOT / "build-verify",
     ]
+    module_names = ["simplinho", "simplex"]
     for candidate in candidates:
-        if candidate.exists() and any(candidate.glob("simplex*.so")):
-            sys.path.insert(0, str(candidate))
-            return importlib.import_module("simplex")
+        if not candidate.exists():
+            continue
+        built_modules = list(candidate.glob("*.so"))
+        if not built_modules:
+            continue
+        sys.path.insert(0, str(candidate))
+        for module_name in module_names:
+            try:
+                return importlib.import_module(module_name)
+            except ImportError:
+                continue
     raise ImportError(
-        "Could not find a built simplex extension in build-local/, build/, or "
+        "Could not find a built solver extension in build-local/, build/, or "
         "build-verify/."
     )
 
@@ -218,6 +227,136 @@ def objective_close(lhs: float, rhs: float, tol: float) -> bool:
         return lhs == rhs
     scale = max(1.0, abs(lhs), abs(rhs))
     return abs(lhs - rhs) <= tol * scale
+
+
+def exercise_model_editing_api(simplex) -> list[str]:
+    notes: list[str] = []
+
+    model = simplex.Model()
+    x = model.addVar("x", lb=0.0, obj=1.0)
+    y = model.addVar("y", lb=0.0, ub=4.0, obj=2.0)
+
+    c1 = model.addConstr(x + y <= 4.0, name="mix")
+    c2 = model.addConstr(x <= 3.0, name="cap_x")
+    model.maximize(x + 2.0 * y)
+
+    sol1 = model.solve()
+    if simplex.status_to_string(sol1.status) != "optimal":
+        notes.append("initial model solve was not optimal")
+    if not objective_close(sol1.obj, 8.0, 1e-8):
+        notes.append(f"initial objective mismatch: expected 8.0, got {sol1.obj:.10g}")
+    if not objective_close(sol1.value(y), 4.0, 1e-8):
+        notes.append(f"initial y value mismatch: expected 4.0, got {sol1.value(y):.10g}")
+
+    x.obj = 3.0
+    if not objective_close(x.obj, 3.0, 1e-12):
+        notes.append(f"x.obj property did not update: got {x.obj:.10g}")
+
+    c1.set_coeff(y, 2.0)
+    c1.rhs = 5.0
+    if not objective_close(c1.get_coeff(y), 2.0, 1e-12):
+        notes.append(f"constraint coefficient update failed: got {c1.get_coeff(y):.10g}")
+    if not objective_close(c1.rhs, 5.0, 1e-12):
+        notes.append(f"constraint rhs update failed: got {c1.rhs:.10g}")
+    if not objective_close(model.getObjCoeff(x), 3.0, 1e-12):
+        notes.append(
+            f"model objective coefficient getter failed: got {model.getObjCoeff(x):.10g}"
+        )
+
+    sol2 = model.reoptimize()
+    if simplex.status_to_string(sol2.status) != "optimal":
+        notes.append("edited model reoptimize() was not optimal")
+    if not objective_close(sol2.obj, 11.0, 1e-8):
+        notes.append(f"edited objective mismatch: expected 11.0, got {sol2.obj:.10g}")
+    if not objective_close(sol2.value(x), 3.0, 1e-8):
+        notes.append(f"edited x value mismatch: expected 3.0, got {sol2.value(x):.10g}")
+    if not objective_close(sol2.value(y), 1.0, 1e-8):
+        notes.append(f"edited y value mismatch: expected 1.0, got {sol2.value(y):.10g}")
+
+    model.deleteConstr(c1)
+    if c2.index != 0:
+        notes.append(f"surviving constraint did not reindex to 0, got {c2.index}")
+
+    model.deleteVar(x)
+    if model.num_vars != 1:
+        notes.append(f"expected 1 variable after deletion, got {model.num_vars}")
+    if y.name != "y":
+        notes.append(f"surviving variable handle did not resolve back to y, got {y.name!r}")
+
+    try:
+        _ = x.lb
+        notes.append("deleted variable handle remained usable")
+    except Exception:
+        pass
+
+    sol3 = model.reoptimize()
+    if simplex.status_to_string(sol3.status) != "optimal":
+        notes.append("post-delete reoptimize() was not optimal")
+    if not objective_close(sol3.obj, 8.0, 1e-8):
+        notes.append(
+            f"post-delete objective mismatch: expected 8.0, got {sol3.obj:.10g}"
+        )
+    if not objective_close(sol3.value(y), 4.0, 1e-8):
+        notes.append(
+            f"post-delete y value mismatch: expected 4.0, got {sol3.value(y):.10g}"
+        )
+
+    return notes
+
+
+def exercise_solver_logging_api(simplex) -> list[str]:
+    notes: list[str] = []
+
+    options = simplex.RevisedSimplexOptions()
+    options.verbose = True
+    options.verbose_every = 1
+    options.mode = simplex.SimplexMode.Auto
+
+    model = simplex.Model(options)
+    x = model.addVar("x", lb=0.0)
+    y = model.addVar("y", lb=0.0)
+    model.addConstr(x + y <= 4.0, name="cap")
+    model.maximize(x + 2.0 * y)
+
+    sol = model.solve()
+    stats = sol.stats
+
+    if simplex.status_to_string(sol.status) != "optimal":
+        notes.append("logging model solve was not optimal")
+    if stats.status != "optimal":
+        notes.append(f"stats.status mismatch: expected 'optimal', got {stats.status!r}")
+    if stats.iterations != sol.iters:
+        notes.append(f"stats.iterations mismatch: expected {sol.iters}, got {stats.iterations}")
+    if stats.phase2_iterations > stats.iterations:
+        notes.append("phase2_iterations exceeded total iterations")
+    if stats.trace_lines != len(sol.log_lines):
+        notes.append(
+            f"trace line count mismatch: stats={stats.trace_lines} "
+            f"log_lines={len(sol.log_lines)}"
+        )
+    if stats.trace_lines <= 0:
+        notes.append("expected verbose solve to emit at least one trace line")
+    if "[solve] start" not in sol.log:
+        notes.append("expected joined log text to contain '[solve] start'")
+    if "raw_info" not in stats.as_dict():
+        notes.append("SolveStats.as_dict() did not include raw_info")
+    if not isinstance(stats.raw_info, dict):
+        notes.append("SolveStats.raw_info was not exposed as a dict")
+
+    A = np.array([[1.0, 1.0]], dtype=float)
+    b = np.array([4.0], dtype=float)
+    c = np.array([1.0, 2.0], dtype=float)
+    l = np.array([0.0, 0.0], dtype=float)
+    u = np.array([np.inf, np.inf], dtype=float)
+    solver = simplex.RevisedSimplex(options)
+    raw = solver.solve(A, b, c, l, u)
+    raw_stats = raw.stats
+    if raw_stats.trace_lines != len(raw.log_lines):
+        notes.append("LPSolution trace_lines did not match low-level log length")
+    if "[solve] start" not in raw.log:
+        notes.append("expected low-level joined log text to contain '[solve] start'")
+
+    return notes
 
 
 def compare_results(
@@ -460,6 +599,28 @@ def run_suite(args: argparse.Namespace) -> int:
         print("highspy not available; running simplex-only feasibility checks.", flush=True)
     else:
         print(f"Loaded highspy {getattr(highspy, '__version__', 'unknown')}", flush=True)
+    edit_notes = exercise_model_editing_api(simplex)
+    edit_passed = len(edit_notes) == 0
+    print(
+        f"{'PASS' if edit_passed else 'FAIL':4}  {'model_editing_api':24} "
+        f"live edits, deletes, and reoptimize"
+    )
+    if args.verbose or not edit_passed:
+        for note in edit_notes:
+            print(f"      - {note}")
+    if not edit_passed:
+        return 1
+    logging_notes = exercise_solver_logging_api(simplex)
+    logging_passed = len(logging_notes) == 0
+    print(
+        f"{'PASS' if logging_passed else 'FAIL':4}  {'solver_logging_api':24} "
+        f"typed stats and joined logs"
+    )
+    if args.verbose or not logging_passed:
+        for note in logging_notes:
+            print(f"      - {note}")
+    if not logging_passed:
+        return 1
     print(f"Running {len(cases)} problem(s) with mode={args.mode}", flush=True)
     print()
 
