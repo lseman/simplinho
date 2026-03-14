@@ -43,6 +43,8 @@ The Python module also exposes:
 - `RevisedSimplexOptions`
 - `SimplexMode`
 - `LPStatus`
+- `LPBasis`
+- `LPBasisStatus`
 - `status_to_string(...)`
 
 ## Solver Features
@@ -138,8 +140,34 @@ print("x:", solution.x)
 print("iterations:", solution.iters)
 print("stats:", solution.stats.as_dict())
 print("log:", solution.log)
+print("basis:", solution.basis_state)
 print("dual values:", solution.dual_values_internal)
 print("reduced costs:", solution.reduced_costs_internal)
+```
+
+You can also reuse that basis as a warm start after bound changes:
+
+```python
+basis = solution.basis_state
+
+u2 = np.array([1.5, np.inf])
+warm = solver.solve(A, b, c, l, u2, basis=basis)
+print(warm.stats.basis_start)
+```
+
+If you keep the same `RevisedSimplex` instance in `Dual` mode, it will also
+automatically reuse the last valid basis on later `solve(...)` calls with the
+same row/column dimensions. That makes repeated bound-fixing re-solves behave
+more like a branch-and-bound node LP loop:
+
+```python
+options.mode = simplex.SimplexMode.Dual
+solver = simplex.RevisedSimplex(options)
+
+root = solver.solve(A, b, c, l, u)
+u_node = np.array([1.5, np.inf])
+node = solver.solve(A, b, c, l, u_node)
+print(node.stats.basis_start)
 ```
 
 ## Modeling API Example
@@ -170,6 +198,7 @@ print("x        :", solution.value(x))
 print("y        :", solution.value("y"))
 print("all vars :", solution.values)
 print("stats    :", solution.stats.as_dict())
+print("basis    :", solution.basis)
 print("log      :", solution.log)
 print("dual c1  :", c1.pi)
 print("dual c2  :", c2.pi)
@@ -190,12 +219,25 @@ model.deleteVar(x)
 solution = model.reoptimize()
 ```
 
+When the model structure stays the same, `reoptimize()` will automatically try
+to reuse the last valid basis after edits like bound changes, RHS updates,
+coefficient changes, or objective changes. You can also pass an explicit saved
+basis for fast dual re-solves:
+
+```python
+basis = solution.basis
+x.ub = 1.5
+model.options.mode = simplex.SimplexMode.Dual
+solution = model.reoptimize(basis)
+```
+
 ## Useful Outputs
 
 The low-level `LPSolution` object includes more than just the primal vector:
 
 - `status`, `obj`, `x`, `iters`
 - `stats` with typed solve telemetry and `as_dict()`
+- `basis_state` / `basis` for reusable warm starts
 - `log_lines` and `log` for verbose solver traces
 - `basis`, `basis_internal`, `nonbasis_internal`
 - `tableau`, `tableau_rhs`, `has_internal_tableau`

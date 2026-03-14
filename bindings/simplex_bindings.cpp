@@ -56,6 +56,7 @@ struct ModelState {
     LinearExprData objective;
     bool maximize = false;
     std::vector<double> last_constraint_pi;
+    std::optional<LPBasis> last_basis;
     std::uint64_t revision = 0;
     std::uint64_t solved_revision = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t next_var_id = 1;
@@ -260,6 +261,167 @@ std::optional<bool> find_info_bool(
         return false;
     }
     return std::nullopt;
+}
+
+LPBasis parse_basis_state_from_info(
+    const std::unordered_map<std::string, std::string>& info,
+    const LPBasis& fallback = LPBasis{}) {
+    const auto it = info.find("warm_start_basis_state");
+    if (it == info.end()) {
+        return fallback;
+    }
+    LPBasis out;
+    std::stringstream ss(it->second);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        if (tok.empty()) continue;
+        const int value = std::stoi(tok);
+        switch (value) {
+            case 0:
+                out.column_status.push_back(LPBasisStatus::Basic);
+                break;
+            case 1:
+                out.column_status.push_back(LPBasisStatus::AtLower);
+                break;
+            case 2:
+                out.column_status.push_back(LPBasisStatus::AtUpper);
+                break;
+            case 3:
+                out.column_status.push_back(LPBasisStatus::Fixed);
+                break;
+            default:
+                out.column_status.push_back(LPBasisStatus::AtLower);
+                break;
+        }
+    }
+    return out;
+}
+
+std::optional<std::vector<double>> parse_double_list_from_info(
+    const std::unordered_map<std::string, std::string>& info, const char* key) {
+    const auto it = info.find(key);
+    if (it == info.end()) return std::nullopt;
+    std::vector<double> out;
+    std::stringstream ss(it->second);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        if (tok.empty()) continue;
+        out.push_back(std::stod(tok));
+    }
+    return out;
+}
+
+LPBasis rebuild_basis_from_solution(const LPSolution& sol) {
+    const auto maybe_l = parse_double_list_from_info(sol.info, "original_l");
+    const auto maybe_u = parse_double_list_from_info(sol.info, "original_u");
+    const auto maybe_m = find_info_int(sol.info, "original_m");
+    if (!maybe_l || !maybe_u || !maybe_m) {
+        return parse_basis_state_from_info(sol.info, sol.basis_state);
+    }
+    if (sol.x.size() != static_cast<int>(maybe_l->size()) ||
+        sol.x.size() != static_cast<int>(maybe_u->size())) {
+        return parse_basis_state_from_info(sol.info, sol.basis_state);
+    }
+
+    std::vector<int> status(sol.x.size(), 1);
+    std::vector<char> eligible(sol.x.size(), 1);
+    const double tol = 1e-8;
+    for (int j = 0; j < sol.x.size(); ++j) {
+        const double x = sol.x(j);
+        const double l = (*maybe_l)[j];
+        const double u = (*maybe_u)[j];
+        const bool has_l = std::isfinite(l);
+        const bool has_u = std::isfinite(u);
+        const bool fixed = has_l && has_u && std::abs(u - l) <= tol;
+        if (fixed) {
+            status[j] = 3;
+            eligible[j] = 0;
+            continue;
+        }
+        const bool near_l = has_l && std::abs(x - l) <= tol;
+        const bool near_u = has_u && std::abs(x - u) <= tol;
+        if (near_u && !near_l) {
+            status[j] = 2;
+        } else if (near_l) {
+            status[j] = 1;
+        } else if (has_u && !has_l) {
+            status[j] = 2;
+        } else if (has_l && has_u) {
+            status[j] = (std::abs(x - u) + tol < std::abs(x - l)) ? 2 : 1;
+        } else {
+            status[j] = 1;
+        }
+    }
+
+    const int target = *maybe_m;
+    std::vector<char> chosen(sol.x.size(), 0);
+    auto choose_if = [&](int j) {
+        if (j < 0 || j >= sol.x.size() || chosen[j] || !eligible[j]) return false;
+        chosen[j] = 1;
+        status[j] = 0;
+        return true;
+    };
+
+    int chosen_count = 0;
+    for (int j : sol.basis) {
+        if (chosen_count == target) break;
+        if (j < 0 || j >= sol.x.size()) continue;
+        const double l = (*maybe_l)[j];
+        const double u = (*maybe_u)[j];
+        const bool has_l = std::isfinite(l);
+        const bool has_u = std::isfinite(u);
+        const bool near_l = has_l && std::abs(sol.x(j) - l) <= tol;
+        const bool near_u = has_u && std::abs(sol.x(j) - u) <= tol;
+        if (!near_l && !near_u && choose_if(j)) ++chosen_count;
+    }
+    for (int j = 0; j < sol.x.size() && chosen_count < target; ++j) {
+        const double l = (*maybe_l)[j];
+        const double u = (*maybe_u)[j];
+        const bool has_l = std::isfinite(l);
+        const bool has_u = std::isfinite(u);
+        const bool near_l = has_l && std::abs(sol.x(j) - l) <= tol;
+        const bool near_u = has_u && std::abs(sol.x(j) - u) <= tol;
+        if (!near_l && !near_u && choose_if(j)) ++chosen_count;
+    }
+    for (int j : sol.basis) {
+        if (chosen_count == target) break;
+        if (choose_if(j)) ++chosen_count;
+    }
+    for (int j = 0; j < sol.x.size() && chosen_count < target; ++j) {
+        if (choose_if(j)) ++chosen_count;
+    }
+
+    LPBasis out;
+    out.column_status.reserve(status.size());
+    for (const int value : status) {
+        switch (value) {
+            case 0:
+                out.column_status.push_back(LPBasisStatus::Basic);
+                break;
+            case 2:
+                out.column_status.push_back(LPBasisStatus::AtUpper);
+                break;
+            case 3:
+                out.column_status.push_back(LPBasisStatus::Fixed);
+                break;
+            case 1:
+            default:
+                out.column_status.push_back(LPBasisStatus::AtLower);
+                break;
+        }
+    }
+    return out;
+}
+
+bool basis_matches_dimensions(const LPBasis& basis, int columns, int rows) {
+    if (basis.column_status.size() != static_cast<std::size_t>(columns)) {
+        return false;
+    }
+    int basic_count = 0;
+    for (const auto status : basis.column_status) {
+        if (status == LPBasisStatus::Basic) ++basic_count;
+    }
+    return basic_count == rows;
 }
 
 struct SolveStats {
@@ -477,10 +639,11 @@ class Var {
     }
 
    private:
-    void touch_state_() const {
+    void touch_state_(bool invalidate_basis = false) const {
         ++state_->revision;
         state_->solved_revision = std::numeric_limits<std::uint64_t>::max();
         state_->last_constraint_pi.clear();
+        if (invalidate_basis) state_->last_basis.reset();
     }
 
     int resolve_index_(const char* context) const {
@@ -692,7 +855,7 @@ class ConstraintHandle {
 
     void set_sense(ConstraintSense value) {
         const int index = resolve_index_("set_sense");
-        touch_state_();
+        touch_state_(true);
         state_->constraints[index].sense = value;
     }
 
@@ -730,10 +893,11 @@ class ConstraintHandle {
     }
 
    private:
-    void touch_state_() const {
+    void touch_state_(bool invalidate_basis = false) const {
         ++state_->revision;
         state_->solved_revision = std::numeric_limits<std::uint64_t>::max();
         state_->last_constraint_pi.clear();
+        if (invalidate_basis) state_->last_basis.reset();
     }
 
     int resolve_index_(const char* context) const {
@@ -787,6 +951,7 @@ class ModelSolution {
     const std::vector<std::string>& log_lines() const { return raw_.trace; }
     std::string log() const { return join_trace_lines(raw_.trace); }
     SolveStats stats() const { return build_solve_stats(raw_); }
+    LPBasis basis() const { return rebuild_basis_from_solution(raw_); }
 
     double value(const Var& var) const {
         if (!state_ || !var.state() || state_.get() != var.state().get()) {
@@ -833,7 +998,7 @@ class Model {
     Var add_var(const std::optional<std::string>& name = std::nullopt, double lb = 0.0,
                 double ub = std::numeric_limits<double>::infinity(),
                 double obj = 0.0) {
-        touch_();
+        touch_(true);
         if (std::isfinite(lb) && std::isfinite(ub) && ub < lb) {
             throw std::invalid_argument("simplex: add_var received ub < lb");
         }
@@ -863,7 +1028,7 @@ class Model {
 
     ConstraintHandle add_constr(const ConstraintSpec& constr,
                                 const std::optional<std::string>& name = std::nullopt) {
-        touch_();
+        touch_(true);
         if (!constr.state() || constr.state().get() != state_.get()) {
             throw std::invalid_argument(
                 "simplex: constraint does not belong to this model");
@@ -945,7 +1110,7 @@ class Model {
     void delete_var(const Var& var) {
         ensure_same_model_(var.state(), "delete_var");
         const int removed_index = var.index();
-        touch_();
+        touch_(true);
         state_->vars.erase(state_->vars.begin() + removed_index);
         rebuild_name_to_index_();
         erase_and_reindex_coeffs(state_->objective, removed_index);
@@ -956,13 +1121,15 @@ class Model {
 
     void delete_constr(const ConstraintHandle& constr) {
         ensure_same_model_(constr.state(), "delete_constr");
-        touch_();
+        touch_(true);
         state_->constraints.erase(state_->constraints.begin() + constr.index());
     }
 
-    ModelSolution reoptimize() const { return solve(); }
+    ModelSolution reoptimize(std::optional<LPBasis> warm_start = std::nullopt) const {
+        return solve(std::move(warm_start));
+    }
 
-    ModelSolution solve() const {
+    ModelSolution solve(std::optional<LPBasis> warm_start = std::nullopt) const {
         const int n = static_cast<int>(state_->vars.size());
         int slack_count = 0;
         for (const auto& constr : state_->constraints) {
@@ -1014,10 +1181,27 @@ class Model {
         }
 
         RevisedSimplex solver(state_->options);
-        auto raw = solver.solve(A, b, c, l, u);
+        const LPBasis* effective_basis = nullptr;
+        if (warm_start) {
+            if (!basis_matches_dimensions(*warm_start, total_vars, m)) {
+                throw std::invalid_argument(
+                    "simplex: warm-start basis does not match model dimensions");
+            }
+            effective_basis = &*warm_start;
+        } else if (state_->last_basis &&
+                   basis_matches_dimensions(*state_->last_basis, total_vars, m)) {
+            effective_basis = &*state_->last_basis;
+        }
+
+        auto raw = effective_basis ? solver.solve(A, b, c, l, u, *effective_basis)
+                                   : solver.solve(A, b, c, l, u);
         state_->last_constraint_pi =
             compute_constraint_duals(A, c, raw, objective_sign);
         state_->solved_revision = state_->revision;
+        const LPBasis rebuilt_basis = rebuild_basis_from_solution(raw);
+        if (basis_matches_dimensions(rebuilt_basis, total_vars, m)) {
+            state_->last_basis = rebuilt_basis;
+        }
 
         Eigen::VectorXd primal =
             Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
@@ -1063,10 +1247,11 @@ class Model {
         return candidate;
     }
 
-    void touch_() {
+    void touch_(bool invalidate_basis = false) {
         ++state_->revision;
         state_->solved_revision = std::numeric_limits<std::uint64_t>::max();
         state_->last_constraint_pi.clear();
+        if (invalidate_basis) state_->last_basis.reset();
     }
 
     std::shared_ptr<ModelState> state_;
@@ -1084,6 +1269,36 @@ PYBIND11_MODULE(simplinho, m) {
         .value("IterLimit", LPSolution::Status::IterLimit)
         .value("Singular", LPSolution::Status::Singular)
         .value("NeedPhase1", LPSolution::Status::NeedPhase1);
+
+    py::enum_<LPBasisStatus>(m, "LPBasisStatus")
+        .value("Basic", LPBasisStatus::Basic)
+        .value("AtLower", LPBasisStatus::AtLower)
+        .value("AtUpper", LPBasisStatus::AtUpper)
+        .value("Fixed", LPBasisStatus::Fixed);
+
+    py::class_<LPBasis>(m, "LPBasis")
+        .def(py::init<>())
+        .def_readwrite("column_status", &LPBasis::column_status)
+        .def_property_readonly("num_columns", [](const LPBasis& self) {
+            return static_cast<int>(self.column_status.size());
+        })
+        .def_property_readonly("basic_columns", [](const LPBasis& self) {
+            std::vector<int> out;
+            for (int j = 0; j < static_cast<int>(self.column_status.size()); ++j) {
+                if (self.column_status[j] == LPBasisStatus::Basic) out.push_back(j);
+            }
+            return out;
+        })
+        .def("__repr__", [](const LPBasis& self) {
+            int basics = 0;
+            for (const auto status : self.column_status) {
+                if (status == LPBasisStatus::Basic) ++basics;
+            }
+            std::ostringstream oss;
+            oss << "LPBasis(num_columns=" << self.column_status.size()
+                << ", basics=" << basics << ")";
+            return oss.str();
+        });
 
     py::class_<SolveStats>(m, "SolveStats")
         .def_property_readonly("status", [](const SolveStats& self) { return self.status; })
@@ -1196,6 +1411,9 @@ PYBIND11_MODULE(simplinho, m) {
         .def_readonly("iters", &LPSolution::iters)
         .def_readonly("info", &LPSolution::info)
         .def_readonly("trace", &LPSolution::trace)
+        .def_property_readonly("basis_state", [](const LPSolution& self) {
+            return rebuild_basis_from_solution(self);
+        })
         .def_property_readonly("stats", [](const LPSolution& self) {
             return build_solve_stats(self);
         })
@@ -1434,6 +1652,7 @@ PYBIND11_MODULE(simplinho, m) {
         .def_property_readonly("values", &ModelSolution::values,
                                py::return_value_policy::reference_internal)
         .def_property_readonly("stats", &ModelSolution::stats)
+        .def_property_readonly("basis", &ModelSolution::basis)
         .def_property_readonly("log_lines", &ModelSolution::log_lines,
                                py::return_value_policy::reference_internal)
         .def_property_readonly("log", &ModelSolution::log)
@@ -1517,21 +1736,52 @@ PYBIND11_MODULE(simplinho, m) {
             "options",
             [](Model& self) -> RevisedSimplexOptions& { return self.options(); },
             py::return_value_policy::reference_internal)
-        .def("solve", &Model::solve)
-        .def("reoptimize", &Model::reoptimize)
+        .def(
+            "solve",
+            [](const Model& self, py::object basis) {
+                if (basis.is_none()) return self.solve();
+                if (py::isinstance<LPBasis>(basis)) {
+                    return self.solve(basis.cast<LPBasis>());
+                }
+                throw std::invalid_argument(
+                    "simplex: model.solve basis must be an LPBasis");
+            },
+            py::arg("basis") = py::none())
+        .def(
+            "reoptimize",
+            [](const Model& self, py::object basis) {
+                if (basis.is_none()) return self.reoptimize();
+                if (py::isinstance<LPBasis>(basis)) {
+                    return self.reoptimize(basis.cast<LPBasis>());
+                }
+                throw std::invalid_argument(
+                    "simplex: model.reoptimize basis must be an LPBasis");
+            },
+            py::arg("basis") = py::none())
         .def("__repr__", &Model::repr);
 
     py::class_<RevisedSimplex>(m, "RevisedSimplex")
         .def(py::init<const RevisedSimplexOptions&>(),
              py::arg("options") = RevisedSimplexOptions())
+        .def("clear_basis_cache", &RevisedSimplex::clear_basis_cache)
+        .def("clearBasisCache", &RevisedSimplex::clear_basis_cache)
         .def(
             "solve",
             [](RevisedSimplex& self, const Eigen::MatrixXd& A,
                const Eigen::VectorXd& b, const Eigen::VectorXd& c,
-               const Eigen::VectorXd& l, const Eigen::VectorXd& u) {
-                return self.solve(A, b, c, l, u);
+               const Eigen::VectorXd& l, const Eigen::VectorXd& u,
+               py::object basis) {
+                if (basis.is_none()) {
+                    return self.solve(A, b, c, l, u);
+                }
+                if (py::isinstance<LPBasis>(basis)) {
+                    return self.solve(A, b, c, l, u, basis.cast<LPBasis>());
+                }
+                return self.solve(A, b, c, l, u,
+                                  basis.cast<std::vector<int>>());
             },
             py::arg("A"), py::arg("b"), py::arg("c"), py::arg("l"), py::arg("u"),
+            py::arg("basis") = py::none(),
             "Solve LP: min c^T x s.t. Ax=b, l<=x<=u");
 
     m.attr("SimplexModel") = m.attr("Model");

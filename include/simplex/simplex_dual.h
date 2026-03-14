@@ -184,7 +184,8 @@ class RevisedSimplexDualEngine {
     static RevisedSimplex::PhaseResult run(
         RevisedSimplex& self, const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
         const Eigen::VectorXd& c, std::optional<std::vector<int>> basis_opt,
-        const Eigen::VectorXd& l, const Eigen::VectorXd& u) {
+        const Eigen::VectorXd& l, const Eigen::VectorXd& u,
+        std::optional<std::vector<LPBasisStatus>> warm_status = std::nullopt) {
         const int m = static_cast<int>(A.rows());
         const int n = static_cast<int>(A.cols());
         int iters = 0;
@@ -228,6 +229,8 @@ class RevisedSimplexDualEngine {
 
         std::vector<BoundView> view(n, BoundView::Lower);
         for (int j = 0; j < n; ++j) view[j] = default_bound_view(j, l, u);
+        const bool warm_views_provided =
+            warm_status && warm_status->size() == static_cast<std::size_t>(n);
         self.bridge_.reset();
         DualAdaptivePricer dual_pricer(self.opt_.pricing_rule,
                                        self.opt_.devex_reset,
@@ -235,8 +238,44 @@ class RevisedSimplexDualEngine {
 
         Eigen::MatrixXd Ahat = A;
         Eigen::VectorXd chat = c;
+        if (warm_views_provided) {
+            std::vector<char> inB(n, 0);
+            for (int j : basis)
+                if (j >= 0 && j < n) inB[j] = 1;
+            for (int j = 0; j < n; ++j) {
+                if (inB[j]) continue;
+                switch ((*warm_status)[j]) {
+                    case LPBasisStatus::AtUpper:
+                        view[j] = std::isfinite(u(j)) ? BoundView::Upper
+                                                      : BoundView::Lower;
+                        break;
+                    case LPBasisStatus::Fixed:
+                        view[j] = BoundView::Fixed;
+                        break;
+                    case LPBasisStatus::Basic:
+                    case LPBasisStatus::AtLower:
+                    default:
+                        view[j] = BoundView::Lower;
+                        break;
+                }
+            }
+        }
+        for (int j = 0; j < n; ++j) {
+            const double sign = static_cast<double>(view_sign(view[j]));
+            if (sign > 0.0) {
+                Ahat.col(j) = A.col(j);
+                chat(j) = c(j);
+            } else {
+                Ahat.col(j) = -A.col(j);
+                chat(j) = -c(j);
+            }
+        }
         for (int j : basis) {
             if (j >= 0 && j < n) view[j] = BoundView::Lower;
+            if (j >= 0 && j < n) {
+                Ahat.col(j) = A.col(j);
+                chat(j) = c(j);
+            }
         }
 
         std::optional<FTBasis> Bopt;
@@ -300,18 +339,11 @@ class RevisedSimplexDualEngine {
             return changed;
         };
 
-        {
+        if (!warm_views_provided) {
             Eigen::VectorXd cB(m);
             for (int i = 0; i < m; ++i) cB(i) = chat(basis[i]);
             Eigen::VectorXd ydual = B.solve_BT(cB);
             apply_views_to_nonbasics(ydual);
-        }
-
-        for (int j : basis) {
-            if (view_sign(view[j]) < 0) {
-                Ahat.col(j) = -A.col(j);
-                chat(j) = -c(j);
-            }
         }
         B.refactor();
         dual_pricer.build_dual_pool(B, Ahat, N);
@@ -377,7 +409,8 @@ class RevisedSimplexDualEngine {
                     ydual = B.solve_BT(cB);
                 }
 
-                if (apply_views_to_nonbasics(ydual)) {
+                if (!(warm_views_provided && iters == 1) &&
+                    apply_views_to_nonbasics(ydual)) {
                     rhs_eff = b - transformed_rhs(A, view, l, u);
                     dual_pricer.build_dual_pool(B, Ahat, N);
                     continue;

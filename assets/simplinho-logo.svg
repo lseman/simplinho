@@ -52,7 +52,7 @@
 
   <g fill="#19323C">
     <text x="342" y="152" font-family="'Avenir Next', 'Montserrat', 'Trebuchet MS', sans-serif" font-size="82" font-weight="800" letter-spacing="-2.5">simplinho</text>
-    <text x="346" y="198" font-family="'Avenir Next', 'Montserrat', 'Trebuchet MS', sans-serif" font-size="26" font-weight="600" letter-spacing="4.2" fill="#0F7B7B">REVISED SIMPLEX SOLVER</text>
+    <text x="346" y="198" font-family="'Avenir Next', 'Montserrat', 'Trebuchet MS', sans-serif" font-size="26" font-weight="600" letter-spacing="4.2" fill="#0F7B7B">SIMPLE SIMPLEX SOLVER</text>
   </g>
 
   <g fill="#B96A43">

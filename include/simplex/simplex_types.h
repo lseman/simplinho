@@ -10,6 +10,12 @@
 // ============================================================================
 // Public result container
 // ============================================================================
+enum class LPBasisStatus { Basic, AtLower, AtUpper, Fixed };
+
+struct LPBasis {
+    std::vector<LPBasisStatus> column_status;
+};
+
 struct LPSolution {
     enum class Status {
         Optimal,
@@ -39,6 +45,7 @@ struct LPSolution {
     int iters = 0;           // total iterations (Phase I + II)
     std::unordered_map<std::string, std::string> info;  // telemetry
     std::vector<std::string> trace;  // verbose trace, if enabled
+    LPBasis basis_state;  // reusable warm start in the original column space
     Eigen::VectorXd farkas_y;  // Farkas certificate of infeasibility (if any)
     Eigen::VectorXd farkas_y_internal;  // Farkas certificate on internal rows
     bool farkas_has_cert = false;  // whether farkas_y is valid

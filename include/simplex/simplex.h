@@ -87,15 +87,68 @@ class RevisedSimplex {
                      const Eigen::VectorXd& c_in,
                      std::optional<std::vector<int>> basis_opt = std::nullopt) {
         const int n = static_cast<int>(A_in.cols());
-        return solve(
+        const LPBasis* implicit_basis = nullptr;
+        if (!basis_opt && should_reuse_cached_basis_(A_in.rows(), n)) {
+            implicit_basis = &*cached_basis_state_;
+        }
+        LPSolution sol = solve_impl_(
             A_in, b_in, c_in, Eigen::VectorXd::Zero(n),
-            Eigen::VectorXd::Constant(n, presolve::inf()), basis_opt);
+            Eigen::VectorXd::Constant(n, presolve::inf()), basis_opt,
+            implicit_basis);
+        update_cached_basis_(sol, A_in.rows(), Eigen::VectorXd::Zero(n),
+                             Eigen::VectorXd::Constant(n, presolve::inf()));
+        return sol;
+    }
+
+    LPSolution solve(const Eigen::MatrixXd& A_in, const Eigen::VectorXd& b_in,
+                     const Eigen::VectorXd& c_in, const LPBasis& warm_start) {
+        const int n = static_cast<int>(A_in.cols());
+        LPSolution sol = solve_impl_(A_in, b_in, c_in, Eigen::VectorXd::Zero(n),
+                                     Eigen::VectorXd::Constant(n, presolve::inf()),
+                                     std::nullopt, &warm_start);
+        update_cached_basis_(sol, A_in.rows(), Eigen::VectorXd::Zero(n),
+                             Eigen::VectorXd::Constant(n, presolve::inf()));
+        return sol;
     }
 
     LPSolution solve(const Eigen::MatrixXd& A_in, const Eigen::VectorXd& b_in,
                      const Eigen::VectorXd& c_in, const Eigen::VectorXd& l_in,
                      const Eigen::VectorXd& u_in,
                      std::optional<std::vector<int>> basis_opt = std::nullopt) {
+        const int n = static_cast<int>(A_in.cols());
+        const LPBasis* implicit_basis = nullptr;
+        if (!basis_opt && should_reuse_cached_basis_(A_in.rows(), n)) {
+            implicit_basis = &*cached_basis_state_;
+        }
+        LPSolution sol =
+            solve_impl_(A_in, b_in, c_in, l_in, u_in, basis_opt, implicit_basis);
+        update_cached_basis_(sol, A_in.rows(), l_in, u_in);
+        return sol;
+    }
+
+    LPSolution solve(const Eigen::MatrixXd& A_in, const Eigen::VectorXd& b_in,
+                     const Eigen::VectorXd& c_in, const Eigen::VectorXd& l_in,
+                     const Eigen::VectorXd& u_in, const LPBasis& warm_start) {
+        LPSolution sol =
+            solve_impl_(A_in, b_in, c_in, l_in, u_in, std::nullopt, &warm_start);
+        update_cached_basis_(sol, A_in.rows(), l_in, u_in);
+        return sol;
+    }
+
+    void clear_basis_cache() {
+        cached_basis_state_.reset();
+        cached_basis_rows_ = -1;
+        cached_basis_cols_ = -1;
+    }
+
+   private:
+    LPSolution solve_impl_(const Eigen::MatrixXd& A_in,
+                           const Eigen::VectorXd& b_in,
+                           const Eigen::VectorXd& c_in,
+                           const Eigen::VectorXd& l_in,
+                           const Eigen::VectorXd& u_in,
+                           std::optional<std::vector<int>> basis_opt,
+                           const LPBasis* basis_state_opt) {
         SolveTraceScope trace_scope(*this);
         const int n = static_cast<int>(A_in.cols());
         if (b_in.size() != A_in.rows()) {
@@ -119,6 +172,16 @@ class RevisedSimplex {
                         std::to_string(sanitized_bounds.relaxed_upper) +
                         " lower=" +
                         std::to_string(sanitized_bounds.relaxed_lower));
+        }
+
+        if ((!basis_opt || basis_opt->empty()) && basis_state_opt &&
+            !basis_state_opt->column_status.empty()) {
+            if ((int)basis_state_opt->column_status.size() != n) {
+                throw std::invalid_argument(
+                    "simplex: warm-start basis column_status size mismatch");
+            }
+            basis_opt = basis_columns_from_basis_state_(*basis_state_opt,
+                                                        static_cast<int>(A_in.rows()));
         }
 
         bool is_nonnegative_standard = true;
@@ -145,6 +208,10 @@ class RevisedSimplex {
             };
 
             std::vector<ReformVar> map(n);
+            std::vector<int> single_y(n, -1);
+            std::vector<int> upper_slack(n, -1);
+            std::vector<int> split_pos(n, -1);
+            std::vector<int> split_neg(n, -1);
             int nv = 0;
             int upper_rows = 0;
             double obj_shift = 0.0;
@@ -165,6 +232,7 @@ class RevisedSimplex {
                 if (has_l) {
                     map[j].uses_single_var = true;
                     map[j].y = nv++;
+                    single_y[j] = map[j].y;
                     map[j].shift = l_use(j);
                     map[j].sign = 1;
                     obj_shift += c_in(j) * l_use(j);
@@ -175,12 +243,15 @@ class RevisedSimplex {
                 } else if (has_u) {
                     map[j].uses_single_var = true;
                     map[j].y = nv++;
+                    single_y[j] = map[j].y;
                     map[j].shift = u_use(j);
                     map[j].sign = -1;
                     obj_shift += c_in(j) * u_use(j);
                 } else {
                     map[j].y_pos = nv++;
                     map[j].y_neg = nv++;
+                    split_pos[j] = map[j].y_pos;
+                    split_neg[j] = map[j].y_neg;
                 }
             }
 
@@ -231,6 +302,7 @@ class RevisedSimplex {
                 if (!map[j].has_upper_row) continue;
                 const int slack = nv + upper_row;
                 map[j].upper_slack = slack;
+                upper_slack[j] = slack;
                 A_std(row, map[j].y) = 1.0;
                 A_std(row, slack) = 1.0;
                 b_std(row) = u_use(j) - l_use(j);
@@ -239,6 +311,7 @@ class RevisedSimplex {
             }
 
             std::optional<std::vector<int>> basis_std = std::nullopt;
+            std::optional<LPBasis> basis_state_std = std::nullopt;
             if (basis_opt && !basis_opt->empty()) {
                 std::vector<int> cand;
                 cand.reserve(std::min(m_eq, (int)basis_opt->size()) + upper_rows);
@@ -256,8 +329,18 @@ class RevisedSimplex {
                 }
                 if ((int)cand.size() == m_total) basis_std = std::move(cand);
             }
+            if (basis_state_opt &&
+                !basis_state_opt->column_status.empty() &&
+                (int)basis_state_opt->column_status.size() == n) {
+                basis_state_std = map_reformulated_basis_state_(
+                    *basis_state_opt, l_use, u_use, n_total, single_y, upper_slack,
+                    split_pos, split_neg);
+            }
 
-            LPSolution std_sol = solve(A_std, b_std, c_std, l_std, u_std, basis_std);
+            LPSolution std_sol =
+                basis_state_std
+                    ? solve(A_std, b_std, c_std, l_std, u_std, *basis_state_std)
+                    : solve(A_std, b_std, c_std, l_std, u_std, basis_std);
 
             Eigen::VectorXd x = Eigen::VectorXd::Constant(
                 n, std::numeric_limits<double>::quiet_NaN());
@@ -293,6 +376,9 @@ class RevisedSimplex {
 
             auto info = std_sol.info;
             info["bound_reformulation"] = "1";
+            info["original_m"] = std::to_string(m_eq);
+            info["original_l"] = serialize_double_vec_(l_in);
+            info["original_u"] = serialize_double_vec_(u_in);
             if (sanitized_bounds.relaxed_upper > 0) {
                 info["input_upper_bounds_relaxed"] =
                     std::to_string(sanitized_bounds.relaxed_upper);
@@ -327,6 +413,13 @@ class RevisedSimplex {
             sol.shadow_prices_internal = std_sol.shadow_prices_internal;
             sol.farkas_y_internal = std_sol.farkas_y_internal;
             sol.primal_ray_internal = std_sol.primal_ray_internal;
+            const LPBasis warm_basis = compute_basis_state_(sol.basis, sol.x, l_in,
+                                                            u_in, opt_.tol, m_eq);
+            const std::string warm_basis_serialized =
+                serialize_basis_state_from_primal_(sol.basis, sol.x, l_in, u_in,
+                                                   opt_.tol, m_eq);
+            sol.basis_state = warm_basis;
+            sol.info["warm_start_basis_state"] = warm_basis_serialized;
             if (std_sol.primal_ray_has_cert &&
                 std_sol.primal_ray.size() == n_total) {
                 Eigen::VectorXd ray = Eigen::VectorXd::Zero(n);
@@ -347,7 +440,8 @@ class RevisedSimplex {
                 sol.primal_ray = clip_small_(ray);
             }
             sol.has_internal_tableau = std_sol.has_internal_tableau;
-            return finalize_solution_(std::move(sol));
+            return finalize_solution_(attach_basis_state_(std::move(sol), l_in, u_in,
+                                                          opt_.tol));
         }
 
         Eigen::MatrixXd A_model = A_in;
@@ -467,7 +561,8 @@ class RevisedSimplex {
             sol.dual_values = clip_small_vec_(
                 P.postsolve_dual(Eigen::VectorXd::Zero(0)), opt_.tol);
             sol.shadow_prices = sol.dual_values;
-            return finalize_solution_(std::move(sol));
+            return finalize_solution_(attach_basis_state_(std::move(sol), l_in, u_in,
+                                                          opt_.tol));
         }
 
         // ---- (3) Solve reduced problem directly with explicit bounds ----
@@ -500,6 +595,7 @@ class RevisedSimplex {
 
         // ---- (4) Map incoming basis into reduced space (optional) ----
         std::optional<std::vector<int>> red_basis_opt = std::nullopt;
+        std::optional<LPBasis> red_basis_state_opt = std::nullopt;
         if (basis_opt && !basis_opt->empty()) {
             std::unordered_map<int, int> orig2red;
             orig2red.reserve(n_eff);
@@ -520,6 +616,14 @@ class RevisedSimplex {
             }
             if (!cand.empty()) red_basis_opt = std::move(cand);
         }
+        if (basis_state_opt && !basis_state_opt->column_status.empty()) {
+            red_basis_state_opt = map_reduced_basis_state_(
+                *basis_state_opt, col_orig_map, l_eff, u_eff, opt_.tol);
+            if (!red_basis_opt || red_basis_opt->empty()) {
+                red_basis_opt = basis_columns_from_basis_state_(*red_basis_state_opt,
+                                                                m_eff);
+            }
+        }
 
         // ---- (5) Try Phase II directly on reduced problem (Primal/Dual per
         // mode) ----
@@ -538,6 +642,9 @@ class RevisedSimplex {
         const auto add_info =
             [&](std::unordered_map<std::string, std::string> info) {
                 info["presolve_actions"] = std::to_string(pres.stack.size());
+                info["original_m"] = std::to_string(A_in.rows());
+                info["original_l"] = serialize_double_vec_(l_in);
+                info["original_u"] = serialize_double_vec_(u_in);
                 info["reduced_m"] = std::to_string(m_eff);
                 info["reduced_n"] = std::to_string(n_eff);
                 info["obj_shift"] = std::to_string(pres.obj_shift);
@@ -609,7 +716,16 @@ class RevisedSimplex {
                 return phase_(Ared, bred, cred, basis_guess, l_eff, u_eff);
             };
             auto run_dual = [&] {
-                return dual_phase_(Ared, bred, cred, basis_guess, l_eff, u_eff);
+                const bool use_warm_status =
+                    red_basis_state_opt && basis_choice.source == "warm_start" &&
+                    red_basis_state_opt->column_status.size() ==
+                        static_cast<std::size_t>(n_eff);
+                return dual_phase_(
+                    Ared, bred, cred, basis_guess, l_eff, u_eff,
+                    use_warm_status
+                        ? std::optional<std::vector<LPBasisStatus>>(
+                              red_basis_state_opt->column_status)
+                        : std::nullopt);
             };
 
             if (opt_.mode == SimplexMode::Dual) {
@@ -674,7 +790,7 @@ class RevisedSimplex {
                                        it2, std::move(info)),
                         red_basis2, internal_column_labels));
                 }
-                return finalize_solution_(attach_mapped_primal_ray_(
+                return finalize_solution_(attach_basis_state_(attach_mapped_primal_ray_(
                     attach_postsolved_farkas_(
                         attach_postsolved_row_duals_(
                             attach_internal_tableau_(
@@ -688,7 +804,8 @@ class RevisedSimplex {
                                 opt_.tol),
                             P, opt_.tol),
                         P, opt_.tol),
-                    col_orig_map, sign, A_model.cols(), opt_.tol));
+                    col_orig_map, sign, A_model.cols(), opt_.tol),
+                    l_in, u_in, opt_.tol));
             }
             if (st == LPSolution::Status::Singular) {
                 auto info = add_info({});
@@ -869,7 +986,7 @@ class RevisedSimplex {
         if (status2 == LPSolution::Status::Optimal &&
             !primal_feasible_(A_in, b_in, x_full, l_in, u_in, opt_.tol)) {
             merged_info["reason"] = "invalid_returned_primal";
-            return finalize_solution_(attach_mapped_primal_ray_(
+            return finalize_solution_(attach_basis_state_(attach_mapped_primal_ray_(
                 attach_postsolved_farkas_(
                     attach_postsolved_row_duals_(
                         attach_internal_tableau_(
@@ -883,11 +1000,12 @@ class RevisedSimplex {
                             opt_.tol),
                         P, opt_.tol),
                     P, opt_.tol),
-                col_orig_map, sign, A_model.cols(), opt_.tol));
+                col_orig_map, sign, A_model.cols(), opt_.tol),
+                l_in, u_in, opt_.tol));
         }
 
         if (status2 == LPSolution::Status::Optimal) {
-            return finalize_solution_(attach_mapped_primal_ray_(
+            return finalize_solution_(attach_basis_state_(attach_mapped_primal_ray_(
                 attach_postsolved_farkas_(
                     attach_postsolved_row_duals_(
                         attach_internal_tableau_(
@@ -901,7 +1019,8 @@ class RevisedSimplex {
                             opt_.tol),
                         P, opt_.tol),
                     P, opt_.tol),
-                col_orig_map, sign, A_model.cols(), opt_.tol));
+                col_orig_map, sign, A_model.cols(), opt_.tol),
+                l_in, u_in, opt_.tol));
         }
         if (status2 == LPSolution::Status::Unbounded) {
             return finalize_solution_(attach_mapped_primal_ray_(
@@ -926,7 +1045,7 @@ class RevisedSimplex {
             x_full.array().isFinite().all()
                 ? total_obj
                 : std::numeric_limits<double>::quiet_NaN();
-        return finalize_solution_(attach_mapped_primal_ray_(
+        return finalize_solution_(attach_basis_state_(attach_mapped_primal_ray_(
             attach_postsolved_farkas_(
                 attach_postsolved_row_duals_(
                     attach_internal_tableau_(
@@ -938,7 +1057,8 @@ class RevisedSimplex {
                         internal_row_labels, opt_.tol),
                     P, opt_.tol),
                 P, opt_.tol),
-            col_orig_map, sign, A_model.cols(), opt_.tol));
+            col_orig_map, sign, A_model.cols(), opt_.tol),
+            l_in, u_in, opt_.tol));
     }
 
    private:
@@ -1025,6 +1145,276 @@ class RevisedSimplex {
             if (!in_basis[j]) nonbasis.push_back(j);
         }
         return nonbasis;
+    }
+
+    static LPBasisStatus default_basis_status_for_bounds_(
+        int j, const Eigen::VectorXd& l, const Eigen::VectorXd& u,
+        double tol = 1e-12) {
+        const bool has_l = (j < l.size()) && std::isfinite(l(j));
+        const bool has_u = (j < u.size()) && std::isfinite(u(j));
+        if (has_l && has_u && std::abs(u(j) - l(j)) <= tol) {
+            return LPBasisStatus::Fixed;
+        }
+        if (has_u && !has_l) return LPBasisStatus::AtUpper;
+        return LPBasisStatus::AtLower;
+    }
+
+    static std::optional<std::vector<int>> basis_columns_from_basis_state_(
+        const LPBasis& basis_state, int expected_rows) {
+        std::vector<int> basis;
+        basis.reserve(basis_state.column_status.size());
+        for (int j = 0; j < (int)basis_state.column_status.size(); ++j) {
+            if (basis_state.column_status[j] == LPBasisStatus::Basic) {
+                basis.push_back(j);
+            }
+        }
+        if (expected_rows >= 0 && (int)basis.size() != expected_rows) {
+            return std::nullopt;
+        }
+        return basis;
+    }
+
+    static LPBasis compute_basis_state_(const std::vector<int>& basis,
+                                        const Eigen::VectorXd& x,
+                                        const Eigen::VectorXd& l,
+                                        const Eigen::VectorXd& u,
+                                        double tol, int basic_target = -1) {
+        LPBasis basis_state;
+        if (x.size() <= 0) return basis_state;
+
+        basis_state.column_status.resize(x.size(), LPBasisStatus::AtLower);
+        std::vector<char> eligible_basic(x.size(), 1);
+        for (int j = 0; j < x.size(); ++j) {
+            const bool has_l = (j < l.size()) && std::isfinite(l(j));
+            const bool has_u = (j < u.size()) && std::isfinite(u(j));
+            const bool fixed =
+                has_l && has_u && std::abs(u(j) - l(j)) <= tol;
+            if (fixed) {
+                basis_state.column_status[j] = LPBasisStatus::Fixed;
+                eligible_basic[j] = 0;
+                continue;
+            }
+
+            const bool near_l = has_l && std::abs(x(j) - l(j)) <= 10.0 * tol;
+            const bool near_u = has_u && std::abs(x(j) - u(j)) <= 10.0 * tol;
+            if (near_u && !near_l) {
+                basis_state.column_status[j] = LPBasisStatus::AtUpper;
+            } else if (near_l) {
+                basis_state.column_status[j] = LPBasisStatus::AtLower;
+            } else if (has_u && !has_l) {
+                basis_state.column_status[j] = LPBasisStatus::AtUpper;
+            } else if (has_l && has_u) {
+                const double dl = std::abs(x(j) - l(j));
+                const double du = std::abs(x(j) - u(j));
+                basis_state.column_status[j] =
+                    (du + tol < dl) ? LPBasisStatus::AtUpper
+                                    : LPBasisStatus::AtLower;
+            } else {
+                basis_state.column_status[j] = LPBasisStatus::AtLower;
+            }
+        }
+
+        const int target =
+            (basic_target >= 0) ? basic_target : static_cast<int>(basis.size());
+        if (target <= 0) return basis_state;
+
+        std::vector<char> chosen(x.size(), 0);
+        auto choose_if = [&](int j) {
+            if (j < 0 || j >= x.size() || chosen[j] || !eligible_basic[j]) return false;
+            chosen[j] = 1;
+            basis_state.column_status[j] = LPBasisStatus::Basic;
+            return true;
+        };
+
+        int chosen_count = 0;
+        for (int j : basis) {
+            if (chosen_count == target) break;
+            const bool has_l = (j < l.size()) && std::isfinite(l(j));
+            const bool has_u = (j < u.size()) && std::isfinite(u(j));
+            const bool near_l = has_l && std::abs(x(j) - l(j)) <= 10.0 * tol;
+            const bool near_u = has_u && std::abs(x(j) - u(j)) <= 10.0 * tol;
+            const bool interior = !near_l && !near_u;
+            if (interior && choose_if(j)) ++chosen_count;
+        }
+        for (int j = 0; j < x.size() && chosen_count < target; ++j) {
+            const bool has_l = (j < l.size()) && std::isfinite(l(j));
+            const bool has_u = (j < u.size()) && std::isfinite(u(j));
+            const bool near_l = has_l && std::abs(x(j) - l(j)) <= 10.0 * tol;
+            const bool near_u = has_u && std::abs(x(j) - u(j)) <= 10.0 * tol;
+            const bool interior = !near_l && !near_u;
+            if (interior && choose_if(j)) ++chosen_count;
+        }
+        for (int j : basis) {
+            if (chosen_count == target) break;
+            if (choose_if(j)) ++chosen_count;
+        }
+        for (int j = 0; j < x.size() && chosen_count < target; ++j) {
+            if (choose_if(j)) {
+                ++chosen_count;
+            }
+        }
+        return basis_state;
+    }
+
+    static bool basis_state_matches_problem_(const LPBasis& basis_state, int rows,
+                                             int cols) {
+        if ((int)basis_state.column_status.size() != cols) return false;
+        int basic_count = 0;
+        for (const auto status : basis_state.column_status) {
+            if (status == LPBasisStatus::Basic) ++basic_count;
+        }
+        return basic_count == rows;
+    }
+
+    static LPBasis map_reformulated_basis_state_(
+        const LPBasis& original_basis_state, const Eigen::VectorXd& l,
+        const Eigen::VectorXd& u, int n_total,
+        const std::vector<int>& single_y, const std::vector<int>& upper_slack,
+        const std::vector<int>& split_pos, const std::vector<int>& split_neg) {
+        LPBasis mapped;
+        mapped.column_status.resize(n_total, LPBasisStatus::AtLower);
+        for (int j = 0; j < (int)original_basis_state.column_status.size(); ++j) {
+            const LPBasisStatus status = original_basis_state.column_status[j];
+            if (single_y[j] >= 0) {
+                const int y = single_y[j];
+                const int slack = upper_slack[j];
+                if (slack >= 0) {
+                    if (status == LPBasisStatus::Basic) {
+                        mapped.column_status[y] = LPBasisStatus::Basic;
+                        mapped.column_status[slack] = LPBasisStatus::Basic;
+                    } else if (status == LPBasisStatus::AtUpper) {
+                        mapped.column_status[y] = LPBasisStatus::Basic;
+                        mapped.column_status[slack] = LPBasisStatus::AtLower;
+                    } else {
+                        mapped.column_status[y] = LPBasisStatus::AtLower;
+                        mapped.column_status[slack] = LPBasisStatus::Basic;
+                    }
+                } else {
+                    mapped.column_status[y] =
+                        (status == LPBasisStatus::Basic) ? LPBasisStatus::Basic
+                                                         : LPBasisStatus::AtLower;
+                }
+                continue;
+            }
+
+            if (split_pos[j] >= 0) {
+                mapped.column_status[split_pos[j]] =
+                    (status == LPBasisStatus::Basic) ? LPBasisStatus::Basic
+                                                     : LPBasisStatus::AtLower;
+            }
+            if (split_neg[j] >= 0 && split_neg[j] < n_total) {
+                mapped.column_status[split_neg[j]] = LPBasisStatus::AtLower;
+            }
+        }
+        return mapped;
+    }
+
+    static LPBasis map_reduced_basis_state_(
+        const LPBasis& original_basis_state, const std::vector<int>& col_orig_map,
+        const Eigen::VectorXd& l, const Eigen::VectorXd& u, double tol) {
+        LPBasis mapped;
+        mapped.column_status.resize(col_orig_map.size(), LPBasisStatus::AtLower);
+        for (int jr = 0; jr < (int)col_orig_map.size(); ++jr) {
+            const int jorig = col_orig_map[jr];
+            if (jorig >= 0 &&
+                jorig < (int)original_basis_state.column_status.size()) {
+                mapped.column_status[jr] =
+                    original_basis_state.column_status[jorig];
+            } else {
+                mapped.column_status[jr] =
+                    default_basis_status_for_bounds_(jr, l, u, tol);
+            }
+        }
+        return mapped;
+    }
+
+    static std::string serialize_double_vec_(const Eigen::VectorXd& v) {
+        std::ostringstream oss;
+        oss.setf(std::ios::scientific);
+        oss << std::setprecision(17);
+        for (int i = 0; i < v.size(); ++i) {
+            if (i) oss << ",";
+            oss << v(i);
+        }
+        return oss.str();
+    }
+
+    static std::string serialize_basis_state_from_primal_(
+        const std::vector<int>& basis, const Eigen::VectorXd& x,
+        const Eigen::VectorXd& l, const Eigen::VectorXd& u, double tol,
+        int basic_target = -1) {
+        if (x.size() <= 0) return "";
+
+        std::vector<int> status(x.size(), 1);
+        std::vector<char> eligible_basic(x.size(), 1);
+        for (int j = 0; j < x.size(); ++j) {
+            const bool has_l = (j < l.size()) && std::isfinite(l(j));
+            const bool has_u = (j < u.size()) && std::isfinite(u(j));
+            const bool fixed =
+                has_l && has_u && std::abs(u(j) - l(j)) <= tol;
+            if (fixed) {
+                status[j] = 3;
+                eligible_basic[j] = 0;
+                continue;
+            }
+
+            const bool near_l = has_l && std::abs(x(j) - l(j)) <= 10.0 * tol;
+            const bool near_u = has_u && std::abs(x(j) - u(j)) <= 10.0 * tol;
+            if (near_u && !near_l) {
+                status[j] = 2;
+            } else if (near_l) {
+                status[j] = 1;
+            } else if (has_u && !has_l) {
+                status[j] = 2;
+            } else if (has_l && has_u) {
+                const double dl = std::abs(x(j) - l(j));
+                const double du = std::abs(x(j) - u(j));
+                status[j] = (du + tol < dl) ? 2 : 1;
+            } else {
+                status[j] = 1;
+            }
+        }
+
+        const int target =
+            (basic_target >= 0) ? basic_target : static_cast<int>(basis.size());
+        std::vector<char> chosen(x.size(), 0);
+        auto choose_if = [&](int j) {
+            if (j < 0 || j >= x.size() || chosen[j] || !eligible_basic[j]) return false;
+            chosen[j] = 1;
+            status[j] = 0;
+            return true;
+        };
+
+        int chosen_count = 0;
+        for (int j : basis) {
+            if (chosen_count == target) break;
+            const bool has_l = (j < l.size()) && std::isfinite(l(j));
+            const bool has_u = (j < u.size()) && std::isfinite(u(j));
+            const bool near_l = has_l && std::abs(x(j) - l(j)) <= 10.0 * tol;
+            const bool near_u = has_u && std::abs(x(j) - u(j)) <= 10.0 * tol;
+            if (!near_l && !near_u && choose_if(j)) ++chosen_count;
+        }
+        for (int j = 0; j < x.size() && chosen_count < target; ++j) {
+            const bool has_l = (j < l.size()) && std::isfinite(l(j));
+            const bool has_u = (j < u.size()) && std::isfinite(u(j));
+            const bool near_l = has_l && std::abs(x(j) - l(j)) <= 10.0 * tol;
+            const bool near_u = has_u && std::abs(x(j) - u(j)) <= 10.0 * tol;
+            if (!near_l && !near_u && choose_if(j)) ++chosen_count;
+        }
+        for (int j : basis) {
+            if (chosen_count == target) break;
+            if (choose_if(j)) ++chosen_count;
+        }
+        for (int j = 0; j < x.size() && chosen_count < target; ++j) {
+            if (choose_if(j)) ++chosen_count;
+        }
+
+        std::ostringstream oss;
+        for (int j = 0; j < x.size(); ++j) {
+            if (j) oss << ",";
+            oss << status[j];
+        }
+        return oss.str();
     }
 
     static Eigen::VectorXd clip_small_vec_(Eigen::VectorXd x,
@@ -1194,6 +1584,20 @@ class RevisedSimplex {
         }
 
         sol.has_internal_tableau = true;
+        return sol;
+    }
+
+    static LPSolution attach_basis_state_(LPSolution sol,
+                                          const Eigen::VectorXd& l,
+                                          const Eigen::VectorXd& u,
+                                          double tol) {
+        if (sol.x.size() > 0 && sol.x.array().isFinite().all()) {
+            const LPBasis warm_basis =
+                compute_basis_state_(sol.basis, sol.x, l, u, tol);
+            sol.basis_state = warm_basis;
+            sol.info["warm_start_basis_state"] =
+                serialize_basis_state_from_primal_(sol.basis, sol.x, l, u, tol);
+        }
         return sol;
     }
 
@@ -2231,7 +2635,38 @@ class RevisedSimplex {
                             const Eigen::VectorXd& c,
                             std::optional<std::vector<int>> basis_opt,
                             const Eigen::VectorXd& l,
-                            const Eigen::VectorXd& u);
+                            const Eigen::VectorXd& u,
+                            std::optional<std::vector<LPBasisStatus>>
+                                warm_status = std::nullopt);
+
+    bool should_reuse_cached_basis_(int rows, int cols) const {
+        return opt_.mode == SimplexMode::Dual && cached_basis_state_ &&
+               cached_basis_rows_ == rows && cached_basis_cols_ == cols &&
+               basis_state_matches_problem_(*cached_basis_state_, rows, cols);
+    }
+
+    void update_cached_basis_(const LPSolution& sol, int rows,
+                              const Eigen::VectorXd& l,
+                              const Eigen::VectorXd& u) {
+        const int cols = static_cast<int>(l.size());
+        if (sol.x.size() == cols && sol.x.array().isFinite().all()) {
+            const LPBasis rebuilt =
+                compute_basis_state_(sol.basis, sol.x, l, u, opt_.tol, rows);
+            if (basis_state_matches_problem_(rebuilt, rows, cols)) {
+                cached_basis_state_ = rebuilt;
+                cached_basis_rows_ = rows;
+                cached_basis_cols_ = cols;
+                return;
+            }
+        }
+        if (basis_state_matches_problem_(sol.basis_state, rows, cols)) {
+            cached_basis_state_ = sol.basis_state;
+            cached_basis_rows_ = rows;
+            cached_basis_cols_ = cols;
+        } else {
+            clear_basis_cache();
+        }
+    }
 
     // --------------------------- Utilities ---------------------------
     static LPSolution make_solution_(
@@ -2267,6 +2702,9 @@ class RevisedSimplex {
     DegeneracyManager degen_;
     AdaptivePricer adaptive_pricer_{1};
     std::unique_ptr<PrimalPricingBridge<AdaptivePricer>> bridge_;
+    std::optional<LPBasis> cached_basis_state_;
+    int cached_basis_rows_ = -1;
+    int cached_basis_cols_ = -1;
     mutable std::vector<std::string> trace_;
     mutable int solve_depth_ = 0;
 };
@@ -2285,7 +2723,8 @@ inline RevisedSimplex::PhaseResult RevisedSimplex::phase_(
 inline RevisedSimplex::PhaseResult RevisedSimplex::dual_phase_(
     const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
     const Eigen::VectorXd& c, std::optional<std::vector<int>> basis_opt,
-    const Eigen::VectorXd& l, const Eigen::VectorXd& u) {
+    const Eigen::VectorXd& l, const Eigen::VectorXd& u,
+    std::optional<std::vector<LPBasisStatus>> warm_status) {
     return RevisedSimplexDualEngine::run(*this, A, b, c, std::move(basis_opt),
-                                         l, u);
+                                         l, u, std::move(warm_status));
 }

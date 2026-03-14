@@ -359,6 +359,100 @@ def exercise_solver_logging_api(simplex) -> list[str]:
     return notes
 
 
+def exercise_basis_warm_start_api(simplex) -> list[str]:
+    notes: list[str] = []
+
+    options = simplex.RevisedSimplexOptions()
+    options.mode = simplex.SimplexMode.Auto
+
+    model = simplex.Model(options)
+    x = model.addVar("x", lb=0.0, ub=5.0)
+    y = model.addVar("y", lb=0.0, ub=5.0)
+    model.addConstr(x + y <= 6.0, name="cap")
+    model.maximize(4.0 * x + 3.0 * y)
+
+    sol1 = model.solve()
+    basis = sol1.basis
+    if simplex.status_to_string(sol1.status) != "optimal":
+        notes.append("initial warm-start model solve was not optimal")
+        return notes
+    if basis.num_columns != 3:
+        notes.append(f"expected model basis to span 3 columns, got {basis.num_columns}")
+    if len(basis.basic_columns) != 1:
+        notes.append(
+            f"expected 1 basic column for the single-row model, got {len(basis.basic_columns)}"
+        )
+
+    model.options.mode = simplex.SimplexMode.Dual
+    x.ub = 1.5
+    sol2 = model.reoptimize()
+    if simplex.status_to_string(sol2.status) != "optimal":
+        notes.append("automatic dual warm-start reoptimize() was not optimal")
+    if sol2.value(x) > 1.5 + 1e-8:
+        notes.append(f"automatic reoptimize() violated tightened upper bound: {sol2.value(x):.10g}")
+    if sol2.stats.basis_start not in {"warm_start", "repaired_warm_start"}:
+        notes.append(
+            f"expected automatic warm-start basis source, got {sol2.stats.basis_start!r}"
+        )
+
+    x.ub = 1.0
+    sol3 = model.reoptimize(basis)
+    if simplex.status_to_string(sol3.status) != "optimal":
+        notes.append("explicit dual warm-start reoptimize() was not optimal")
+    if sol3.value(x) > 1.0 + 1e-8:
+        notes.append(f"explicit basis reoptimize() violated tightened upper bound: {sol3.value(x):.10g}")
+    if sol3.stats.basis_start not in {"warm_start", "repaired_warm_start"}:
+        notes.append(
+            f"expected explicit warm-start basis source, got {sol3.stats.basis_start!r}"
+        )
+
+    A = np.array([[1.0, 1.0]], dtype=float)
+    b = np.array([6.0], dtype=float)
+    c = np.array([-4.0, -3.0], dtype=float)
+    l = np.array([0.0, 0.0], dtype=float)
+    u = np.array([5.0, 5.0], dtype=float)
+
+    solver = simplex.RevisedSimplex(options)
+    raw1 = solver.solve(A, b, c, l, u)
+    if simplex.status_to_string(raw1.status) != "optimal":
+        notes.append("initial low-level warm-start solve was not optimal")
+        return notes
+
+    dual_options = simplex.RevisedSimplexOptions()
+    dual_options.mode = simplex.SimplexMode.Dual
+    dual_solver = simplex.RevisedSimplex(dual_options)
+    dual_raw1 = dual_solver.solve(A, b, c, l, u)
+    if simplex.status_to_string(dual_raw1.status) != "optimal":
+        notes.append("initial persistent dual solve was not optimal")
+    else:
+        u_auto = np.array([1.75, 5.0], dtype=float)
+        dual_raw2 = dual_solver.solve(A, b, c, l, u_auto)
+        if simplex.status_to_string(dual_raw2.status) != "optimal":
+            notes.append("persistent dual auto-reuse solve was not optimal")
+        if dual_raw2.stats.basis_start not in {"warm_start", "repaired_warm_start"}:
+            notes.append(
+                "expected persistent dual solve to reuse cached basis, "
+                f"got {dual_raw2.stats.basis_start!r}"
+            )
+        if dual_raw2.x[0] > 1.75 + 1e-8:
+            notes.append(
+                f"persistent dual x[0] violated tightened upper bound: {dual_raw2.x[0]:.10g}"
+            )
+
+    u2 = np.array([1.5, 5.0], dtype=float)
+    raw2 = solver.solve(A, b, c, l, u2, raw1.basis_state)
+    if simplex.status_to_string(raw2.status) != "optimal":
+        notes.append("low-level warm-start solve after bound change was not optimal")
+    if raw2.stats.basis_start not in {"warm_start", "repaired_warm_start"}:
+        notes.append(
+            f"expected low-level warm-start basis source, got {raw2.stats.basis_start!r}"
+        )
+    if raw2.x[0] > 1.5 + 1e-8:
+        notes.append(f"low-level x[0] violated tightened upper bound: {raw2.x[0]:.10g}")
+
+    return notes
+
+
 def compare_results(
     case: ProblemCase,
     ours: SolverResult,
@@ -620,6 +714,17 @@ def run_suite(args: argparse.Namespace) -> int:
         for note in logging_notes:
             print(f"      - {note}")
     if not logging_passed:
+        return 1
+    warm_start_notes = exercise_basis_warm_start_api(simplex)
+    warm_start_passed = len(warm_start_notes) == 0
+    print(
+        f"{'PASS' if warm_start_passed else 'FAIL':4}  {'basis_warm_start_api':24} "
+        f"basis export and dual reoptimize"
+    )
+    if args.verbose or not warm_start_passed:
+        for note in warm_start_notes:
+            print(f"      - {note}")
+    if not warm_start_passed:
         return 1
     print(f"Running {len(cases)} problem(s) with mode={args.mode}", flush=True)
     print()
