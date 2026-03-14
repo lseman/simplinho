@@ -195,9 +195,31 @@ class Var {
         return state_->vars[index_].lb;
     }
 
+    void set_lower_bound(double value) {
+        ensure_valid_("set_lower_bound");
+        if (std::isfinite(state_->vars[index_].ub) &&
+            value > state_->vars[index_].ub) {
+            throw std::invalid_argument(
+                "simplex: variable lower bound cannot exceed upper bound");
+        }
+        touch_state_();
+        state_->vars[index_].lb = value;
+    }
+
     double upper_bound() const {
         ensure_valid_("upper_bound");
         return state_->vars[index_].ub;
+    }
+
+    void set_upper_bound(double value) {
+        ensure_valid_("set_upper_bound");
+        if (std::isfinite(state_->vars[index_].lb) &&
+            value < state_->vars[index_].lb) {
+            throw std::invalid_argument(
+                "simplex: variable upper bound cannot be below lower bound");
+        }
+        touch_state_();
+        state_->vars[index_].ub = value;
     }
 
     std::string repr() const {
@@ -215,6 +237,12 @@ class Var {
     }
 
    private:
+    void touch_state_() const {
+        ++state_->revision;
+        state_->solved_revision = std::numeric_limits<std::uint64_t>::max();
+        state_->last_constraint_pi.clear();
+    }
+
     void ensure_valid_(const char* context) const {
         if (!state_ || index_ < 0 ||
             index_ >= static_cast<int>(state_->vars.size())) {
@@ -743,8 +771,8 @@ PYBIND11_MODULE(simplex, m) {
 
     py::class_<Var>(m, "Var")
         .def_property_readonly("name", &Var::name)
-        .def_property_readonly("lb", &Var::lower_bound)
-        .def_property_readonly("ub", &Var::upper_bound)
+        .def_property("lb", &Var::lower_bound, &Var::set_lower_bound)
+        .def_property("ub", &Var::upper_bound, &Var::set_upper_bound)
         .def("__repr__", &Var::repr)
         .def("__add__", [](const Var& self, const Var& other) {
             return add_expr(to_expr(self), to_expr(other));
