@@ -1391,44 +1391,130 @@ PYBIND11_MODULE(simplinho, m) {
             return oss.str();
         });
 
+    // -----------------------------------------------------------------------
+    // LPSolution
+    //
+    // Attributes come in two groups:
+    //
+    //   Original space  — indexed over the columns/rows of the A matrix you
+    //                     passed to solve().  Use these for sensitivity
+    //                     analysis, warm starts, and Gomory cuts.
+    //
+    //   Internal space  — indexed over the presolve-reduced problem that the
+    //                     simplex engine actually solved.  Column k in the
+    //                     internal problem corresponds to original column
+    //                     internal_column_labels[k].  Use these for
+    //                     debugging, advanced cut generation from the
+    //                     reduced tableau, or when presolve changes matter.
+    // -----------------------------------------------------------------------
     py::class_<LPSolution>(m, "LPSolution")
-        .def_readonly("status", &LPSolution::status)
-        .def_readonly("x", &LPSolution::x)
-        .def_readonly("obj", &LPSolution::obj)
-        .def_readonly("basis", &LPSolution::basis)
-        .def_readonly("basis_internal", &LPSolution::basis_internal)
-        .def_readonly("nonbasis_internal", &LPSolution::nonbasis_internal)
-        .def_readonly("internal_column_labels", &LPSolution::internal_column_labels)
-        .def_readonly("internal_row_labels", &LPSolution::internal_row_labels)
-        .def_readonly("tableau", &LPSolution::tableau)
-        .def_readonly("tableau_rhs", &LPSolution::tableau_rhs)
-        .def_readonly("reduced_costs_internal", &LPSolution::reduced_costs_internal)
-        .def_readonly("dual_values", &LPSolution::dual_values)
-        .def_readonly("shadow_prices", &LPSolution::shadow_prices)
-        .def_readonly("dual_values_internal", &LPSolution::dual_values_internal)
-        .def_readonly("shadow_prices_internal", &LPSolution::shadow_prices_internal)
-        .def_readonly("has_internal_tableau", &LPSolution::has_internal_tableau)
-        .def_readonly("iters", &LPSolution::iters)
-        .def_readonly("info", &LPSolution::info)
-        .def_readonly("trace", &LPSolution::trace)
+        // ── Status / objective ────────────────────────────────────────────
+        .def_readonly("status", &LPSolution::status,
+            "Solve status (LPSolution.Status enum).")
+        .def_readonly("obj", &LPSolution::obj,
+            "Optimal objective value; NaN when infeasible or unbounded.")
+        .def_readonly("iters", &LPSolution::iters,
+            "Total simplex iterations (Phase I + Phase II).")
+
+        // ── Primal solution (original space) ──────────────────────────────
+        .def_readonly("x", &LPSolution::x,
+            "Primal solution vector x, length n (original columns).\n"
+            "NaN entries indicate infeasible or unbounded.")
+        .def_readonly("basis", &LPSolution::basis,
+            "List of basic column indices in the *original* problem.\n"
+            "len(basis) == m when all basis variables map to original columns\n"
+            "(always true for standard-form problems).  Use this together with\n"
+            "the original A, b, c to reconstruct the original-space tableau\n"
+            "for Gomory cuts or sensitivity analysis:\n"
+            "    B = A[:, sol.basis]; T = np.linalg.solve(B, A)")
+
+        // ── Dual / reduced costs (original space) ─────────────────────────
+        .def_readonly("dual_values", &LPSolution::dual_values,
+            "Dual variables y = B^{-T} c_B, length m (original rows).\n"
+            "These are the shadow prices on the original equality constraints.\n"
+            "Reduced costs in the original space: c - A^T @ dual_values.")
+
+        // ── Certificates ──────────────────────────────────────────────────
+        .def_readonly("farkas_y", &LPSolution::farkas_y,
+            "Farkas infeasibility certificate in the original row space.\n"
+            "Valid only when farkas_has_cert is True.")
+        .def_readonly("farkas_has_cert", &LPSolution::farkas_has_cert,
+            "True when a Farkas certificate of infeasibility is available.")
+        .def_readonly("primal_ray", &LPSolution::primal_ray,
+            "Primal unbounded ray in the original column space.\n"
+            "Valid only when primal_ray_has_cert is True.")
+        .def_readonly("primal_ray_has_cert", &LPSolution::primal_ray_has_cert,
+            "True when a primal unbounded ray certificate is available.")
+
+        // ── Warm-start basis ──────────────────────────────────────────────
         .def_property_readonly("basis_state", [](const LPSolution& self) {
             return rebuild_basis_from_solution(self);
-        })
+        }, "LPBasis for warm-starting a subsequent solve on the same problem\n"
+           "structure.  Stores Basic/AtLower/AtUpper/Fixed status per original\n"
+           "column.  Pass to solver.solve(..., basis_state) or model.reoptimize(basis_state).")
+
+        // ── Internal (reduced) space ───────────────────────────────────────
+        // The solver applies presolve transformations and bound shifts before
+        // running the simplex.  The fields below are expressed in terms of
+        // the *reduced* problem, whose columns are a subset (and reordering)
+        // of the original columns.  internal_column_labels[k] gives the
+        // original column index for internal column k.
+        .def_readonly("basis_internal", &LPSolution::basis_internal,
+            "Basic column indices in the internal (presolve-reduced) problem.")
+        .def_readonly("nonbasis_internal", &LPSolution::nonbasis_internal,
+            "Nonbasic column indices in the internal problem.")
+        .def_readonly("internal_column_labels", &LPSolution::internal_column_labels,
+            "internal_column_labels[k] is the original column index for internal column k.\n"
+            "Use to map internal-space results back to original variables.")
+        .def_readonly("internal_row_labels", &LPSolution::internal_row_labels,
+            "internal_row_labels[i] is the original row index for internal row i.")
+        .def_readonly("tableau_internal", &LPSolution::tableau,
+            "B^{-1} A in the internal problem, shape (m_int, n_int).\n"
+            "tableau_internal[:, basis_internal] == I (identity on basis columns).\n"
+            "Non-empty only when has_tableau is True.")
+        .def_readonly("tableau_rhs_internal", &LPSolution::tableau_rhs,
+            "B^{-1} b in the internal problem, length m_int.\n"
+            "Gives the basic variable values in the shifted/reduced space.\n"
+            "Non-empty only when has_tableau is True.")
+        .def_readonly("reduced_costs_internal", &LPSolution::reduced_costs_internal,
+            "Reduced costs c - A^T y in the internal problem, length n_int.")
+        .def_readonly("dual_values_internal", &LPSolution::dual_values_internal,
+            "Dual variables y = B^{-T} c_B in the internal problem, length m_int.")
+        .def_property_readonly("has_tableau", [](const LPSolution& self) {
+            return self.has_internal_tableau;
+        }, "True when tableau_internal and tableau_rhs_internal are populated.\n"
+           "They are empty for infeasible/unbounded solves.")
+        .def_readonly("farkas_y_internal", &LPSolution::farkas_y_internal,
+            "Farkas certificate in the internal row space (debug use).")
+        .def_readonly("primal_ray_internal", &LPSolution::primal_ray_internal,
+            "Primal ray in the internal column space (debug use).")
+
+        // ── Diagnostics / logging ─────────────────────────────────────────
+        .def_readonly("info", &LPSolution::info,
+            "Raw key-value telemetry dict (string → string).  Use stats for\n"
+            "a typed, stable interface.")
         .def_property_readonly("stats", [](const LPSolution& self) {
             return build_solve_stats(self);
-        })
+        }, "SolveStats object with typed fields (iterations, basis_start, etc.).")
         .def_property_readonly("log_lines", [](const LPSolution& self) {
             return self.trace;
-        })
+        }, "List of verbose trace lines emitted during the solve\n"
+           "(populated only when options.verbose = True).")
         .def_property_readonly("log", [](const LPSolution& self) {
             return join_trace_lines(self.trace);
-        })
-        .def_readonly("farkas_y", &LPSolution::farkas_y)
-        .def_readonly("farkas_y_internal", &LPSolution::farkas_y_internal)
-        .def_readonly("farkas_has_cert", &LPSolution::farkas_has_cert)
-        .def_readonly("primal_ray", &LPSolution::primal_ray)
-        .def_readonly("primal_ray_internal", &LPSolution::primal_ray_internal)
-        .def_readonly("primal_ray_has_cert", &LPSolution::primal_ray_has_cert);
+        }, "Verbose trace joined into a single newline-delimited string.")
+        .def("__repr__", [](const LPSolution& self) {
+            std::ostringstream oss;
+            oss << "LPSolution(status=" << to_string(self.status)
+                << ", obj=";
+            if (std::isfinite(self.obj))
+                oss << self.obj;
+            else
+                oss << (std::isnan(self.obj) ? "nan" : (self.obj > 0 ? "inf" : "-inf"));
+            oss << ", iters=" << self.iters
+                << ", basis_size=" << self.basis.size() << ")";
+            return oss.str();
+        });
 
     py::class_<RevisedSimplexOptions>(m, "RevisedSimplexOptions")
         .def(py::init<>())

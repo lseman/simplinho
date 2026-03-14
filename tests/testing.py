@@ -453,6 +453,227 @@ def exercise_basis_warm_start_api(simplex) -> list[str]:
     return notes
 
 
+def build_original_basis_tableau(
+    A: np.ndarray,
+    b: np.ndarray,
+    c: np.ndarray,
+    sol,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Reconstruct the simplex tableau in the *original* variable space.
+
+    Uses sol.basis (original column indices) and the original A, b, c directly —
+    no coordinate remapping, no bound shifts.  This is the same basis used by the
+    warm-start mechanism (sol.basis_state).
+
+    Returns (T, rhs, rc, y) where:
+        T   : (m, n) ndarray  — B^{-1} A
+        rhs : (m,)  ndarray  — B^{-1} b  (= basic variable values at optimum)
+        rc  : (n,)  ndarray  — c - A^T y  (reduced costs)
+        y   : (m,)  ndarray  — B^{-T} c_B  (dual variables / shadow prices)
+
+    Returns None when sol.basis does not span a full m-dimensional basis
+    (can happen when upper-bound slack variables from the bound reformulation
+    are basic but don't correspond to original columns).
+    """
+    basis = list(sol.basis)
+    m, n = A.shape
+    if len(basis) != m:
+        return None
+    B = A[:, basis]
+    try:
+        T = np.linalg.solve(B, A)
+        rhs = np.linalg.solve(B, b)
+        c_B = c[basis]
+        y = np.linalg.solve(B.T, c_B)
+        rc = c - A.T @ y
+    except np.linalg.LinAlgError:
+        return None
+    return T, rhs, rc, y
+
+
+def exercise_basis_correctness_for_gomory(simplex) -> list[str]:
+    """Verify the basis returned by the solver is correct for Gomory cuts.
+
+    Primary checks operate on the *original* variable space: reconstruct the
+    tableau via build_original_basis_tableau (sol.basis + original A, b, c) and
+    verify the canonical-form invariants.  For problems without presolve
+    elimination we also cross-check against sol.tableau_internal.
+    """
+    notes: list[str] = []
+    tol = 1e-8
+
+    def check_case(name: str, A: np.ndarray, b: np.ndarray, c: np.ndarray,
+                   l: np.ndarray, u: np.ndarray) -> list[str]:
+        errs: list[str] = []
+        opts = simplex.RevisedSimplexOptions()
+        opts.mode = simplex.SimplexMode.Auto
+        solver = simplex.RevisedSimplex(opts)
+        sol = solver.solve(A, b, c, l, u)
+        status = simplex.status_to_string(sol.status)
+        if "optimal" not in status.lower():
+            errs.append(f"[{name}] unexpected status {status!r}")
+            return errs
+
+        m, n = A.shape
+        basis = list(sol.basis)
+
+        # ── Original-space tableau ──────────────────────────────────────────
+        orig = build_original_basis_tableau(A, b, c, sol)
+        if orig is None:
+            # Upper-bound slacks are basic; original-space basis is not square.
+            # Fall back to internal-tableau checks only.
+            errs.extend(_check_internal_tableau(name, sol, tol))
+            return errs
+
+        T, rhs, rc, y = orig
+        nonbasis = [j for j in range(n) if j not in basis]
+
+        # 1. B^{-1} b matches primal solution: x[basis] == rhs
+        x = np.array(sol.x)
+        x_err = np.max(np.abs(x[basis] - rhs))
+        if x_err > tol:
+            errs.append(
+                f"[{name}] original rhs != x[basis]  (max err {x_err:.2e})"
+            )
+
+        # 2. Primal feasibility: A x == b
+        eq_err = np.max(np.abs(A @ x - b))
+        if eq_err > tol:
+            errs.append(f"[{name}] A x != b  (max err {eq_err:.2e})")
+
+        # 3. Identity on basis columns: T[:, basis] == I
+        id_err = np.max(np.abs(T[:, basis] - np.eye(m)))
+        if id_err > tol:
+            errs.append(
+                f"[{name}] T[:,basis] != I  (max err {id_err:.2e})"
+            )
+
+        # 4. Dual feasibility (min): rc[nonbasic] >= -tol
+        if nonbasis:
+            rc_nb = rc[nonbasis]
+            if np.any(rc_nb < -tol):
+                errs.append(
+                    f"[{name}] negative reduced cost on nonbasic: "
+                    f"min={float(rc_nb.min()):.2e}"
+                )
+
+        # 5. Complementarity: rc[basic] == 0
+        rc_b = rc[basis]
+        if np.any(np.abs(rc_b) > tol):
+            errs.append(
+                f"[{name}] nonzero reduced cost on basic: "
+                f"max={float(np.max(np.abs(rc_b))):.2e}"
+            )
+
+        # 6. Dual consistency: y == B^{-T} c_B  and  sol.dual_values agrees
+        if sol.dual_values.size == m:
+            dy_err = np.max(np.abs(np.array(sol.dual_values) - y))
+            if dy_err > tol:
+                errs.append(
+                    f"[{name}] original y != sol.dual_values  (max err {dy_err:.2e})"
+                )
+
+        # 7. Gomory cut violation on fractional rows of the *original* tableau
+        for i, val in enumerate(rhs):
+            f = val - math.floor(val)
+            if not (tol < f < 1.0 - tol):
+                continue
+            # Cut: sum_j {T[i,j]} * x_j >= f
+            # Current LP point has x[nonbasic] = l[nonbasic] (at lower bound = 0)
+            # and x[basis[i]] = rhs[i], so:
+            # LHS = {T[i, basis[i]]} * rhs[i] = 0 * rhs[i] = 0  (since {1} = 0)
+            # Therefore LHS = 0 < f — cut is violated. ✓
+            lhs = sum(
+                math.modf(T[i, j])[0] * (rhs[basis.index(j)] if j in basis else 0.0)
+                for j in range(n)
+            )
+            if lhs >= f - tol:
+                errs.append(
+                    f"[{name}] Gomory row {i}: LP point should violate cut "
+                    f"(lhs={lhs:.4f} >= f={f:.4f})"
+                )
+
+        # 8. Cross-check against internal tableau when no presolve change happened
+        #    (presolve_actions == m means only trivial row ops; safe to compare)
+        if sol.has_tableau:
+            errs.extend(_check_internal_tableau(name, sol, tol))
+
+        return errs
+
+    def _check_internal_tableau(name: str, sol, tol: float) -> list[str]:
+        """Sanity-check the internal tableau independently of original space."""
+        errs: list[str] = []
+        T = np.array(sol.tableau_internal)
+        rhs = np.array(sol.tableau_rhs_internal)
+        rc = np.array(sol.reduced_costs_internal)
+        basis_int = list(sol.basis_internal)
+        nonbasis_int = list(sol.nonbasis_internal)
+        if T.size == 0:
+            return errs
+        m_int = T.shape[0]
+        # Identity on basis cols
+        id_err = np.max(np.abs(T[:, basis_int] - np.eye(m_int)))
+        if id_err > tol:
+            errs.append(
+                f"[{name}] internal T[:,basis] != I  (max err {id_err:.2e})"
+            )
+        # Primal feasibility in std form
+        if np.any(rhs < -tol):
+            errs.append(
+                f"[{name}] internal tableau_rhs < 0: min={float(rhs.min()):.2e}"
+            )
+        # Dual feasibility
+        if nonbasis_int:
+            rc_nb = rc[nonbasis_int]
+            if np.any(rc_nb < -tol):
+                errs.append(
+                    f"[{name}] internal rc[nonbasic] < 0: min={float(rc_nb.min()):.2e}"
+                )
+        return errs
+
+    inf = float("inf")
+
+    # --- Test 1: trivial 1-row ---
+    # min -x - y  s.t. x + y = 4, x,y >= 0  →  optimal at corner (4,0) or (0,4)
+    notes.extend(check_case(
+        "simple_eq",
+        A=np.array([[1.0, 1.0]]),
+        b=np.array([4.0]),
+        c=np.array([-1.0, -1.0]),
+        l=np.array([0.0, 0.0]),
+        u=np.array([inf, inf]),
+    ))
+
+    # --- Test 2: 2-row LP in standard form, fractional LP optimal ---
+    # min -5x1 - 4x2  s.t.  x1+x2+s1=5,  10x1+6x2+s2=45,  all >= 0
+    # Optimal: x1=3, x2=1.5  (fractional → Gomory cut check fires)
+    notes.extend(check_case(
+        "bounded_2d",
+        A=np.array([[1.0, 1.0, 1.0, 0.0],
+                    [10.0, 6.0, 0.0, 1.0]]),
+        b=np.array([5.0, 45.0]),
+        c=np.array([-5.0, -4.0, 0.0, 0.0]),
+        l=np.zeros(4),
+        u=np.full(4, inf),
+    ))
+
+    # --- Test 3: 3-row fractional LP relaxation ---
+    # min -x1 - x2  s.t.  x1+x2+s1=5.5, x1+s2=3.5, x2+s3=3.5,  all >= 0
+    # Optimal: x1=3.5, x2=2 (or x1=2, x2=3.5) — two fractional cuts possible
+    notes.extend(check_case(
+        "fractional_lp",
+        A=np.array([[1.0, 1.0, 1.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 1.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0, 1.0]]),
+        b=np.array([5.5, 3.5, 3.5]),
+        c=np.array([-1.0, -1.0, 0.0, 0.0, 0.0]),
+        l=np.zeros(5),
+        u=np.full(5, inf),
+    ))
+
+    return notes
+
+
 def compare_results(
     case: ProblemCase,
     ours: SolverResult,
@@ -725,6 +946,17 @@ def run_suite(args: argparse.Namespace) -> int:
         for note in warm_start_notes:
             print(f"      - {note}")
     if not warm_start_passed:
+        return 1
+    gomory_notes = exercise_basis_correctness_for_gomory(simplex)
+    gomory_passed = len(gomory_notes) == 0
+    print(
+        f"{'PASS' if gomory_passed else 'FAIL':4}  {'basis_gomory_checks':24} "
+        f"tableau=B^{{-1}}A, identity on basis, Gomory cut sanity"
+    )
+    if args.verbose or not gomory_passed:
+        for note in gomory_notes:
+            print(f"      - {note}")
+    if not gomory_passed:
         return 1
     print(f"Running {len(cases)} problem(s) with mode={args.mode}", flush=True)
     print()
