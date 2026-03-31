@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -17,15 +18,25 @@
 #include <utility>
 #include <vector>
 
+#include "simplex/bnb.h"
 #include "simplex/simplex.h"
 
 namespace py = pybind11;
+namespace simplex_bnb = simplex::bnb;
 
 namespace {
 
 constexpr double kCoeffTol = 1e-12;
 
 enum class ConstraintSense { LessEqual, Equal, GreaterEqual };
+using VarType = simplex_bnb::VariableType;
+using MIPStatus = simplex_bnb::Status;
+using NodeSelectionStrategy = simplex_bnb::NodeSelectionStrategy;
+using BranchingStrategy = simplex_bnb::BranchingStrategy;
+using DivingStrategy = simplex_bnb::DivingStrategy;
+using BranchAndBoundOptions = simplex_bnb::Options;
+using MIPTreeNode = simplex_bnb::TreeNode;
+using MIPTreeNodeStatus = simplex_bnb::TreeNodeStatus;
 
 struct LinearExprData {
     std::unordered_map<int, double> coeffs;
@@ -39,6 +50,7 @@ struct VarData {
     std::string name;
     double lb = 0.0;
     double ub = std::numeric_limits<double>::infinity();
+    VarType type = VarType::Continuous;
 };
 
 struct ConstraintData {
@@ -69,6 +81,25 @@ class ConstraintSpec;
 class ConstraintHandle;
 class Model;
 class ModelSolution;
+class MIPSolution;
+
+std::pair<double, double> canonicalize_var_bounds(VarType type, double lb, double ub) {
+    if (type == VarType::Binary && !std::isfinite(ub)) {
+        ub = 1.0;
+    }
+    if (std::isfinite(lb) && std::isfinite(ub) && ub < lb) {
+        throw std::invalid_argument("simplex: variable upper bound cannot be below lower bound");
+    }
+    if (type == VarType::Binary) {
+        if (lb < -kCoeffTol || ub > 1.0 + kCoeffTol) {
+            throw std::invalid_argument(
+                "simplex: binary variables must satisfy 0 <= lb <= ub <= 1");
+        }
+        lb = std::max(0.0, lb);
+        ub = std::min(1.0, ub);
+    }
+    return {lb, ub};
+}
 
 double normalized_coeff(double value) {
     return std::abs(value) <= kCoeffTol ? 0.0 : value;
@@ -424,12 +455,867 @@ bool basis_matches_dimensions(const LPBasis& basis, int columns, int rows) {
     return basic_count == rows;
 }
 
+simplex_bnb::LinearConstraintSense to_bnb_sense(ConstraintSense sense) {
+    switch (sense) {
+        case ConstraintSense::LessEqual:
+            return simplex_bnb::LinearConstraintSense::LessEqual;
+        case ConstraintSense::GreaterEqual:
+            return simplex_bnb::LinearConstraintSense::GreaterEqual;
+        case ConstraintSense::Equal:
+            return simplex_bnb::LinearConstraintSense::Equal;
+    }
+    return simplex_bnb::LinearConstraintSense::Equal;
+}
+
+struct SimplifiedCutsResult {
+    bool infeasible = false;
+    std::vector<simplex_bnb::Cut> cuts;
+};
+
+struct NodeBoundPresolveResult {
+    bool infeasible = false;
+    Eigen::VectorXd lower;
+    Eigen::VectorXd upper;
+    int tightened_bounds = 0;
+};
+
+struct SparseActivityRange {
+    double min_activity = 0.0;
+    double max_activity = 0.0;
+    bool min_finite = true;
+    bool max_finite = true;
+};
+
+struct SparseRowView {
+    const std::vector<int>* indices = nullptr;
+    const std::vector<double>* values = nullptr;
+    simplex_bnb::LinearConstraintSense sense = simplex_bnb::LinearConstraintSense::Equal;
+    double rhs = 0.0;
+};
+
+struct SparseVariableContribution {
+    double min_value = 0.0;
+    double max_value = 0.0;
+    bool min_finite = true;
+    bool max_finite = true;
+};
+
+struct SparseRowActivitySummary {
+    double min_activity = 0.0;
+    double max_activity = 0.0;
+    int min_infinite_terms = 0;
+    int max_infinite_terms = 0;
+};
+
+struct RootProblemPresolveResult {
+    simplex_bnb::Problem problem;
+    bool infeasible = false;
+    int tightened_bounds = 0;
+    int removed_rows = 0;
+    int removed_coeffs = 0;
+    int aggregations = 0;
+};
+
+void tighten_discrete_bounds(VarType type, double* lower, double* upper, double tol);
+
+SparseVariableContribution sparse_variable_contribution(double coeff, int index,
+                                                        const Eigen::VectorXd& lower,
+                                                        const Eigen::VectorXd& upper) {
+    SparseVariableContribution contribution;
+    if (index < 0 || index >= lower.size() || index >= upper.size() ||
+        std::abs(coeff) <= kCoeffTol) {
+        return contribution;
+    }
+
+    const double lo = lower(index);
+    const double up = upper(index);
+    if (coeff >= 0.0) {
+        contribution.min_finite = std::isfinite(lo);
+        contribution.max_finite = std::isfinite(up);
+        if (contribution.min_finite) contribution.min_value = coeff * lo;
+        if (contribution.max_finite) contribution.max_value = coeff * up;
+    } else {
+        contribution.min_finite = std::isfinite(up);
+        contribution.max_finite = std::isfinite(lo);
+        if (contribution.min_finite) contribution.min_value = coeff * up;
+        if (contribution.max_finite) contribution.max_value = coeff * lo;
+    }
+
+    return contribution;
+}
+
+SparseRowActivitySummary sparse_row_activity_summary(const SparseRowView& row,
+                                                     const Eigen::VectorXd& lower,
+                                                     const Eigen::VectorXd& upper) {
+    SparseRowActivitySummary summary;
+    if (!row.indices || !row.values) {
+        return summary;
+    }
+
+    for (int k = 0; k < static_cast<int>(row.indices->size()) &&
+                    k < static_cast<int>(row.values->size());
+         ++k) {
+        const int index = (*row.indices)[k];
+        const double coeff = (*row.values)[k];
+        const SparseVariableContribution contribution =
+            sparse_variable_contribution(coeff, index, lower, upper);
+
+        if (contribution.min_finite) {
+            summary.min_activity += contribution.min_value;
+        } else if (std::abs(coeff) > kCoeffTol) {
+            ++summary.min_infinite_terms;
+        }
+
+        if (contribution.max_finite) {
+            summary.max_activity += contribution.max_value;
+        } else if (std::abs(coeff) > kCoeffTol) {
+            ++summary.max_infinite_terms;
+        }
+    }
+
+    return summary;
+}
+
+bool sparse_row_is_feasible(const SparseRowActivitySummary& summary,
+                            simplex_bnb::LinearConstraintSense sense, double rhs, double tol) {
+    switch (sense) {
+        case simplex_bnb::LinearConstraintSense::LessEqual:
+            return summary.min_infinite_terms > 0 || summary.min_activity <= rhs + tol;
+        case simplex_bnb::LinearConstraintSense::GreaterEqual:
+            return summary.max_infinite_terms > 0 || summary.max_activity >= rhs - tol;
+        case simplex_bnb::LinearConstraintSense::Equal:
+            return (summary.min_infinite_terms > 0 || summary.min_activity <= rhs + tol) &&
+                   (summary.max_infinite_terms > 0 || summary.max_activity >= rhs - tol);
+    }
+    return true;
+}
+
+bool sparse_row_is_redundant(const SparseRowActivitySummary& summary,
+                             simplex_bnb::LinearConstraintSense sense, double rhs, double tol) {
+    switch (sense) {
+        case simplex_bnb::LinearConstraintSense::LessEqual:
+            return summary.max_infinite_terms == 0 && summary.max_activity <= rhs + tol;
+        case simplex_bnb::LinearConstraintSense::GreaterEqual:
+            return summary.min_infinite_terms == 0 && summary.min_activity >= rhs - tol;
+        case simplex_bnb::LinearConstraintSense::Equal:
+            return summary.min_infinite_terms == 0 && summary.max_infinite_terms == 0 &&
+                   summary.min_activity >= rhs - tol && summary.max_activity <= rhs + tol;
+    }
+    return false;
+}
+
+std::string sparse_row_signature(const simplex_bnb::SparseLinearConstraint& row,
+                                 int precision = 12) {
+    const double scale = std::pow(10.0, precision);
+    std::ostringstream oss;
+    for (int k = 0; k < static_cast<int>(row.indices.size()) &&
+                    k < static_cast<int>(row.values.size());
+         ++k) {
+        const double coeff = row.values[k];
+        if (std::abs(coeff) <= kCoeffTol) continue;
+        const double rounded = std::round(coeff * scale) / scale;
+        oss << row.indices[k] << ":" << rounded << ";";
+    }
+    const double rounded_rhs = std::round(row.rhs * scale) / scale;
+    oss << "|rhs:" << rounded_rhs << "|sense:" << static_cast<int>(row.sense);
+    return oss.str();
+}
+
+void canonicalize_sparse_row(simplex_bnb::SparseLinearConstraint* row,
+                             const Eigen::VectorXd& lower, const Eigen::VectorXd& upper,
+                             int* removed_coeffs, double tol) {
+    if (!row) return;
+
+    std::vector<std::pair<int, double>> terms;
+    terms.reserve(std::min(row->indices.size(), row->values.size()));
+    double rhs = row->rhs;
+
+    for (int k = 0; k < static_cast<int>(row->indices.size()) &&
+                    k < static_cast<int>(row->values.size());
+         ++k) {
+        const int index = row->indices[k];
+        const double coeff = row->values[k];
+        if (index < 0 || index >= lower.size() || index >= upper.size() ||
+            std::abs(coeff) <= kCoeffTol) {
+            if (removed_coeffs) ++(*removed_coeffs);
+            continue;
+        }
+
+        if (std::isfinite(lower(index)) && std::isfinite(upper(index)) &&
+            std::abs(lower(index) - upper(index)) <= tol) {
+            rhs -= coeff * lower(index);
+            if (removed_coeffs) ++(*removed_coeffs);
+            continue;
+        }
+
+        terms.emplace_back(index, coeff);
+    }
+
+    std::sort(terms.begin(), terms.end(),
+              [](const auto& lhs, const auto& rhs_pair) { return lhs.first < rhs_pair.first; });
+
+    row->indices.clear();
+    row->values.clear();
+    row->rhs = rhs;
+    for (const auto& [index, coeff] : terms) {
+        if (!row->indices.empty() && row->indices.back() == index) {
+            const double merged = row->values.back() + coeff;
+            if (std::abs(merged) <= kCoeffTol) {
+                row->indices.pop_back();
+                row->values.pop_back();
+                if (removed_coeffs) ++(*removed_coeffs);
+            } else {
+                row->values.back() = merged;
+            }
+            continue;
+        }
+        row->indices.push_back(index);
+        row->values.push_back(coeff);
+    }
+}
+
+std::optional<int> find_row_coefficient_position(const simplex_bnb::SparseLinearConstraint& row,
+                                                 int index) {
+    for (int k = 0; k < static_cast<int>(row.indices.size()) &&
+                    k < static_cast<int>(row.values.size());
+         ++k) {
+        if (row.indices[k] == index) return k;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::pair<double, double>> implied_interval_for_equality_pivot(
+    const simplex_bnb::SparseLinearConstraint& row, int pivot, const Eigen::VectorXd& lower,
+    const Eigen::VectorXd& upper, double tol) {
+    const auto pivot_pos = find_row_coefficient_position(row, pivot);
+    if (!pivot_pos.has_value()) return std::nullopt;
+
+    const SparseRowView view{&row.indices, &row.values, row.sense, row.rhs};
+    const SparseRowActivitySummary summary = sparse_row_activity_summary(view, lower, upper);
+    const double aij = row.values[*pivot_pos];
+    const SparseVariableContribution pivot_contribution =
+        sparse_variable_contribution(aij, pivot, lower, upper);
+    const bool other_min_finite =
+        summary.min_infinite_terms - (pivot_contribution.min_finite ? 0 : 1) == 0;
+    const bool other_max_finite =
+        summary.max_infinite_terms - (pivot_contribution.max_finite ? 0 : 1) == 0;
+    if (!other_min_finite || !other_max_finite || std::abs(aij) <= tol) {
+        return std::nullopt;
+    }
+
+    const double other_min =
+        summary.min_activity -
+        (pivot_contribution.min_finite ? pivot_contribution.min_value : 0.0);
+    const double other_max =
+        summary.max_activity -
+        (pivot_contribution.max_finite ? pivot_contribution.max_value : 0.0);
+
+    double implied_lower = 0.0;
+    double implied_upper = 0.0;
+    if (aij > 0.0) {
+        implied_lower = (row.rhs - other_max) / aij;
+        implied_upper = (row.rhs - other_min) / aij;
+    } else {
+        implied_lower = (row.rhs - other_min) / aij;
+        implied_upper = (row.rhs - other_max) / aij;
+    }
+    if (implied_lower > implied_upper) std::swap(implied_lower, implied_upper);
+    return std::make_pair(implied_lower, implied_upper);
+}
+
+bool try_aggregate_implied_free_continuous_variable(
+    simplex_bnb::Problem* problem, int row_index, double tol, int* removed_coeffs,
+    int* aggregation_count) {
+    if (!problem || row_index < 0 ||
+        row_index >= static_cast<int>(problem->base_constraints.size())) {
+        return false;
+    }
+
+    auto& defining_row = problem->base_constraints[row_index];
+    if (defining_row.sense != simplex_bnb::LinearConstraintSense::Equal) {
+        return false;
+    }
+    const int row_nnz =
+        std::min(static_cast<int>(defining_row.indices.size()),
+                 static_cast<int>(defining_row.values.size()));
+    if (row_nnz < 2 || row_nnz > 8) {
+        return false;
+    }
+
+    std::vector<std::vector<int>> col_to_rows(problem->lower_bounds.size());
+    std::vector<double> col_max_abs(problem->lower_bounds.size(), 0.0);
+    for (int r = 0; r < static_cast<int>(problem->base_constraints.size()); ++r) {
+        const auto& row = problem->base_constraints[r];
+        for (int k = 0; k < static_cast<int>(row.indices.size()) &&
+                        k < static_cast<int>(row.values.size());
+             ++k) {
+            const int index = row.indices[k];
+            if (index < 0 || index >= problem->lower_bounds.size()) continue;
+            if (std::abs(row.values[k]) <= kCoeffTol) continue;
+            col_to_rows[index].push_back(r);
+            col_max_abs[index] = std::max(col_max_abs[index], std::abs(row.values[k]));
+        }
+    }
+
+    double row_max_abs = 0.0;
+    for (int k = 0; k < row_nnz; ++k) {
+        row_max_abs = std::max(row_max_abs, std::abs(defining_row.values[k]));
+    }
+
+    struct Candidate {
+        int pivot = -1;
+        int pivot_pos = -1;
+        int col_nnz = 0;
+        int estimated_fill = 0;
+        double coeff_abs = 0.0;
+    };
+    std::optional<Candidate> best;
+
+    for (int k = 0; k < row_nnz; ++k) {
+        const int pivot = defining_row.indices[k];
+        const double aij = defining_row.values[k];
+        if (pivot < 0 || pivot >= problem->lower_bounds.size()) continue;
+        if (problem->variable_types[pivot] != VarType::Continuous) continue;
+        if (std::abs(aij) <= kCoeffTol) continue;
+
+        const auto implied = implied_interval_for_equality_pivot(
+            defining_row, pivot, problem->lower_bounds, problem->upper_bounds, tol);
+        if (!implied.has_value()) continue;
+
+        const double explicit_l = problem->lower_bounds(pivot);
+        const double explicit_u = problem->upper_bounds(pivot);
+        if ((std::isfinite(explicit_l) && implied->first < explicit_l - tol) ||
+            (std::isfinite(explicit_u) && implied->second > explicit_u + tol)) {
+            continue;
+        }
+
+        const int col_nnz = static_cast<int>(col_to_rows[pivot].size());
+        if (col_nnz <= 1 || col_nnz > 4) continue;
+
+        const double coeff_abs = std::abs(aij);
+        if (coeff_abs < 0.01 * row_max_abs || coeff_abs < 0.01 * col_max_abs[pivot]) {
+            continue;
+        }
+
+        const int estimated_fill = (col_nnz - 1) * std::max(0, row_nnz - 2);
+        if (estimated_fill > 12) continue;
+
+        Candidate candidate{pivot, k, col_nnz, estimated_fill, coeff_abs};
+        if (!best.has_value() || candidate.estimated_fill < best->estimated_fill ||
+            (candidate.estimated_fill == best->estimated_fill &&
+             candidate.col_nnz < best->col_nnz) ||
+            (candidate.estimated_fill == best->estimated_fill &&
+             candidate.col_nnz == best->col_nnz && candidate.coeff_abs > best->coeff_abs)) {
+            best = candidate;
+        }
+    }
+
+    if (!best.has_value()) return false;
+
+    const int pivot = best->pivot;
+    const int pivot_pos = best->pivot_pos;
+    const double pivot_coeff = defining_row.values[pivot_pos];
+    const double objective_coeff =
+        pivot < problem->objective_coefficients.size() ? problem->objective_coefficients(pivot) : 0.0;
+
+    if (std::abs(objective_coeff) > kCoeffTol) {
+        problem->objective_constant += objective_coeff * defining_row.rhs / pivot_coeff;
+        for (int k = 0; k < row_nnz; ++k) {
+            if (k == pivot_pos) continue;
+            const int index = defining_row.indices[k];
+            if (index < 0 || index >= problem->objective_coefficients.size()) continue;
+            problem->objective_coefficients(index) -=
+                objective_coeff * defining_row.values[k] / pivot_coeff;
+        }
+        problem->objective_coefficients(pivot) = 0.0;
+    }
+
+    const auto affected_rows = col_to_rows[pivot];
+    for (const int other_row_index : affected_rows) {
+        if (other_row_index == row_index) continue;
+        auto& other_row = problem->base_constraints[other_row_index];
+        const auto other_pivot_pos = find_row_coefficient_position(other_row, pivot);
+        if (!other_pivot_pos.has_value()) continue;
+        const double factor = other_row.values[*other_pivot_pos] / pivot_coeff;
+        if (std::abs(factor) <= kCoeffTol) continue;
+
+        other_row.indices.push_back(pivot);
+        other_row.values.push_back(-other_row.values[*other_pivot_pos]);
+        for (int k = 0; k < row_nnz; ++k) {
+            other_row.indices.push_back(defining_row.indices[k]);
+            other_row.values.push_back(-factor * defining_row.values[k]);
+        }
+        other_row.rhs -= factor * defining_row.rhs;
+        canonicalize_sparse_row(&other_row, problem->lower_bounds, problem->upper_bounds,
+                                removed_coeffs, tol);
+    }
+
+    if (aggregation_count) ++(*aggregation_count);
+    return true;
+}
+
+void update_row_summary_for_bound_change(const SparseVariableContribution& old_contribution,
+                                         const SparseVariableContribution& new_contribution,
+                                         SparseRowActivitySummary* summary) {
+    if (old_contribution.min_finite) {
+        summary->min_activity -= old_contribution.min_value;
+    } else {
+        --summary->min_infinite_terms;
+    }
+    if (old_contribution.max_finite) {
+        summary->max_activity -= old_contribution.max_value;
+    } else {
+        --summary->max_infinite_terms;
+    }
+
+    if (new_contribution.min_finite) {
+        summary->min_activity += new_contribution.min_value;
+    } else {
+        ++summary->min_infinite_terms;
+    }
+    if (new_contribution.max_finite) {
+        summary->max_activity += new_contribution.max_value;
+    } else {
+        ++summary->max_infinite_terms;
+    }
+}
+
+bool tighten_bounds_from_sparse_row(const SparseRowView& row, const simplex_bnb::Problem& problem,
+                                    Eigen::VectorXd* lower, Eigen::VectorXd* upper,
+                                    int* tightened_bounds,
+                                    const std::vector<std::vector<int>>& col_to_rows,
+                                    std::vector<char>* next_dirty_rows, double tol) {
+    SparseRowActivitySummary summary = sparse_row_activity_summary(row, *lower, *upper);
+    if (!sparse_row_is_feasible(summary, row.sense, row.rhs, tol)) {
+        return false;
+    }
+    if (!row.indices || !row.values) {
+        return true;
+    }
+
+    for (int k = 0; k < static_cast<int>(row.indices->size()) &&
+                    k < static_cast<int>(row.values->size());
+         ++k) {
+        const int index = (*row.indices)[k];
+        if (index < 0 || index >= lower->size() || index >= upper->size()) {
+            continue;
+        }
+
+        const double coeff = (*row.values)[k];
+        if (std::abs(coeff) <= kCoeffTol) {
+            continue;
+        }
+
+        const SparseVariableContribution old_contribution =
+            sparse_variable_contribution(coeff, index, *lower, *upper);
+        const bool other_min_finite =
+            summary.min_infinite_terms - (old_contribution.min_finite ? 0 : 1) == 0;
+        const bool other_max_finite =
+            summary.max_infinite_terms - (old_contribution.max_finite ? 0 : 1) == 0;
+        const double other_min_activity =
+            summary.min_activity - (old_contribution.min_finite ? old_contribution.min_value : 0.0);
+        const double other_max_activity =
+            summary.max_activity - (old_contribution.max_finite ? old_contribution.max_value : 0.0);
+
+        double tightened_lower = (*lower)(index);
+        double tightened_upper = (*upper)(index);
+
+        const auto apply_upper = [&](double candidate) {
+            if (std::isfinite(candidate) && candidate < tightened_upper - tol) {
+                tightened_upper = candidate;
+            }
+        };
+        const auto apply_lower = [&](double candidate) {
+            if (std::isfinite(candidate) && candidate > tightened_lower + tol) {
+                tightened_lower = candidate;
+            }
+        };
+
+        switch (row.sense) {
+            case simplex_bnb::LinearConstraintSense::LessEqual:
+                if (coeff > 0.0 && other_min_finite) {
+                    apply_upper((row.rhs - other_min_activity) / coeff);
+                } else if (coeff < 0.0 && other_min_finite) {
+                    apply_lower((row.rhs - other_min_activity) / coeff);
+                }
+                break;
+            case simplex_bnb::LinearConstraintSense::GreaterEqual:
+                if (coeff > 0.0 && other_max_finite) {
+                    apply_lower((row.rhs - other_max_activity) / coeff);
+                } else if (coeff < 0.0 && other_max_finite) {
+                    apply_upper((row.rhs - other_max_activity) / coeff);
+                }
+                break;
+            case simplex_bnb::LinearConstraintSense::Equal:
+                if (coeff > 0.0) {
+                    if (other_min_finite) {
+                        apply_upper((row.rhs - other_min_activity) / coeff);
+                    }
+                    if (other_max_finite) {
+                        apply_lower((row.rhs - other_max_activity) / coeff);
+                    }
+                } else {
+                    if (other_min_finite) {
+                        apply_lower((row.rhs - other_min_activity) / coeff);
+                    }
+                    if (other_max_finite) {
+                        apply_upper((row.rhs - other_max_activity) / coeff);
+                    }
+                }
+                break;
+        }
+
+        tighten_discrete_bounds(problem.variable_types[index], &tightened_lower, &tightened_upper,
+                                tol);
+        if (tightened_upper + tol < tightened_lower) {
+            return false;
+        }
+
+        const bool lower_changed = tightened_lower > (*lower)(index) + tol;
+        const bool upper_changed = tightened_upper < (*upper)(index) - tol;
+        if (!lower_changed && !upper_changed) {
+            continue;
+        }
+
+        (*lower)(index) = tightened_lower;
+        (*upper)(index) = tightened_upper;
+        if (lower_changed) ++(*tightened_bounds);
+        if (upper_changed) ++(*tightened_bounds);
+
+        const SparseVariableContribution new_contribution =
+            sparse_variable_contribution(coeff, index, *lower, *upper);
+        update_row_summary_for_bound_change(old_contribution, new_contribution, &summary);
+
+        if (next_dirty_rows && index >= 0 && index < static_cast<int>(col_to_rows.size())) {
+            for (const int affected_row : col_to_rows[index]) {
+                if (affected_row >= 0 &&
+                    affected_row < static_cast<int>(next_dirty_rows->size())) {
+                    (*next_dirty_rows)[affected_row] = 1;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+void tighten_discrete_bounds(VarType type, double* lower, double* upper, double tol) {
+    if (type == VarType::Continuous) {
+        return;
+    }
+
+    if (type == VarType::Binary) {
+        *lower = std::max(*lower, 0.0);
+        *upper = std::min(*upper, 1.0);
+    }
+
+    if (std::isfinite(*lower)) {
+        *lower = std::ceil(*lower - tol);
+    }
+    if (std::isfinite(*upper)) {
+        *upper = std::floor(*upper + tol);
+    }
+}
+
+NodeBoundPresolveResult presolve_mip_node_bounds(
+    const simplex_bnb::Problem& problem, const Eigen::VectorXd& lower_in,
+    const Eigen::VectorXd& upper_in,
+    const std::vector<simplex_bnb::Cut>& extra_cuts = {}, double tol = 1e-9,
+    int max_passes = 2) {
+    NodeBoundPresolveResult out;
+    out.lower = lower_in;
+    out.upper = upper_in;
+
+    int n = static_cast<int>(problem.lower_bounds.size());
+    n = std::min(n, static_cast<int>(problem.upper_bounds.size()));
+    n = std::min(n, static_cast<int>(out.lower.size()));
+    n = std::min(n, static_cast<int>(out.upper.size()));
+    n = std::min(n, static_cast<int>(problem.variable_types.size()));
+    out.lower.conservativeResize(n);
+    out.upper.conservativeResize(n);
+
+    for (int j = 0; j < n; ++j) {
+        tighten_discrete_bounds(problem.variable_types[j], &out.lower(j), &out.upper(j), tol);
+        if (out.upper(j) + tol < out.lower(j)) {
+            out.infeasible = true;
+            return out;
+        }
+    }
+
+    std::vector<SparseRowView> rows;
+    rows.reserve(problem.base_constraints.size() + extra_cuts.size());
+    std::vector<std::vector<int>> col_to_rows(n);
+
+    const auto add_row = [&](const auto& source_row) {
+        const int row_index = static_cast<int>(rows.size());
+        rows.push_back(SparseRowView{&source_row.indices, &source_row.values, source_row.sense,
+                                     source_row.rhs});
+        for (int k = 0; k < static_cast<int>(source_row.indices.size()) &&
+                        k < static_cast<int>(source_row.values.size());
+             ++k) {
+            const int index = source_row.indices[k];
+            if (index < 0 || index >= n || std::abs(source_row.values[k]) <= kCoeffTol) {
+                continue;
+            }
+            col_to_rows[index].push_back(row_index);
+        }
+    };
+
+    for (const auto& row : problem.base_constraints) add_row(row);
+    for (const auto& cut : extra_cuts) add_row(cut);
+
+    std::vector<char> dirty_rows(rows.size(), 1);
+    const int propagation_rounds = std::max(2, 2 * std::max(1, max_passes));
+    for (int round = 0; round < propagation_rounds; ++round) {
+        bool any_dirty = false;
+        bool changed = false;
+        std::vector<char> next_dirty_rows(rows.size(), 0);
+
+        for (int row_index = 0; row_index < static_cast<int>(rows.size()); ++row_index) {
+            if (!dirty_rows[row_index]) continue;
+            any_dirty = true;
+
+            const int tightened_before = out.tightened_bounds;
+            if (!tighten_bounds_from_sparse_row(rows[row_index], problem, &out.lower, &out.upper,
+                                                &out.tightened_bounds, col_to_rows,
+                                                &next_dirty_rows, tol)) {
+                out.infeasible = true;
+                return out;
+            }
+            if (out.tightened_bounds != tightened_before) {
+                changed = true;
+            }
+        }
+
+        if (!any_dirty || !changed) {
+            break;
+        }
+        dirty_rows = std::move(next_dirty_rows);
+    }
+
+    return out;
+}
+
+RootProblemPresolveResult presolve_mip_root_problem(const simplex_bnb::Problem& input,
+                                                    double tol = 1e-9, int max_passes = 4) {
+    RootProblemPresolveResult out;
+    out.problem = input;
+
+    int n = static_cast<int>(out.problem.lower_bounds.size());
+    n = std::min(n, static_cast<int>(out.problem.upper_bounds.size()));
+    n = std::min(n, static_cast<int>(out.problem.variable_types.size()));
+    out.problem.lower_bounds.conservativeResize(n);
+    out.problem.upper_bounds.conservativeResize(n);
+    if (out.problem.objective_coefficients.size() == 0) {
+        out.problem.objective_coefficients = Eigen::VectorXd::Zero(n);
+    } else {
+        out.problem.objective_coefficients.conservativeResize(n);
+    }
+
+    for (int j = 0; j < n; ++j) {
+        tighten_discrete_bounds(out.problem.variable_types[j], &out.problem.lower_bounds(j),
+                                &out.problem.upper_bounds(j), tol);
+        if (out.problem.upper_bounds(j) + tol < out.problem.lower_bounds(j)) {
+            out.infeasible = true;
+            return out;
+        }
+    }
+
+    for (int pass = 0; pass < std::max(1, max_passes); ++pass) {
+        bool changed = false;
+        std::vector<simplex_bnb::SparseLinearConstraint> kept_rows;
+        kept_rows.reserve(out.problem.base_constraints.size());
+        std::unordered_map<std::string, int> seen_rows;
+
+        for (const auto& base_row : out.problem.base_constraints) {
+            simplex_bnb::SparseLinearConstraint row = base_row;
+            canonicalize_sparse_row(&row, out.problem.lower_bounds, out.problem.upper_bounds,
+                                    &out.removed_coeffs, tol);
+
+            const SparseRowView view{&row.indices, &row.values, row.sense, row.rhs};
+            const SparseRowActivitySummary summary =
+                sparse_row_activity_summary(view, out.problem.lower_bounds, out.problem.upper_bounds);
+            if (!sparse_row_is_feasible(summary, row.sense, row.rhs, tol)) {
+                out.infeasible = true;
+                return out;
+            }
+            if (sparse_row_is_redundant(summary, row.sense, row.rhs, tol)) {
+                ++out.removed_rows;
+                changed = true;
+                continue;
+            }
+
+            const std::string signature = sparse_row_signature(row);
+            if (seen_rows.contains(signature)) {
+                ++out.removed_rows;
+                changed = true;
+                continue;
+            }
+            seen_rows.emplace(signature, static_cast<int>(kept_rows.size()));
+            kept_rows.push_back(std::move(row));
+        }
+
+        out.problem.base_constraints = std::move(kept_rows);
+
+        const NodeBoundPresolveResult tightened = presolve_mip_node_bounds(
+            out.problem, out.problem.lower_bounds, out.problem.upper_bounds, {}, tol, 2);
+        if (tightened.infeasible) {
+            out.infeasible = true;
+            return out;
+        }
+        if (tightened.tightened_bounds > 0) {
+            out.problem.lower_bounds = tightened.lower;
+            out.problem.upper_bounds = tightened.upper;
+            out.tightened_bounds += tightened.tightened_bounds;
+            changed = true;
+        }
+
+        bool aggregated = false;
+        for (int row_index = 0; row_index < static_cast<int>(out.problem.base_constraints.size());
+             ++row_index) {
+            if (try_aggregate_implied_free_continuous_variable(
+                    &out.problem, row_index, tol, &out.removed_coeffs, &out.aggregations)) {
+                aggregated = true;
+                changed = true;
+                break;
+            }
+        }
+
+        if (!changed) break;
+    }
+
+    return out;
+}
+
+double cut_activity_bound(const simplex_bnb::Cut& cut, const Eigen::VectorXd& lower,
+                          const Eigen::VectorXd& upper, bool use_upper) {
+    double activity = 0.0;
+    for (int k = 0; k < static_cast<int>(cut.indices.size()) &&
+                    k < static_cast<int>(cut.values.size());
+         ++k) {
+        const int index = cut.indices[k];
+        if (index < 0 || index >= lower.size() || index >= upper.size()) {
+            continue;
+        }
+        const double coeff = cut.values[k];
+        const bool take_upper = use_upper ? (coeff >= 0.0) : (coeff < 0.0);
+        activity += coeff * (take_upper ? upper(index) : lower(index));
+    }
+    return activity;
+}
+
+SimplifiedCutsResult simplify_cuts_for_bounds(
+    const std::vector<simplex_bnb::Cut>& cuts, const Eigen::VectorXd& lower,
+    const Eigen::VectorXd& upper, double tol = 1e-9) {
+    SimplifiedCutsResult out;
+    out.cuts.reserve(cuts.size());
+
+    for (const auto& cut : cuts) {
+        const double min_activity = cut_activity_bound(cut, lower, upper, false);
+        const double max_activity = cut_activity_bound(cut, lower, upper, true);
+
+        bool redundant = false;
+        bool infeasible = false;
+        switch (cut.sense) {
+            case simplex_bnb::LinearConstraintSense::LessEqual:
+                redundant = max_activity <= cut.rhs + tol;
+                infeasible = min_activity > cut.rhs + tol;
+                break;
+            case simplex_bnb::LinearConstraintSense::GreaterEqual:
+                redundant = min_activity >= cut.rhs - tol;
+                infeasible = max_activity < cut.rhs - tol;
+                break;
+            case simplex_bnb::LinearConstraintSense::Equal:
+                redundant = max_activity <= cut.rhs + tol && min_activity >= cut.rhs - tol;
+                infeasible = max_activity < cut.rhs - tol || min_activity > cut.rhs + tol;
+                break;
+        }
+
+        if (infeasible) {
+            out.infeasible = true;
+            out.cuts.clear();
+            return out;
+        }
+        if (redundant) {
+            continue;
+        }
+
+        simplex_bnb::Cut simplified;
+        simplified.sense = cut.sense;
+        simplified.rhs = cut.rhs;
+        simplified.cut_type = cut.cut_type;
+        simplified.strength = cut.strength;
+        simplified.times_used = cut.times_used;
+        simplified.age = cut.age;
+
+        for (int k = 0; k < static_cast<int>(cut.indices.size()) &&
+                        k < static_cast<int>(cut.values.size());
+             ++k) {
+            const int index = cut.indices[k];
+            if (index < 0 || index >= lower.size() || index >= upper.size()) {
+                continue;
+            }
+            const double coeff = cut.values[k];
+            if (std::abs(coeff) <= kCoeffTol) {
+                continue;
+            }
+            if (std::isfinite(lower(index)) && std::isfinite(upper(index)) &&
+                std::abs(lower(index) - upper(index)) <= tol) {
+                simplified.rhs -= coeff * lower(index);
+                continue;
+            }
+            simplified.indices.push_back(index);
+            simplified.values.push_back(coeff);
+        }
+
+        if (simplified.indices.empty()) {
+            bool scalar_redundant = false;
+            bool scalar_infeasible = false;
+            switch (simplified.sense) {
+                case simplex_bnb::LinearConstraintSense::LessEqual:
+                    scalar_redundant = 0.0 <= simplified.rhs + tol;
+                    scalar_infeasible = 0.0 > simplified.rhs + tol;
+                    break;
+                case simplex_bnb::LinearConstraintSense::GreaterEqual:
+                    scalar_redundant = 0.0 >= simplified.rhs - tol;
+                    scalar_infeasible = 0.0 < simplified.rhs - tol;
+                    break;
+                case simplex_bnb::LinearConstraintSense::Equal:
+                    scalar_redundant = std::abs(simplified.rhs) <= tol;
+                    scalar_infeasible = !scalar_redundant;
+                    break;
+            }
+            if (scalar_infeasible) {
+                out.infeasible = true;
+                out.cuts.clear();
+                return out;
+            }
+            if (scalar_redundant) {
+                continue;
+            }
+        }
+
+        out.cuts.push_back(std::move(simplified));
+    }
+
+    return out;
+}
+
+std::string cut_set_signature(const std::vector<simplex_bnb::Cut>& cuts) {
+    std::ostringstream oss;
+    for (const auto& cut : cuts) {
+        oss << simplex_bnb::detail::cut_signature(cut) << '\n';
+    }
+    return oss.str();
+}
+
 struct SolveStats {
     std::string status;
     int iterations = 0;
     int phase2_iterations = 0;
     std::optional<int> phase1_iterations;
     std::optional<int> presolve_actions;
+    std::optional<int> presolve_implied_bound_updates;
     std::optional<int> reduced_rows;
     std::optional<int> reduced_cols;
     std::optional<double> objective_shift;
@@ -468,6 +1354,9 @@ struct SolveStats {
             phase1_iterations ? py::cast(*phase1_iterations) : py::none();
         out["presolve_actions"] =
             presolve_actions ? py::cast(*presolve_actions) : py::none();
+        out["presolve_implied_bound_updates"] = presolve_implied_bound_updates
+                                                   ? py::cast(*presolve_implied_bound_updates)
+                                                   : py::none();
         out["reduced_rows"] = reduced_rows ? py::cast(*reduced_rows) : py::none();
         out["reduced_cols"] = reduced_cols ? py::cast(*reduced_cols) : py::none();
         out["objective_shift"] =
@@ -530,6 +1419,8 @@ SolveStats build_solve_stats(const LPSolution& sol) {
     stats.phase2_iterations =
         sol.iters - stats.phase1_iterations.value_or(0);
     stats.presolve_actions = find_info_int(sol.info, "presolve_actions");
+    stats.presolve_implied_bound_updates =
+        find_info_int(sol.info, "presolve_implied_bound_updates");
     stats.reduced_rows = find_info_int(sol.info, "reduced_m");
     stats.reduced_cols = find_info_int(sol.info, "reduced_n");
     stats.objective_shift = find_info_double(sol.info, "obj_shift");
@@ -589,12 +1480,11 @@ class Var {
 
     void set_lower_bound(double value) {
         const int index = resolve_index_("set_lower_bound");
-        if (std::isfinite(state_->vars[index].ub) && value > state_->vars[index].ub) {
-            throw std::invalid_argument(
-                "simplex: variable lower bound cannot exceed upper bound");
-        }
         touch_state_();
-        state_->vars[index].lb = value;
+        auto [lb, ub] =
+            canonicalize_var_bounds(state_->vars[index].type, value, state_->vars[index].ub);
+        state_->vars[index].lb = lb;
+        state_->vars[index].ub = ub;
     }
 
     double upper_bound() const {
@@ -604,12 +1494,26 @@ class Var {
 
     void set_upper_bound(double value) {
         const int index = resolve_index_("set_upper_bound");
-        if (std::isfinite(state_->vars[index].lb) && value < state_->vars[index].lb) {
-            throw std::invalid_argument(
-                "simplex: variable upper bound cannot be below lower bound");
-        }
         touch_state_();
-        state_->vars[index].ub = value;
+        auto [lb, ub] =
+            canonicalize_var_bounds(state_->vars[index].type, state_->vars[index].lb, value);
+        state_->vars[index].lb = lb;
+        state_->vars[index].ub = ub;
+    }
+
+    VarType type() const {
+        const int index = resolve_index_("type");
+        return state_->vars[index].type;
+    }
+
+    void set_type(VarType value) {
+        const int index = resolve_index_("set_type");
+        touch_state_(true);
+        auto [lb, ub] =
+            canonicalize_var_bounds(value, state_->vars[index].lb, state_->vars[index].ub);
+        state_->vars[index].lb = lb;
+        state_->vars[index].ub = ub;
+        state_->vars[index].type = value;
     }
 
     double objective_coefficient() const {
@@ -633,6 +1537,18 @@ class Var {
             oss << format_number(state_->vars[index].ub);
         } else {
             oss << "inf";
+        }
+        oss << ", type=";
+        switch (state_->vars[index].type) {
+            case VarType::Continuous:
+                oss << "'continuous'";
+                break;
+            case VarType::Integer:
+                oss << "'integer'";
+                break;
+            case VarType::Binary:
+                oss << "'binary'";
+                break;
         }
         oss << ", obj=" << format_number(objective_coefficient()) << ")";
         return oss.str();
@@ -988,6 +1904,175 @@ class ModelSolution {
     std::unordered_map<std::string, double> values_;
 };
 
+class MIPSolution {
+   public:
+    MIPSolution() = default;
+
+    MIPSolution(std::shared_ptr<ModelState> state, simplex_bnb::SolveResult result,
+                int original_vars)
+        : state_(std::move(state)),
+          status_(result.status),
+          objective_(result.objective),
+          best_bound_(result.best_bound),
+          root_relaxation_objective_(result.root_relaxation_objective),
+          root_presolve_tightened_bounds_(result.root_presolve_tightened_bounds),
+          root_presolve_removed_rows_(result.root_presolve_removed_rows),
+          root_presolve_removed_coeffs_(result.root_presolve_removed_coeffs),
+          root_presolve_aggregations_(result.root_presolve_aggregations),
+          node_count_(result.node_count),
+          lp_iterations_(result.lp_iterations),
+          incumbent_updates_(result.incumbent_updates),
+          heuristic_lp_iterations_(result.heuristic_lp_iterations),
+          heuristic_successes_(result.heuristic_successes),
+          feasibility_jump_successes_(result.feasibility_jump_successes),
+          feasibility_pump_successes_(result.feasibility_pump_successes),
+          rens_successes_(result.rens_successes),
+          rins_successes_(result.rins_successes),
+          local_search_successes_(result.local_search_successes),
+          local_branching_successes_(result.local_branching_successes),
+          cuts_generated_(result.cuts_generated),
+          cuts_applied_(result.cuts_applied),
+          duplicate_cuts_(result.duplicate_cuts),
+          cut_pool_size_(result.cut_pool_size),
+          tree_nodes_(std::move(result.tree_nodes)) {
+        primal_ = Eigen::VectorXd::Constant(original_vars, std::numeric_limits<double>::quiet_NaN());
+        if (result.primal.size() >= original_vars) {
+            primal_ = result.primal.head(original_vars);
+        }
+        has_solution_ = true;
+        for (int i = 0; i < primal_.size(); ++i) {
+            if (!std::isfinite(primal_(i))) {
+                has_solution_ = false;
+                break;
+            }
+        }
+        if (state_ && has_solution_) {
+            for (int i = 0; i < primal_.size() && i < static_cast<int>(state_->vars.size());
+                 ++i) {
+                values_.emplace(state_->vars[i].name, primal_(i));
+            }
+        }
+    }
+
+    MIPStatus status() const { return status_; }
+    const Eigen::VectorXd& x() const { return primal_; }
+    double objective() const { return objective_; }
+    double best_bound() const { return best_bound_; }
+    double root_relaxation_objective() const { return root_relaxation_objective_; }
+    int root_presolve_tightened_bounds() const { return root_presolve_tightened_bounds_; }
+    int root_presolve_removed_rows() const { return root_presolve_removed_rows_; }
+    int root_presolve_removed_coeffs() const { return root_presolve_removed_coeffs_; }
+    int root_presolve_aggregations() const { return root_presolve_aggregations_; }
+    int node_count() const { return node_count_; }
+    int lp_iterations() const { return lp_iterations_; }
+    int incumbent_updates() const { return incumbent_updates_; }
+    int heuristic_lp_iterations() const { return heuristic_lp_iterations_; }
+    int heuristic_successes() const { return heuristic_successes_; }
+    int feasibility_jump_successes() const { return feasibility_jump_successes_; }
+    int feasibility_pump_successes() const { return feasibility_pump_successes_; }
+    int rens_successes() const { return rens_successes_; }
+    int rins_successes() const { return rins_successes_; }
+    int local_search_successes() const { return local_search_successes_; }
+    int local_branching_successes() const { return local_branching_successes_; }
+    int cuts_generated() const { return cuts_generated_; }
+    int cuts_applied() const { return cuts_applied_; }
+    int duplicate_cuts() const { return duplicate_cuts_; }
+    int cut_pool_size() const { return cut_pool_size_; }
+    bool has_solution() const { return has_solution_; }
+    const std::unordered_map<std::string, double>& values() const { return values_; }
+    const std::vector<MIPTreeNode>& tree_nodes() const { return tree_nodes_; }
+
+    std::optional<double> relative_gap() const {
+        if (!has_solution_ || !std::isfinite(best_bound_) || !std::isfinite(objective_)) {
+            return std::nullopt;
+        }
+        const double denom = std::max(1.0, std::abs(objective_));
+        return std::abs(best_bound_ - objective_) / denom;
+    }
+
+    double value(const Var& var) const {
+        if (!has_solution_ || !state_ || !var.state() || state_.get() != var.state().get()) {
+            throw std::invalid_argument(
+                "simplex: variable does not belong to this MIP solution's model");
+        }
+        const int index = var.index();
+        if (index < 0 || index >= primal_.size()) {
+            throw std::out_of_range("simplex: variable index out of range");
+        }
+        return primal_(index);
+    }
+
+    double value(const std::string& name) const {
+        const auto it = values_.find(name);
+        if (it == values_.end()) {
+            throw std::out_of_range("simplex: unknown variable name '" + name + "'");
+        }
+        return it->second;
+    }
+
+    std::string repr() const {
+        std::ostringstream oss;
+        oss << "MIPSolution(status='" << simplex_bnb::to_string(status_) << "', obj=";
+        if (std::isfinite(objective_)) {
+            oss << format_number(objective_);
+        } else {
+            oss << "nan";
+        }
+        oss << ", best_bound=";
+        if (std::isfinite(best_bound_)) {
+            oss << format_number(best_bound_);
+        } else if (std::isnan(best_bound_)) {
+            oss << "nan";
+        } else {
+            oss << (best_bound_ > 0.0 ? "inf" : "-inf");
+        }
+        oss << ", nodes=" << node_count_ << ")";
+        return oss.str();
+    }
+
+   private:
+    std::shared_ptr<ModelState> state_;
+    MIPStatus status_ = MIPStatus::Infeasible;
+    Eigen::VectorXd primal_;
+    double objective_ = std::numeric_limits<double>::quiet_NaN();
+    double best_bound_ = std::numeric_limits<double>::quiet_NaN();
+    double root_relaxation_objective_ = std::numeric_limits<double>::quiet_NaN();
+    int root_presolve_tightened_bounds_ = 0;
+    int root_presolve_removed_rows_ = 0;
+    int root_presolve_removed_coeffs_ = 0;
+    int root_presolve_aggregations_ = 0;
+    int node_count_ = 0;
+    int lp_iterations_ = 0;
+    int incumbent_updates_ = 0;
+    int heuristic_lp_iterations_ = 0;
+    int heuristic_successes_ = 0;
+    int feasibility_jump_successes_ = 0;
+    int feasibility_pump_successes_ = 0;
+    int rens_successes_ = 0;
+    int rins_successes_ = 0;
+    int local_search_successes_ = 0;
+    int local_branching_successes_ = 0;
+    int cuts_generated_ = 0;
+    int cuts_applied_ = 0;
+    int duplicate_cuts_ = 0;
+    int cut_pool_size_ = 0;
+    bool has_solution_ = false;
+    std::unordered_map<std::string, double> values_;
+    std::vector<MIPTreeNode> tree_nodes_;
+};
+
+struct ModelLPData {
+    Eigen::MatrixXd A;
+    Eigen::VectorXd b;
+    Eigen::VectorXd c;
+    Eigen::VectorXd l;
+    Eigen::VectorXd u;
+    double objective_sign = 1.0;
+    int original_vars = 0;
+    int total_vars = 0;
+    int rows = 0;
+};
+
 class Model {
    public:
     explicit Model(const RevisedSimplexOptions& options = {})
@@ -997,11 +2082,9 @@ class Model {
 
     Var add_var(const std::optional<std::string>& name = std::nullopt, double lb = 0.0,
                 double ub = std::numeric_limits<double>::infinity(),
-                double obj = 0.0) {
+                double obj = 0.0, VarType var_type = VarType::Continuous) {
         touch_(true);
-        if (std::isfinite(lb) && std::isfinite(ub) && ub < lb) {
-            throw std::invalid_argument("simplex: add_var received ub < lb");
-        }
+        std::tie(lb, ub) = canonicalize_var_bounds(var_type, lb, ub);
 
         std::string resolved_name;
         if (name && !name->empty()) {
@@ -1017,13 +2100,25 @@ class Model {
 
         const int index = static_cast<int>(state_->vars.size());
         const std::uint64_t id = state_->next_var_id++;
-        state_->vars.push_back(VarData{id, resolved_name, lb, ub});
+        state_->vars.push_back(VarData{id, resolved_name, lb, ub, var_type});
         state_->name_to_index.emplace(resolved_name, index);
         if (std::abs(obj) > kCoeffTol) {
             add_coeff(state_->objective, index, obj);
         }
 
         return Var(state_, index, id);
+    }
+
+    Var add_integer_var(const std::optional<std::string>& name = std::nullopt,
+                        double lb = 0.0,
+                        double ub = std::numeric_limits<double>::infinity(),
+                        double obj = 0.0) {
+        return add_var(name, lb, ub, obj, VarType::Integer);
+    }
+
+    Var add_binary_var(const std::optional<std::string>& name = std::nullopt,
+                       double obj = 0.0) {
+        return add_var(name, 0.0, 1.0, obj, VarType::Binary);
     }
 
     ConstraintHandle add_constr(const ConstraintSpec& constr,
@@ -1130,88 +2225,414 @@ class Model {
     }
 
     ModelSolution solve(std::optional<LPBasis> warm_start = std::nullopt) const {
-        const int n = static_cast<int>(state_->vars.size());
-        int slack_count = 0;
-        for (const auto& constr : state_->constraints) {
-            if (constr.sense != ConstraintSense::Equal) {
-                ++slack_count;
-            }
-        }
-
-        const int total_vars = n + slack_count;
-        const int m = static_cast<int>(state_->constraints.size());
-
-        Eigen::MatrixXd A = Eigen::MatrixXd::Zero(m, total_vars);
-        Eigen::VectorXd b = Eigen::VectorXd::Zero(m);
-        Eigen::VectorXd c = Eigen::VectorXd::Zero(total_vars);
-        Eigen::VectorXd l = Eigen::VectorXd::Zero(total_vars);
-        Eigen::VectorXd u =
-            Eigen::VectorXd::Constant(total_vars, std::numeric_limits<double>::infinity());
-
-        for (int j = 0; j < n; ++j) {
-            l(j) = state_->vars[j].lb;
-            u(j) = state_->vars[j].ub;
-        }
-
-        const double objective_sign = state_->maximize ? -1.0 : 1.0;
-        for (const auto& [index, coeff] : state_->objective.coeffs) {
-            if (index < 0 || index >= n) {
-                throw std::out_of_range("simplex: objective references invalid variable");
-            }
-            c(index) = objective_sign * coeff;
-        }
-
-        int next_slack = n;
-        for (int row = 0; row < m; ++row) {
-            const auto& constr = state_->constraints[row];
-            for (const auto& [index, coeff] : constr.expr.coeffs) {
-                if (index < 0 || index >= n) {
-                    throw std::out_of_range(
-                        "simplex: constraint references invalid variable");
-                }
-                A(row, index) = coeff;
-            }
-            b(row) = -constr.expr.constant;
-
-            if (constr.sense == ConstraintSense::LessEqual) {
-                A(row, next_slack++) = 1.0;
-            } else if (constr.sense == ConstraintSense::GreaterEqual) {
-                A(row, next_slack++) = -1.0;
-            }
-        }
-
+        const ModelLPData data = build_lp_data_();
         RevisedSimplex solver(state_->options);
         const LPBasis* effective_basis = nullptr;
         if (warm_start) {
-            if (!basis_matches_dimensions(*warm_start, total_vars, m)) {
+            if (!basis_matches_dimensions(*warm_start, data.total_vars, data.rows)) {
                 throw std::invalid_argument(
                     "simplex: warm-start basis does not match model dimensions");
             }
             effective_basis = &*warm_start;
         } else if (state_->last_basis &&
-                   basis_matches_dimensions(*state_->last_basis, total_vars, m)) {
+                   basis_matches_dimensions(*state_->last_basis, data.total_vars, data.rows)) {
             effective_basis = &*state_->last_basis;
         }
 
-        auto raw = effective_basis ? solver.solve(A, b, c, l, u, *effective_basis)
-                                   : solver.solve(A, b, c, l, u);
+        auto raw = effective_basis
+                       ? solver.solve(data.A, data.b, data.c, data.l, data.u, *effective_basis)
+                       : solver.solve(data.A, data.b, data.c, data.l, data.u);
         state_->last_constraint_pi =
-            compute_constraint_duals(A, c, raw, objective_sign);
+            compute_constraint_duals(data.A, data.c, raw, data.objective_sign);
         state_->solved_revision = state_->revision;
         const LPBasis rebuilt_basis = rebuild_basis_from_solution(raw);
-        if (basis_matches_dimensions(rebuilt_basis, total_vars, m)) {
+        if (basis_matches_dimensions(rebuilt_basis, data.total_vars, data.rows)) {
             state_->last_basis = rebuilt_basis;
         }
+        return make_model_solution_(std::move(raw), data);
+    }
 
-        Eigen::VectorXd primal =
-            Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
-        if (raw.x.size() >= n) {
-            primal = raw.x.head(n);
+    MIPSolution solve_mip(
+        const BranchAndBoundOptions& mip_options = BranchAndBoundOptions()) const {
+        // Keep the LP option profile aligned with model.solve(): forcing a
+        // different pricing/mode here led to incorrect infeasibility in some
+        // cover-cut subproblems.
+        RevisedSimplexOptions cold_lp_options = state_->options;
+        RevisedSimplexOptions warm_lp_options = state_->options;
+        state_->last_constraint_pi.clear();
+        state_->solved_revision = std::numeric_limits<std::uint64_t>::max();
+        state_->last_basis.reset();
+        simplex_bnb::Problem problem;
+        const int original_vars = static_cast<int>(state_->vars.size());
+        problem.lower_bounds = Eigen::VectorXd::Zero(original_vars);
+        problem.upper_bounds = Eigen::VectorXd::Constant(
+            original_vars, std::numeric_limits<double>::infinity());
+        problem.maximize = state_->maximize;
+        problem.objective_coefficients = Eigen::VectorXd::Zero(original_vars);
+        problem.objective_constant = state_->objective.constant;
+        problem.variable_types.assign(original_vars, VarType::Continuous);
+        for (int j = 0; j < original_vars; ++j) {
+            problem.lower_bounds(j) = state_->vars[j].lb;
+            problem.upper_bounds(j) = state_->vars[j].ub;
+            problem.variable_types[j] = state_->vars[j].type;
         }
+        for (const auto& [index, coeff] : state_->objective.coeffs) {
+            if (index >= 0 && index < original_vars) {
+                problem.objective_coefficients(index) = coeff;
+            }
+        }
+        problem.base_constraints = build_base_constraints_();
 
-        const double objective =
-            objective_sign * raw.obj + state_->objective.constant;
-        return ModelSolution(state_, std::move(raw), std::move(primal), objective);
+        const RootProblemPresolveResult root_presolve = presolve_mip_root_problem(problem);
+        if (root_presolve.infeasible) {
+            simplex_bnb::SolveResult infeasible_result;
+            infeasible_result.status = simplex_bnb::Status::Infeasible;
+            infeasible_result.primal = Eigen::VectorXd::Constant(
+                original_vars, std::numeric_limits<double>::quiet_NaN());
+            infeasible_result.objective = std::numeric_limits<double>::quiet_NaN();
+            infeasible_result.best_bound = state_->maximize
+                                               ? -std::numeric_limits<double>::infinity()
+                                               : std::numeric_limits<double>::infinity();
+            infeasible_result.root_presolve_tightened_bounds = root_presolve.tightened_bounds;
+            infeasible_result.root_presolve_removed_rows = root_presolve.removed_rows;
+            infeasible_result.root_presolve_removed_coeffs = root_presolve.removed_coeffs;
+            infeasible_result.root_presolve_aggregations = root_presolve.aggregations;
+            return MIPSolution(state_, std::move(infeasible_result), original_vars);
+        }
+        problem = root_presolve.problem;
+        const ModelLPData data = build_lp_data_from_problem_(problem);
+        problem.lower_bounds = data.l;
+        problem.upper_bounds = data.u;
+        problem.objective_coefficients.conservativeResize(data.total_vars);
+        for (int j = original_vars; j < data.total_vars; ++j) {
+            problem.objective_coefficients(j) = 0.0;
+        }
+        problem.variable_types.resize(data.total_vars, VarType::Continuous);
+
+        struct ThreadLocalMIPLPContext {
+            RevisedSimplex cold_solver;
+            RevisedSimplex warm_solver;
+            std::optional<RevisedSimplex> fallback_solver;
+            std::unordered_map<std::string, ModelLPData> node_lp_cache;
+
+            ThreadLocalMIPLPContext(const RevisedSimplexOptions& cold_options,
+                                    const RevisedSimplexOptions& warm_options)
+                : cold_solver(cold_options), warm_solver(warm_options) {
+                if (cold_options.mode == SimplexMode::Dual) {
+                    RevisedSimplexOptions fallback_options = cold_options;
+                    fallback_options.mode = SimplexMode::Auto;
+                    fallback_solver.emplace(fallback_options);
+                } else if (cold_options.mode == SimplexMode::Auto) {
+                    RevisedSimplexOptions fallback_options = cold_options;
+                    fallback_options.mode = SimplexMode::Primal;
+                    fallback_solver.emplace(fallback_options);
+                }
+            }
+        };
+
+        simplex_bnb::Solver bnb_solver(problem, mip_options);
+        simplex_bnb::SolveResult result = bnb_solver.solve(
+            [&](const Eigen::VectorXd& l_node, const Eigen::VectorXd& u_node,
+                const LPBasis* basis,
+                const std::vector<simplex_bnb::Cut>& cuts)
+                -> simplex_bnb::RelaxationSolution {
+                static thread_local std::unordered_map<const ModelState*,
+                                                       std::unique_ptr<ThreadLocalMIPLPContext>>
+                    thread_contexts;
+                auto& context_ptr = thread_contexts[state_.get()];
+                if (!context_ptr) {
+                    context_ptr = std::make_unique<ThreadLocalMIPLPContext>(cold_lp_options,
+                                                                            warm_lp_options);
+                }
+                ThreadLocalMIPLPContext& thread_context = *context_ptr;
+
+                std::vector<simplex_bnb::Cut> presolve_only_cuts;
+                std::vector<simplex_bnb::Cut> structural_cuts;
+                presolve_only_cuts.reserve(cuts.size());
+                structural_cuts.reserve(cuts.size());
+                for (const auto& cut : cuts) {
+                    if (cut.cut_type == "IncumbentCutoff") {
+                        presolve_only_cuts.push_back(cut);
+                    } else {
+                        structural_cuts.push_back(cut);
+                    }
+                }
+
+                Eigen::VectorXd node_l = data.l;
+                Eigen::VectorXd node_u = data.u;
+                if (l_node.size() == data.original_vars && u_node.size() == data.original_vars) {
+                    node_l.head(data.original_vars) = l_node;
+                    node_u.head(data.original_vars) = u_node;
+                } else if (l_node.size() == data.total_vars && u_node.size() == data.total_vars) {
+                    node_l = l_node;
+                    node_u = u_node;
+                }
+
+                // Structural cuts stay in the LP as rows. Simplifying them
+                // node-by-node was pruning feasible cover-cut branches.
+                SimplifiedCutsResult simplified_structural_cuts;
+                simplified_structural_cuts.cuts = structural_cuts;
+                const SimplifiedCutsResult simplified_presolve_cuts =
+                    simplify_cuts_for_bounds(presolve_only_cuts, node_l.head(data.total_vars),
+                                             node_u.head(data.total_vars));
+                if (simplified_presolve_cuts.infeasible) {
+                    simplex_bnb::RelaxationSolution out;
+                    out.status = simplex_bnb::RelaxationStatus::Infeasible;
+                    out.primal = Eigen::VectorXd::Constant(
+                        data.total_vars, std::numeric_limits<double>::quiet_NaN());
+                    out.objective = state_->maximize ? -std::numeric_limits<double>::infinity()
+                                                     : std::numeric_limits<double>::infinity();
+                    return out;
+                }
+                const NodeBoundPresolveResult base_presolve = presolve_mip_node_bounds(
+                    problem, node_l.head(data.original_vars), node_u.head(data.original_vars),
+                    simplified_presolve_cuts.cuts);
+                if (base_presolve.infeasible) {
+                    simplex_bnb::RelaxationSolution out;
+                    out.status = simplex_bnb::RelaxationStatus::Infeasible;
+                    out.primal = Eigen::VectorXd::Constant(
+                        data.total_vars, std::numeric_limits<double>::quiet_NaN());
+                    out.objective = state_->maximize ? -std::numeric_limits<double>::infinity()
+                                                     : std::numeric_limits<double>::infinity();
+                    return out;
+                }
+                node_l.head(data.original_vars) = base_presolve.lower;
+                node_u.head(data.original_vars) = base_presolve.upper;
+
+                const ModelLPData* node_data = &data;
+                if (!simplified_structural_cuts.cuts.empty()) {
+                    const std::string cache_key =
+                        cut_set_signature(simplified_structural_cuts.cuts);
+                    auto it = thread_context.node_lp_cache.find(cache_key);
+                    if (it == thread_context.node_lp_cache.end()) {
+                        it = thread_context.node_lp_cache
+                                 .emplace(cache_key,
+                                          build_node_lp_data_from_base_(data,
+                                                                       simplified_structural_cuts
+                                                                           .cuts))
+                                 .first;
+                    }
+                    node_data = &it->second;
+                }
+
+                Eigen::VectorXd solve_l = node_data->l;
+                Eigen::VectorXd solve_u = node_data->u;
+                solve_l.head(data.total_vars) = node_l;
+                solve_u.head(data.total_vars) = node_u;
+
+                std::vector<simplex_bnb::Cut> node_presolve_cuts =
+                    simplified_presolve_cuts.cuts;
+                const NodeBoundPresolveResult node_presolve = presolve_mip_node_bounds(
+                    problem, solve_l.head(data.original_vars), solve_u.head(data.original_vars),
+                    node_presolve_cuts);
+                if (node_presolve.infeasible) {
+                    simplex_bnb::RelaxationSolution out;
+                    out.status = simplex_bnb::RelaxationStatus::Infeasible;
+                    out.primal = Eigen::VectorXd::Constant(
+                        data.total_vars, std::numeric_limits<double>::quiet_NaN());
+                    out.objective = state_->maximize ? -std::numeric_limits<double>::infinity()
+                                                     : std::numeric_limits<double>::infinity();
+                    return out;
+                }
+                solve_l.head(data.original_vars) = node_presolve.lower;
+                solve_u.head(data.original_vars) = node_presolve.upper;
+
+                struct StandardizedNodeLP {
+                    Eigen::MatrixXd A;
+                    Eigen::VectorXd b;
+                    Eigen::VectorXd c;
+                    Eigen::VectorXd l;
+                    Eigen::VectorXd u;
+                    Eigen::VectorXd shift;
+                    double objective_shift = 0.0;
+                };
+
+                auto standardize_node_lp = [&](const ModelLPData& lp_data,
+                                               const Eigen::VectorXd& lower,
+                                               const Eigen::VectorXd& upper) {
+                    StandardizedNodeLP std_lp;
+                    const int base_n = lp_data.total_vars;
+                    const int base_m = lp_data.rows;
+
+                    std_lp.shift = Eigen::VectorXd::Zero(base_n);
+                    if (lower.size() >= base_n) {
+                        std_lp.shift = lower.head(base_n);
+                    }
+
+                    std::vector<int> bounded_cols;
+                    bounded_cols.reserve(base_n);
+                    for (int j = 0; j < base_n && j < upper.size(); ++j) {
+                        if (std::isfinite(upper(j))) bounded_cols.push_back(j);
+                    }
+
+                    const int extra_rows = static_cast<int>(bounded_cols.size());
+                    const int extra_cols = extra_rows;
+                    std_lp.A = Eigen::MatrixXd::Zero(base_m + extra_rows, base_n + extra_cols);
+                    std_lp.b = Eigen::VectorXd::Zero(base_m + extra_rows);
+                    std_lp.c = Eigen::VectorXd::Zero(base_n + extra_cols);
+                    std_lp.l = Eigen::VectorXd::Zero(base_n + extra_cols);
+                    std_lp.u = Eigen::VectorXd::Constant(base_n + extra_cols,
+                                                         std::numeric_limits<double>::infinity());
+
+                    std_lp.A.topLeftCorner(base_m, base_n) = lp_data.A;
+                    std_lp.b.head(base_m) = lp_data.b - lp_data.A * std_lp.shift;
+                    std_lp.c.head(base_n) = lp_data.c;
+                    std_lp.objective_shift = lp_data.c.dot(std_lp.shift);
+
+                    for (int k = 0; k < extra_rows; ++k) {
+                        const int j = bounded_cols[k];
+                        const int row = base_m + k;
+                        const int slack = base_n + k;
+                        const double rhs =
+                            std::max(0.0, upper(j) - ((j < lower.size()) ? lower(j) : 0.0));
+                        std_lp.A(row, j) = 1.0;
+                        std_lp.A(row, slack) = 1.0;
+                        std_lp.b(row) = rhs;
+                    }
+                    return std_lp;
+                };
+
+                const bool needs_standardized_node_lp =
+                    (solve_l.size() >= node_data->total_vars &&
+                     solve_u.size() >= node_data->total_vars) &&
+                    (((solve_l.head(node_data->total_vars).array().abs() > 1e-12).any()) ||
+                     (solve_u.head(node_data->total_vars).array().isFinite().any()));
+                std::optional<StandardizedNodeLP> standardized_node_lp;
+                if (needs_standardized_node_lp) {
+                    standardized_node_lp =
+                        standardize_node_lp(*node_data, solve_l, solve_u);
+                }
+
+                const LPBasis* effective_basis = nullptr;
+                if (!standardized_node_lp.has_value() && basis &&
+                    basis_matches_dimensions(*basis, node_data->total_vars, node_data->rows)) {
+                    effective_basis = basis;
+                }
+                const bool use_fresh_solvers_for_this_lp =
+                    !simplified_structural_cuts.cuts.empty();
+                RevisedSimplex local_cold_solver(cold_lp_options);
+                RevisedSimplex local_warm_solver(warm_lp_options);
+                std::optional<RevisedSimplex> local_fallback_solver;
+                if (use_fresh_solvers_for_this_lp) {
+                    if (cold_lp_options.mode == SimplexMode::Dual) {
+                        RevisedSimplexOptions fallback_options = cold_lp_options;
+                        fallback_options.mode = SimplexMode::Auto;
+                        local_fallback_solver.emplace(fallback_options);
+                    } else if (cold_lp_options.mode == SimplexMode::Auto) {
+                        RevisedSimplexOptions fallback_options = cold_lp_options;
+                        fallback_options.mode = SimplexMode::Primal;
+                        local_fallback_solver.emplace(fallback_options);
+                    }
+                }
+                RevisedSimplex* warm_solver =
+                    use_fresh_solvers_for_this_lp ? &local_warm_solver
+                                                  : &thread_context.warm_solver;
+                RevisedSimplex* cold_solver =
+                    use_fresh_solvers_for_this_lp ? &local_cold_solver
+                                                  : &thread_context.cold_solver;
+                std::optional<RevisedSimplex>* fallback_solver =
+                    use_fresh_solvers_for_this_lp ? &local_fallback_solver
+                                                  : &thread_context.fallback_solver;
+                const auto is_retryable_lu_failure = [](const std::runtime_error& err) {
+                    const std::string_view msg(err.what());
+                    return msg.find("MarkowitzLU: singular matrix") != std::string_view::npos ||
+                           msg.find("MarkowitzLU: numerically singular pivot") !=
+                               std::string_view::npos;
+                };
+                const auto try_lp_solve =
+                    [&](RevisedSimplex& solver,
+                        const LPBasis* basis_arg) -> std::optional<LPSolution> {
+                    try {
+                        if (standardized_node_lp.has_value()) {
+                            const RevisedSimplex::SparseMatrix A_sparse =
+                                standardized_node_lp->A.sparseView(kCoeffTol, 1.0);
+                            return solver.solve(A_sparse, standardized_node_lp->b,
+                                                standardized_node_lp->c,
+                                                standardized_node_lp->l,
+                                                standardized_node_lp->u);
+                        }
+                        const RevisedSimplex::SparseMatrix A_sparse =
+                            node_data->A.sparseView(kCoeffTol, 1.0);
+                        if (basis_arg) {
+                            return solver.solve(A_sparse, node_data->b, node_data->c, solve_l,
+                                                solve_u, *basis_arg);
+                        }
+                        return solver.solve(A_sparse, node_data->b, node_data->c, solve_l,
+                                            solve_u);
+                    } catch (const std::runtime_error& err) {
+                        if (is_retryable_lu_failure(err)) {
+                            return std::nullopt;
+                        }
+                        throw;
+                    }
+                };
+
+                std::optional<LPSolution> raw_opt;
+                if (effective_basis) {
+                    raw_opt = try_lp_solve(*warm_solver, effective_basis);
+                } else {
+                    raw_opt = try_lp_solve(*cold_solver, nullptr);
+                }
+
+                if ((!raw_opt.has_value() || raw_opt->status == LPSolution::Status::Singular ||
+                     raw_opt->status == LPSolution::Status::NeedPhase1) &&
+                    effective_basis) {
+                    raw_opt = try_lp_solve(*cold_solver, nullptr);
+                }
+                if ((!raw_opt.has_value() || raw_opt->status == LPSolution::Status::Singular ||
+                     raw_opt->status == LPSolution::Status::NeedPhase1) &&
+                    fallback_solver->has_value()) {
+                    raw_opt = try_lp_solve(**fallback_solver, nullptr);
+                }
+
+                LPSolution raw;
+                if (raw_opt.has_value()) {
+                    raw = std::move(*raw_opt);
+                } else {
+                    raw.status = LPSolution::Status::Singular;
+                    raw.x = Eigen::VectorXd::Constant(
+                        node_data->total_vars, std::numeric_limits<double>::quiet_NaN());
+                    raw.obj = std::numeric_limits<double>::quiet_NaN();
+                }
+
+                simplex_bnb::RelaxationSolution out;
+                if (raw.status == LPSolution::Status::Optimal) {
+                    out.status = simplex_bnb::RelaxationStatus::Optimal;
+                } else if (raw.status == LPSolution::Status::Unbounded) {
+                    out.status = simplex_bnb::RelaxationStatus::Unbounded;
+                } else {
+                    out.status = simplex_bnb::RelaxationStatus::Infeasible;
+                }
+                if (standardized_node_lp.has_value()) {
+                    out.primal = Eigen::VectorXd::Zero(node_data->total_vars);
+                    if (raw.x.size() >= node_data->total_vars) {
+                        out.primal = raw.x.head(node_data->total_vars);
+                    }
+                    out.primal += standardized_node_lp->shift;
+                    out.objective = node_data->objective_sign *
+                                        (raw.obj + standardized_node_lp->objective_shift) +
+                                    state_->objective.constant;
+                } else {
+                    out.primal = raw.x;
+                    out.objective =
+                        node_data->objective_sign * raw.obj + state_->objective.constant;
+                }
+                out.iterations = raw.iters;
+                out.lp_solution = raw;
+                if (!standardized_node_lp.has_value()) {
+                    const LPBasis rebuilt_basis = rebuild_basis_from_solution(raw);
+                    if (basis_matches_dimensions(rebuilt_basis, node_data->total_vars,
+                                                node_data->rows)) {
+                        out.basis = rebuilt_basis;
+                    }
+                }
+                return out;
+            });
+        result.root_presolve_tightened_bounds = root_presolve.tightened_bounds;
+        result.root_presolve_removed_rows = root_presolve.removed_rows;
+        result.root_presolve_removed_coeffs = root_presolve.removed_coeffs;
+        result.root_presolve_aggregations = root_presolve.aggregations;
+        return MIPSolution(state_, std::move(result), data.original_vars);
     }
 
     std::string repr() const {
@@ -1236,6 +2657,249 @@ class Model {
         for (int i = 0; i < static_cast<int>(state_->vars.size()); ++i) {
             state_->name_to_index.emplace(state_->vars[i].name, i);
         }
+    }
+
+    ModelLPData build_lp_data_(
+        const std::vector<simplex_bnb::Cut>& cuts = {}) const {
+        const int n = static_cast<int>(state_->vars.size());
+        int base_slack_count = 0;
+        for (const auto& constr : state_->constraints) {
+            if (constr.sense != ConstraintSense::Equal) {
+                ++base_slack_count;
+            }
+        }
+        int cut_slack_count = 0;
+        for (const auto& cut : cuts) {
+            if (cut.sense != simplex_bnb::LinearConstraintSense::Equal) {
+                ++cut_slack_count;
+            }
+        }
+
+        ModelLPData out;
+        out.original_vars = n;
+        out.total_vars = n + base_slack_count + cut_slack_count;
+        out.rows = static_cast<int>(state_->constraints.size() + cuts.size());
+        out.A = Eigen::MatrixXd::Zero(out.rows, out.total_vars);
+        out.b = Eigen::VectorXd::Zero(out.rows);
+        out.c = Eigen::VectorXd::Zero(out.total_vars);
+        out.l = Eigen::VectorXd::Zero(out.total_vars);
+        out.u = Eigen::VectorXd::Constant(out.total_vars,
+                                          std::numeric_limits<double>::infinity());
+
+        for (int j = 0; j < n; ++j) {
+            out.l(j) = state_->vars[j].lb;
+            out.u(j) = state_->vars[j].ub;
+        }
+
+        out.objective_sign = state_->maximize ? -1.0 : 1.0;
+        for (const auto& [index, coeff] : state_->objective.coeffs) {
+            if (index < 0 || index >= n) {
+                throw std::out_of_range("simplex: objective references invalid variable");
+            }
+            out.c(index) = out.objective_sign * coeff;
+        }
+
+        int next_slack = n;
+        int row = 0;
+        for (; row < static_cast<int>(state_->constraints.size()); ++row) {
+            const auto& constr = state_->constraints[row];
+            for (const auto& [index, coeff] : constr.expr.coeffs) {
+                if (index < 0 || index >= n) {
+                    throw std::out_of_range(
+                        "simplex: constraint references invalid variable");
+                }
+                out.A(row, index) = coeff;
+            }
+            out.b(row) = -constr.expr.constant;
+
+            if (constr.sense == ConstraintSense::LessEqual) {
+                out.A(row, next_slack++) = 1.0;
+            } else if (constr.sense == ConstraintSense::GreaterEqual) {
+                out.A(row, next_slack++) = -1.0;
+            }
+        }
+
+        for (const auto& cut : cuts) {
+            for (int k = 0; k < static_cast<int>(cut.indices.size()) &&
+                            k < static_cast<int>(cut.values.size());
+                 ++k) {
+                const int index = cut.indices[k];
+                if (index < 0 || index >= n + base_slack_count) {
+                    throw std::out_of_range("simplex: cut references invalid base variable");
+                }
+                out.A(row, index) = cut.values[k];
+            }
+            out.b(row) = cut.rhs;
+            if (cut.sense == simplex_bnb::LinearConstraintSense::LessEqual) {
+                out.A(row, next_slack++) = 1.0;
+            } else if (cut.sense == simplex_bnb::LinearConstraintSense::GreaterEqual) {
+                out.A(row, next_slack++) = -1.0;
+            }
+            ++row;
+        }
+
+        return out;
+    }
+
+    ModelLPData build_lp_data_from_problem_(
+        const simplex_bnb::Problem& problem,
+        const std::vector<simplex_bnb::Cut>& cuts = {}) const {
+        const int n = static_cast<int>(problem.lower_bounds.size());
+        int base_slack_count = 0;
+        for (const auto& row : problem.base_constraints) {
+            if (row.sense != simplex_bnb::LinearConstraintSense::Equal) {
+                ++base_slack_count;
+            }
+        }
+        int cut_slack_count = 0;
+        for (const auto& cut : cuts) {
+            if (cut.sense != simplex_bnb::LinearConstraintSense::Equal) {
+                ++cut_slack_count;
+            }
+        }
+
+        ModelLPData out;
+        out.original_vars = n;
+        out.total_vars = n + base_slack_count + cut_slack_count;
+        out.rows = static_cast<int>(problem.base_constraints.size() + cuts.size());
+        out.A = Eigen::MatrixXd::Zero(out.rows, out.total_vars);
+        out.b = Eigen::VectorXd::Zero(out.rows);
+        out.c = Eigen::VectorXd::Zero(out.total_vars);
+        out.l = Eigen::VectorXd::Zero(out.total_vars);
+        out.u = Eigen::VectorXd::Constant(out.total_vars,
+                                          std::numeric_limits<double>::infinity());
+        out.objective_sign = problem.maximize ? -1.0 : 1.0;
+
+        out.l.head(n) = problem.lower_bounds;
+        out.u.head(n) = problem.upper_bounds;
+        for (int j = 0; j < n && j < problem.objective_coefficients.size(); ++j) {
+            out.c(j) = out.objective_sign * problem.objective_coefficients(j);
+        }
+
+        int next_slack = n;
+        int row_index = 0;
+        for (const auto& row : problem.base_constraints) {
+            for (int k = 0; k < static_cast<int>(row.indices.size()) &&
+                            k < static_cast<int>(row.values.size());
+                 ++k) {
+                const int index = row.indices[k];
+                if (index < 0 || index >= n) {
+                    throw std::out_of_range("simplex: sparse problem row references invalid variable");
+                }
+                out.A(row_index, index) = row.values[k];
+            }
+            out.b(row_index) = row.rhs;
+            if (row.sense == simplex_bnb::LinearConstraintSense::LessEqual) {
+                out.A(row_index, next_slack++) = 1.0;
+            } else if (row.sense == simplex_bnb::LinearConstraintSense::GreaterEqual) {
+                out.A(row_index, next_slack++) = -1.0;
+            }
+            ++row_index;
+        }
+
+        for (const auto& cut : cuts) {
+            for (int k = 0; k < static_cast<int>(cut.indices.size()) &&
+                            k < static_cast<int>(cut.values.size());
+                 ++k) {
+                const int index = cut.indices[k];
+                if (index < 0 || index >= n + base_slack_count) {
+                    throw std::out_of_range("simplex: cut references invalid base variable");
+                }
+                out.A(row_index, index) = cut.values[k];
+            }
+            out.b(row_index) = cut.rhs;
+            if (cut.sense == simplex_bnb::LinearConstraintSense::LessEqual) {
+                out.A(row_index, next_slack++) = 1.0;
+            } else if (cut.sense == simplex_bnb::LinearConstraintSense::GreaterEqual) {
+                out.A(row_index, next_slack++) = -1.0;
+            }
+            ++row_index;
+        }
+
+        return out;
+    }
+
+    ModelLPData build_node_lp_data_from_base_(
+        const ModelLPData& base_data, const std::vector<simplex_bnb::Cut>& cuts) const {
+        int cut_slack_count = 0;
+        for (const auto& cut : cuts) {
+            if (cut.sense != simplex_bnb::LinearConstraintSense::Equal) {
+                ++cut_slack_count;
+            }
+        }
+
+        ModelLPData out;
+        out.original_vars = base_data.original_vars;
+        out.objective_sign = base_data.objective_sign;
+        out.rows = base_data.rows + static_cast<int>(cuts.size());
+        out.total_vars = base_data.total_vars + cut_slack_count;
+        out.A = Eigen::MatrixXd::Zero(out.rows, out.total_vars);
+        out.b = Eigen::VectorXd::Zero(out.rows);
+        out.c = Eigen::VectorXd::Zero(out.total_vars);
+        out.l = Eigen::VectorXd::Zero(out.total_vars);
+        out.u = Eigen::VectorXd::Constant(out.total_vars,
+                                          std::numeric_limits<double>::infinity());
+
+        out.A.topLeftCorner(base_data.rows, base_data.total_vars) = base_data.A;
+        out.b.head(base_data.rows) = base_data.b;
+        out.c.head(base_data.total_vars) = base_data.c;
+        out.l.head(base_data.total_vars) = base_data.l;
+        out.u.head(base_data.total_vars) = base_data.u;
+
+        int next_slack = base_data.total_vars;
+        int row = base_data.rows;
+        for (const auto& cut : cuts) {
+            for (int k = 0; k < static_cast<int>(cut.indices.size()) &&
+                            k < static_cast<int>(cut.values.size());
+                 ++k) {
+                const int index = cut.indices[k];
+                if (index < 0 || index >= base_data.total_vars) {
+                    throw std::out_of_range("simplex: cut references invalid base variable");
+                }
+                out.A(row, index) = cut.values[k];
+            }
+            out.b(row) = cut.rhs;
+            if (cut.sense == simplex_bnb::LinearConstraintSense::LessEqual) {
+                out.A(row, next_slack++) = 1.0;
+            } else if (cut.sense == simplex_bnb::LinearConstraintSense::GreaterEqual) {
+                out.A(row, next_slack++) = -1.0;
+            }
+            ++row;
+        }
+
+        return out;
+    }
+
+    std::vector<simplex_bnb::SparseLinearConstraint> build_base_constraints_() const {
+        std::vector<simplex_bnb::SparseLinearConstraint> out;
+        out.reserve(state_->constraints.size());
+        for (const auto& constr : state_->constraints) {
+            simplex_bnb::SparseLinearConstraint row;
+            row.sense = to_bnb_sense(constr.sense);
+            row.rhs = -constr.expr.constant;
+            for (const auto& [index, coeff] : constr.expr.coeffs) {
+                if (index < 0 || index >= static_cast<int>(state_->vars.size())) {
+                    throw std::out_of_range(
+                        "simplex: constraint references invalid variable");
+                }
+                row.indices.push_back(index);
+                row.values.push_back(coeff);
+            }
+            out.push_back(std::move(row));
+        }
+        return out;
+    }
+
+    ModelSolution make_model_solution_(LPSolution raw, const ModelLPData& data) const {
+        Eigen::VectorXd primal = Eigen::VectorXd::Constant(
+            data.original_vars, std::numeric_limits<double>::quiet_NaN());
+        if (raw.x.size() >= data.original_vars) {
+            primal = raw.x.head(data.original_vars);
+        }
+
+        const double objective =
+            data.objective_sign * raw.obj + state_->objective.constant;
+        return ModelSolution(state_, std::move(raw), std::move(primal), objective);
     }
 
     std::string next_auto_name_() const {
@@ -1276,6 +2940,70 @@ PYBIND11_MODULE(simplinho, m) {
         .value("AtUpper", LPBasisStatus::AtUpper)
         .value("Fixed", LPBasisStatus::Fixed);
 
+    py::enum_<VarType>(m, "VarType")
+        .value("Continuous", VarType::Continuous)
+        .value("Integer", VarType::Integer)
+        .value("Binary", VarType::Binary);
+
+    py::enum_<MIPStatus>(m, "MIPStatus")
+        .value("Optimal", MIPStatus::Optimal)
+        .value("Infeasible", MIPStatus::Infeasible)
+        .value("Unbounded", MIPStatus::Unbounded)
+        .value("NodeLimit", MIPStatus::NodeLimit);
+
+    py::enum_<NodeSelectionStrategy>(m, "NodeSelectionStrategy")
+        .value("DepthFirst", NodeSelectionStrategy::DepthFirst)
+        .value("BreadthFirst", NodeSelectionStrategy::BreadthFirst)
+        .value("BestBound", NodeSelectionStrategy::BestBound)
+        .value("BestFirst", NodeSelectionStrategy::BestBound)
+        .value("BestEstimate", NodeSelectionStrategy::BestEstimate)
+        .value("Hybrid", NodeSelectionStrategy::Hybrid);
+
+    py::enum_<BranchingStrategy>(m, "BranchingStrategy")
+        .value("MostFractional", BranchingStrategy::MostFractional)
+        .value("PseudoCost", BranchingStrategy::PseudoCost)
+        .value("StrongBranching", BranchingStrategy::StrongBranching);
+
+    py::enum_<DivingStrategy>(m, "DivingStrategy")
+        .value("Disabled", DivingStrategy::Disabled)
+        .value("Fractional", DivingStrategy::Fractional)
+        .value("VectorLength", DivingStrategy::VectorLength)
+        .value("ObjectiveValue", DivingStrategy::ObjectiveValue)
+        .value("Coefficient", DivingStrategy::Coefficient)
+        .value("Guided", DivingStrategy::Guided)
+        .value("Adaptive", DivingStrategy::Adaptive);
+
+    py::enum_<MIPTreeNodeStatus>(m, "MIPTreeNodeStatus")
+        .value("Created", MIPTreeNodeStatus::Created)
+        .value("Fractional", MIPTreeNodeStatus::Fractional)
+        .value("Integral", MIPTreeNodeStatus::Integral)
+        .value("Infeasible", MIPTreeNodeStatus::Infeasible)
+        .value("Unbounded", MIPTreeNodeStatus::Unbounded)
+        .value("PrunedByBound", MIPTreeNodeStatus::PrunedByBound)
+        .value("Branched", MIPTreeNodeStatus::Branched)
+        .value("Fathomed", MIPTreeNodeStatus::Fathomed);
+
+    py::class_<MIPTreeNode>(m, "MIPTreeNode")
+        .def_property_readonly("id", [](const MIPTreeNode& self) { return self.id; })
+        .def_property_readonly("parent_id",
+                               [](const MIPTreeNode& self) { return self.parent_id; })
+        .def_property_readonly("depth", [](const MIPTreeNode& self) { return self.depth; })
+        .def_property_readonly("order", [](const MIPTreeNode& self) { return self.order; })
+        .def_property_readonly("status", [](const MIPTreeNode& self) { return self.status; })
+        .def_property_readonly("bound", [](const MIPTreeNode& self) { return self.bound; })
+        .def_property_readonly("estimate", [](const MIPTreeNode& self) { return self.estimate; })
+        .def_property_readonly("branch_var",
+                               [](const MIPTreeNode& self) { return self.branch_var; })
+        .def_property_readonly("branch_value",
+                               [](const MIPTreeNode& self) { return self.branch_value; })
+        .def("__repr__", [](const MIPTreeNode& self) {
+            std::ostringstream oss;
+            oss << "MIPTreeNode(id=" << self.id << ", parent_id=" << self.parent_id
+                << ", depth=" << self.depth << ", estimate=" << self.estimate
+                << ", status='" << simplex_bnb::to_string(self.status) << "')";
+            return oss.str();
+        });
+
     py::class_<LPBasis>(m, "LPBasis")
         .def(py::init<>())
         .def_readwrite("column_status", &LPBasis::column_status)
@@ -1310,6 +3038,10 @@ PYBIND11_MODULE(simplinho, m) {
                                [](const SolveStats& self) { return self.phase2_iterations; })
         .def_property_readonly("presolve_actions",
                                [](const SolveStats& self) { return self.presolve_actions; })
+        .def_property_readonly("presolve_implied_bound_updates",
+                               [](const SolveStats& self) {
+                                   return self.presolve_implied_bound_updates;
+                               })
         .def_property_readonly("reduced_rows",
                                [](const SolveStats& self) { return self.reduced_rows; })
         .def_property_readonly("reduced_cols",
@@ -1388,6 +3120,104 @@ PYBIND11_MODULE(simplinho, m) {
             std::ostringstream oss;
             oss << "SolveStats(status='" << self.status << "', iterations="
                 << self.iterations << ", trace_lines=" << self.trace_lines << ")";
+            return oss.str();
+        });
+
+    py::class_<BranchAndBoundOptions>(m, "BranchAndBoundOptions")
+        .def(py::init<>())
+        .def_readwrite("max_nodes", &BranchAndBoundOptions::max_nodes)
+        .def_property(
+            "node_limit",
+            [](const BranchAndBoundOptions& self) { return self.max_nodes; },
+            [](BranchAndBoundOptions& self, int value) { self.max_nodes = value; })
+        .def_readwrite("parallel_workers", &BranchAndBoundOptions::parallel_workers)
+        .def_readwrite("integrality_tol", &BranchAndBoundOptions::integrality_tol)
+        .def_readwrite("verbose", &BranchAndBoundOptions::verbose)
+        .def_readwrite("log_frequency", &BranchAndBoundOptions::log_frequency)
+        .def_readwrite("node_selection", &BranchAndBoundOptions::node_selection)
+        .def_readwrite("hybrid_depth_bias", &BranchAndBoundOptions::hybrid_depth_bias)
+        .def_readwrite("branching_strategy", &BranchAndBoundOptions::branching_strategy)
+        .def_readwrite("diving_strategy", &BranchAndBoundOptions::diving_strategy)
+        .def_readwrite("strong_branching_candidates",
+                       &BranchAndBoundOptions::strong_branching_candidates)
+        .def_readwrite("strong_branching_max_depth",
+                       &BranchAndBoundOptions::strong_branching_max_depth)
+        .def_readwrite("pseudocost_reliability",
+                       &BranchAndBoundOptions::pseudocost_reliability)
+        .def_readwrite("max_dive_depth", &BranchAndBoundOptions::max_dive_depth)
+        .def_readwrite("max_dive_lp_solves", &BranchAndBoundOptions::max_dive_lp_solves)
+        .def_readwrite("heuristic_frequency", &BranchAndBoundOptions::heuristic_frequency)
+        .def_readwrite("heuristic_max_depth", &BranchAndBoundOptions::heuristic_max_depth)
+        .def_readwrite("use_rins", &BranchAndBoundOptions::use_rins)
+        .def_readwrite("rins_fix_ratio", &BranchAndBoundOptions::rins_fix_ratio)
+        .def_readwrite("rins_tolerance", &BranchAndBoundOptions::rins_tolerance)
+        .def_readwrite("use_rens", &BranchAndBoundOptions::use_rens)
+        .def_readwrite("rens_fix_ratio", &BranchAndBoundOptions::rens_fix_ratio)
+        .def_readwrite("use_local_search", &BranchAndBoundOptions::use_local_search)
+        .def_readwrite("local_search_iterations",
+                       &BranchAndBoundOptions::local_search_iterations)
+        .def_readwrite("local_search_max_free_vars",
+                       &BranchAndBoundOptions::local_search_max_free_vars)
+        .def_readwrite("use_local_branching",
+                       &BranchAndBoundOptions::use_local_branching)
+        .def_readwrite("local_branching_neighborhood_ratio",
+                       &BranchAndBoundOptions::local_branching_neighborhood_ratio)
+        .def_readwrite("local_branching_min_radius",
+                       &BranchAndBoundOptions::local_branching_min_radius)
+        .def_readwrite("local_branching_max_radius",
+                       &BranchAndBoundOptions::local_branching_max_radius)
+        .def_readwrite("local_branching_fix_agree_ratio",
+                       &BranchAndBoundOptions::local_branching_fix_agree_ratio)
+        .def_readwrite("local_branching_lp_agreement_tol",
+                       &BranchAndBoundOptions::local_branching_lp_agreement_tol)
+        .def_readwrite("use_feasibility_pump",
+                       &BranchAndBoundOptions::use_feasibility_pump)
+        .def_readwrite("feasibility_pump_iterations",
+                       &BranchAndBoundOptions::feasibility_pump_iterations)
+        .def_readwrite("feasibility_pump_fix_ratio",
+                       &BranchAndBoundOptions::feasibility_pump_fix_ratio)
+        .def_readwrite("use_feasibility_jump",
+                       &BranchAndBoundOptions::use_feasibility_jump)
+        .def_readwrite("feasibility_jump_iterations",
+                       &BranchAndBoundOptions::feasibility_jump_iterations)
+        .def_readwrite("feasibility_jump_max_free_vars",
+                       &BranchAndBoundOptions::feasibility_jump_max_free_vars)
+        .def_readwrite("feasibility_jump_objective_weight",
+                       &BranchAndBoundOptions::feasibility_jump_objective_weight)
+        .def_readwrite("heuristic_subproblem_max_nodes",
+                       &BranchAndBoundOptions::heuristic_subproblem_max_nodes)
+        .def_readwrite("use_cut_pool", &BranchAndBoundOptions::use_cut_pool)
+        .def_readwrite("max_cut_rounds_per_node",
+                       &BranchAndBoundOptions::max_cut_rounds_per_node)
+        .def_readwrite("max_cuts_added_per_round",
+                       &BranchAndBoundOptions::max_cuts_added_per_round)
+        .def_readwrite("max_cut_pool_size", &BranchAndBoundOptions::max_cut_pool_size)
+        .def_readwrite("min_cut_violation", &BranchAndBoundOptions::min_cut_violation)
+        .def_readwrite("max_cut_age", &BranchAndBoundOptions::max_cut_age)
+        .def_readwrite("use_gomory_cuts", &BranchAndBoundOptions::use_gomory_cuts)
+        .def_readwrite("use_cover_cuts", &BranchAndBoundOptions::use_cover_cuts)
+        .def_readwrite("use_implied_bound_cuts",
+                       &BranchAndBoundOptions::use_implied_bound_cuts)
+        .def_readwrite("use_clique_cuts", &BranchAndBoundOptions::use_clique_cuts)
+        .def_readwrite("use_probing_implications",
+                       &BranchAndBoundOptions::use_probing_implications)
+        .def_readwrite("probing_max_candidates",
+                       &BranchAndBoundOptions::probing_max_candidates)
+        .def_readwrite("use_conflict_cuts", &BranchAndBoundOptions::use_conflict_cuts)
+        .def_readwrite("max_conflict_cuts_per_round",
+                       &BranchAndBoundOptions::max_conflict_cuts_per_round)
+        .def_readwrite("max_cuts_per_type", &BranchAndBoundOptions::max_cuts_per_type)
+        .def_readwrite("cut_max_parallelism", &BranchAndBoundOptions::cut_max_parallelism)
+        .def("__repr__", [](const BranchAndBoundOptions& self) {
+            std::ostringstream oss;
+            oss << "BranchAndBoundOptions(max_nodes=" << self.max_nodes
+                << ", integrality_tol=" << self.integrality_tol
+                << ", verbose=" << (self.verbose ? "True" : "False")
+                << ", log_frequency=" << self.log_frequency
+                << ", node_selection='" << simplex_bnb::to_string(self.node_selection) << "'"
+                << ", branching_strategy='" << simplex_bnb::to_string(self.branching_strategy)
+                << "', diving_strategy='" << simplex_bnb::to_string(self.diving_strategy)
+                << "')";
             return oss.str();
         });
 
@@ -1538,6 +3368,26 @@ PYBIND11_MODULE(simplinho, m) {
         .def_readwrite("devex_reset", &RevisedSimplexOptions::devex_reset)
         .def_readwrite("pricing_rule", &RevisedSimplexOptions::pricing_rule)
         .def_readwrite("adaptive_reset_freq", &RevisedSimplexOptions::adaptive_reset_freq)
+        .def_readwrite("partial_pricing", &RevisedSimplexOptions::partial_pricing)
+        .def_readwrite("dual_pricing", &RevisedSimplexOptions::dual_pricing)
+        .def_readwrite("row_pricing_threshold",
+                       &RevisedSimplexOptions::row_pricing_threshold)
+        .def_readwrite("primal_edge_weight_strategy",
+                       &RevisedSimplexOptions::primal_edge_weight_strategy)
+        .def_readwrite("dual_edge_weight_strategy",
+                       &RevisedSimplexOptions::dual_edge_weight_strategy)
+        .def_readwrite("primal_steepest_edge_weight_log_error_threshold",
+                       &RevisedSimplexOptions::
+                           primal_steepest_edge_weight_log_error_threshold)
+        .def_readwrite("dual_steepest_edge_weight_log_error_threshold",
+                       &RevisedSimplexOptions::
+                           dual_steepest_edge_weight_log_error_threshold)
+        .def_readwrite("primal_simplex_cost_perturbation_multiplier",
+                       &RevisedSimplexOptions::
+                           primal_simplex_cost_perturbation_multiplier)
+        .def_readwrite("dual_simplex_cost_perturbation_multiplier",
+                       &RevisedSimplexOptions::
+                           dual_simplex_cost_perturbation_multiplier)
         .def_readwrite("max_basis_rebuilds", &RevisedSimplexOptions::max_basis_rebuilds)
         .def_readwrite("crash_attempts", &RevisedSimplexOptions::crash_attempts)
         .def_readwrite("crash_markowitz_tol", &RevisedSimplexOptions::crash_markowitz_tol)
@@ -1567,6 +3417,7 @@ PYBIND11_MODULE(simplinho, m) {
         .def_property_readonly("name", &Var::name)
         .def_property("lb", &Var::lower_bound, &Var::set_lower_bound)
         .def_property("ub", &Var::upper_bound, &Var::set_upper_bound)
+        .def_property("type", &Var::type, &Var::set_type)
         .def_property("obj", &Var::objective_coefficient,
                       &Var::set_objective_coefficient)
         .def("__repr__", &Var::repr)
@@ -1749,20 +3600,86 @@ PYBIND11_MODULE(simplinho, m) {
              py::arg("name"))
         .def("__repr__", &ModelSolution::repr);
 
+    py::class_<MIPSolution>(m, "MIPSolution")
+        .def_property_readonly("status", &MIPSolution::status)
+        .def_property_readonly("x", &MIPSolution::x,
+                               py::return_value_policy::reference_internal)
+        .def_property_readonly("obj", &MIPSolution::objective)
+        .def_property_readonly("objective", &MIPSolution::objective)
+        .def_property_readonly("best_bound", &MIPSolution::best_bound)
+        .def_property_readonly("root_relaxation_objective",
+                               &MIPSolution::root_relaxation_objective)
+        .def_property_readonly("root_presolve_tightened_bounds",
+                               &MIPSolution::root_presolve_tightened_bounds)
+        .def_property_readonly("root_presolve_removed_rows",
+                               &MIPSolution::root_presolve_removed_rows)
+        .def_property_readonly("root_presolve_removed_coeffs",
+                               &MIPSolution::root_presolve_removed_coeffs)
+        .def_property_readonly("root_presolve_aggregations",
+                               &MIPSolution::root_presolve_aggregations)
+        .def_property_readonly("node_count", &MIPSolution::node_count)
+        .def_property_readonly("lp_iterations", &MIPSolution::lp_iterations)
+        .def_property_readonly("incumbent_updates", &MIPSolution::incumbent_updates)
+        .def_property_readonly("heuristic_lp_iterations",
+                               &MIPSolution::heuristic_lp_iterations)
+        .def_property_readonly("heuristic_successes",
+                               &MIPSolution::heuristic_successes)
+        .def_property_readonly("feasibility_jump_successes",
+                               &MIPSolution::feasibility_jump_successes)
+        .def_property_readonly("feasibility_pump_successes",
+                               &MIPSolution::feasibility_pump_successes)
+        .def_property_readonly("rens_successes", &MIPSolution::rens_successes)
+        .def_property_readonly("rins_successes", &MIPSolution::rins_successes)
+        .def_property_readonly("local_search_successes",
+                               &MIPSolution::local_search_successes)
+        .def_property_readonly("local_branching_successes",
+                               &MIPSolution::local_branching_successes)
+        .def_property_readonly("cuts_generated", &MIPSolution::cuts_generated)
+        .def_property_readonly("cuts_applied", &MIPSolution::cuts_applied)
+        .def_property_readonly("duplicate_cuts", &MIPSolution::duplicate_cuts)
+        .def_property_readonly("cut_pool_size", &MIPSolution::cut_pool_size)
+        .def_property_readonly("has_solution", &MIPSolution::has_solution)
+        .def_property_readonly("values", &MIPSolution::values,
+                               py::return_value_policy::reference_internal)
+        .def_property_readonly("tree_nodes", &MIPSolution::tree_nodes,
+                               py::return_value_policy::reference_internal)
+        .def_property_readonly("relative_gap", &MIPSolution::relative_gap)
+        .def("value", py::overload_cast<const Var&>(&MIPSolution::value, py::const_),
+             py::arg("var"))
+        .def("value",
+             py::overload_cast<const std::string&>(&MIPSolution::value, py::const_),
+             py::arg("name"))
+        .def("__repr__", &MIPSolution::repr);
+
     py::class_<Model>(m, "Model")
         .def(py::init<const RevisedSimplexOptions&>(),
              py::arg("options") = RevisedSimplexOptions())
         .def("add_var", &Model::add_var, py::arg("name") = py::none(),
              py::arg("lb") = 0.0,
              py::arg("ub") = std::numeric_limits<double>::infinity(),
-             py::arg("obj") = 0.0)
+             py::arg("obj") = 0.0,
+             py::arg("var_type") = VarType::Continuous)
         .def("addVar", &Model::add_var, py::arg("name") = py::none(),
              py::arg("lb") = 0.0,
              py::arg("ub") = std::numeric_limits<double>::infinity(),
-             py::arg("obj") = 0.0)
+             py::arg("obj") = 0.0,
+             py::arg("var_type") = VarType::Continuous)
         .def("addvar", &Model::add_var, py::arg("name") = py::none(),
              py::arg("lb") = 0.0,
              py::arg("ub") = std::numeric_limits<double>::infinity(),
+             py::arg("obj") = 0.0,
+             py::arg("var_type") = VarType::Continuous)
+        .def("add_integer_var", &Model::add_integer_var, py::arg("name") = py::none(),
+             py::arg("lb") = 0.0,
+             py::arg("ub") = std::numeric_limits<double>::infinity(),
+             py::arg("obj") = 0.0)
+        .def("addIntegerVar", &Model::add_integer_var, py::arg("name") = py::none(),
+             py::arg("lb") = 0.0,
+             py::arg("ub") = std::numeric_limits<double>::infinity(),
+             py::arg("obj") = 0.0)
+        .def("add_binary_var", &Model::add_binary_var, py::arg("name") = py::none(),
+             py::arg("obj") = 0.0)
+        .def("addBinaryVar", &Model::add_binary_var, py::arg("name") = py::none(),
              py::arg("obj") = 0.0)
         .def("add_constr", &Model::add_constr, py::arg("constraint"),
              py::arg("name") = py::none())
@@ -1844,6 +3761,8 @@ PYBIND11_MODULE(simplinho, m) {
                     "simplex: model.reoptimize basis must be an LPBasis");
             },
             py::arg("basis") = py::none())
+        .def("solve_mip", &Model::solve_mip,
+             py::arg("options") = BranchAndBoundOptions())
         .def("__repr__", &Model::repr);
 
     py::class_<RevisedSimplex>(m, "RevisedSimplex")
@@ -1868,10 +3787,42 @@ PYBIND11_MODULE(simplinho, m) {
             },
             py::arg("A"), py::arg("b"), py::arg("c"), py::arg("l"), py::arg("u"),
             py::arg("basis") = py::none(),
+            "Solve LP: min c^T x s.t. Ax=b, l<=x<=u")
+        .def(
+            "solve",
+            [](RevisedSimplex& self, const RevisedSimplex::SparseMatrix& A,
+               const Eigen::VectorXd& b, const Eigen::VectorXd& c,
+               const Eigen::VectorXd& l, const Eigen::VectorXd& u,
+               py::object basis) {
+                if (basis.is_none()) {
+                    return self.solve(A, b, c, l, u);
+                }
+                if (py::isinstance<LPBasis>(basis)) {
+                    return self.solve(A, b, c, l, u, basis.cast<LPBasis>());
+                }
+                return self.solve(A, b, c, l, u,
+                                  basis.cast<std::vector<int>>());
+            },
+            py::arg("A"), py::arg("b"), py::arg("c"), py::arg("l"), py::arg("u"),
+            py::arg("basis") = py::none(),
             "Solve LP: min c^T x s.t. Ax=b, l<=x<=u");
 
     m.attr("SimplexModel") = m.attr("Model");
     m.def("status_to_string", [](LPSolution::Status status) {
         return std::string(to_string(status));
     });
+    m.def("mip_status_to_string", [](MIPStatus status) {
+        return std::string(simplex_bnb::to_string(status));
+    });
+
+    // HiGHS-inspired: cost perturbation utility for degeneracy handling
+    m.def(
+        "perturb_costs",
+        [](Eigen::VectorXd c, double multiplier, int seed) {
+            std::mt19937 rng(seed);
+            degeneracy_helpers::perturbCosts(c, rng, multiplier);
+            return c;
+        },
+        py::arg("costs"), py::arg("multiplier") = 1e-8, py::arg("seed") = 13,
+        "Apply small random perturbations to cost vector to break degeneracy");
 }

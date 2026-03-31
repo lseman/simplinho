@@ -14,6 +14,8 @@
 #include <Eigen/Dense>
 #include <Eigen/SVD>
 #include <Eigen/Sparse>
+#include <Eigen/SparseLU>
+#include <Eigen/SparseQR>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -33,6 +35,7 @@
 #include <utility>
 #include <vector>
 
+#include "degeneracy.h"     // DegeneracyManager + perturbation helpers
 #include "presolver.h"      // presolve::LP, Presolver
 #include "pricer.h"         // pricing + degeneracy helpers
 #include "simplex_lu.h"     // FTBasis implementation (solve_B, solve_BT, replace_column, refactor)
@@ -45,6 +48,8 @@ static inline std::unordered_map<std::string, std::string> dm_stats_to_map(
     info["deg_streak"] = std::to_string(s.degeneracy_streak);
     info["deg_total"] = std::to_string(s.degeneracy_total);
     info["cycle_len"] = std::to_string(s.suspected_cycling);
+    info["basis_repeat_hits"] = std::to_string(s.repeated_basis_hits);
+    info["basis_cycle_hits"] = std::to_string(s.basis_cycle_hits);
     info["cond_est"] = std::to_string(s.cond_est);
     info["deg_thresh"] = std::to_string(s.adaptive_deg_threshold);
     info["deg_epoch"] = std::to_string(s.epoch);
@@ -59,6 +64,7 @@ class RevisedSimplexDualEngine;
 
 class RevisedSimplex {
    public:
+    using SparseMatrix = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
     using PhaseResult =
         std::tuple<LPSolution::Status, Eigen::VectorXd, std::vector<int>, int,
                    std::unordered_map<std::string, std::string>>;
@@ -135,6 +141,60 @@ class RevisedSimplex {
         return sol;
     }
 
+    LPSolution solve(const SparseMatrix& A_in, const Eigen::VectorXd& b_in,
+                     const Eigen::VectorXd& c_in,
+                     std::optional<std::vector<int>> basis_opt = std::nullopt) {
+        const int n = static_cast<int>(A_in.cols());
+        const LPBasis* implicit_basis = nullptr;
+        if (!basis_opt && should_reuse_cached_basis_(A_in.rows(), n)) {
+            implicit_basis = &*cached_basis_state_;
+        }
+        LPSolution sol = solve_impl_sparse_(
+            A_in, b_in, c_in, Eigen::VectorXd::Zero(n),
+            Eigen::VectorXd::Constant(n, presolve::inf()), basis_opt,
+            implicit_basis);
+        update_cached_basis_(sol, A_in.rows(), Eigen::VectorXd::Zero(n),
+                             Eigen::VectorXd::Constant(n, presolve::inf()));
+        return sol;
+    }
+
+    LPSolution solve(const SparseMatrix& A_in, const Eigen::VectorXd& b_in,
+                     const Eigen::VectorXd& c_in, const LPBasis& warm_start) {
+        const int n = static_cast<int>(A_in.cols());
+        LPSolution sol = solve_impl_sparse_(
+            A_in, b_in, c_in, Eigen::VectorXd::Zero(n),
+            Eigen::VectorXd::Constant(n, presolve::inf()), std::nullopt,
+            &warm_start);
+        update_cached_basis_(sol, A_in.rows(), Eigen::VectorXd::Zero(n),
+                             Eigen::VectorXd::Constant(n, presolve::inf()));
+        return sol;
+    }
+
+    LPSolution solve(const SparseMatrix& A_in, const Eigen::VectorXd& b_in,
+                     const Eigen::VectorXd& c_in, const Eigen::VectorXd& l_in,
+                     const Eigen::VectorXd& u_in,
+                     std::optional<std::vector<int>> basis_opt = std::nullopt) {
+        const int n = static_cast<int>(A_in.cols());
+        const LPBasis* implicit_basis = nullptr;
+        if (!basis_opt && should_reuse_cached_basis_(A_in.rows(), n)) {
+            implicit_basis = &*cached_basis_state_;
+        }
+        LPSolution sol = solve_impl_sparse_(A_in, b_in, c_in, l_in, u_in,
+                                            basis_opt, implicit_basis);
+        update_cached_basis_(sol, A_in.rows(), l_in, u_in);
+        return sol;
+    }
+
+    LPSolution solve(const SparseMatrix& A_in, const Eigen::VectorXd& b_in,
+                     const Eigen::VectorXd& c_in, const Eigen::VectorXd& l_in,
+                     const Eigen::VectorXd& u_in, const LPBasis& warm_start) {
+        LPSolution sol =
+            solve_impl_sparse_(A_in, b_in, c_in, l_in, u_in, std::nullopt,
+                               &warm_start);
+        update_cached_basis_(sol, A_in.rows(), l_in, u_in);
+        return sol;
+    }
+
     void clear_basis_cache() {
         cached_basis_state_.reset();
         cached_basis_rows_ = -1;
@@ -150,6 +210,7 @@ class RevisedSimplex {
                            std::optional<std::vector<int>> basis_opt,
                            const LPBasis* basis_state_opt) {
         SolveTraceScope trace_scope(*this);
+        degen_.reset();
         const int n = static_cast<int>(A_in.cols());
         if (b_in.size() != A_in.rows()) {
             throw std::invalid_argument("simplex: b size mismatch with rows(A)");
@@ -486,14 +547,21 @@ class RevisedSimplex {
         lp.u = u_model;
         lp.c0 = c_in.dot(anchor);
 
+        const bool warm_start_requested =
+            (basis_opt && !basis_opt->empty()) ||
+            (basis_state_opt && !basis_state_opt->column_status.empty());
+
         // ---- (1) Presolve ----
         presolve::Presolver::Options popt;
-        popt.enable_rowreduce = true;
-        popt.enable_scaling = true;
-        popt.enable_objective_probing = false;
-        popt.non_destructive = true;
+        popt.enable_rowreduce = !warm_start_requested;
+        popt.enable_scaling = !warm_start_requested;
+        popt.enable_objective_probing =
+            !warm_start_requested && A_in.rows() <= 200 && A_in.cols() <= 200;
+        popt.non_destructive = warm_start_requested;
         popt.allow_structural_changes = false;
-        popt.max_passes = 5;
+        popt.max_passes = warm_start_requested ? 1 : 8;
+        popt.probing_max_rounds = warm_start_requested ? 0 : 1;
+        popt.probing_max_vars = warm_start_requested ? 0 : 8;
         if (A_in.cols() > static_cast<int>(A_in.rows() * 1.2)) {
             popt.conservative_mode = true;
         }
@@ -642,6 +710,8 @@ class RevisedSimplex {
         const auto add_info =
             [&](std::unordered_map<std::string, std::string> info) {
                 info["presolve_actions"] = std::to_string(pres.stack.size());
+                info["presolve_implied_bound_updates"] =
+                    std::to_string(pres.implied_bound_updates);
                 info["original_m"] = std::to_string(A_in.rows());
                 info["original_l"] = serialize_double_vec_(l_in);
                 info["original_u"] = serialize_double_vec_(u_in);
@@ -1061,6 +1131,14 @@ class RevisedSimplex {
             l_in, u_in, opt_.tol));
     }
 
+    LPSolution solve_impl_sparse_(const SparseMatrix& A_in,
+                                  const Eigen::VectorXd& b_in,
+                                  const Eigen::VectorXd& c_in,
+                                  const Eigen::VectorXd& l_in,
+                                  const Eigen::VectorXd& u_in,
+                                  std::optional<std::vector<int>> basis_opt,
+                                  const LPBasis* basis_state_opt);
+
    private:
     friend class RevisedSimplexPrimalEngine;
     friend class RevisedSimplexDualEngine;
@@ -1102,6 +1180,65 @@ class RevisedSimplex {
         return std::string(to_string(status));
     }
 
+    static Eigen::MatrixXd dense_copy_(const Eigen::MatrixXd& A) { return A; }
+    static Eigen::MatrixXd dense_copy_(const SparseMatrix& A) {
+        return Eigen::MatrixXd(A);
+    }
+
+    static Eigen::MatrixXd dense_basis_copy_(const SparseMatrix& A,
+                                             const std::vector<int>& basis) {
+        Eigen::MatrixXd B = Eigen::MatrixXd::Zero(A.rows(), basis.size());
+        for (int k = 0; k < (int)basis.size(); ++k) {
+            const int j = basis[k];
+            if (j < 0 || j >= A.cols()) continue;
+            for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
+                B(it.row(), k) = it.value();
+            }
+        }
+        return B;
+    }
+
+    static SparseMatrix sparse_basis_copy_(const SparseMatrix& A,
+                                           const std::vector<int>& basis) {
+        std::size_t reserve_nnz = 0;
+        if (A.isCompressed()) {
+            const int* outer = A.outerIndexPtr();
+            for (int j : basis) {
+                if (j < 0 || j >= A.cols()) continue;
+                reserve_nnz += static_cast<std::size_t>(outer[j + 1] - outer[j]);
+            }
+        } else {
+            reserve_nnz = static_cast<std::size_t>(std::max<int>(1, basis.size() * 8));
+        }
+
+        std::vector<Eigen::Triplet<double>> trips;
+        trips.reserve(reserve_nnz);
+        for (int k = 0; k < (int)basis.size(); ++k) {
+            const int j = basis[k];
+            if (j < 0 || j >= A.cols()) continue;
+            for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
+                trips.emplace_back(it.row(), k, it.value());
+            }
+        }
+
+        SparseMatrix B(A.rows(), basis.size());
+        if (!trips.empty()) B.setFromTriplets(trips.begin(), trips.end());
+        B.makeCompressed();
+        return B;
+    }
+
+    static bool sparse_basis_has_full_rank_(const SparseMatrix& A,
+                                            const std::vector<int>& basis) {
+        const int m = static_cast<int>(A.rows());
+        if ((int)basis.size() != m) return false;
+        if (m == 0) return true;
+        SparseMatrix B = sparse_basis_copy_(A, basis);
+        Eigen::SparseLU<SparseMatrix> lu;
+        lu.analyzePattern(B);
+        lu.factorize(B);
+        return lu.info() == Eigen::Success;
+    }
+
     static std::vector<std::string> make_internal_column_labels_(
         const std::vector<int>& col_orig_map) {
         std::vector<std::string> labels;
@@ -1115,6 +1252,26 @@ class RevisedSimplex {
             }
         }
         return labels;
+    }
+
+    static std::optional<Eigen::VectorXd> parse_serialized_vec_(
+        const std::unordered_map<std::string, std::string>& info,
+        const char* key, int expected_dim) {
+        auto it = info.find(key);
+        if (it == info.end()) return std::nullopt;
+        std::vector<double> vals;
+        std::stringstream ss(it->second);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            if (!tok.empty()) vals.push_back(std::stod(tok));
+        }
+        if (expected_dim >= 0 && (int)vals.size() != expected_dim) {
+            return std::nullopt;
+        }
+        if (vals.empty() && expected_dim == 0) return Eigen::VectorXd::Zero(0);
+        if (vals.empty()) return std::nullopt;
+        return Eigen::Map<const Eigen::VectorXd>(vals.data(),
+                                                static_cast<int>(vals.size()));
     }
 
     static std::vector<std::string> make_internal_row_labels_(
@@ -1587,6 +1744,73 @@ class RevisedSimplex {
         return sol;
     }
 
+    static LPSolution attach_internal_tableau_(
+        LPSolution sol, const SparseMatrix& A_internal,
+        const Eigen::VectorXd& b_internal, const Eigen::VectorXd& c_internal,
+        std::vector<int> basis_internal,
+        std::vector<std::string> internal_column_labels,
+        std::vector<std::string> internal_row_labels, double tol) {
+        sol.basis_internal = std::move(basis_internal);
+        sol.internal_column_labels = std::move(internal_column_labels);
+        sol.internal_row_labels = std::move(internal_row_labels);
+        sol.nonbasis_internal =
+            make_nonbasis_internal_(static_cast<int>(A_internal.cols()),
+                                    sol.basis_internal);
+
+        const int m = static_cast<int>(A_internal.rows());
+        const int n = static_cast<int>(A_internal.cols());
+        if (m == 0) {
+            sol.tableau = Eigen::MatrixXd::Zero(0, n);
+            sol.tableau_rhs = Eigen::VectorXd::Zero(0);
+            sol.reduced_costs_internal = clip_small_vec_(c_internal, tol);
+            sol.dual_values_internal = Eigen::VectorXd::Zero(0);
+            sol.shadow_prices_internal = Eigen::VectorXd::Zero(0);
+            sol.has_internal_tableau = true;
+            return sol;
+        }
+        if ((int)sol.basis_internal.size() != m) return sol;
+
+        SparseMatrix B = sparse_basis_copy_(A_internal, sol.basis_internal);
+        Eigen::SparseLU<SparseMatrix> lu;
+        lu.analyzePattern(B);
+        lu.factorize(B);
+        if (lu.info() != Eigen::Success) return sol;
+
+        sol.tableau = Eigen::MatrixXd::Zero(m, n);
+        for (int j = 0; j < n; ++j) {
+            Eigen::VectorXd rhs = Eigen::VectorXd::Zero(m);
+            for (SparseMatrix::InnerIterator it(A_internal, j); it; ++it) {
+                rhs(it.row()) = it.value();
+            }
+            Eigen::VectorXd col = lu.solve(rhs);
+            if (lu.info() != Eigen::Success) return sol;
+            sol.tableau.col(j) = col;
+        }
+        sol.tableau = clip_small_mat_(std::move(sol.tableau), tol);
+
+        sol.tableau_rhs = clip_small_vec_(lu.solve(b_internal), tol);
+        if (lu.info() != Eigen::Success) return sol;
+
+        Eigen::VectorXd cB(m);
+        for (int i = 0; i < m; ++i) cB(i) = c_internal(sol.basis_internal[i]);
+
+        SparseMatrix BT = B.transpose();
+        Eigen::SparseLU<SparseMatrix> lu_t;
+        lu_t.analyzePattern(BT);
+        lu_t.factorize(BT);
+        if (lu_t.info() != Eigen::Success) return sol;
+        const Eigen::VectorXd y = lu_t.solve(cB);
+        if (lu_t.info() == Eigen::Success && y.allFinite()) {
+            sol.dual_values_internal = clip_small_vec_(y, tol);
+            sol.shadow_prices_internal = sol.dual_values_internal;
+            sol.reduced_costs_internal =
+                clip_small_vec_(c_internal - A_internal.transpose() * y, tol);
+        }
+
+        sol.has_internal_tableau = true;
+        return sol;
+    }
+
     static LPSolution attach_basis_state_(LPSolution sol,
                                           const Eigen::VectorXd& l,
                                           const Eigen::VectorXd& u,
@@ -1939,6 +2163,79 @@ class RevisedSimplex {
         return q;
     }
 
+    static BasisQuality evaluate_basis_quality_(const SparseMatrix& A,
+                                                const Eigen::VectorXd& b,
+                                                const Eigen::VectorXd& c,
+                                                const std::vector<int>& basis,
+                                                double tol) {
+        BasisQuality q;
+        const int m = static_cast<int>(A.rows());
+        const int n = static_cast<int>(A.cols());
+        if ((int)basis.size() != m || m == 0) {
+            if (m == 0 && basis.empty()) {
+                q.valid = true;
+                q.primal_feasible = true;
+                q.dual_feasible = true;
+                q.rank = 0;
+                q.primal_violation = 0.0;
+                q.dual_violation = 0.0;
+                q.density = 0.0;
+            }
+            return q;
+        }
+
+        std::vector<char> in_basis(n, 0);
+        double basis_nnz = 0.0;
+        for (int j : basis) {
+            if (j < 0 || j >= n || in_basis[j]) return q;
+            in_basis[j] = 1;
+            for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
+                if (std::abs(it.value()) > 1e-12) basis_nnz += 1.0;
+            }
+        }
+
+        SparseMatrix B = sparse_basis_copy_(A, basis);
+        q.density =
+            static_cast<double>(B.nonZeros()) / std::max(1.0, static_cast<double>(m) * m);
+
+        Eigen::SparseLU<SparseMatrix> lu;
+        lu.analyzePattern(B);
+        lu.factorize(B);
+        if (lu.info() != Eigen::Success) return q;
+        q.rank = m;
+
+        q.valid = true;
+        const Eigen::VectorXd xB = lu.solve(b);
+        if (lu.info() != Eigen::Success) return q;
+        q.primal_violation = positive_violation_max_(-xB, tol);
+        q.primal_feasible = xB.allFinite() && q.primal_violation <= tol;
+
+        Eigen::VectorXd cB(m);
+        for (int i = 0; i < m; ++i) cB(i) = c(basis[i]);
+        SparseMatrix BT = B.transpose();
+        Eigen::SparseLU<SparseMatrix> luT;
+        luT.analyzePattern(BT);
+        luT.factorize(BT);
+        if (luT.info() != Eigen::Success) return q;
+        const Eigen::VectorXd y = luT.solve(cB);
+        if (luT.info() != Eigen::Success) return q;
+        if (!y.allFinite()) return q;
+
+        Eigen::VectorXd neg_rc = Eigen::VectorXd::Zero(n - m);
+        int k = 0;
+        for (int j = 0; j < n; ++j) {
+            if (in_basis[j]) continue;
+            double ay = 0.0;
+            for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
+                ay += it.value() * y(it.row());
+            }
+            neg_rc(k++) = -(c(j) - ay);
+        }
+        q.dual_violation = positive_violation_max_(neg_rc, tol);
+        q.dual_feasible = q.dual_violation <= tol;
+        return q;
+    }
+
     static bool better_basis_quality_(const CrashSelection& lhs,
                                       const CrashSelection& rhs,
                                       SimplexMode mode) {
@@ -2138,6 +2435,28 @@ class RevisedSimplex {
         if (best_row >= 0) used_row[best_row] = 1;
     }
 
+    static void mark_pivot_row_(const SparseMatrix& A, int col,
+                                int pivot_row_hint,
+                                std::vector<char>& used_row) {
+        if (pivot_row_hint >= 0 && pivot_row_hint < (int)used_row.size() &&
+            !used_row[pivot_row_hint]) {
+            used_row[pivot_row_hint] = 1;
+            return;
+        }
+
+        int best_row = -1;
+        double best_abs = 0.0;
+        for (SparseMatrix::InnerIterator it(A, col); it; ++it) {
+            if (used_row[it.row()]) continue;
+            const double aa = std::abs(it.value());
+            if (aa > best_abs) {
+                best_abs = aa;
+                best_row = it.row();
+            }
+        }
+        if (best_row >= 0) used_row[best_row] = 1;
+    }
+
     static bool try_add_basis_column_(const Eigen::MatrixXd& A,
                                       std::vector<int>& basis,
                                       std::vector<char>& used_row,
@@ -2155,6 +2474,31 @@ class RevisedSimplex {
                                               (int)candidate.size()));
         Eigen::FullPivLU<Eigen::MatrixXd> lu(Bcand);
         const int rank = lu.rank();
+        if (rank <= current_rank) return false;
+
+        basis.push_back(col);
+        current_rank = rank;
+        mark_pivot_row_(A, col, pivot_row_hint, used_row);
+        return true;
+    }
+
+    static bool try_add_basis_column_(const SparseMatrix& A,
+                                      std::vector<int>& basis,
+                                      std::vector<char>& used_row,
+                                      std::vector<char>& used_col,
+                                      int& current_rank, int col,
+                                      int pivot_row_hint) {
+        const int n = static_cast<int>(A.cols());
+        if (col < 0 || col >= n || used_col[col]) return false;
+        used_col[col] = 1;
+
+        std::vector<int> candidate = basis;
+        candidate.push_back(col);
+        SparseMatrix Bcand = sparse_basis_copy_(A, candidate);
+        Eigen::SparseQR<SparseMatrix, Eigen::COLAMDOrdering<int>> qr;
+        qr.compute(Bcand);
+        if (qr.info() != Eigen::Success) return false;
+        const int rank = qr.rank();
         if (rank <= current_rank) return false;
 
         basis.push_back(col);
@@ -2216,6 +2560,58 @@ class RevisedSimplex {
         return best;
     }
 
+    static CrashCandidate choose_slack_like_column_(
+        const SparseMatrix& A, const Eigen::VectorXd& b,
+        const Eigen::VectorXd& c, const std::vector<char>& used_row,
+        const std::vector<char>& used_col) {
+        CrashCandidate best;
+        const int n = static_cast<int>(A.cols());
+        double c_scale = 1.0;
+        if (c.size() > 0) c_scale = std::max(1.0, c.cwiseAbs().maxCoeff());
+
+        for (int j = 0; j < n; ++j) {
+            if (used_col[j]) continue;
+            int pivot_row = -1;
+            int nnz = 0;
+            double pivot = 0.0;
+            double off_sum = 0.0;
+            for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
+                const double aij = it.value();
+                if (std::abs(aij) <= 1e-12) continue;
+                ++nnz;
+                if (used_row[it.row()]) {
+                    off_sum += std::abs(aij);
+                    continue;
+                }
+                if (std::abs(aij) > std::abs(pivot)) {
+                    if (pivot_row >= 0) off_sum += std::abs(pivot);
+                    pivot_row = it.row();
+                    pivot = aij;
+                } else {
+                    off_sum += std::abs(aij);
+                }
+            }
+            if (pivot_row < 0 || std::abs(pivot) <= 1e-12) continue;
+
+            const bool exact_unit =
+                (nnz == 1 && std::abs(std::abs(pivot) - 1.0) <= 1e-10);
+            const bool slack_like = (nnz == 1) || (off_sum <= 1e-10);
+            if (!slack_like) continue;
+
+            double score = exact_unit ? 1e6 : 1e5;
+            score += 1e3 / (1.0 + off_sum);
+            score += 10.0 / (1.0 + std::abs(std::abs(pivot) - 1.0));
+            if (pivot_row < b.size() && b(pivot_row) >= -1e-10) score += 50.0;
+            score -= std::abs(c(j)) / c_scale;
+            score -= 0.01 * static_cast<double>(j);
+
+            if (score > best.score) {
+                best = {j, pivot_row, score};
+            }
+        }
+        return best;
+    }
+
     static CrashCandidate choose_sprint_column_(
         const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
         const Eigen::VectorXd& c, const std::vector<char>& used_row,
@@ -2264,6 +2660,59 @@ class RevisedSimplex {
             if (score > best.score) best = {j, pivot_row, score};
         }
         return best;
+    }
+
+    static std::vector<int> find_logical_basis_(const Eigen::MatrixXd& A) {
+        const int m = static_cast<int>(A.rows());
+        const int n = static_cast<int>(A.cols());
+        if (m == 0) return {};
+        if (n < m) return {};
+
+        std::vector<int> basis(m, -1);
+        for (int j = 0; j < n; ++j) {
+            int pivot_row = -1;
+            bool exact_unit = true;
+            for (int i = 0; i < m; ++i) {
+                const double aij = A(i, j);
+                if (std::abs(aij) <= 1e-12) continue;
+                if (pivot_row >= 0 || std::abs(std::abs(aij) - 1.0) > 1e-10) {
+                    exact_unit = false;
+                    break;
+                }
+                pivot_row = i;
+            }
+            if (!exact_unit || pivot_row < 0 || basis[pivot_row] >= 0) continue;
+            basis[pivot_row] = j;
+        }
+        if (std::find(basis.begin(), basis.end(), -1) != basis.end()) return {};
+        return basis;
+    }
+
+    static std::vector<int> find_logical_basis_(const SparseMatrix& A) {
+        const int m = static_cast<int>(A.rows());
+        const int n = static_cast<int>(A.cols());
+        if (m == 0) return {};
+        if (n < m) return {};
+
+        std::vector<int> basis(m, -1);
+        for (int j = 0; j < n; ++j) {
+            int pivot_row = -1;
+            bool exact_unit = true;
+            int nnz = 0;
+            for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
+                if (std::abs(it.value()) <= 1e-12) continue;
+                ++nnz;
+                if (nnz > 1 || std::abs(std::abs(it.value()) - 1.0) > 1e-10) {
+                    exact_unit = false;
+                    break;
+                }
+                pivot_row = it.row();
+            }
+            if (!exact_unit || pivot_row < 0 || basis[pivot_row] >= 0) continue;
+            basis[pivot_row] = j;
+        }
+        if (std::find(basis.begin(), basis.end(), -1) != basis.end()) return {};
+        return basis;
     }
 
     static CrashCandidate choose_triangular_column_(
@@ -2358,6 +2807,33 @@ class RevisedSimplex {
                 (A.col(a).array().abs() > 1e-12).cast<double>().sum();
             const double nnz_b =
                 (A.col(b_idx).array().abs() > 1e-12).cast<double>().sum();
+            const double score_a =
+                nnz_a + cfg.cost_penalty * std::abs(c(a)) +
+                cfg.jitter * std::sin(static_cast<double>(a + 1));
+            const double score_b =
+                nnz_b + cfg.cost_penalty * std::abs(c(b_idx)) +
+                cfg.jitter * std::sin(static_cast<double>(b_idx + 1));
+            if (std::abs(score_a - score_b) > 1e-12) return score_a < score_b;
+            return a < b_idx;
+        });
+        return ranked;
+    }
+
+    static std::vector<int> rank_remaining_columns_(
+        const SparseMatrix& A, const Eigen::VectorXd& c,
+        const std::vector<char>& used_col, const CrashAttemptConfig& cfg) {
+        std::vector<int> ranked;
+        ranked.reserve(A.cols());
+        for (int j = 0; j < A.cols(); ++j) {
+            if (!used_col[j]) ranked.push_back(j);
+        }
+        std::sort(ranked.begin(), ranked.end(), [&](int a, int b_idx) {
+            double nnz_a = 0.0;
+            double nnz_b = 0.0;
+            for (SparseMatrix::InnerIterator it(A, a); it; ++it)
+                if (std::abs(it.value()) > 1e-12) nnz_a += 1.0;
+            for (SparseMatrix::InnerIterator it(A, b_idx); it; ++it)
+                if (std::abs(it.value()) > 1e-12) nnz_b += 1.0;
             const double score_a =
                 nnz_a + cfg.cost_penalty * std::abs(c(a)) +
                 cfg.jitter * std::sin(static_cast<double>(a + 1));
@@ -2524,6 +3000,52 @@ class RevisedSimplex {
                                        seed_basis);
     }
 
+    static std::vector<int> build_basis_attempt_(
+        const SparseMatrix& A, const Eigen::VectorXd& b,
+        const Eigen::VectorXd& c, const CrashAttemptConfig& cfg,
+        double /*tol*/, SimplexMode /*mode*/,
+        std::optional<std::vector<int>> seed_basis = std::nullopt) {
+        const int m = static_cast<int>(A.rows());
+        const int n = static_cast<int>(A.cols());
+        if (m == 0) return {};
+        if (n < m) return {};
+
+        std::vector<int> basis;
+        basis.reserve(m);
+        std::vector<char> used_row(m, 0), used_col(n, 0);
+        int current_rank = 0;
+
+        if (seed_basis) {
+            for (int j : *seed_basis) {
+                if ((int)basis.size() == m) break;
+                (void)try_add_basis_column_(A, basis, used_row, used_col,
+                                            current_rank, j, -1);
+            }
+        }
+
+        while ((int)basis.size() < m) {
+            const CrashCandidate cand =
+                choose_slack_like_column_(A, b, c, used_row, used_col);
+            if (cand.col < 0) break;
+            if (!try_add_basis_column_(A, basis, used_row, used_col,
+                                       current_rank, cand.col,
+                                       cand.pivot_row)) {
+                continue;
+            }
+        }
+
+        if ((int)basis.size() < m) {
+            for (int j : rank_remaining_columns_(A, c, used_col, cfg)) {
+                if ((int)basis.size() == m) break;
+                (void)try_add_basis_column_(A, basis, used_row, used_col,
+                                            current_rank, j, -1);
+            }
+        }
+
+        if ((int)basis.size() != m) return {};
+        return basis;
+    }
+
     static CrashSelection choose_initial_basis_(
         const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
         const Eigen::VectorXd& c, const RevisedSimplexOptions& opt,
@@ -2537,9 +3059,13 @@ class RevisedSimplex {
             sel.basis = std::move(candidate);
             sel.quality = evaluate_basis_quality_(A, b, c, sel.basis, opt.tol);
             sel.source = std::move(source);
-            sel.style = (attempt >= 0)
-                            ? crash_attempt_config_(opt, attempt).style_name
-                            : "mapped";
+            if (attempt >= 0) {
+                sel.style = crash_attempt_config_(opt, attempt).style_name;
+            } else if (attempt == -2) {
+                sel.style = "logical";
+            } else {
+                sel.style = "mapped";
+            }
             sel.attempt = attempt;
             if (better_basis_quality_(sel, best, opt.mode)) best = std::move(sel);
         };
@@ -2561,6 +3087,61 @@ class RevisedSimplex {
             }
         }
 
+        consider(find_logical_basis_(A), "logical_basis", -2);
+
+        const int attempts = std::max(1, opt.crash_attempts);
+        for (int k = 0; k < attempts; ++k) {
+            consider(build_basis_attempt_(A, b, c, crash_attempt_config_(opt, k),
+                                         opt.tol,
+                                         opt.mode),
+                     "crash", k);
+        }
+        return best;
+    }
+
+    static CrashSelection choose_initial_basis_(
+        const SparseMatrix& A, const Eigen::VectorXd& b,
+        const Eigen::VectorXd& c, const RevisedSimplexOptions& opt,
+        std::optional<std::vector<int>> seed_basis = std::nullopt) {
+        CrashSelection best;
+
+        auto consider = [&](std::vector<int> candidate, std::string source,
+                            int attempt) {
+            if (candidate.empty() && A.rows() != 0) return;
+            CrashSelection sel;
+            sel.basis = std::move(candidate);
+            sel.quality = evaluate_basis_quality_(A, b, c, sel.basis, opt.tol);
+            sel.source = std::move(source);
+            if (attempt >= 0) {
+                sel.style = crash_attempt_config_(opt, attempt).style_name;
+            } else if (attempt == -2) {
+                sel.style = "logical";
+            } else {
+                sel.style = "mapped";
+            }
+            sel.attempt = attempt;
+            if (better_basis_quality_(sel, best, opt.mode)) best = std::move(sel);
+        };
+
+        if (seed_basis && !seed_basis->empty()) {
+            if ((int)seed_basis->size() == A.rows()) {
+                consider(*seed_basis, "warm_start", -1);
+            }
+            if (opt.repair_mapped_basis) {
+                const int attempts = std::max(1, opt.crash_attempts);
+                for (int k = 0; k < attempts; ++k) {
+                    consider(build_basis_attempt_(A, b, c,
+                                                 crash_attempt_config_(opt, k),
+                                                 opt.tol,
+                                                 opt.mode,
+                                                 seed_basis),
+                             "repaired_warm_start", k);
+                }
+            }
+        }
+
+        consider(find_logical_basis_(A), "logical_basis", -2);
+
         const int attempts = std::max(1, opt.crash_attempts);
         for (int k = 0; k < attempts; ++k) {
             consider(build_basis_attempt_(A, b, c, crash_attempt_config_(opt, k),
@@ -2576,6 +3157,34 @@ class RevisedSimplex {
         const Eigen::VectorXd& c,
         const RevisedSimplexOptions& opt = RevisedSimplexOptions{},
         std::optional<std::vector<int>> seed_basis = std::nullopt) {
+        if (!seed_basis || seed_basis->empty()) {
+            std::vector<int> logical = find_logical_basis_(A);
+            const BasisQuality logical_quality =
+                evaluate_basis_quality_(A, b, c, logical, opt.tol);
+            if (logical_quality.valid &&
+                logical_quality.rank == static_cast<int>(A.rows())) {
+                return logical;
+            }
+        }
+        CrashSelection sel = choose_initial_basis_(A, b, c, opt, seed_basis);
+        if (!sel.quality.valid) return std::nullopt;
+        return sel.basis;
+    }
+
+    static std::optional<std::vector<int>> find_initial_basis_(
+        const SparseMatrix& A, const Eigen::VectorXd& b,
+        const Eigen::VectorXd& c,
+        const RevisedSimplexOptions& opt = RevisedSimplexOptions{},
+        std::optional<std::vector<int>> seed_basis = std::nullopt) {
+        if (!seed_basis || seed_basis->empty()) {
+            std::vector<int> logical = find_logical_basis_(A);
+            const BasisQuality logical_quality =
+                evaluate_basis_quality_(A, b, c, logical, opt.tol);
+            if (logical_quality.valid &&
+                logical_quality.rank == static_cast<int>(A.rows())) {
+                return logical;
+            }
+        }
         CrashSelection sel = choose_initial_basis_(A, b, c, opt, seed_basis);
         if (!sel.quality.valid) return std::nullopt;
         return sel.basis;
@@ -2593,6 +3202,23 @@ class RevisedSimplex {
         Eigen::FullPivLU<Eigen::MatrixXd> lu(B);
         if (lu.rank() != m || !lu.isInvertible()) return false;
         const Eigen::VectorXd xB = lu.solve(b);
+        return xB.allFinite() && (xB.array() >= -tol).all();
+    }
+
+    static bool basis_is_primal_feasible_(const SparseMatrix& A,
+                                          const Eigen::VectorXd& b,
+                                          const std::vector<int>& basis,
+                                          double tol) {
+        const int m = static_cast<int>(A.rows());
+        if ((int)basis.size() != m) return false;
+        if (m == 0) return true;
+        SparseMatrix B = sparse_basis_copy_(A, basis);
+        Eigen::SparseLU<SparseMatrix> lu;
+        lu.analyzePattern(B);
+        lu.factorize(B);
+        if (lu.info() != Eigen::Success) return false;
+        const Eigen::VectorXd xB = lu.solve(b);
+        if (lu.info() != Eigen::Success) return false;
         return xB.allFinite() && (xB.array() >= -tol).all();
     }
 
@@ -2624,14 +3250,68 @@ class RevisedSimplex {
         return {A_aux, b1, c_aux, basis, static_cast<std::size_t>(n), m};
     }
 
+    static std::tuple<SparseMatrix, Eigen::VectorXd, Eigen::VectorXd,
+                      std::vector<int>, std::size_t, int>
+    make_phase1_(const SparseMatrix& A, const Eigen::VectorXd& b) {
+        const int m = static_cast<int>(A.rows());
+        const int n = static_cast<int>(A.cols());
+
+        Eigen::VectorXd b1 = b;
+        Eigen::VectorXd row_sign = Eigen::VectorXd::Ones(m);
+        for (int i = 0; i < m; ++i) {
+            if (b1(i) < 0.0) {
+                b1(i) *= -1.0;
+                row_sign(i) = -1.0;
+            }
+        }
+
+        std::vector<Eigen::Triplet<double>> trips;
+        trips.reserve(static_cast<std::size_t>(A.nonZeros() + m));
+        for (int j = 0; j < A.outerSize(); ++j) {
+            for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
+                trips.emplace_back(it.row(), it.col(),
+                                   row_sign(it.row()) * it.value());
+            }
+        }
+        for (int i = 0; i < m; ++i) {
+            trips.emplace_back(i, n + i, 1.0);
+        }
+
+        SparseMatrix A_aux(m, n + m);
+        if (!trips.empty()) A_aux.setFromTriplets(trips.begin(), trips.end());
+        A_aux.makeCompressed();
+
+        Eigen::VectorXd c_aux(n + m);
+        c_aux.setZero();
+        c_aux.tail(m).setOnes();
+
+        std::vector<int> basis(m);
+        std::iota(basis.begin(), basis.end(), n);
+
+        return {A_aux, b1, c_aux, basis, static_cast<std::size_t>(n), m};
+    }
+
     // --------------------------- PRIMAL PHASE ---------------------------
     PhaseResult phase_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                        const Eigen::VectorXd& c,
                        std::optional<std::vector<int>> basis_opt,
                        const Eigen::VectorXd& l, const Eigen::VectorXd& u);
 
+    PhaseResult phase_(const SparseMatrix& A, const Eigen::VectorXd& b,
+                       const Eigen::VectorXd& c,
+                       std::optional<std::vector<int>> basis_opt,
+                       const Eigen::VectorXd& l, const Eigen::VectorXd& u);
+
     // --------------------------- DUAL PHASE ---------------------------
     PhaseResult dual_phase_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
+                            const Eigen::VectorXd& c,
+                            std::optional<std::vector<int>> basis_opt,
+                            const Eigen::VectorXd& l,
+                            const Eigen::VectorXd& u,
+                            std::optional<std::vector<LPBasisStatus>>
+                                warm_status = std::nullopt);
+
+    PhaseResult dual_phase_(const SparseMatrix& A, const Eigen::VectorXd& b,
                             const Eigen::VectorXd& c,
                             std::optional<std::vector<int>> basis_opt,
                             const Eigen::VectorXd& l,
@@ -2720,10 +3400,512 @@ inline RevisedSimplex::PhaseResult RevisedSimplex::phase_(
                                            l, u);
 }
 
+inline LPSolution RevisedSimplex::solve_impl_sparse_(
+    const SparseMatrix& A_in, const Eigen::VectorXd& b_in,
+    const Eigen::VectorXd& c_in, const Eigen::VectorXd& l_in,
+    const Eigen::VectorXd& u_in, std::optional<std::vector<int>> basis_opt,
+    const LPBasis* basis_state_opt) {
+    SolveTraceScope trace_scope(*this);
+    degen_.reset();
+    const int m_in = static_cast<int>(A_in.rows());
+    const int n = static_cast<int>(A_in.cols());
+    if (b_in.size() != m_in) {
+        throw std::invalid_argument("simplex: b size mismatch with rows(A)");
+    }
+    if (c_in.size() != n || l_in.size() != n || u_in.size() != n) {
+        throw std::invalid_argument("simplex: c/l/u sizes must equal cols(A)");
+    }
+
+    trace_line_("[solve] sparse start m=" + std::to_string(m_in) +
+                " n=" + std::to_string(n));
+
+    const auto sanitized_bounds =
+        canonicalize_inactive_huge_bounds_(dense_copy_(A_in), b_in, l_in, u_in);
+    const Eigen::VectorXd& l_use = sanitized_bounds.l;
+    const Eigen::VectorXd& u_use = sanitized_bounds.u;
+
+    if ((!basis_opt || basis_opt->empty()) && basis_state_opt &&
+        !basis_state_opt->column_status.empty()) {
+        if ((int)basis_state_opt->column_status.size() != n) {
+            throw std::invalid_argument(
+                "simplex: warm-start basis column_status size mismatch");
+        }
+        basis_opt = basis_columns_from_basis_state_(*basis_state_opt, m_in);
+    }
+
+    bool is_nonnegative_standard = true;
+    for (int j = 0; j < n; ++j) {
+        const bool l_is_zero =
+            std::isfinite(l_use(j)) && std::abs(l_use(j)) <= opt_.tol;
+        const bool u_is_inf = !std::isfinite(u_use(j));
+        if (!l_is_zero || !u_is_inf) {
+            is_nonnegative_standard = false;
+            break;
+        }
+    }
+
+    if (!is_nonnegative_standard) {
+        struct ReformVar {
+            int y = -1;
+            int y_pos = -1;
+            int y_neg = -1;
+            int upper_slack = -1;
+            double shift = 0.0;
+            int sign = 1;
+            bool uses_single_var = false;
+            bool has_upper_row = false;
+        };
+
+        std::vector<ReformVar> map(n);
+        std::vector<int> single_y(n, -1);
+        std::vector<int> upper_slack(n, -1);
+        std::vector<int> split_pos(n, -1);
+        std::vector<int> split_neg(n, -1);
+        int nv = 0;
+        int upper_rows = 0;
+        double obj_shift = 0.0;
+
+        for (int j = 0; j < n; ++j) {
+            const bool has_l = std::isfinite(l_use(j));
+            const bool has_u = std::isfinite(u_use(j));
+            if (has_l && has_u && u_use(j) < l_use(j) - opt_.tol) {
+                Eigen::VectorXd xnan = Eigen::VectorXd::Constant(
+                    n, std::numeric_limits<double>::quiet_NaN());
+                return finalize_solution_(make_solution_(
+                    LPSolution::Status::Infeasible, xnan,
+                    std::numeric_limits<double>::infinity(), {}, 0,
+                    {{"reason", "invalid_bounds"}}));
+            }
+            if (has_l) {
+                map[j].uses_single_var = true;
+                map[j].y = nv++;
+                single_y[j] = map[j].y;
+                map[j].shift = l_use(j);
+                map[j].sign = 1;
+                obj_shift += c_in(j) * l_use(j);
+                if (has_u) {
+                    map[j].has_upper_row = true;
+                    ++upper_rows;
+                }
+            } else if (has_u) {
+                map[j].uses_single_var = true;
+                map[j].y = nv++;
+                single_y[j] = map[j].y;
+                map[j].shift = u_use(j);
+                map[j].sign = -1;
+                obj_shift += c_in(j) * u_use(j);
+            } else {
+                map[j].y_pos = nv++;
+                map[j].y_neg = nv++;
+                split_pos[j] = map[j].y_pos;
+                split_neg[j] = map[j].y_neg;
+            }
+        }
+
+        const int m_eq = m_in;
+        const int n_total = nv + upper_rows;
+        const int m_total = m_eq + upper_rows;
+        Eigen::VectorXd b_std = Eigen::VectorXd::Zero(m_total);
+        Eigen::VectorXd c_std = Eigen::VectorXd::Zero(n_total);
+        Eigen::VectorXd l_std = Eigen::VectorXd::Zero(n_total);
+        Eigen::VectorXd u_std =
+            Eigen::VectorXd::Constant(n_total, presolve::inf());
+
+        for (int j = 0; j < n; ++j) {
+            if (map[j].uses_single_var) {
+                c_std(map[j].y) += static_cast<double>(map[j].sign) * c_in(j);
+            } else {
+                c_std(map[j].y_pos) += c_in(j);
+                c_std(map[j].y_neg) += -c_in(j);
+            }
+        }
+
+        std::vector<Eigen::Triplet<double>> trips;
+        trips.reserve(static_cast<std::size_t>(A_in.nonZeros() * 2 + upper_rows * 2));
+        for (int j = 0; j < A_in.outerSize(); ++j) {
+            for (SparseMatrix::InnerIterator it(A_in, j); it; ++it) {
+                const int row = it.row();
+                const double aij = it.value();
+                if (map[j].uses_single_var) {
+                    b_std(row) -= aij * map[j].shift;
+                    trips.emplace_back(row, map[j].y,
+                                       static_cast<double>(map[j].sign) * aij);
+                } else {
+                    trips.emplace_back(row, map[j].y_pos, aij);
+                    trips.emplace_back(row, map[j].y_neg, -aij);
+                }
+            }
+        }
+        for (int i = 0; i < m_eq; ++i) b_std(i) += b_in(i);
+
+        int upper_row = 0;
+        for (int j = 0; j < n; ++j) {
+            if (!map[j].has_upper_row) continue;
+            const int slack = nv + upper_row;
+            const int row = m_eq + upper_row;
+            map[j].upper_slack = slack;
+            upper_slack[j] = slack;
+            trips.emplace_back(row, map[j].y, 1.0);
+            trips.emplace_back(row, slack, 1.0);
+            b_std(row) = u_use(j) - l_use(j);
+            ++upper_row;
+        }
+
+        SparseMatrix A_std(m_total, n_total);
+        if (!trips.empty()) A_std.setFromTriplets(trips.begin(), trips.end());
+        A_std.makeCompressed();
+
+        std::optional<std::vector<int>> basis_std = std::nullopt;
+        std::optional<LPBasis> basis_state_std = std::nullopt;
+        if (basis_opt && !basis_opt->empty()) {
+            std::vector<int> cand;
+            cand.reserve(std::min(m_eq, (int)basis_opt->size()) + upper_rows);
+            for (int jorig : *basis_opt) {
+                if (jorig < 0 || jorig >= n) continue;
+                if (map[jorig].uses_single_var) {
+                    cand.push_back(map[jorig].y);
+                } else if (map[jorig].y_pos >= 0) {
+                    cand.push_back(map[jorig].y_pos);
+                }
+                if ((int)cand.size() == m_eq) break;
+            }
+            for (int j = 0; j < n; ++j) {
+                if (map[j].upper_slack >= 0) cand.push_back(map[j].upper_slack);
+            }
+            if ((int)cand.size() == m_total) basis_std = std::move(cand);
+        }
+        if (basis_state_opt && !basis_state_opt->column_status.empty() &&
+            (int)basis_state_opt->column_status.size() == n) {
+            basis_state_std = map_reformulated_basis_state_(
+                *basis_state_opt, l_use, u_use, n_total, single_y, upper_slack,
+                split_pos, split_neg);
+        }
+
+        LPSolution std_sol = basis_state_std
+                                 ? solve(A_std, b_std, c_std, l_std, u_std,
+                                         *basis_state_std)
+                                 : solve(A_std, b_std, c_std, l_std, u_std,
+                                         basis_std);
+
+        Eigen::VectorXd x = Eigen::VectorXd::Constant(
+            n, std::numeric_limits<double>::quiet_NaN());
+        if (std_sol.x.size() == n_total && std_sol.x.array().isFinite().all()) {
+            for (int j = 0; j < n; ++j) {
+                if (map[j].uses_single_var) {
+                    x(j) = map[j].shift +
+                           static_cast<double>(map[j].sign) * std_sol.x(map[j].y);
+                } else {
+                    x(j) = std_sol.x(map[j].y_pos) - std_sol.x(map[j].y_neg);
+                }
+            }
+        }
+
+        std::vector<int> basis_out;
+        std::vector<char> seen(n, 0);
+        for (int idx : std_sol.basis) {
+            for (int j = 0; j < n; ++j) {
+                const bool matches_single =
+                    map[j].uses_single_var && map[j].y == idx;
+                const bool matches_split =
+                    !map[j].uses_single_var &&
+                    (map[j].y_pos == idx || map[j].y_neg == idx);
+                if ((matches_single || matches_split) && !seen[j]) {
+                    seen[j] = 1;
+                    basis_out.push_back(j);
+                    break;
+                }
+            }
+        }
+
+        auto info = std_sol.info;
+        info["bound_reformulation"] = "1";
+        info["sparse_pipeline"] = "1";
+        const double obj =
+            x.array().isFinite().all() ? c_in.dot(x)
+                                       : (std::isfinite(std_sol.obj)
+                                              ? (std_sol.obj + obj_shift)
+                                              : std_sol.obj);
+        auto sol = make_solution_(std_sol.status, std::move(x), obj,
+                                  std::move(basis_out), std_sol.iters,
+                                  std::move(info), std_sol.farkas_y,
+                                  std_sol.farkas_has_cert, std_sol.primal_ray,
+                                  std_sol.primal_ray_has_cert);
+        sol.basis_internal = std_sol.basis_internal;
+        sol.nonbasis_internal = std_sol.nonbasis_internal;
+        sol.internal_column_labels = std_sol.internal_column_labels;
+        sol.internal_row_labels = std_sol.internal_row_labels;
+        sol.tableau = std_sol.tableau;
+        sol.tableau_rhs = std_sol.tableau_rhs;
+        sol.reduced_costs_internal = std_sol.reduced_costs_internal;
+        sol.dual_values = std_sol.dual_values;
+        sol.shadow_prices = std_sol.shadow_prices;
+        sol.dual_values_internal = std_sol.dual_values_internal;
+        sol.shadow_prices_internal = std_sol.shadow_prices_internal;
+        sol.farkas_y_internal = std_sol.farkas_y_internal;
+        sol.primal_ray_internal = std_sol.primal_ray_internal;
+        return finalize_solution_(
+            attach_basis_state_(std::move(sol), l_in, u_in, opt_.tol));
+    }
+
+    SparseMatrix A_model = A_in;
+    Eigen::VectorXd b_model = b_in;
+    Eigen::VectorXd c_model = c_in;
+    Eigen::VectorXd l_model = Eigen::VectorXd::Zero(n);
+    Eigen::VectorXd u_model = Eigen::VectorXd::Constant(n, presolve::inf());
+    Eigen::VectorXd anchor = Eigen::VectorXd::Zero(n);
+    Eigen::VectorXd sign = Eigen::VectorXd::Ones(n);
+
+    for (int j = 0; j < n; ++j) {
+        const bool has_l = std::isfinite(l_use(j));
+        const bool has_u = std::isfinite(u_use(j));
+        if (!has_l && !has_u) {
+            throw std::invalid_argument(
+                "simplex: free variables are unsupported in solve(A,b,c,l,u)");
+        }
+
+        if (has_l) {
+            anchor(j) = l_use(j);
+            l_model(j) = 0.0;
+            u_model(j) = has_u ? (u_use(j) - l_use(j)) : presolve::inf();
+        } else {
+            anchor(j) = u_use(j);
+            sign(j) = -1.0;
+            l_model(j) = 0.0;
+            u_model(j) = presolve::inf();
+            RevisedSimplexDualEngine::scale_column(A_model, j, -1.0);
+            c_model(j) = -c_model(j);
+        }
+
+        if (anchor(j) != 0.0) {
+            const Eigen::VectorXd model_col = A_model.col(j);
+            b_model.noalias() -= model_col * anchor(j);
+        }
+    }
+
+    const SparseMatrix& Ared = A_model;
+    const Eigen::VectorXd& bred = b_model;
+    const Eigen::VectorXd& cred = c_model;
+    const Eigen::VectorXd& l_eff = l_model;
+    const Eigen::VectorXd& u_eff = u_model;
+    std::vector<int> col_orig_map(n);
+    std::iota(col_orig_map.begin(), col_orig_map.end(), 0);
+    std::vector<int> row_orig_map(m_in);
+    std::iota(row_orig_map.begin(), row_orig_map.end(), 0);
+    const std::vector<std::string> internal_column_labels =
+        make_internal_column_labels_(col_orig_map);
+    const std::vector<std::string> internal_row_labels =
+        make_internal_row_labels_(row_orig_map);
+
+    std::optional<std::vector<int>> red_basis_opt = basis_opt;
+    std::optional<LPBasis> red_basis_state_opt = std::nullopt;
+    if (basis_state_opt && !basis_state_opt->column_status.empty()) {
+        red_basis_state_opt = map_reduced_basis_state_(*basis_state_opt, col_orig_map,
+                                                       l_eff, u_eff, opt_.tol);
+        if (!red_basis_opt || red_basis_opt->empty()) {
+            red_basis_opt = basis_columns_from_basis_state_(*red_basis_state_opt,
+                                                            m_in);
+        }
+    }
+
+    CrashSelection basis_choice = choose_initial_basis_(
+        Ared, bred, cred, opt_,
+        (red_basis_opt && !red_basis_opt->empty())
+            ? std::optional<std::vector<int>>(*red_basis_opt)
+            : std::nullopt);
+    std::vector<int> basis_guess = basis_choice.basis;
+    const bool basis_guess_from_warm_start =
+        (basis_choice.source == "warm_start" ||
+         basis_choice.source == "repaired_warm_start");
+    const bool basis_valid =
+        ((int)basis_guess.size() == m_in) && basis_choice.quality.valid;
+    const bool allow_direct_primal =
+        basis_valid &&
+        (basis_choice.quality.primal_feasible || basis_guess_from_warm_start);
+    const bool allow_direct_dual =
+        basis_valid &&
+        (basis_choice.quality.dual_feasible || basis_guess_from_warm_start);
+
+    auto add_sparse_info = [&](std::unordered_map<std::string, std::string> info) {
+        info["sparse_pipeline"] = "1";
+        info["original_m"] = std::to_string(m_in);
+        info["reduced_m"] = std::to_string(m_in);
+        info["reduced_n"] = std::to_string(n);
+        if (!basis_choice.source.empty() && basis_choice.source != "none") {
+            info["basis_start"] = basis_choice.source;
+            info["basis_start_style"] = basis_choice.style;
+        }
+        return info;
+    };
+
+    auto finalize_sparse_solution =
+        [&](LPSolution::Status status, const Eigen::VectorXd& z,
+            const std::vector<int>& red_basis, int iters,
+            std::unordered_map<std::string, std::string> info) {
+            Eigen::VectorXd x_full = anchor + sign.cwiseProduct(z);
+            std::vector<int> basis_full = red_basis;
+            const bool has_primal_ray =
+                info.count("primal_ray_has_cert") &&
+                info.at("primal_ray_has_cert") == "1";
+            const auto primal_ray_internal =
+                has_primal_ray ? parse_serialized_vec_(info, "primal_ray", n)
+                               : std::nullopt;
+            double obj = x_full.array().isFinite().all()
+                             ? c_in.dot(x_full)
+                             : std::numeric_limits<double>::quiet_NaN();
+            if (status == LPSolution::Status::Unbounded) {
+                obj = -std::numeric_limits<double>::infinity();
+            }
+            auto sol = make_solution_(status, x_full, obj, basis_full, iters,
+                                      add_sparse_info(std::move(info)),
+                                      std::nullopt, std::nullopt,
+                                      primal_ray_internal, has_primal_ray);
+            return finalize_solution_(attach_basis_state_(attach_internal_tableau_(
+                                              std::move(sol), Ared, bred,
+                                              cred, red_basis,
+                                              internal_column_labels,
+                                              internal_row_labels, opt_.tol),
+                                          l_in, u_in, opt_.tol));
+        };
+
+    if (allow_direct_primal || allow_direct_dual) {
+        LPSolution::Status st = LPSolution::Status::NeedPhase1;
+        Eigen::VectorXd v2;
+        std::vector<int> red_basis2;
+        int it2 = 0;
+        std::unordered_map<std::string, std::string> info2;
+
+        if (opt_.mode == SimplexMode::Dual) {
+            if (allow_direct_dual) {
+                std::tie(st, v2, red_basis2, it2, info2) =
+                    dual_phase_(Ared, bred, cred, basis_guess, l_eff, u_eff);
+            }
+        } else if (opt_.mode == SimplexMode::Primal) {
+            if (allow_direct_primal) {
+                std::tie(st, v2, red_basis2, it2, info2) =
+                    phase_(Ared, bred, cred, basis_guess, l_eff, u_eff);
+            }
+        } else {
+            if (allow_direct_primal) {
+                std::tie(st, v2, red_basis2, it2, info2) =
+                    phase_(Ared, bred, cred, basis_guess, l_eff, u_eff);
+            }
+            if (allow_direct_dual &&
+                st == LPSolution::Status::NeedPhase1 &&
+                info2.count("reason") &&
+                info2.at("reason") == std::string("negative_basic_vars")) {
+                std::tie(st, v2, red_basis2, it2, info2) =
+                    dual_phase_(Ared, bred, cred, basis_guess, l_eff, u_eff);
+            }
+        }
+
+        if (st == LPSolution::Status::Optimal ||
+            st == LPSolution::Status::Unbounded ||
+            st == LPSolution::Status::IterLimit) {
+            return finalize_sparse_solution(st, v2, red_basis2, it2,
+                                            std::move(info2));
+        }
+    }
+
+    auto [A1, b1, c1, basis1, n_orig_eff, m_rows] = make_phase1_(Ared, bred);
+    auto [status1, v1, basis1_out, it1, info1] =
+        phase_(A1, b1, c1, basis1, Eigen::VectorXd::Zero(A1.cols()),
+               Eigen::VectorXd::Constant(A1.cols(), presolve::inf()));
+    if (status1 == LPSolution::Status::NeedPhase1 && info1.count("reason") &&
+        info1.at("reason") == std::string("negative_basic_vars")) {
+        std::tie(status1, v1, basis1_out, it1, info1) =
+            dual_phase_(A1, b1, c1, basis1_out.empty() ? basis1 : basis1_out,
+                        Eigen::VectorXd::Zero(A1.cols()),
+                        Eigen::VectorXd::Constant(A1.cols(), presolve::inf()));
+    }
+    if (status1 != LPSolution::Status::Optimal || c1.dot(v1) > opt_.tol) {
+        auto info = add_sparse_info({{"phase1_status", to_string(status1)}});
+        return finalize_solution_(make_solution_(
+            LPSolution::Status::Infeasible, Eigen::VectorXd::Zero(n),
+            std::numeric_limits<double>::infinity(), {}, it1, std::move(info)));
+    }
+
+    std::vector<int> red_basis2;
+    red_basis2.reserve(m_rows);
+    for (int j : basis1_out)
+        if (j < (int)n_orig_eff) red_basis2.push_back(j);
+
+    if ((int)red_basis2.size() < m_rows) {
+        std::vector<int> fallback_basis = red_basis2;
+        for (int j = 0; j < (int)n_orig_eff; ++j) {
+            if ((int)red_basis2.size() == m_rows) break;
+            if (std::find(red_basis2.begin(), red_basis2.end(), j) !=
+                red_basis2.end())
+                continue;
+            std::vector<int> cand = red_basis2;
+            cand.push_back(j);
+            if ((int)cand.size() > m_rows) continue;
+            if (!sparse_basis_has_full_rank_(Ared, cand)) continue;
+            if (basis_is_primal_feasible_(Ared, bred, cand, opt_.tol)) {
+                red_basis2 = std::move(cand);
+                continue;
+            }
+            if ((int)fallback_basis.size() < (int)cand.size()) {
+                fallback_basis = cand;
+            }
+        }
+        if ((int)red_basis2.size() < m_rows &&
+            (int)fallback_basis.size() == m_rows) {
+            red_basis2 = std::move(fallback_basis);
+        }
+    }
+
+    LPSolution::Status status2;
+    Eigen::VectorXd v2;
+    std::vector<int> red_basis_out;
+    int it2 = 0;
+    std::unordered_map<std::string, std::string> info2;
+    if ((int)red_basis2.size() == m_rows) {
+        if (opt_.mode == SimplexMode::Dual) {
+            std::tie(status2, v2, red_basis_out, it2, info2) =
+                dual_phase_(Ared, bred, cred, red_basis2, l_eff, u_eff);
+        } else if (opt_.mode == SimplexMode::Primal) {
+            std::tie(status2, v2, red_basis_out, it2, info2) =
+                phase_(Ared, bred, cred, red_basis2, l_eff, u_eff);
+        } else {
+            std::tie(status2, v2, red_basis_out, it2, info2) =
+                phase_(Ared, bred, cred, red_basis2, l_eff, u_eff);
+            if (status2 == LPSolution::Status::NeedPhase1 &&
+                info2.count("reason") &&
+                info2.at("reason") == std::string("negative_basic_vars")) {
+                std::tie(status2, v2, red_basis_out, it2, info2) =
+                    dual_phase_(Ared, bred, cred, red_basis2, l_eff, u_eff);
+            }
+        }
+    } else {
+        std::tie(status2, v2, red_basis_out, it2, info2) =
+            phase_(Ared, bred, cred, std::nullopt, l_eff, u_eff);
+    }
+
+    return finalize_sparse_solution(status2, v2, red_basis_out, it1 + it2,
+                                    std::move(info2));
+}
+
 inline RevisedSimplex::PhaseResult RevisedSimplex::dual_phase_(
     const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
     const Eigen::VectorXd& c, std::optional<std::vector<int>> basis_opt,
     const Eigen::VectorXd& l, const Eigen::VectorXd& u,
+    std::optional<std::vector<LPBasisStatus>> warm_status) {
+    return RevisedSimplexDualEngine::run(*this, A, b, c, std::move(basis_opt),
+                                         l, u, std::move(warm_status));
+}
+
+inline RevisedSimplex::PhaseResult RevisedSimplex::phase_(
+    const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
+    std::optional<std::vector<int>> basis_opt, const Eigen::VectorXd& l,
+    const Eigen::VectorXd& u) {
+    return RevisedSimplexPrimalEngine::run(*this, A, b, c, std::move(basis_opt),
+                                           l, u);
+}
+
+inline RevisedSimplex::PhaseResult RevisedSimplex::dual_phase_(
+    const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
+    std::optional<std::vector<int>> basis_opt, const Eigen::VectorXd& l,
+    const Eigen::VectorXd& u,
     std::optional<std::vector<LPBasisStatus>> warm_status) {
     return RevisedSimplexDualEngine::run(*this, A, b, c, std::move(basis_opt),
                                          l, u, std::move(warm_status));

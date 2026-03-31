@@ -3,6 +3,7 @@
 #include "degeneracy.h"
 
 #include <Eigen/Dense>
+#include <Eigen/Sparse>
 
 #include <algorithm>
 #include <cmath>
@@ -15,6 +16,72 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+namespace pricing_detail {
+
+inline double clamp_positive(double value, double fallback = 1.0) {
+    return (std::isfinite(value) && value > 0.0) ? value : fallback;
+}
+
+inline double log_weight_error(double updated_weight, double reference_weight) {
+    const double updated = clamp_positive(updated_weight);
+    const double reference = clamp_positive(reference_weight);
+    return std::abs(std::log(updated / reference));
+}
+
+inline bool weight_log_error_ok(double updated_weight, double reference_weight,
+                                double log_error_threshold) {
+    return log_weight_error(updated_weight, reference_weight) <=
+           std::max(0.0, log_error_threshold);
+}
+
+inline double diagonal_weight_surrogate(const Eigen::VectorXd& direction) {
+    return 1.0 + direction.cwiseAbs().sum();
+}
+
+inline double edge_weight_from_direction(const Eigen::VectorXd& direction,
+                                         const std::string& strategy) {
+    const double dense_weight = 1.0 + direction.squaredNorm();
+    if (strategy == "diagonal") {
+        return diagonal_weight_surrogate(direction);
+    }
+    if (strategy == "dense_diagonal" || strategy == "hybrid") {
+        return 0.5 * (dense_weight + diagonal_weight_surrogate(direction));
+    }
+    return dense_weight;
+}
+
+template <class MatrixLike>
+inline Eigen::VectorXd dense_column(const MatrixLike& A, int j) {
+    return A.col(j);
+}
+
+inline Eigen::VectorXd dense_column(
+    const Eigen::SparseMatrix<double, Eigen::ColMajor, int>& A, int j) {
+    Eigen::VectorXd out = Eigen::VectorXd::Zero(A.rows());
+    for (Eigen::SparseMatrix<double, Eigen::ColMajor, int>::InnerIterator it(A, j);
+         it; ++it) {
+        out(it.row()) = it.value();
+    }
+    return out;
+}
+
+template <class MatrixLike>
+inline double column_dot(const MatrixLike& A, int j, const Eigen::VectorXd& v) {
+    return A.col(j).dot(v);
+}
+
+inline double column_dot(const Eigen::SparseMatrix<double, Eigen::ColMajor, int>& A,
+                         int j, const Eigen::VectorXd& v) {
+    double dot = 0.0;
+    for (Eigen::SparseMatrix<double, Eigen::ColMajor, int>::InnerIterator it(A, j);
+         it; ++it) {
+        dot += it.value() * v(it.row());
+    }
+    return dot;
+}
+
+}  // namespace pricing_detail
 
 // ============================================================================
 // PrimalPricingBridge
@@ -29,11 +96,11 @@ struct PrimalPricingBridge {
     PrimalPricingBridge(DegeneracyManager& dm_, PrimalPricer& pr_)
         : dm(dm_), pricer(pr_) {}
 
-    template <class BasisLike>
+    template <class BasisLike, class MatrixLike>
     std::optional<int> choose_primal_entering(
         const Eigen::VectorXd& rN, const std::vector<int>& N, double tol,
         int iteration, double current_objective, const BasisLike& basis,
-        const Eigen::MatrixXd& A) {
+        const MatrixLike& A, bool encourage_partial_pricing = false) {
         const auto& sig =
             dm.begin_pricing(current_objective, iteration, int(N.size()));
 
@@ -79,7 +146,9 @@ struct PrimalPricingBridge {
 
         auto entering_rel =
             pricer.choose_primal_entering(rN_eff, N, tol, iteration,
-                                          current_objective, basis, A);
+                                          current_objective, basis, A,
+                                          encourage_partial_pricing ||
+                                              sig.encourage_partial_pricing);
 
         // Forbid list: ABS -> REL mapping
         if (entering_rel && !sig.forbid_abs_candidates.empty()) {
@@ -104,9 +173,10 @@ struct PrimalPricingBridge {
         return entering_rel;
     }
 
+    template <class MatrixLike>
     void after_primal_pivot(int leaving_rel, int entering_abs, int old_abs,
                             const Eigen::VectorXd& pivot_column, double alpha,
-                            double step_size, const Eigen::MatrixXd& A,
+                            double step_size, const MatrixLike& A,
                             const std::vector<int>& N,
                             double rc_improvement = 0.0) {
         pricer.update_after_primal_pivot(leaving_rel, entering_abs, old_abs,
@@ -132,11 +202,17 @@ class SteepestEdgePricer {
         double weight;      // 1 + ||t||^2
     };
 
-    explicit SteepestEdgePricer(int pool_max = 0, int reset_frequency = 1000)
-        : pool_max_(pool_max), reset_freq_(reset_frequency) {}
+    explicit SteepestEdgePricer(
+        int pool_max = 0, int reset_frequency = 1000,
+        std::string weight_strategy = "dense",
+        double log_error_threshold = 1.3862943611198906)
+        : pool_max_(pool_max),
+          reset_freq_(reset_frequency),
+          weight_strategy_(std::move(weight_strategy)),
+          log_error_threshold_(log_error_threshold) {}
 
-    template <class BasisLike>
-    void build_primal_pool(const BasisLike& B, const Eigen::MatrixXd& A,
+    template <class BasisLike, class MatrixLike>
+    void build_primal_pool(const BasisLike& B, const MatrixLike& A,
                            const std::vector<int>& N) {
         pool_.clear();
         pos_.clear();
@@ -148,8 +224,10 @@ class SteepestEdgePricer {
             const int j = N[k];
             Entry e;
             e.jN = j;
-            e.t = B.solve_B(A.col(j));  // caller-provided
-            e.weight = 1.0 + e.t.squaredNorm();
+            const Eigen::VectorXd Aj = pricing_detail::dense_column(A, j);
+            e.t = B.solve_B(Aj);  // caller-provided
+            e.weight =
+                pricing_detail::edge_weight_from_direction(e.t, weight_strategy_);
             pos_[j] = (int)pool_.size();
             pool_.push_back(std::move(e));
         }
@@ -157,13 +235,29 @@ class SteepestEdgePricer {
         need_rebuild_ = false;
     }
 
+    // HiGHS-inspired: partial pricing with adaptive pool size
+    // Only price a subset of nonbasic variables to save computation
+    // Pool size grows if no improving column found
     std::optional<int> choose_primal_entering(
-        const Eigen::VectorXd& rcN, const std::vector<int>& N, double tol) {
+        const Eigen::VectorXd& rcN, const std::vector<int>& N, double tol,
+        bool partial_pricing = false) {
         ++iter_count_;
         int best_rel = -1;
         double best_score = -1.0;
 
-        for (int k = 0; k < (int)N.size(); ++k) {
+        // Determine pool size: partial pricing or full scan
+        int pool_size = (int)N.size();
+        if (partial_pricing && pool_size > 10) {
+            // Start with 10% of nonbasic vars, grow if no improvement
+            pool_size = std::min<int>(pool_size, std::max(10, pool_size / 10));
+            // Grow pool after several iterations without improvement
+            if (no_improvement_count_ > 5) {
+                pool_size = std::min<int>(pool_size * 2, pool_size + 50);
+            }
+        }
+
+        int candidates_priced = 0;
+        for (int k = 0; k < std::min(pool_size, (int)N.size()); ++k) {
             if (rcN(k) >= -tol) continue;
             const int j = N[k];
             double w = 1.0;
@@ -174,13 +268,23 @@ class SteepestEdgePricer {
                 best_score = score;
                 best_rel = k;
             }
+            ++candidates_priced;
         }
+
+        // Track no-improvement count for adaptive pool sizing
+        if (best_rel >= 0) {
+            no_improvement_count_ = 0;
+        } else if (partial_pricing) {
+            ++no_improvement_count_;
+        }
+
         return (best_rel >= 0) ? std::optional<int>(best_rel) : std::nullopt;
     }
 
+    template <class MatrixLike>
     void update_after_primal_pivot(int leave_rel, int e_abs, int old_abs,
                                    const Eigen::VectorXd& s, double alpha,
-                                   const Eigen::MatrixXd& /*A*/,
+                                   const MatrixLike& /*A*/,
                                    const std::vector<int>& /*N*/,
                                    bool insert_leaver_into_pool = true) {
         if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol) {
@@ -190,13 +294,22 @@ class SteepestEdgePricer {
 
         const double inv_alpha = 1.0 / alpha;
 
-        // Update t, weight
+        // Update t, weight with error checking
         for (auto& E : pool_) {
             if (leave_rel < E.t.size()) {
                 const double tr = E.t(leave_rel);
                 if (tr != 0.0) {
+                    const double old_weight = E.weight;
                     E.t.noalias() -= s * (tr * inv_alpha);
-                    E.weight = 1.0 + E.t.squaredNorm();
+                    const double new_weight = pricing_detail::edge_weight_from_direction(
+                        E.t, weight_strategy_);
+                    if (pricing_detail::weight_log_error_ok(
+                            new_weight, old_weight, log_error_threshold_)) {
+                        E.weight = new_weight;
+                    } else {
+                        E.t.noalias() += s * (tr * inv_alpha);
+                        need_rebuild_ = true;
+                    }
                 }
             }
         }
@@ -220,7 +333,8 @@ class SteepestEdgePricer {
             E.t = Eigen::VectorXd::Zero(s.size());
             if (leave_rel < E.t.size()) E.t(leave_rel) = 1.0;
             E.t.noalias() -= s * inv_alpha;
-            E.weight = 1.0 + E.t.squaredNorm();
+            E.weight =
+                pricing_detail::edge_weight_from_direction(E.t, weight_strategy_);
 
             if (pool_max_ > 0 && (int)pool_.size() >= pool_max_) {
                 // Evict largest-weight entry
@@ -255,34 +369,53 @@ class SteepestEdgePricer {
     int reset_freq_{1000};
     int iter_count_{0};
     bool need_rebuild_{false};
+    std::string weight_strategy_{"dense"};
+    double log_error_threshold_{1.3862943611198906};
+    // HiGHS-inspired: track no-improvement iterations for adaptive pool sizing
+    int no_improvement_count_{0};
 };
 
 // ============================================================================
-// DevexPricer (lightweight weights; API preserved)
+// DevexPricer (lightweight weights with error checking; API preserved)
 // ============================================================================
 class DevexPricer {
    public:
     explicit DevexPricer(double threshold = 0.99, int reset_frequency = 1000)
         : threshold_(threshold), reset_freq_(reset_frequency) {}
 
-    template <class BasisLike>
-    void build_primal_pool(const BasisLike& /*B*/, const Eigen::MatrixXd& /*A*/,
+    // HiGHS-inspired: minimum fraction of previous weight to accept update
+    static constexpr double kMinWeightAcceptRatio = 0.25;
+
+    template <class BasisLike, class MatrixLike>
+    void build_primal_pool(const BasisLike& /*B*/, const MatrixLike& /*A*/,
                            const std::vector<int>& N) {
         weights_.clear();
         for (int j : N) weights_[j] = 1.0;
         iter_count_ = 0;
+        no_improvement_count_ = 0;
     }
 
+    // HiGHS-inspired: partial pricing with adaptive pool
     std::optional<int> choose_primal_entering(
-        const Eigen::VectorXd& rcN, const std::vector<int>& N, double tol) {
+        const Eigen::VectorXd& rcN, const std::vector<int>& N, double tol,
+        bool partial_pricing = false) {
         ++iter_count_;
         if (iter_count_ % reset_freq_ == 0) {
             for (auto& p : weights_) p.second = 1.0;
         }
 
+        // Partial pricing: only price subset of nonbasic vars
+        int pool_size = (int)N.size();
+        if (partial_pricing && pool_size > 10) {
+            pool_size = std::min<int>(pool_size, std::max(10, pool_size / 10));
+            if (no_improvement_count_ > 5) {
+                pool_size = std::min<int>(pool_size * 2, pool_size + 50);
+            }
+        }
+
         int best_rel = -1;
         double best_crit = -1.0;
-        for (int k = 0; k < (int)N.size(); ++k) {
+        for (int k = 0; k < std::min(pool_size, (int)N.size()); ++k) {
             if (rcN(k) >= -tol) continue;
             const int j = N[k];
             const double w = (weights_.count(j) ? weights_.at(j) : 1.0);
@@ -292,22 +425,30 @@ class DevexPricer {
                 best_rel = k;
             }
         }
+
+        if (best_rel >= 0) {
+            no_improvement_count_ = 0;
+        } else if (partial_pricing) {
+            ++no_improvement_count_;
+        }
+
         return (best_rel >= 0) ? std::optional<int>(best_rel) : std::nullopt;
     }
 
+    template <class MatrixLike>
     void update_after_primal_pivot(int leave_rel, int e_abs, int old_abs,
                                    const Eigen::VectorXd& pivot_column,
                                    double alpha,
-                                   const Eigen::MatrixXd& /*A*/,
+                                   const MatrixLike& /*A*/,
                                    const std::vector<int>& N,
                                    bool /*insert_leaver_into_pool*/ = true) {
         if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol) return;
 
-        // Entering weight: keep bounded to avoid runaway
+        // Entering weight: keep bounded to avoid runaway (HiGHS style)
         const double a2 = alpha * alpha;
         weights_[e_abs] = std::min(std::max(a2, 1e-4), 1e6);
 
-        // Update others (classic Devex-like)
+        // Update others (classic Devex-like) with error checking
         if (leave_rel < pivot_column.size()) {
             const double gamma_over_alpha = pivot_column(leave_rel) / alpha;
             const double add = gamma_over_alpha * gamma_over_alpha;
@@ -316,8 +457,14 @@ class DevexPricer {
                 if (j == e_abs) continue;
                 double& w = weights_[j];
                 if (!weights_.count(j)) w = 1.0;
+                const double old_w = w;
                 const double nw = w + add;
                 w = std::max(nw, threshold_ * w);
+                // HiGHS-inspired: check for weight corruption
+                if (w < kMinWeightAcceptRatio * old_w && old_w > 0) {
+                    // Weight dropped too far - mark for rebuild
+                    need_rebuild_ = true;
+                }
             }
         }
 
@@ -326,14 +473,16 @@ class DevexPricer {
         if (!weights_.count(old_abs)) weights_[old_abs] = 1.0;
     }
 
-    bool needs_rebuild() const { return false; }
-    void clear_rebuild_flag() {}
+    bool needs_rebuild() const { return need_rebuild_; }
+    void clear_rebuild_flag() { need_rebuild_ = false; }
 
    private:
     std::unordered_map<int, double> weights_;
     double threshold_{0.99};
     int reset_freq_{1000};
     int iter_count_{0};
+    int no_improvement_count_{0};
+    bool need_rebuild_{false};
 };
 
 // ============================================================================
@@ -358,12 +507,17 @@ class DualSteepestEdgePricer {
         double weight = 1.0;
     };
 
-    explicit DualSteepestEdgePricer(int pool_max = 0,
-                                    int reset_frequency = 1000)
-        : pool_max_(pool_max), reset_freq_(reset_frequency) {}
+    explicit DualSteepestEdgePricer(
+        int pool_max = 0, int reset_frequency = 1000,
+        std::string weight_strategy = "dense",
+        double log_error_threshold = 1.3862943611198906)
+        : pool_max_(pool_max),
+          reset_freq_(reset_frequency),
+          weight_strategy_(std::move(weight_strategy)),
+          log_error_threshold_(log_error_threshold) {}
 
-    template <class BasisLike>
-    void build_dual_pool(const BasisLike& B, const Eigen::MatrixXd& A,
+    template <class BasisLike, class MatrixLike>
+    void build_dual_pool(const BasisLike& B, const MatrixLike& A,
                          const std::vector<int>& N) {
         dual_pool_.clear();
         dual_pos_.clear();
@@ -376,9 +530,10 @@ class DualSteepestEdgePricer {
             const int j = N[k];
             DualEntry e;
             e.jN = j;
-            const Eigen::VectorXd Aj = A.col(j);
+            const Eigen::VectorXd Aj = pricing_detail::dense_column(A, j);
             e.w = B.solve_BT(Aj);  // caller-provided
-            e.dual_weight = e.w.squaredNorm();
+            e.dual_weight =
+                pricing_detail::edge_weight_from_direction(e.w, weight_strategy_);
             dual_pos_[j] = (int)dual_pool_.size();
             dual_pool_.push_back(std::move(e));
         }
@@ -387,8 +542,9 @@ class DualSteepestEdgePricer {
             Eigen::VectorXd e_i = Eigen::VectorXd::Zero(A.rows());
             e_i(i) = 1.0;
             row_pool_[i].psi = B.solve_BT(e_i);
-            row_pool_[i].weight =
-                std::max(1.0, row_pool_[i].psi.squaredNorm());
+            row_pool_[i].weight = std::max(
+                1.0, pricing_detail::edge_weight_from_direction(
+                         row_pool_[i].psi, weight_strategy_));
         }
         iter_count_ = 0;
         need_rebuild_ = false;
@@ -416,7 +572,9 @@ class DualSteepestEdgePricer {
                     Eigen::VectorXd e_i = Eigen::VectorXd::Zero(yB.size());
                     e_i(i) = 1.0;
                     best.dual_row = B.solve_BT(e_i);
-                    weight = std::max(1.0, best.dual_row.squaredNorm());
+                    weight = std::max(
+                        1.0, pricing_detail::edge_weight_from_direction(
+                                 best.dual_row, weight_strategy_));
                 }
                 best.weight = weight;
             }
@@ -424,9 +582,10 @@ class DualSteepestEdgePricer {
         return best;
     }
 
+    template <class MatrixLike>
     void update_after_dual_pivot(int leave_rel, int e_abs, int old_abs,
                                  const Eigen::VectorXd& s, double alpha,
-                                 const Eigen::MatrixXd& A,
+                                 const MatrixLike& A,
                                  const std::vector<int>& /*N*/,
                                  const Eigen::VectorXd& dual_row,
                                  bool insert_leaver_into_pool = true) {
@@ -461,12 +620,14 @@ class DualSteepestEdgePricer {
                 if (coeff != 0.0) {
                     row_pool_[i].psi.noalias() -= psi_before * coeff;
                 }
-                row_pool_[i].weight =
-                    std::max(1.0, row_pool_[i].psi.squaredNorm());
+                row_pool_[i].weight = std::max(
+                    1.0, pricing_detail::edge_weight_from_direction(
+                             row_pool_[i].psi, weight_strategy_));
             }
             row_pool_[leave_rel].psi = psi_before / alpha;
-            row_pool_[leave_rel].weight =
-                std::max(1.0, row_pool_[leave_rel].psi.squaredNorm());
+            row_pool_[leave_rel].weight = std::max(
+                1.0, pricing_detail::edge_weight_from_direction(
+                         row_pool_[leave_rel].psi, weight_strategy_));
         }
 
         Eigen::VectorXd e_r = Eigen::VectorXd::Zero(s.size());
@@ -479,9 +640,21 @@ class DualSteepestEdgePricer {
         // where psi_r = B^{-T} e_r from the pre-pivot basis.
         for (auto& E : dual_pool_) {
             if (E.jN == e_abs) continue;
-            const double beta = s_minus_er.dot(A.col(E.jN)) * inv_alpha;
-            if (beta != 0.0) E.w.noalias() -= psi_r * beta;
-            E.dual_weight = std::max(1.0, E.w.squaredNorm());
+            const Eigen::VectorXd Aj = pricing_detail::dense_column(A, E.jN);
+            const double beta = s_minus_er.dot(Aj) * inv_alpha;
+            if (beta != 0.0) {
+                const double old_weight = E.dual_weight;
+                E.w.noalias() -= psi_r * beta;
+                const double new_weight = std::max(
+                    1.0, pricing_detail::edge_weight_from_direction(
+                             E.w, weight_strategy_));
+                if (!pricing_detail::weight_log_error_ok(
+                        new_weight, old_weight, log_error_threshold_)) {
+                    need_rebuild_ = true;
+                } else {
+                    E.dual_weight = new_weight;
+                }
+            }
         }
 
         // Remove entering
@@ -500,9 +673,12 @@ class DualSteepestEdgePricer {
             DualEntry E;
             E.jN = old_abs;
             E.w = e_r;
-            const double beta_old = s_minus_er.dot(A.col(old_abs)) * inv_alpha;
+            const Eigen::VectorXd Aold = pricing_detail::dense_column(A, old_abs);
+            const double beta_old = s_minus_er.dot(Aold) * inv_alpha;
             if (beta_old != 0.0) E.w.noalias() -= psi_r * beta_old;
-            E.dual_weight = std::max(1.0, E.w.squaredNorm());
+            E.dual_weight = std::max(
+                1.0, pricing_detail::edge_weight_from_direction(
+                         E.w, weight_strategy_));
 
             if (pool_max_ > 0 && (int)dual_pool_.size() >= pool_max_) {
                 int evict = 0;
@@ -536,11 +712,16 @@ class DualSteepestEdgePricer {
     int pool_max_{0};
     int reset_freq_{1000};
     int iter_count_{0};
+    int no_improvement_count_{0};
     bool need_rebuild_{false};
+    std::string weight_strategy_{"dense"};
+    double log_error_threshold_{1.3862943611198906};
 };
 
 // ============================================================================
 // DualDevexPricer (dual leaving-row Devex with exact resets)
+// ============================================================================
+// DualDevexPricer with weight error checking
 // ============================================================================
 class DualDevexPricer {
    public:
@@ -550,11 +731,14 @@ class DualDevexPricer {
         double weight = 1.0;
     };
 
+    // HiGHS-inspired: minimum fraction of previous weight to accept
+    static constexpr double kMinWeightAcceptRatio = 0.25;
+
     explicit DualDevexPricer(double threshold = 0.99, int reset_frequency = 200)
         : threshold_(threshold), reset_freq_(reset_frequency) {}
 
-    template <class BasisLike>
-    void build_dual_pool(const BasisLike& B, const Eigen::MatrixXd& A,
+    template <class BasisLike, class MatrixLike>
+    void build_dual_pool(const BasisLike& B, const MatrixLike& A,
                          const std::vector<int>& /*N*/) {
         row_weights_.assign(A.rows(), 1.0);
         for (int i = 0; i < A.rows(); ++i) {
@@ -564,6 +748,7 @@ class DualDevexPricer {
             row_weights_[i] = std::max(1.0, psi_i.squaredNorm());
         }
         iter_count_ = 0;
+        no_improvement_count_ = 0;
         need_rebuild_ = false;
     }
 
@@ -595,9 +780,10 @@ class DualDevexPricer {
         return best;
     }
 
+    template <class MatrixLike>
     void update_after_dual_pivot(int leave_rel, int /*e_abs*/, int /*old_abs*/,
                                  const Eigen::VectorXd& s, double alpha,
-                                 const Eigen::MatrixXd& /*A*/,
+                                 const MatrixLike& /*A*/,
                                  const std::vector<int>& /*N*/,
                                  const Eigen::VectorXd& /*dual_row*/,
                                  bool /*insert_leaver_into_pool*/ = true) {
@@ -613,10 +799,16 @@ class DualDevexPricer {
         const double pivot_weight = std::max(1.0, row_weights_[leave_rel]);
         const double inv_alpha = 1.0 / alpha;
         for (int i = 0; i < (int)row_weights_.size() && i < s.size(); ++i) {
+            const double old_weight = row_weights_[i];
             const double sigma = (i == leave_rel) ? inv_alpha : s(i) * inv_alpha;
             const double candidate = sigma * sigma * pivot_weight;
             row_weights_[i] =
                 std::max({1.0, threshold_ * row_weights_[i], candidate});
+            // HiGHS-inspired: check for weight corruption
+            if (row_weights_[i] < kMinWeightAcceptRatio * old_weight &&
+                old_weight > 0) {
+                need_rebuild_ = true;
+            }
         }
 
         ++iter_count_;
@@ -631,7 +823,137 @@ class DualDevexPricer {
     double threshold_{0.99};
     int reset_freq_{200};
     int iter_count_{0};
+    int no_improvement_count_{0};
     bool need_rebuild_{false};
+};
+
+// ============================================================================
+// DualRowPricer (HiGHS-inspired row pricing for dual simplex)
+// Uses row pricing when rows are sparse, column pricing when dense
+// ============================================================================
+class DualRowPricer {
+   public:
+    struct LeavingChoice {
+        int row = -1;
+        Eigen::VectorXd dual_row;
+        double weight = 1.0;
+    };
+
+    explicit DualRowPricer(int reset_frequency = 200, int density_threshold = 10,
+                           std::string weight_strategy = "dense")
+        : reset_freq_(reset_frequency),
+          density_threshold_(density_threshold),
+          weight_strategy_(std::move(weight_strategy)) {}
+
+    template <class BasisLike, class MatrixLike>
+    void build_dual_pool(const BasisLike& B, const MatrixLike& A,
+                         const std::vector<int>& N) {
+        update_row_weights(B, A, N);
+        iter_count_ = 0;
+        need_rebuild_ = false;
+    }
+
+    template <class BasisLike>
+    LeavingChoice choose_dual_leaving(const BasisLike& B,
+                                      const Eigen::VectorXd& yB,
+                                      double tol) const {
+        LeavingChoice best;
+        double best_score = -1.0;
+
+        for (int i = 0; i < yB.size(); ++i) {
+            if (yB(i) >= -tol) continue;
+
+            const double infeas = -yB(i);
+            const bool use_row_pricing =
+                (i < (int)prefer_row_pricing_.size()) && prefer_row_pricing_[i];
+            const double weight =
+                use_row_pricing && i < (int)row_weights_.size() ? row_weights_[i]
+                                                                : 1.0;
+            const double score = (infeas * infeas) / std::max(1.0, weight);
+
+            if (score > best_score) {
+                best_score = score;
+                best.row = i;
+                best.weight = std::max(1.0, weight);
+                if (use_row_pricing) {
+                    // Get row vector for row pricing
+                    Eigen::VectorXd e_i = Eigen::VectorXd::Zero(yB.size());
+                    e_i(i) = 1.0;
+                    best.dual_row = B.solve_BT(e_i);
+                }
+            }
+        }
+
+        if (best.row >= 0) {
+            // Always compute the dual row for the leaving row
+            Eigen::VectorXd e_i = Eigen::VectorXd::Zero(yB.size());
+            e_i(best.row) = 1.0;
+            best.dual_row = B.solve_BT(e_i);
+            best.weight = std::max(
+                1.0, pricing_detail::edge_weight_from_direction(
+                         best.dual_row, weight_strategy_));
+        }
+
+        return best;
+    }
+
+    template <class BasisLike, class MatrixLike>
+    void update_row_weights(const BasisLike& B_inv, const MatrixLike& A,
+                            const std::vector<int>& N) {
+        row_weights_.resize(A.rows());
+        prefer_row_pricing_.resize(A.rows(), false);
+        for (int i = 0; i < A.rows(); ++i) {
+            // Compute row weight as ||B^{-T} e_i||^2
+            Eigen::VectorXd e_i = Eigen::VectorXd::Zero(A.rows());
+            e_i(i) = 1.0;
+            const Eigen::VectorXd psi_i = B_inv.solve_BT(e_i);
+            row_weights_[i] = std::max(
+                1.0, pricing_detail::edge_weight_from_direction(
+                         psi_i, weight_strategy_));
+            prefer_row_pricing_[i] = computeRowDensity(psi_i, A, N) <
+                                     static_cast<double>(density_threshold_);
+        }
+        iter_count_ = 0;
+    }
+
+    template <class MatrixLike>
+    void update_after_dual_pivot(int /*leave_rel*/, int /*e_abs*/, int /*old_abs*/,
+                                 const Eigen::VectorXd& /*s*/, double alpha,
+                                 const MatrixLike& /*A*/,
+                                 const std::vector<int>& /*N*/,
+                                 const Eigen::VectorXd& /*dual_row*/,
+                                 bool /*insert_leaver_into_pool*/ = true) {
+        ++iter_count_;
+        if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol ||
+            iter_count_ >= reset_freq_) {
+            need_rebuild_ = true;
+        }
+    }
+
+    bool needs_rebuild() const { return need_rebuild_; }
+    void clear_rebuild_flag() { need_rebuild_ = false; }
+
+   private:
+    template <class MatrixLike>
+    double computeRowDensity(const Eigen::VectorXd& dual_row,
+                             const MatrixLike& A,
+                             const std::vector<int>& N) const {
+        const int sample_size = std::min<int>(20, N.size());
+        int nz_count = 0;
+        for (int k = 0; k < sample_size; ++k) {
+            const double dot = pricing_detail::column_dot(A, N[k], dual_row);
+            if (std::abs(dot) > 1e-14) ++nz_count;
+        }
+        return static_cast<double>(nz_count);
+    }
+
+    std::vector<double> row_weights_;
+    std::vector<char> prefer_row_pricing_;
+    int reset_freq_{200};
+    int density_threshold_{10};
+    int iter_count_{0};
+    bool need_rebuild_{false};
+    std::string weight_strategy_{"dense"};
 };
 
 // ============================================================================
@@ -646,24 +968,44 @@ class DualAdaptivePricer {
     };
 
     DualAdaptivePricer(std::string pricing_rule, int devex_reset_frequency,
-                       int steepest_reset_frequency)
+                       int steepest_reset_frequency,
+                       bool partial_pricing = false,
+                       std::string dual_pricing = "row",
+                       int row_pricing_threshold = 10,
+                       std::string dual_edge_weight_strategy = "dense",
+                       double dual_weight_log_error_threshold =
+                           1.3862943611198906)
         : requested_rule_(std::move(pricing_rule)),
-          steepest_pricer_(0, steepest_reset_frequency),
-          devex_pricer_(0.99, devex_reset_frequency) {}
+          partial_pricing_enabled_(partial_pricing),
+          dual_pricing_preference_(std::move(dual_pricing)),
+          row_pricing_threshold_(row_pricing_threshold),
+          steepest_pricer_(0, steepest_reset_frequency,
+                           dual_edge_weight_strategy,
+                           dual_weight_log_error_threshold),
+          devex_pricer_(0.99, devex_reset_frequency),
+          row_pricer_(devex_reset_frequency, row_pricing_threshold,
+                      dual_edge_weight_strategy) {}
 
-    template <class BasisLike>
-    void build_dual_pool(const BasisLike& B, const Eigen::MatrixXd& A,
+    template <class BasisLike, class MatrixLike>
+    void build_dual_pool(const BasisLike& B, const MatrixLike& A,
                          const std::vector<int>& N) {
         active_rule_ = select_rule_(A.rows());
         if (active_rule_ == Rule::SteepestEdge) {
             steepest_pricer_.build_dual_pool(B, A, N);
             devex_pricer_.clear_rebuild_flag();
+            row_pricer_.clear_rebuild_flag();
         } else if (active_rule_ == Rule::Devex) {
             devex_pricer_.build_dual_pool(B, A, N);
             steepest_pricer_.clear_rebuild_flag();
+            row_pricer_.clear_rebuild_flag();
+        } else if (active_rule_ == Rule::RowPricing) {
+            row_pricer_.build_dual_pool(B, A, N);
+            steepest_pricer_.clear_rebuild_flag();
+            devex_pricer_.clear_rebuild_flag();
         } else {
             steepest_pricer_.clear_rebuild_flag();
             devex_pricer_.clear_rebuild_flag();
+            row_pricer_.clear_rebuild_flag();
         }
         need_rebuild_ = false;
     }
@@ -680,6 +1022,10 @@ class DualAdaptivePricer {
             }
             case Rule::Devex: {
                 const auto choice = devex_pricer_.choose_dual_leaving(B, yB, tol);
+                return {choice.row, choice.dual_row, choice.weight};
+            }
+            case Rule::RowPricing: {
+                const auto choice = row_pricer_.choose_dual_leaving(B, yB, tol);
                 return {choice.row, choice.dual_row, choice.weight};
             }
             case Rule::MostInfeasible: {
@@ -709,9 +1055,10 @@ class DualAdaptivePricer {
         return {};
     }
 
+    template <class MatrixLike>
     void update_after_dual_pivot(int leave_rel, int e_abs, int old_abs,
                                  const Eigen::VectorXd& s, double alpha,
-                                 const Eigen::MatrixXd& A,
+                                 const MatrixLike& A,
                                  const std::vector<int>& N,
                                  const Eigen::VectorXd& dual_row,
                                  bool insert_leaver_into_pool = true) {
@@ -728,6 +1075,12 @@ class DualAdaptivePricer {
                     insert_leaver_into_pool);
                 need_rebuild_ = devex_pricer_.needs_rebuild();
                 break;
+            case Rule::RowPricing:
+                row_pricer_.update_after_dual_pivot(
+                    leave_rel, e_abs, old_abs, s, alpha, A, N, dual_row,
+                    insert_leaver_into_pool);
+                need_rebuild_ = row_pricer_.needs_rebuild();
+                break;
             case Rule::MostInfeasible:
                 need_rebuild_ =
                     (std::abs(alpha) < dm_consts::kDegenerateAlphaTol);
@@ -739,6 +1092,8 @@ class DualAdaptivePricer {
         return need_rebuild_ ||
                (active_rule_ == Rule::SteepestEdge &&
                 steepest_pricer_.needs_rebuild()) ||
+               (active_rule_ == Rule::RowPricing &&
+                row_pricer_.needs_rebuild()) ||
                (active_rule_ == Rule::Devex && devex_pricer_.needs_rebuild());
     }
 
@@ -746,6 +1101,7 @@ class DualAdaptivePricer {
         need_rebuild_ = false;
         steepest_pricer_.clear_rebuild_flag();
         devex_pricer_.clear_rebuild_flag();
+        row_pricer_.clear_rebuild_flag();
     }
 
     const char* current_strategy_name() const {
@@ -754,6 +1110,8 @@ class DualAdaptivePricer {
                 return "dual_steepest_edge";
             case Rule::Devex:
                 return "dual_devex";
+            case Rule::RowPricing:
+                return "dual_row_pricing";
             case Rule::MostInfeasible:
                 return "dual_most_infeasible";
         }
@@ -761,9 +1119,14 @@ class DualAdaptivePricer {
     }
 
    private:
-    enum class Rule { SteepestEdge, Devex, MostInfeasible };
+    enum class Rule { SteepestEdge, Devex, RowPricing, MostInfeasible };
 
     Rule select_rule_(int basis_rows) const {
+        if (dual_pricing_preference_ == "row") return Rule::RowPricing;
+        if (dual_pricing_preference_ == "switch" &&
+            (partial_pricing_enabled_ || basis_rows <= row_pricing_threshold_)) {
+            return Rule::RowPricing;
+        }
         if (requested_rule_ == "devex") return Rule::Devex;
         if (requested_rule_ == "most_negative") return Rule::MostInfeasible;
         if (requested_rule_ == "adaptive") {
@@ -773,10 +1136,14 @@ class DualAdaptivePricer {
     }
 
     std::string requested_rule_;
+    bool partial_pricing_enabled_{false};
+    std::string dual_pricing_preference_{"row"};
+    int row_pricing_threshold_{10};
     Rule active_rule_{Rule::SteepestEdge};
     bool need_rebuild_{false};
     DualSteepestEdgePricer steepest_pricer_;
     DualDevexPricer devex_pricer_;
+    DualRowPricer row_pricer_;
 };
 
 // ============================================================================
@@ -803,6 +1170,8 @@ class AdaptivePricer {
         int steepest_pool_max = 0;
         int steepest_reset_freq = 1000;
         int devex_reset_freq = 1000;
+        std::string primal_edge_weight_strategy = "dense";
+        double primal_weight_log_error_threshold = 1.3862943611198906;
     };
 
     struct PricingStats {
@@ -819,7 +1188,9 @@ class AdaptivePricer {
         : current_strategy_(opts.initial_strategy),
           options_(opts),
           n_(n),
-          steepest_pricer_(opts.steepest_pool_max, opts.steepest_reset_freq),
+          steepest_pricer_(opts.steepest_pool_max, opts.steepest_reset_freq,
+                           opts.primal_edge_weight_strategy,
+                           opts.primal_weight_log_error_threshold),
           devex_pricer_(0.99, opts.devex_reset_freq),
           iterations_since_switch_(0),
           last_objective_(0.0),
@@ -828,11 +1199,11 @@ class AdaptivePricer {
     }
 
     // Main pricing entry
-    template <typename BasisLike>
+    template <typename BasisLike, typename MatrixLike>
     std::optional<int> choose_primal_entering(
         const Eigen::VectorXd& rN, const std::vector<int>& N, double tol,
         int iteration, double current_objective, const BasisLike& basis,
-        const Eigen::MatrixXd& A) {
+        const MatrixLike& A, bool encourage_partial_pricing = false) {
         ++stats_.total_pricing_calls;
         ++stats_.strategy_usage_count[current_strategy_];
 
@@ -846,9 +1217,11 @@ class AdaptivePricer {
 
         switch (current_strategy_) {
             case STEEPEST_EDGE:
-                return steepest_pricer_.choose_primal_entering(rN, N, tol);
+                return steepest_pricer_.choose_primal_entering(
+                    rN, N, tol, encourage_partial_pricing);
             case DEVEX:
-                return devex_pricer_.choose_primal_entering(rN, N, tol);
+                return devex_pricer_.choose_primal_entering(
+                    rN, N, tol, encourage_partial_pricing);
             case PARTIAL_PRICING:
                 return partial_pricing_(rN, N, tol, iteration);
             case MOST_NEGATIVE:
@@ -858,8 +1231,8 @@ class AdaptivePricer {
     }
 
     // Build pools for all (cheap; preserves API)
-    template <typename BasisLike>
-    void build_primal_pools(const BasisLike& basis, const Eigen::MatrixXd& A,
+    template <typename BasisLike, typename MatrixLike>
+    void build_primal_pools(const BasisLike& basis, const MatrixLike& A,
                             const std::vector<int>& N) {
         steepest_pricer_.build_primal_pool(basis, A, N);
         devex_pricer_.build_primal_pool(basis, A, N);
@@ -877,11 +1250,12 @@ class AdaptivePricer {
         return true;
     }
 
+    template <typename MatrixLike>
     void update_after_primal_pivot(int leaving_rel, int entering_abs,
                                    int old_abs,
                                    const Eigen::VectorXd& pivot_column,
                                    double alpha, double step_size,
-                                   const Eigen::MatrixXd& A,
+                                   const MatrixLike& A,
                                    const std::vector<int>& N) {
         steepest_pricer_.update_after_primal_pivot(
             leaving_rel, entering_abs, old_abs, pivot_column, alpha, A, N, true);
@@ -934,8 +1308,8 @@ class AdaptivePricer {
     }
 
    private:
-    template <typename BasisLike>
-    void rebuild_pools_(const BasisLike& basis, const Eigen::MatrixXd& A,
+    template <typename BasisLike, typename MatrixLike>
+    void rebuild_pools_(const BasisLike& basis, const MatrixLike& A,
                         const std::vector<int>& N) {
         switch (current_strategy_) {
             case STEEPEST_EDGE:

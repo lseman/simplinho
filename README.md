@@ -26,6 +26,15 @@ The core solver is header-only C++ in `include/simplex/`, the Python bindings li
 - Degeneracy management, anti-cycling support, and Harris-style ratio tests
 - Rich solve outputs: basis data, reduced costs, dual values, shadow prices, internal tableau data, traces, and Farkas certificates
 - A higher-level Python modeling layer with algebraic expressions, named variables, named constraints, and post-solve dual access
+- Early mixed-integer support on top of the LP engine with integer/binary variables
+  and branch-and-bound node selection strategies such as depth-first, breadth-first,
+  and best-bound
+- A modular branch-and-bound layer under `include/bnb/` with split responsibilities
+  for core solve flow, branching rules, search policies, and heuristics
+- Diving heuristics for MIP incumbent search, including fractional, vector-length,
+  objective-value, and coefficient-inspired diving
+- Incumbent heuristics for restricted neighborhood search, including RINS-style
+  fixing and a lightweight local search around the current incumbent
 
 ## What The Project Exposes
 
@@ -43,9 +52,16 @@ The Python module also exposes:
 - `RevisedSimplexOptions`
 - `SimplexMode`
 - `LPStatus`
+- `MIPStatus`
 - `LPBasis`
 - `LPBasisStatus`
+- `VarType`
+- `BranchAndBoundOptions`
+- `NodeSelectionStrategy`
+- `BranchingStrategy`
+- `DivingStrategy`
 - `status_to_string(...)`
+- `mip_status_to_string(...)`
 
 ## Solver Features
 
@@ -55,6 +71,10 @@ The Python module also exposes:
 - Automatic fallback behavior when a direct solve needs Phase I work
 - Support for bounded variables, free variables, shifted variables, and internally added slacks
 - Bound-flip logic for dual iterations when enabled through `dual_allow_bound_flip`
+- Branch-and-bound for integer and binary models with depth-first, breadth-first, and best-bound search
+- Branching rules including most-fractional, pseudocost, and strong branching
+- Primal heuristics including diving, feasibility-pump-style repair, RENS, RINS-style fixing, and local search
+- Global cut pool support with Gomory mixed-integer and cover cuts
 
 ### Numerics
 
@@ -231,6 +251,41 @@ model.options.mode = simplex.SimplexMode.Dual
 solution = model.reoptimize(basis)
 ```
 
+For mixed-integer models, mark variables as `Integer` or `Binary` and call
+`solve_mip()`:
+
+```python
+import simplinho as simplex
+
+model = simplex.Model()
+x = model.add_binary_var("x", obj=4.0)
+y = model.add_var("y", lb=0.0, ub=5.0, obj=3.0, var_type=simplex.VarType.Integer)
+
+model.addConstr(2 * x + y <= 4, name="cap")
+model.maximize(4 * x + 3 * y)
+
+mip = simplex.BranchAndBoundOptions()
+mip.node_selection = simplex.NodeSelectionStrategy.BestBound
+mip.branching_strategy = simplex.BranchingStrategy.StrongBranching
+mip.diving_strategy = simplex.DivingStrategy.ObjectiveValue
+mip.use_feasibility_pump = True
+mip.use_rens = True
+mip.use_rins = True
+mip.use_local_search = True
+mip.use_cut_pool = True
+mip.use_gomory_cuts = True
+mip.use_cover_cuts = True
+
+solution = model.solve_mip(mip)
+print(simplex.mip_status_to_string(solution.status))
+print(solution.obj, solution.values, solution.node_count)
+print(solution.tree_nodes[0])
+print(solution.heuristic_successes, solution.heuristic_lp_iterations)
+print(solution.feasibility_pump_successes, solution.rens_successes)
+print(solution.rins_successes, solution.local_search_successes)
+print(solution.cuts_generated, solution.cuts_applied, solution.cut_pool_size)
+```
+
 ## Useful Outputs
 
 The low-level `LPSolution` object includes more than just the primal vector:
@@ -253,7 +308,8 @@ The modeling layer wraps that in `ModelSolution`, while still exposing the raw s
 
 ## Repository Layout
 
-- `include/simplex/`: header-only solver core, presolve, LU, pricing, and degeneracy helpers
+- `include/simplex/`: umbrella headers for the simplex solver and compatibility includes
+- `include/bnb/`: branch-and-bound core, branching rules, search policies, diving strategies, primal heuristics, cut management, and shared MIP types
 - `bindings/`: `pybind11` bindings and modeling API
 - `src/`: reserved for future non-header sources
 - `simplex_modeling_api_demo.ipynb`: notebook showing the modeling API in action

@@ -2,16 +2,35 @@ cmake_minimum_required(VERSION 3.16)
 
 project(simplinho VERSION 1.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 include(FetchContent)
 
+# CPM.cmake
+if(NOT COMMAND CPMAddPackage)
+    FetchContent_Declare(
+        CPM
+        GIT_REPOSITORY https://github.com/cpm-cmake/CPM.cmake.git
+        GIT_TAG v0.40.5)
+    FetchContent_MakeAvailable(CPM)
+    include(${cpm_SOURCE_DIR}/cmake/CPM.cmake)
+endif()
+
+
+cpmaddpackage(
+    NAME stdexec
+    GITHUB_REPOSITORY NVIDIA/stdexec
+    GIT_TAG main
+    OPTIONS "STDEXEC_BUILD_TESTS OFF" "STDEXEC_BUILD_EXAMPLES OFF" "STDEXEC_BUILD_BENCHMARKS OFF" "STDEXEC_BUILD_DOCS OFF" "BUILD_TESTING OFF"
+)
+
 set(PYBIND11_FINDPYTHON ON CACHE BOOL "Use CMake's FindPython for pybind11" FORCE)
 set(PYBIND11_PYTHON_VERSION 3.13 CACHE STRING
     "Python version to use when building pybind11 modules" FORCE)
 find_package(Python 3.13 EXACT REQUIRED COMPONENTS Interpreter Development)
+find_package(Threads REQUIRED)
 
 set(SIMPLEX_LOCAL_DEPS_ROOT "")
 foreach(SIMPLEX_DEPS_CANDIDATE
@@ -69,7 +88,9 @@ endif()
 add_library(simplex_core INTERFACE)
 target_include_directories(simplex_core INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(simplex_core INTERFACE Eigen3::Eigen)
+target_link_libraries(simplex_core INTERFACE Eigen3::Eigen STDEXEC::stdexec)
 
 pybind11_add_module(simplinho bindings/simplex_bindings.cpp)
-target_link_libraries(simplinho PRIVATE simplex_core pybind11::module)
+target_link_libraries(simplinho PRIVATE simplex_core pybind11::module Threads::Threads STDEXEC::stdexec)
+
+install(TARGETS simplinho DESTINATION .)

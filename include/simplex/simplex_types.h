@@ -103,6 +103,19 @@ struct RevisedSimplexOptions {
     int devex_reset = 200;
     std::string pricing_rule = "adaptive";  // or "devex" / "most_negative"
     int adaptive_reset_freq = 1000;
+    bool partial_pricing = false;  // HiGHS-inspired partial pricing
+    std::string dual_pricing = "row";     // "row" | "col" | "switch" (HiGHS-inspired)
+    int row_pricing_threshold = 10;       // switch if row density < this
+    std::string primal_edge_weight_strategy =
+        "dense";  // "dense" | "diagonal" | "dense_diagonal"
+    std::string dual_edge_weight_strategy =
+        "dense";  // "dense" | "diagonal" | "dense_diagonal"
+    double primal_steepest_edge_weight_log_error_threshold =
+        1.3862943611198906;  // log(4), equivalent to 25% acceptance
+    double dual_steepest_edge_weight_log_error_threshold =
+        1.3862943611198906;  // log(4), equivalent to 25% acceptance
+    double primal_simplex_cost_perturbation_multiplier = 1.0;
+    double dual_simplex_cost_perturbation_multiplier = 1.0;
 
     // Recovery
     int max_basis_rebuilds = 3;

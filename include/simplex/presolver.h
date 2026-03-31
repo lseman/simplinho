@@ -104,6 +104,7 @@ struct PresolveResult {
     double obj_shift = 0.0;
     bool proven_infeasible = false;
     bool proven_unbounded = false;
+    int implied_bound_updates = 0;
 };
 
 struct ActivityBounds {
@@ -118,6 +119,19 @@ struct ActivityRange {
 struct ImpliedInterval {
     double lower = ninf(), upper = inf();
     bool has_lower = false, has_upper = false;
+};
+
+struct ImpliedBoundsSummary {
+    Eigen::VectorXd impl_col_lower;
+    Eigen::VectorXd impl_col_upper;
+    std::vector<char> has_lower;
+    std::vector<char> has_upper;
+
+    explicit ImpliedBoundsSummary(int n = 0)
+        : impl_col_lower(Eigen::VectorXd::Constant(n, ninf())),
+          impl_col_upper(Eigen::VectorXd::Constant(n, inf())),
+          has_lower(n, 0),
+          has_upper(n, 0) {}
 };
 
 inline ActivityBounds row_activity_bounds(const Eigen::RowVectorXd& a,
@@ -187,6 +201,14 @@ inline bool nearly_zero(double v, double tol = 1e-12) {
     return std::abs(v) <= tol;
 }
 
+inline double nearest_power_of_two_magnitude(double value) {
+    if (!(std::isfinite(value)) || value <= 0.0) return 1.0;
+    int exponent = 0;
+    const double fraction = std::frexp(value, &exponent);
+    if (fraction < std::sqrt(0.5)) --exponent;
+    return std::ldexp(1.0, exponent);
+}
+
 template <class Derived>
 inline double safe_abs_max(const Eigen::MatrixBase<Derived>& x) {
     return x.size() ? x.cwiseAbs().maxCoeff() : 0.0;
@@ -249,6 +271,7 @@ class Presolver {
         res_.obj_shift = 0.0;
         res_.proven_infeasible = false;
         res_.proven_unbounded = false;
+        res_.implied_bound_updates = 0;
 
         LP P = in;
         const int m0 = (int)P.A.rows();
@@ -468,7 +491,8 @@ class Presolver {
     void scale_rows_unit_inf(LP& P) {
         const int m = (int)P.A.rows();
         for (int i = 0; i < m; ++i) {
-            const double s = safe_abs_max(P.A.row(i));
+            const double s = nearest_power_of_two_magnitude(
+                safe_abs_max(P.A.row(i)));
             if (s > 0 && !nearly_zero(s, opt_.zero_tol) && std::isfinite(s)) {
                 P.A.row(i) /= s;
                 P.b(i) /= s;
@@ -481,7 +505,8 @@ class Presolver {
         if (opt_.non_destructive) return;
         const int n = (int)P.A.cols();
         for (int j = 0; j < n; ++j) {
-            const double s = safe_abs_max(P.A.col(j));
+            const double s = nearest_power_of_two_magnitude(
+                safe_abs_max(P.A.col(j)));
             if (s > 0 && !nearly_zero(s, opt_.zero_tol) && std::isfinite(s)) {
                 P.A.col(j) /= s;
                 P.c(j) /= s;
@@ -718,75 +743,10 @@ class Presolver {
     }
 
     bool tighten_bounds_by_rows(LP& P) {
-        bool changed = false;
-        const int m = (int)P.A.rows(), n = (int)P.A.cols();
-        for (int i = 0; i < m; ++i) {
-            const auto ab =
-                row_activity_range_excluding(P.A.row(i), P.l, P.u, -1,
-                                             opt_.zero_tol);
-            const double rhs = P.b(i);
-            if (P.sense[i] == RowSense::LE) {
-                if (ab.min_finite && ab.min_act > rhs + opt_.infeas_tol) {
-                    res_.proven_infeasible = true;
-                    return true;
-                }
-            } else if (P.sense[i] == RowSense::GE) {
-                if (ab.max_finite && ab.max_act < rhs - opt_.infeas_tol) {
-                    res_.proven_infeasible = true;
-                    return true;
-                }
-            } else {
-                if ((ab.min_finite && ab.min_act > rhs + opt_.infeas_tol) ||
-                    (ab.max_finite && ab.max_act < rhs - opt_.infeas_tol)) {
-                    res_.proven_infeasible = true;
-                    return true;
-                }
-            }
-
-            for (int j = 0; j < n; ++j) {
-                const double aij = P.A(i, j);
-                if (std::abs(aij) <= opt_.zero_tol) continue;
-
-                double L = P.l(j), U = P.u(j);
-                const auto other = row_activity_range_excluding(
-                    P.A.row(i), P.l, P.u, j, opt_.zero_tol);
-                if (P.sense[i] == RowSense::LE) {
-                    if (aij > 0 && other.min_finite)
-                        U = std::min(U, (rhs - other.min_act) / aij);
-                    else if (aij < 0 && other.min_finite)
-                        L = std::max(L, (rhs - other.min_act) / aij);
-                } else if (P.sense[i] == RowSense::GE) {
-                    if (aij > 0 && other.max_finite)
-                        L = std::max(L, (rhs - other.max_act) / aij);
-                    else if (aij < 0 && other.max_finite)
-                        U = std::min(U, (rhs - other.max_act) / aij);
-                } else {
-                    if (aij > 0) {
-                        if (other.min_finite)
-                            U = std::min(U, (rhs - other.min_act) / aij);
-                        if (other.max_finite)
-                            L = std::max(L, (rhs - other.max_act) / aij);
-                    } else {
-                        if (other.min_finite)
-                            L = std::max(L, (rhs - other.min_act) / aij);
-                        if (other.max_finite)
-                            U = std::min(U, (rhs - other.max_act) / aij);
-                    }
-                }
-                if (L > U + opt_.infeas_tol) {
-                    res_.proven_infeasible = true;
-                    return true;
-                }
-                if ((is_finite(L) && L > P.l(j) + opt_.zero_tol) ||
-                    (is_finite(U) && U < P.u(j) - opt_.zero_tol)) {
-                    res_.stack.emplace_back(ActTightenBound{j, P.l(j), P.u(j)});
-                    P.l(j) = L;
-                    P.u(j) = U;
-                    changed = true;
-                }
-            }
-        }
-        return changed;
+        if (!rows_feasible_(P, nullptr)) return true;
+        const ImpliedBoundsSummary implied =
+            collect_implied_bounds_(P, nullptr);
+        return apply_implied_bounds_(P, implied, nullptr, false);
     }
 
     bool domain_propagation_rounds(LP& P) {
@@ -808,107 +768,23 @@ class Presolver {
         std::vector<char> dirty_rows(m, 1), dirty_cols(n, 0);
         const int max_rounds = std::max(2, 2 * opt_.max_passes);
         for (int round = 0; round < max_rounds; ++round) {
-            bool round_changed = false;
             bool any_dirty_row = false;
             std::fill(dirty_cols.begin(), dirty_cols.end(), 0);
 
             for (int i = 0; i < m; ++i) {
-                if (!dirty_rows[i]) continue;
-                any_dirty_row = true;
-
-                const Eigen::RowVectorXd row = P.A.row(i);
-                const double rhs = P.b(i);
-                const ActivityRange ab =
-                    row_activity_range_excluding(row, P.l, P.u, -1,
-                                                 opt_.zero_tol);
-
-                if (P.sense[i] == RowSense::LE) {
-                    if (ab.min_finite && ab.min_act > rhs + opt_.infeas_tol) {
-                        res_.proven_infeasible = true;
-                        return true;
-                    }
-                } else if (P.sense[i] == RowSense::GE) {
-                    if (ab.max_finite && ab.max_act < rhs - opt_.infeas_tol) {
-                        res_.proven_infeasible = true;
-                        return true;
-                    }
-                } else {
-                    if ((ab.min_finite && ab.min_act > rhs + opt_.infeas_tol) ||
-                        (ab.max_finite && ab.max_act < rhs - opt_.infeas_tol)) {
-                        res_.proven_infeasible = true;
-                        return true;
-                    }
-                }
-
-                for (int jj = 0; jj < (int)row_cols[i].size(); ++jj) {
-                    const int j = row_cols[i][jj];
-                    const double aij = row(j);
-                    if (std::abs(aij) <= opt_.zero_tol) continue;
-
-                    const double L = P.l(j), U = P.u(j);
-                    const auto other = row_activity_range_excluding(
-                        row, P.l, P.u, j, opt_.zero_tol);
-                    double newL = L, newU = U;
-                    if (P.sense[i] == RowSense::LE) {
-                        if (aij > 0 && other.min_finite)
-                            newU = std::min(newU, (rhs - other.min_act) / aij);
-                        else if (aij < 0 && other.min_finite)
-                            newL = std::max(newL, (rhs - other.min_act) / aij);
-                    } else if (P.sense[i] == RowSense::GE) {
-                        if (aij > 0 && other.max_finite)
-                            newL = std::max(newL, (rhs - other.max_act) / aij);
-                        else if (aij < 0 && other.max_finite)
-                            newU = std::min(newU, (rhs - other.max_act) / aij);
-                    } else {
-                        if (aij > 0) {
-                            if (other.min_finite)
-                                newU =
-                                    std::min(newU, (rhs - other.min_act) / aij);
-                            if (other.max_finite)
-                                newL =
-                                    std::max(newL, (rhs - other.max_act) / aij);
-                        } else {
-                            if (other.min_finite)
-                                newL =
-                                    std::max(newL, (rhs - other.min_act) / aij);
-                            if (other.max_finite)
-                                newU =
-                                    std::min(newU, (rhs - other.max_act) / aij);
-                        }
-                    }
-
-                    if (newL > newU + opt_.infeas_tol) {
-                        res_.proven_infeasible = true;
-                        return true;
-                    }
-
-                    if (is_finite(newL) && is_finite(newU) &&
-                        std::abs(newU - newL) <= opt_.zero_tol) {
-                        const double xfix = 0.5 * (newL + newU);
-                        newL = xfix;
-                        newU = xfix;
-                    }
-
-                    const bool bigL =
-                        is_finite(newL) &&
-                        (!is_finite(L) || (newL - L) > domprop_min_delta_);
-                    const bool bigU =
-                        is_finite(newU) &&
-                        (!is_finite(U) || (U - newU) > domprop_min_delta_);
-                    if ((bigL && (!is_finite(L) || newL > L + opt_.zero_tol)) ||
-                        (bigU && (!is_finite(U) || newU < U - opt_.zero_tol))) {
-                        res_.stack.emplace_back(
-                            ActTightenBound{j, P.l(j), P.u(j)});
-                        P.l(j) = newL;
-                        P.u(j) = newU;
-                        dirty_cols[j] = 1;
-                        round_changed = true;
-                        changed_any = true;
-                    }
-                }
+                if (dirty_rows[i]) any_dirty_row = true;
             }
 
-            if (!any_dirty_row || !round_changed) break;
+            if (!any_dirty_row) break;
+            if (!rows_feasible_(P, &dirty_rows)) return true;
+
+            const ImpliedBoundsSummary implied =
+                collect_implied_bounds_(P, &dirty_rows);
+            const bool round_changed =
+                apply_implied_bounds_(P, implied, &dirty_cols, true);
+            if (res_.proven_infeasible) return true;
+            if (!round_changed) break;
+            changed_any = true;
 
             std::fill(dirty_rows.begin(), dirty_rows.end(), 0);
             for (int j = 0; j < n; ++j) {
@@ -922,82 +798,10 @@ class Presolver {
     }
 
     bool domain_propagation_once(LP& P) {
-        bool changed_any = false;
-        const int m = (int)P.A.rows(), n = (int)P.A.cols();
-        for (int i = 0; i < m; ++i) {
-            const Eigen::RowVectorXd row = P.A.row(i);
-            const double rhs = P.b(i);
-            const ActivityRange ab =
-                row_activity_range_excluding(row, P.l, P.u, -1,
-                                             opt_.zero_tol);
-
-            if (P.sense[i] == RowSense::LE) {
-                if (ab.min_finite && ab.min_act > rhs + opt_.infeas_tol) {
-                    res_.proven_infeasible = true;
-                    return true;
-                }
-            } else if (P.sense[i] == RowSense::GE) {
-                if (ab.max_finite && ab.max_act < rhs - opt_.infeas_tol) {
-                    res_.proven_infeasible = true;
-                    return true;
-                }
-            } else {
-                if ((ab.min_finite && ab.min_act > rhs + opt_.infeas_tol) ||
-                    (ab.max_finite && ab.max_act < rhs - opt_.infeas_tol)) {
-                    res_.proven_infeasible = true;
-                    return true;
-                }
-            }
-
-            for (int j = 0; j < n; ++j) {
-                const double aij = row(j);
-                if (std::abs(aij) <= opt_.zero_tol) continue;
-
-                double L = P.l(j), U = P.u(j);
-                const auto other = row_activity_range_excluding(
-                    row, P.l, P.u, j, opt_.zero_tol);
-                double newL = L, newU = U;
-                if (P.sense[i] == RowSense::LE) {
-                    if (aij > 0 && other.min_finite)
-                        newU = std::min(newU, (rhs - other.min_act) / aij);
-                    else if (aij < 0 && other.min_finite)
-                        newL = std::max(newL, (rhs - other.min_act) / aij);
-                } else if (P.sense[i] == RowSense::GE) {
-                    if (aij > 0 && other.max_finite)
-                        newL = std::max(newL, (rhs - other.max_act) / aij);
-                    else if (aij < 0 && other.max_finite)
-                        newU = std::min(newU, (rhs - other.max_act) / aij);
-                } else {
-                    if (aij > 0) {
-                        if (other.min_finite)
-                            newU = std::min(newU, (rhs - other.min_act) / aij);
-                        if (other.max_finite)
-                            newL = std::max(newL, (rhs - other.max_act) / aij);
-                    } else {
-                        if (other.min_finite)
-                            newL = std::max(newL, (rhs - other.min_act) / aij);
-                        if (other.max_finite)
-                            newU = std::min(newU, (rhs - other.max_act) / aij);
-                    }
-                }
-                if (newL > newU + opt_.infeas_tol) {
-                    res_.proven_infeasible = true;
-                    return true;
-                }
-
-                const bool bigL = (is_finite(L) && is_finite(newL) &&
-                                   (newL - L) > domprop_min_delta_);
-                const bool bigU = (is_finite(U) && is_finite(newU) &&
-                                   (U - newU) > domprop_min_delta_);
-                if ((bigL && newL > L) || (bigU && newU < U)) {
-                    res_.stack.emplace_back(ActTightenBound{j, P.l(j), P.u(j)});
-                    P.l(j) = std::max(L, newL);
-                    P.u(j) = std::min(U, newU);
-                    changed_any = true;
-                }
-            }
-        }
-        return changed_any;
+        if (!rows_feasible_(P, nullptr)) return true;
+        const ImpliedBoundsSummary implied =
+            collect_implied_bounds_(P, nullptr);
+        return apply_implied_bounds_(P, implied, nullptr, true);
     }
 
     ImpliedInterval singleton_implied_interval(const LP& P, int row_idx,
@@ -1052,6 +856,119 @@ class Presolver {
             std::swap(implied.lower, implied.upper);
         }
         return implied;
+    }
+
+    bool rows_feasible_(const LP& P, const std::vector<char>* active_rows) {
+        for (int i = 0; i < (int)P.A.rows(); ++i) {
+            if (active_rows && (i >= (int)active_rows->size() || !(*active_rows)[i])) {
+                continue;
+            }
+            const ActivityRange ab = row_activity_range_excluding(
+                P.A.row(i), P.l, P.u, -1, opt_.zero_tol);
+            const double rhs = P.b(i);
+            if (P.sense[i] == RowSense::LE) {
+                if (ab.min_finite && ab.min_act > rhs + opt_.infeas_tol) {
+                    res_.proven_infeasible = true;
+                    return false;
+                }
+            } else if (P.sense[i] == RowSense::GE) {
+                if (ab.max_finite && ab.max_act < rhs - opt_.infeas_tol) {
+                    res_.proven_infeasible = true;
+                    return false;
+                }
+            } else {
+                if ((ab.min_finite && ab.min_act > rhs + opt_.infeas_tol) ||
+                    (ab.max_finite && ab.max_act < rhs - opt_.infeas_tol)) {
+                    res_.proven_infeasible = true;
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    void merge_implied_interval_(ImpliedBoundsSummary& summary, int j,
+                                 const ImpliedInterval& implied) const {
+        if (j < 0 || j >= summary.impl_col_lower.size()) return;
+        if (implied.has_lower) {
+            if (!summary.has_lower[j] || implied.lower > summary.impl_col_lower(j)) {
+                summary.impl_col_lower(j) = implied.lower;
+            }
+            summary.has_lower[j] = 1;
+        }
+        if (implied.has_upper) {
+            if (!summary.has_upper[j] || implied.upper < summary.impl_col_upper(j)) {
+                summary.impl_col_upper(j) = implied.upper;
+            }
+            summary.has_upper[j] = 1;
+        }
+    }
+
+    ImpliedBoundsSummary collect_implied_bounds_(
+        const LP& P, const std::vector<char>* active_rows) const {
+        ImpliedBoundsSummary summary(P.A.cols());
+        for (int i = 0; i < (int)P.A.rows(); ++i) {
+            if (active_rows && (i >= (int)active_rows->size() || !(*active_rows)[i])) {
+                continue;
+            }
+            for (int j = 0; j < (int)P.A.cols(); ++j) {
+                if (std::abs(P.A(i, j)) <= opt_.zero_tol) continue;
+                merge_implied_interval_(summary, j,
+                                        singleton_implied_interval(P, i, j));
+            }
+        }
+        return summary;
+    }
+
+    bool apply_implied_bounds_(LP& P, const ImpliedBoundsSummary& summary,
+                               std::vector<char>* dirty_cols,
+                               bool require_big_delta) {
+        bool changed = false;
+        for (int j = 0; j < (int)P.A.cols(); ++j) {
+            double newL = P.l(j);
+            double newU = P.u(j);
+            if (j < (int)summary.has_lower.size() && summary.has_lower[j]) {
+                newL = std::max(newL, summary.impl_col_lower(j));
+            }
+            if (j < (int)summary.has_upper.size() && summary.has_upper[j]) {
+                newU = std::min(newU, summary.impl_col_upper(j));
+            }
+
+            if (newL > newU + opt_.infeas_tol) {
+                res_.proven_infeasible = true;
+                return true;
+            }
+            if (is_finite(newL) && is_finite(newU) &&
+                std::abs(newU - newL) <= opt_.zero_tol) {
+                const double xfix = 0.5 * (newL + newU);
+                newL = xfix;
+                newU = xfix;
+            }
+
+            const double oldL = P.l(j);
+            const double oldU = P.u(j);
+            const bool tightenL =
+                is_finite(newL) &&
+                (!is_finite(oldL) || newL > oldL + opt_.zero_tol) &&
+                (!require_big_delta || !is_finite(oldL) ||
+                 (newL - oldL) > domprop_min_delta_);
+            const bool tightenU =
+                is_finite(newU) &&
+                (!is_finite(oldU) || newU < oldU - opt_.zero_tol) &&
+                (!require_big_delta || !is_finite(oldU) ||
+                 (oldU - newU) > domprop_min_delta_);
+            if (!tightenL && !tightenU) continue;
+
+            res_.stack.emplace_back(ActTightenBound{j, oldL, oldU});
+            P.l(j) = tightenL ? newL : oldL;
+            P.u(j) = tightenU ? newU : oldU;
+            ++res_.implied_bound_updates;
+            if (dirty_cols && j < (int)dirty_cols->size()) {
+                (*dirty_cols)[j] = 1;
+            }
+            changed = true;
+        }
+        return changed;
     }
 
     bool apply_structural_fix(LP& P, int j, double xfix) {

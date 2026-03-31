@@ -80,13 +80,16 @@ class RevisedSimplexPrimalEngine {
         return out;
     }
 
+    template <class MatrixType>
     static RevisedSimplex::PhaseResult run(
-        RevisedSimplex& self, const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
+        RevisedSimplex& self, const MatrixType& A, const Eigen::VectorXd& b,
         const Eigen::VectorXd& c, std::optional<std::vector<int>> basis_opt,
         const Eigen::VectorXd& l, const Eigen::VectorXd& u) {
         const int m = static_cast<int>(A.rows());
         const int n = static_cast<int>(A.cols());
         int iters = 0;
+        Eigen::VectorXd c_work = c;
+        bool costs_perturbed = false;
 
         std::vector<int> basis;
         if (basis_opt) {
@@ -137,6 +140,7 @@ class RevisedSimplexPrimalEngine {
                      {"what", e.what()}}};
         }
         FTBasis& B = *Bopt;
+        self.degen_.start_basis_history(basis);
         self.trace_line_("[primal] start basis=" + self.format_basis_(basis));
 
         if (self.opt_.pricing_rule == "adaptive") {
@@ -144,6 +148,10 @@ class RevisedSimplexPrimalEngine {
             popts.steepest_pool_max = 0;
             popts.steepest_reset_freq = self.opt_.adaptive_reset_freq;
             popts.devex_reset_freq = self.opt_.devex_reset;
+            popts.primal_edge_weight_strategy =
+                self.opt_.primal_edge_weight_strategy;
+            popts.primal_weight_log_error_threshold =
+                self.opt_.primal_steepest_edge_weight_log_error_threshold;
             self.adaptive_pricer_ = AdaptivePricer(n, popts);
             self.adaptive_pricer_.build_primal_pools(B, A, N);
             self.bridge_ =
@@ -211,7 +219,7 @@ class RevisedSimplexPrimalEngine {
             xB = xB.cwiseMax(0.0);
 
             Eigen::VectorXd cB(m);
-            for (int i = 0; i < m; ++i) cB(i) = c(basis[i]);
+            for (int i = 0; i < m; ++i) cB(i) = c_work(basis[i]);
 
             Eigen::VectorXd y;
             try {
@@ -231,7 +239,7 @@ class RevisedSimplexPrimalEngine {
             Eigen::VectorXd rN_select(N.size());
             for (int k = 0; k < (int)N.size(); ++k) {
                 const int j = N[k];
-                rN(k) = c(j) - A.col(j).dot(y);
+                rN(k) = c_work(j) - A.col(j).dot(y);
                 rN_select(k) =
                     self.can_increase_from_lower_(j, l, u, self.opt_.tol)
                         ? rN(k)
@@ -260,9 +268,10 @@ class RevisedSimplexPrimalEngine {
                 if (self.opt_.pricing_rule == "adaptive") {
                     Eigen::VectorXd xcur =
                         self.assemble_primal_(n, basis, xB, l, u);
-                    const double current_obj = c.dot(xcur);
+                    const double current_obj = c_work.dot(xcur);
                     e_rel = self.bridge_->choose_primal_entering(
-                        rN_select, N, self.opt_.tol, iters, current_obj, B, A);
+                        rN_select, N, self.opt_.tol, iters, current_obj, B, A,
+                        self.opt_.partial_pricing);
                 } else {
                     int idx = -1;
                     double best = 0.0;
@@ -287,7 +296,7 @@ class RevisedSimplexPrimalEngine {
             }
 
             const int e = N[*e_rel];
-            const auto aE = A.col(e);
+            const Eigen::VectorXd aE = A.col(e);
 
             Eigen::VectorXd dB;
             try {
@@ -357,16 +366,42 @@ class RevisedSimplexPrimalEngine {
             const double alpha = dB(r);
             const int oldAbs = basis[r];
             const int eAbs = e;
+            const auto basis_cycle =
+                self.degen_.register_basis_change(basis, r, eAbs, iters);
+            if (basis_cycle.repeated_basis) {
+                self.trace_line_("[primal] iter=" + std::to_string(iters) +
+                                 " repeated basis candidate leave_var=" +
+                                 std::to_string(oldAbs) + " enter=" +
+                                 std::to_string(eAbs) +
+                                 (basis_cycle.cycling_detected
+                                      ? " cycle_detected=1"
+                                      : " cycle_detected=0"));
+            }
 
             const bool is_degenerate =
                 self.degen_.detect_degeneracy(step, self.opt_.deg_step_tol);
-            if (is_degenerate && self.degen_.should_apply_perturbation()) {
-                auto [Ap, bp, cp] =
-                    self.degen_.apply_perturbation(A, b, c, basis, iters);
-                (void)Ap;
-                (void)bp;
-                (void)cp;
+            if (basis_cycle.cycling_detected ||
+                (is_degenerate && self.degen_.should_apply_perturbation())) {
+                if (!costs_perturbed) {
+                    const double rel_multiplier =
+                        1e-8 *
+                        std::max(1e-6,
+                                 self.opt_.primal_simplex_cost_perturbation_multiplier);
+                    const double abs_multiplier =
+                        1e-10 *
+                        std::max(1e-6,
+                                 self.opt_.primal_simplex_cost_perturbation_multiplier);
+                    degeneracy_helpers::perturbCosts(c_work, self.rng_,
+                                                     rel_multiplier);
+                    degeneracy_helpers::perturbCostsAbsolute(c_work, self.rng_,
+                                                             abs_multiplier);
+                    costs_perturbed = true;
+                }
             } else {
+                if (costs_perturbed) {
+                    c_work = c;
+                    costs_perturbed = false;
+                }
                 (void)self.degen_.reset_perturbation();
             }
 
@@ -395,7 +430,6 @@ class RevisedSimplexPrimalEngine {
 
             try {
                 B.replace_column(r, aE);
-                B.refactor();
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["scikit-build-core>=0.9"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "simplinho"
+version = "0.1.0"
+description = "Simple revised simplex LP solver with Python bindings"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Laio O. Seman", email = "laio@ufsc.br" }]
+requires-python = ">=3.10"
+keywords = ["linear programming", "simplex", "optimization", "operations research"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+[project.urls]
+Repository = "https://github.com/lseman/simplinho"
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = []

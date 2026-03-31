@@ -5,13 +5,47 @@
 #include <Eigen/Dense>
 
 #include <cmath>
+#include <cstdint>
 #include <deque>
+#include <limits>
 #include <optional>
 #include <random>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+
+// ============================================================================
+// HiGHS-inspired cost perturbation utilities for degeneracy handling
+// ============================================================================
+namespace degeneracy_helpers {
+
+// Add small random perturbations to cost vector to break degeneracy
+// Perturbation magnitude is relative to cost magnitude (HiGHS-inspired)
+inline void perturbCosts(Eigen::VectorXd& c, std::mt19937& rng,
+                         double perturbation_multiplier = 1e-8) {
+    std::normal_distribution<double> pert(0.0, 1.0);
+    for (int i = 0; i < c.size(); ++i) {
+        if (std::abs(c(i)) > 1e-14) {
+            // Relative perturbation: perturbation * |c[i]|
+            c(i) += pert(rng) * perturbation_multiplier * std::abs(c(i));
+        }
+    }
+}
+
+// Add absolute perturbation (useful when costs are near zero)
+inline void perturbCostsAbsolute(Eigen::VectorXd& c, std::mt19937& rng,
+                                 double perturbation_amount = 1e-10) {
+    std::uniform_real_distribution<double> pert(-1.0, 1.0);
+    for (int i = 0; i < c.size(); ++i) {
+        if (std::abs(c(i)) < 1e-14) {
+            c(i) += pert(rng) * perturbation_amount;
+        }
+    }
+}
+
+}  // namespace degeneracy_helpers
 
 // ============================================================================
 // DegeneracyManager
@@ -20,6 +54,11 @@
 // ============================================================================
 class DegeneracyManager {
    public:
+    struct BasisCycleEvent {
+        bool repeated_basis{false};
+        bool cycling_detected{false};
+    };
+
     // Signals sent to the primal pricer (nudge only; pricer remains
     // authoritative)
     struct DegeneracySignals {
@@ -80,6 +119,50 @@ class DegeneracyManager {
     bool should_apply_perturbation() const {
         return (deg_streak_ > std::max(10, adaptive_deg_threshold_) &&
                 !perturb_on_);
+    }
+
+    void start_basis_history(const std::vector<int>& basis) {
+        visited_basis_hashes_.clear();
+        current_basis_hash_ = compute_basis_hash_(basis);
+        visited_basis_hashes_.insert(current_basis_hash_);
+        basis_hash_initialized_ = true;
+        previous_iteration_basis_repeat_ = std::numeric_limits<int>::min() / 4;
+    }
+
+    BasisCycleEvent register_basis_change(const std::vector<int>& basis,
+                                          int leaving_rel, int entering_abs,
+                                          int iteration) {
+        BasisCycleEvent event;
+        if (leaving_rel < 0 || leaving_rel >= static_cast<int>(basis.size()) ||
+            entering_abs < 0) {
+            return event;
+        }
+
+        if (!basis_hash_initialized_) start_basis_history(basis);
+
+        const int leaving_abs = basis[leaving_rel];
+        if (leaving_abs < 0 || leaving_abs == entering_abs) {
+            return event;
+        }
+
+        const std::uint64_t next_hash =
+            current_basis_hash_ ^ basis_token_(leaving_abs) ^
+            basis_token_(entering_abs);
+        event.repeated_basis =
+            visited_basis_hashes_.find(next_hash) != visited_basis_hashes_.end();
+        if (event.repeated_basis) {
+            ++basis_repeat_total_;
+            if (iteration == previous_iteration_basis_repeat_ + 1) {
+                event.cycling_detected = true;
+                ++basis_cycle_total_;
+                cycling_len_ = std::max(cycling_len_, 4);
+            }
+            previous_iteration_basis_repeat_ = iteration;
+        }
+
+        current_basis_hash_ = next_hash;
+        visited_basis_hashes_.insert(current_basis_hash_);
+        return event;
     }
 
     // Compatibility: does not modify A,b,c anymore
@@ -199,6 +282,8 @@ class DegeneracyManager {
         int degeneracy_streak{0};
         int degeneracy_total{0};
         int suspected_cycling{0};
+        int repeated_basis_hits{0};
+        int basis_cycle_hits{0};
         double cond_est{0.0};
         int adaptive_deg_threshold{10};
         int epoch{0};
@@ -207,6 +292,8 @@ class DegeneracyManager {
         return Stats{deg_streak_,
                      deg_total_,
                      cycling_len_,
+                     basis_repeat_total_,
+                     basis_cycle_total_,
                      cond_est_,
                      adaptive_deg_threshold_,
                      epoch_};
@@ -237,9 +324,33 @@ class DegeneracyManager {
         perturb_on_ = false;
         current_method_ = default_method_;
         signals_ = {};
+        basis_hash_initialized_ = false;
+        current_basis_hash_ = 0;
+        visited_basis_hashes_.clear();
+        previous_iteration_basis_repeat_ = std::numeric_limits<int>::min() / 4;
+        basis_repeat_total_ = 0;
+        basis_cycle_total_ = 0;
     }
 
    private:
+    static std::uint64_t mix_u64_(std::uint64_t x) {
+        x += 0x9e3779b97f4a7c15ULL;
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+        return x ^ (x >> 31);
+    }
+    static std::uint64_t basis_token_(int col) {
+        return mix_u64_(static_cast<std::uint64_t>(
+            static_cast<std::int64_t>(col) + 0x100000001b3LL));
+    }
+    static std::uint64_t compute_basis_hash_(const std::vector<int>& basis) {
+        std::uint64_t hash = 0;
+        for (const int col : basis) {
+            if (col >= 0) hash ^= basis_token_(col);
+        }
+        return hash;
+    }
+
     // --- small helpers ---
     void push_step_(double s) {
         if ((int)step_hist_.size() >= dm_consts::kStepHistCap)
@@ -333,4 +444,12 @@ class DegeneracyManager {
 
     // Outgoing signals
     DegeneracySignals signals_;
+
+    // Basis-hash based cycling detection
+    bool basis_hash_initialized_{false};
+    std::uint64_t current_basis_hash_{0};
+    std::unordered_set<std::uint64_t> visited_basis_hashes_;
+    int previous_iteration_basis_repeat_{std::numeric_limits<int>::min() / 4};
+    int basis_repeat_total_{0};
+    int basis_cycle_total_{0};
 };

@@ -16,3 +16,13 @@ build-verify/
 # IDE files
 .vscode/
 .idea/
+
+__pycache__/
+.codex/
+highs-sources/
+CLAUDE.md
+.codex
+publish.sh
+papers/
+bnb_python/
+bnb_hihs_improvements.md
