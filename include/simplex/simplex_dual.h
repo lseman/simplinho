@@ -449,8 +449,36 @@ class RevisedSimplexDualEngine {
             Eigen::VectorXd ydual = B.solve_BT(cB);
             apply_views_to_nonbasics(ydual);
         }
-        B.refactor();
-        dual_pricer.build_dual_pool(B, Ahat, N);
+        try {
+            B.refactor();
+        } catch (const std::exception& e) {
+            return {LPSolution::Status::Singular,
+                    Eigen::VectorXd::Zero(n),
+                    basis,
+                    0,
+                    {{"where", "dual initial refactor failed"}, {"what", e.what()}}};
+        }
+        auto rebuild_dual_pool = [&](const char* where, int iter)
+            -> std::optional<RevisedSimplex::PhaseResult> {
+            try {
+                dual_pricer.build_dual_pool(B, Ahat, N);
+                return std::nullopt;
+            } catch (const std::exception& e) {
+                std::unordered_map<std::string, std::string> info{
+                    {"where", where},
+                    {"what", e.what()},
+                };
+                if (iter > 0) {
+                    info["iter"] = std::to_string(iter);
+                }
+                return RevisedSimplex::PhaseResult{LPSolution::Status::Singular,
+                                                   Eigen::VectorXd::Zero(n), basis, iter,
+                                                   std::move(info)};
+            }
+        };
+        if (auto failed = rebuild_dual_pool("dual initial pricing setup failed", 0)) {
+            return *failed;
+        }
         self.trace_line_("[dual] start basis=" + self.format_basis_(basis));
 
         int rebuild_attempts = 0;
@@ -492,7 +520,10 @@ class RevisedSimplexDualEngine {
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after solve_B failure");
                         B.refactor();
-                        dual_pricer.build_dual_pool(B, Ahat, N);
+                        if (auto failed =
+                                rebuild_dual_pool("dual pricing rebuild failed after solve_B", iters)) {
+                            return *failed;
+                        }
                         continue;
                     }
                     return {LPSolution::Status::Singular,
@@ -509,14 +540,21 @@ class RevisedSimplexDualEngine {
                     self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                      " refactor after solve_BT failure");
                     B.refactor();
-                    dual_pricer.build_dual_pool(B, Ahat, N);
+                    if (auto failed =
+                            rebuild_dual_pool("dual pricing rebuild failed after solve_BT", iters)) {
+                        return *failed;
+                    }
                     ydual = B.solve_BT(cB);
                 }
 
                 if (!(warm_views_provided && iters == 1) &&
                     apply_views_to_nonbasics(ydual)) {
                     rhs_eff = b - transformed_rhs(A, view, l, u);
-                    dual_pricer.build_dual_pool(B, Ahat, N);
+                    if (auto failed =
+                            rebuild_dual_pool("dual pricing rebuild failed after bound view update",
+                                              iters)) {
+                        return *failed;
+                    }
                     continue;
                 }
 
@@ -576,7 +614,10 @@ class RevisedSimplexDualEngine {
                             "[dual] iter=" + std::to_string(iters) +
                             " refactor after no eligible entering");
                         B.refactor();
-                        dual_pricer.build_dual_pool(B, Ahat, N);
+                        if (auto failed = rebuild_dual_pool(
+                                "dual pricing rebuild failed after no eligible entering", iters)) {
+                            return *failed;
+                        }
                         continue;
                     }
                     return {LPSolution::Status::Singular,
@@ -617,13 +658,44 @@ class RevisedSimplexDualEngine {
                         ++flips_this_iter;
                         ++total_flips;
                     }
-                    dual_pricer.build_dual_pool(B, Ahat, N);
+                    if (auto failed =
+                            rebuild_dual_pool("dual pricing rebuild failed after bound flips", iters)) {
+                        return *failed;
+                    }
                     continue;
                 }
 
                 e_rel = *bfrt.pivot_rel;
                 eAbs = N[e_rel];
                 tau = bfrt.tau;
+                if (self.degen_.would_repeat_basis_change(basis, r_leave, eAbs)) {
+                    int alt_rel = -1;
+                    double alt_tau = std::numeric_limits<double>::infinity();
+                    for (int k = 0; k < static_cast<int>(N.size()); ++k) {
+                        if (k == e_rel || !(pN(k) < -self.opt_.ratio_delta)) {
+                            continue;
+                        }
+                        const double candidate_tau = rN(k) / (-pN(k));
+                        if (!std::isfinite(candidate_tau) || candidate_tau < 0.0) {
+                            continue;
+                        }
+                        const int candidate_abs = N[k];
+                        if (self.degen_.would_repeat_basis_change(basis, r_leave, candidate_abs)) {
+                            continue;
+                        }
+                        if (candidate_tau < alt_tau - 1e-16 ||
+                            (std::abs(candidate_tau - alt_tau) <= 1e-16 &&
+                             (alt_rel < 0 || candidate_abs < N[alt_rel]))) {
+                            alt_rel = k;
+                            alt_tau = candidate_tau;
+                        }
+                    }
+                    if (alt_rel >= 0) {
+                        e_rel = alt_rel;
+                        eAbs = N[e_rel];
+                        tau = alt_tau;
+                    }
+                }
                 try {
                     const Eigen::VectorXd entering_col = Ahat.col(eAbs);
                     s_enter = B.solve_B(entering_col);
@@ -633,7 +705,10 @@ class RevisedSimplexDualEngine {
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after solve(B,a_e) failure");
                         B.refactor();
-                        dual_pricer.build_dual_pool(B, Ahat, N);
+                        if (auto failed = rebuild_dual_pool(
+                                "dual pricing rebuild failed after solve(B,a_e)", iters)) {
+                            return *failed;
+                        }
                         continue;
                     }
                     return {LPSolution::Status::Singular,
@@ -711,6 +786,8 @@ class RevisedSimplexDualEngine {
                 }
                 (void)self.degen_.reset_perturbation();
             }
+            self.degen_.after_pivot(r_leave, eAbs, tau, 0.0,
+                                    std::isfinite(tau) ? std::abs(tau) : 0.0);
 
             if (self.should_trace_iter_(iters)) {
                 Eigen::VectorXd xcur = assemble_transformed_primal(
@@ -734,14 +811,20 @@ class RevisedSimplexDualEngine {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
                 B.refactor();
-                dual_pricer.build_dual_pool(B, Ahat, N);
+                if (auto failed =
+                        rebuild_dual_pool("dual pricing rebuild failed after replace_column", iters)) {
+                    return *failed;
+                }
             }
 
             dual_pricer.update_after_dual_pivot(r_leave, eAbs, oldAbs, s_enter,
                                                 s_enter(r_leave), Ahat, N, w,
                                                 true);
             if (dual_pricer.needs_rebuild()) {
-                dual_pricer.build_dual_pool(B, Ahat, N);
+                if (auto failed =
+                        rebuild_dual_pool("dual pricing rebuild failed after pivot update", iters)) {
+                    return *failed;
+                }
                 dual_pricer.clear_rebuild_flag();
             }
             if (self.should_trace_iter_(iters) &&

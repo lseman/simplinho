@@ -18,48 +18,54 @@ import argparse
 import importlib
 import math
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def add_repo_venv_to_path() -> None:
-    """Make the repo venv importable when running under system Python."""
-    candidates = sorted((ROOT / ".venv" / "lib").glob("python*/site-packages"))
-    for candidate in candidates:
-        text = str(candidate)
-        if text not in sys.path:
-            sys.path.insert(0, text)
+ROOT = Path.cwd().parent if Path.cwd().name.startswith("tests") else Path.cwd()
 
 
-def import_simplex_module():
-    candidates = [
-        ROOT / "build-local",
-        ROOT / "build",
-        ROOT / "build-verify",
-    ]
-    module_names = ["simplinho", "simplex"]
-    for candidate in candidates:
+def import_simplinho():
+    required_attrs = ("BranchAndBoundOptions", "MIPSolution", "MIPStatus")
+    errors = []
+
+    for build_dir in ("build-perf", "build", "build-verify"):
+        candidate = ROOT / build_dir
         if not candidate.exists():
             continue
-        built_modules = list(candidate.glob("*.so"))
-        if not built_modules:
+
+        module_files = sorted(candidate.glob("simplinho*.so"))
+        if not module_files:
             continue
-        sys.path.insert(0, str(candidate))
-        for module_name in module_names:
-            try:
-                return importlib.import_module(module_name)
-            except ImportError:
-                continue
+
+        module_path = module_files[0]
+
+        try:
+            sys.modules.pop("simplinho", None)
+            spec = importlib.util.spec_from_file_location("simplinho", module_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"could not create import spec for {module_path}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["simplinho"] = module
+            spec.loader.exec_module(module)
+            if all(hasattr(module, attr) for attr in required_attrs):
+                return module, candidate
+            errors.append(f"{build_dir}: loaded {module_path} but MIP API is missing")
+        except Exception as exc:
+            errors.append(f"{build_dir}: {type(exc).__name__}: {exc}")
+        finally:
+            sys.modules.pop("simplinho", None)
+
     raise ImportError(
-        "Could not find a built solver extension in build-local/, build/, or "
-        "build-verify/."
+        "could not find a built simplinho module with MIP bindings. Tried: "
+        + "; ".join(errors)
     )
+
+
+simplex, BUILD_DIR = import_simplinho()
 
 
 @dataclass
@@ -222,6 +228,136 @@ def solve_with_highs(highspy, case: ProblemCase) -> SolverResult:
     )
 
 
+def build_random_lp_case(
+    name: str, rows: int, cols: int, density: float = 0.2, seed: int | None = None
+) -> ProblemCase:
+    rng = np.random.default_rng(seed)
+    A = rng.choice(
+        [0.0, 1.0, -1.0], size=(rows, cols), p=[1 - density, density / 2, density / 2]
+    )
+    A = A.astype(float)
+    b = rng.uniform(-10.0, 10.0, size=(rows,))
+    c = rng.uniform(-10.0, 10.0, size=(cols,))
+    l = np.full((cols,), 0.0)
+    u = np.full((cols,), 10.0)
+    return ProblemCase(name=name, A=A, b=b, c=c, l=l, u=u)
+
+
+def build_benchmark_case(
+    rng: np.random.Generator,
+    name: str,
+    rows: int,
+    cols: int,
+    density: float = 0.2,
+) -> ProblemCase:
+    for attempt in range(100):
+        A = rng.normal(size=(rows, cols))
+        mask = rng.random(size=A.shape) < density
+        A *= mask
+        for i in range(rows):
+            if np.all(np.abs(A[i, :]) <= 1e-12):
+                A[i, int(rng.integers(0, cols))] = float(rng.normal())
+        for j in range(cols):
+            if np.all(np.abs(A[:, j]) <= 1e-12):
+                A[int(rng.integers(0, rows)), j] = float(rng.normal())
+        if rows == 0 or np.linalg.matrix_rank(A) == rows:
+            break
+    else:
+        raise RuntimeError("failed to build a full-row-rank benchmark LP")
+
+    l, u = sample_bounds(rng, cols, require_finite_box=True)
+    x_star = sample_feasible_point(rng, l, u)
+    b = A @ x_star
+    c = rng.normal(size=cols)
+
+    return ProblemCase(
+        name=name,
+        A=A.astype(float),
+        b=b.astype(float),
+        c=c.astype(float),
+        l=l.astype(float),
+        u=u.astype(float),
+        expected="optimal",
+    )
+
+
+def parse_integer_list(value: str) -> list[int]:
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def run_benchmark(args: argparse.Namespace) -> int:
+
+    try:
+        import highspy  # type: ignore
+    except ImportError:
+        highspy = None
+
+    rng = np.random.default_rng(args.seed)
+    sizes = sorted(set(parse_integer_list(args.benchmark_sizes)))
+    benchmark_rows = [
+        max(1, min(size, int(size * args.benchmark_row_ratio))) for size in sizes
+    ]
+
+    print(f"Benchmark sizes: {sizes}")
+    print(f"Benchmark rows per size: {benchmark_rows}")
+    print(f"Benchmark runs per size: {args.benchmark_runs}")
+    if highspy is None:
+        print("highspy not available; running simplex-only benchmark")
+    else:
+        print(f"Loaded highspy {getattr(highspy, '__version__', 'unknown')}")
+
+    for size, rows in zip(sizes, benchmark_rows):
+        build_times: list[float] = []
+        simplex_times: list[float] = []
+        highs_times: list[float] = []
+        for run_idx in range(args.benchmark_runs):
+            build_start = time.perf_counter()
+            case = build_random_benchmark_case(
+                rng,
+                f"benchmark_{size}_{run_idx}",
+                rows,
+                size,
+                density=args.benchmark_density,
+            )
+            build_times.append(time.perf_counter() - build_start)
+
+            try:
+                solve_start = time.perf_counter()
+                solve_with_simplex(simplex, case, args.mode)
+                simplex_times.append(time.perf_counter() - solve_start)
+            except RuntimeError as err:
+                print(
+                    f"WARNING: simplex failed for size={size} run={run_idx}: {err}",
+                    flush=True,
+                )
+
+            if highspy is not None:
+                try:
+                    highs_start = time.perf_counter()
+                    solve_with_highs(highspy, case)
+                    highs_times.append(time.perf_counter() - highs_start)
+                except Exception as err:
+                    print(
+                        f"WARNING: highspy failed for size={size} run={run_idx}: {err}",
+                        flush=True,
+                    )
+
+        avg_build = float(np.mean(build_times)) if build_times else float("nan")
+        avg_simplex = float(np.mean(simplex_times)) if simplex_times else float("nan")
+        avg_highs = float(np.mean(highs_times)) if highs_times else float("nan")
+        print(
+            f"size={size:3d} rows={rows:3d} build={avg_build:.6f}s "
+            f"simplex={avg_simplex:.6f}s",
+            end="",
+        )
+        if highspy is not None:
+            print(f" highs={avg_highs:.6f}s")
+        else:
+            print()
+
+    return 0
+
+
 def objective_close(lhs: float, rhs: float, tol: float) -> bool:
     if not (math.isfinite(lhs) and math.isfinite(rhs)):
         return lhs == rhs
@@ -246,7 +382,9 @@ def exercise_model_editing_api(simplex) -> list[str]:
     if not objective_close(sol1.obj, 8.0, 1e-8):
         notes.append(f"initial objective mismatch: expected 8.0, got {sol1.obj:.10g}")
     if not objective_close(sol1.value(y), 4.0, 1e-8):
-        notes.append(f"initial y value mismatch: expected 4.0, got {sol1.value(y):.10g}")
+        notes.append(
+            f"initial y value mismatch: expected 4.0, got {sol1.value(y):.10g}"
+        )
 
     x.obj = 3.0
     if not objective_close(x.obj, 3.0, 1e-12):
@@ -255,7 +393,9 @@ def exercise_model_editing_api(simplex) -> list[str]:
     c1.set_coeff(y, 2.0)
     c1.rhs = 5.0
     if not objective_close(c1.get_coeff(y), 2.0, 1e-12):
-        notes.append(f"constraint coefficient update failed: got {c1.get_coeff(y):.10g}")
+        notes.append(
+            f"constraint coefficient update failed: got {c1.get_coeff(y):.10g}"
+        )
     if not objective_close(c1.rhs, 5.0, 1e-12):
         notes.append(f"constraint rhs update failed: got {c1.rhs:.10g}")
     if not objective_close(model.getObjCoeff(x), 3.0, 1e-12):
@@ -281,7 +421,9 @@ def exercise_model_editing_api(simplex) -> list[str]:
     if model.num_vars != 1:
         notes.append(f"expected 1 variable after deletion, got {model.num_vars}")
     if y.name != "y":
-        notes.append(f"surviving variable handle did not resolve back to y, got {y.name!r}")
+        notes.append(
+            f"surviving variable handle did not resolve back to y, got {y.name!r}"
+        )
 
     try:
         _ = x.lb
@@ -326,7 +468,9 @@ def exercise_solver_logging_api(simplex) -> list[str]:
     if stats.status != "optimal":
         notes.append(f"stats.status mismatch: expected 'optimal', got {stats.status!r}")
     if stats.iterations != sol.iters:
-        notes.append(f"stats.iterations mismatch: expected {sol.iters}, got {stats.iterations}")
+        notes.append(
+            f"stats.iterations mismatch: expected {sol.iters}, got {stats.iterations}"
+        )
     if stats.phase2_iterations > stats.iterations:
         notes.append("phase2_iterations exceeded total iterations")
     if stats.trace_lines != len(sol.log_lines):
@@ -336,8 +480,10 @@ def exercise_solver_logging_api(simplex) -> list[str]:
         )
     if stats.trace_lines <= 0:
         notes.append("expected verbose solve to emit at least one trace line")
-    if "[solve] start" not in sol.log:
-        notes.append("expected joined log text to contain '[solve] start'")
+    if "[solve] start" not in sol.log and "[solve] sparse start" not in sol.log:
+        notes.append(
+            "expected joined log text to contain '[solve] start' or '[solve] sparse start'"
+        )
     if "raw_info" not in stats.as_dict():
         notes.append("SolveStats.as_dict() did not include raw_info")
     if not isinstance(stats.raw_info, dict):
@@ -353,8 +499,10 @@ def exercise_solver_logging_api(simplex) -> list[str]:
     raw_stats = raw.stats
     if raw_stats.trace_lines != len(raw.log_lines):
         notes.append("LPSolution trace_lines did not match low-level log length")
-    if "[solve] start" not in raw.log:
-        notes.append("expected low-level joined log text to contain '[solve] start'")
+    if "[solve] start" not in raw.log and "[solve] sparse start" not in raw.log:
+        notes.append(
+            "expected low-level joined log text to contain '[solve] start' or '[solve] sparse start'"
+        )
 
     return notes
 
@@ -389,7 +537,9 @@ def exercise_basis_warm_start_api(simplex) -> list[str]:
     if simplex.status_to_string(sol2.status) != "optimal":
         notes.append("automatic dual warm-start reoptimize() was not optimal")
     if sol2.value(x) > 1.5 + 1e-8:
-        notes.append(f"automatic reoptimize() violated tightened upper bound: {sol2.value(x):.10g}")
+        notes.append(
+            f"automatic reoptimize() violated tightened upper bound: {sol2.value(x):.10g}"
+        )
     if sol2.stats.basis_start not in {"warm_start", "repaired_warm_start"}:
         notes.append(
             f"expected automatic warm-start basis source, got {sol2.stats.basis_start!r}"
@@ -400,7 +550,9 @@ def exercise_basis_warm_start_api(simplex) -> list[str]:
     if simplex.status_to_string(sol3.status) != "optimal":
         notes.append("explicit dual warm-start reoptimize() was not optimal")
     if sol3.value(x) > 1.0 + 1e-8:
-        notes.append(f"explicit basis reoptimize() violated tightened upper bound: {sol3.value(x):.10g}")
+        notes.append(
+            f"explicit basis reoptimize() violated tightened upper bound: {sol3.value(x):.10g}"
+        )
     if sol3.stats.basis_start not in {"warm_start", "repaired_warm_start"}:
         notes.append(
             f"expected explicit warm-start basis source, got {sol3.stats.basis_start!r}"
@@ -502,8 +654,14 @@ def exercise_basis_correctness_for_gomory(simplex) -> list[str]:
     notes: list[str] = []
     tol = 1e-8
 
-    def check_case(name: str, A: np.ndarray, b: np.ndarray, c: np.ndarray,
-                   l: np.ndarray, u: np.ndarray) -> list[str]:
+    def check_case(
+        name: str,
+        A: np.ndarray,
+        b: np.ndarray,
+        c: np.ndarray,
+        l: np.ndarray,
+        u: np.ndarray,
+    ) -> list[str]:
         errs: list[str] = []
         opts = simplex.RevisedSimplexOptions()
         opts.mode = simplex.SimplexMode.Auto
@@ -532,9 +690,7 @@ def exercise_basis_correctness_for_gomory(simplex) -> list[str]:
         x = np.array(sol.x)
         x_err = np.max(np.abs(x[basis] - rhs))
         if x_err > tol:
-            errs.append(
-                f"[{name}] original rhs != x[basis]  (max err {x_err:.2e})"
-            )
+            errs.append(f"[{name}] original rhs != x[basis]  (max err {x_err:.2e})")
 
         # 2. Primal feasibility: A x == b
         eq_err = np.max(np.abs(A @ x - b))
@@ -544,9 +700,7 @@ def exercise_basis_correctness_for_gomory(simplex) -> list[str]:
         # 3. Identity on basis columns: T[:, basis] == I
         id_err = np.max(np.abs(T[:, basis] - np.eye(m)))
         if id_err > tol:
-            errs.append(
-                f"[{name}] T[:,basis] != I  (max err {id_err:.2e})"
-            )
+            errs.append(f"[{name}] T[:,basis] != I  (max err {id_err:.2e})")
 
         # 4. Dual feasibility (min): rc[nonbasic] >= -tol
         if nonbasis:
@@ -614,9 +768,7 @@ def exercise_basis_correctness_for_gomory(simplex) -> list[str]:
         # Identity on basis cols
         id_err = np.max(np.abs(T[:, basis_int] - np.eye(m_int)))
         if id_err > tol:
-            errs.append(
-                f"[{name}] internal T[:,basis] != I  (max err {id_err:.2e})"
-            )
+            errs.append(f"[{name}] internal T[:,basis] != I  (max err {id_err:.2e})")
         # Primal feasibility in std form
         if np.any(rhs < -tol):
             errs.append(
@@ -635,41 +787,50 @@ def exercise_basis_correctness_for_gomory(simplex) -> list[str]:
 
     # --- Test 1: trivial 1-row ---
     # min -x - y  s.t. x + y = 4, x,y >= 0  →  optimal at corner (4,0) or (0,4)
-    notes.extend(check_case(
-        "simple_eq",
-        A=np.array([[1.0, 1.0]]),
-        b=np.array([4.0]),
-        c=np.array([-1.0, -1.0]),
-        l=np.array([0.0, 0.0]),
-        u=np.array([inf, inf]),
-    ))
+    notes.extend(
+        check_case(
+            "simple_eq",
+            A=np.array([[1.0, 1.0]]),
+            b=np.array([4.0]),
+            c=np.array([-1.0, -1.0]),
+            l=np.array([0.0, 0.0]),
+            u=np.array([inf, inf]),
+        )
+    )
 
     # --- Test 2: 2-row LP in standard form, fractional LP optimal ---
     # min -5x1 - 4x2  s.t.  x1+x2+s1=5,  10x1+6x2+s2=45,  all >= 0
     # Optimal: x1=3, x2=1.5  (fractional → Gomory cut check fires)
-    notes.extend(check_case(
-        "bounded_2d",
-        A=np.array([[1.0, 1.0, 1.0, 0.0],
-                    [10.0, 6.0, 0.0, 1.0]]),
-        b=np.array([5.0, 45.0]),
-        c=np.array([-5.0, -4.0, 0.0, 0.0]),
-        l=np.zeros(4),
-        u=np.full(4, inf),
-    ))
+    notes.extend(
+        check_case(
+            "bounded_2d",
+            A=np.array([[1.0, 1.0, 1.0, 0.0], [10.0, 6.0, 0.0, 1.0]]),
+            b=np.array([5.0, 45.0]),
+            c=np.array([-5.0, -4.0, 0.0, 0.0]),
+            l=np.zeros(4),
+            u=np.full(4, inf),
+        )
+    )
 
     # --- Test 3: 3-row fractional LP relaxation ---
     # min -x1 - x2  s.t.  x1+x2+s1=5.5, x1+s2=3.5, x2+s3=3.5,  all >= 0
     # Optimal: x1=3.5, x2=2 (or x1=2, x2=3.5) — two fractional cuts possible
-    notes.extend(check_case(
-        "fractional_lp",
-        A=np.array([[1.0, 1.0, 1.0, 0.0, 0.0],
+    notes.extend(
+        check_case(
+            "fractional_lp",
+            A=np.array(
+                [
+                    [1.0, 1.0, 1.0, 0.0, 0.0],
                     [1.0, 0.0, 0.0, 1.0, 0.0],
-                    [0.0, 1.0, 0.0, 0.0, 1.0]]),
-        b=np.array([5.5, 3.5, 3.5]),
-        c=np.array([-1.0, -1.0, 0.0, 0.0, 0.0]),
-        l=np.zeros(5),
-        u=np.full(5, inf),
-    ))
+                    [0.0, 1.0, 0.0, 0.0, 1.0],
+                ]
+            ),
+            b=np.array([5.5, 3.5, 3.5]),
+            c=np.array([-1.0, -1.0, 0.0, 0.0, 0.0]),
+            l=np.zeros(5),
+            u=np.full(5, inf),
+        )
+    )
 
     return notes
 
@@ -683,9 +844,7 @@ def compare_results(
     notes: list[str] = []
 
     if case.expected and ours.status != case.expected:
-        notes.append(
-            f"simplex status {ours.status!r} != expected {case.expected!r}"
-        )
+        notes.append(f"simplex status {ours.status!r} != expected {case.expected!r}")
 
     if highs is None:
         if ours.status == "optimal":
@@ -703,9 +862,7 @@ def compare_results(
     if comparable_statuses == {"infeasible", "ambiguous"}:
         pass
     elif ours.status != highs.status:
-        notes.append(
-            f"status mismatch simplex={ours.status!r} highs={highs.status!r}"
-        )
+        notes.append(f"status mismatch simplex={ours.status!r} highs={highs.status!r}")
 
     if ours.status == "optimal" and highs.status == "optimal":
         if not objective_close(ours.objective, highs.objective, tol):
@@ -878,14 +1035,17 @@ def format_result_line(
     passed: bool,
 ) -> str:
     mark = "PASS" if passed else "FAIL"
-    ours_obj = f"{ours.objective:.8g}" if math.isfinite(ours.objective) else str(ours.objective)
+    ours_obj = (
+        f"{ours.objective:.8g}"
+        if math.isfinite(ours.objective)
+        else str(ours.objective)
+    )
     if highs is None:
-        return (
-            f"{mark:4}  {case.name:24} "
-            f"simplex={ours.status:12} obj={ours_obj:>12}"
-        )
+        return f"{mark:4}  {case.name:24} simplex={ours.status:12} obj={ours_obj:>12}"
     highs_obj = (
-        f"{highs.objective:.8g}" if math.isfinite(highs.objective) else str(highs.objective)
+        f"{highs.objective:.8g}"
+        if math.isfinite(highs.objective)
+        else str(highs.objective)
     )
     return (
         f"{mark:4}  {case.name:24} "
@@ -895,8 +1055,6 @@ def format_result_line(
 
 
 def run_suite(args: argparse.Namespace) -> int:
-    add_repo_venv_to_path()
-    simplex = import_simplex_module()
 
     try:
         import highspy  # type: ignore
@@ -911,9 +1069,14 @@ def run_suite(args: argparse.Namespace) -> int:
         flush=True,
     )
     if highspy is None:
-        print("highspy not available; running simplex-only feasibility checks.", flush=True)
+        print(
+            "highspy not available; running simplex-only feasibility checks.",
+            flush=True,
+        )
     else:
-        print(f"Loaded highspy {getattr(highspy, '__version__', 'unknown')}", flush=True)
+        print(
+            f"Loaded highspy {getattr(highspy, '__version__', 'unknown')}", flush=True
+        )
     edit_notes = exercise_model_editing_api(simplex)
     edit_passed = len(edit_notes) == 0
     print(
@@ -1026,11 +1189,42 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         action="store_true",
         help="Print residuals and comparison notes for every case.",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run an LP build and solve benchmark instead of the validation suite.",
+    )
+    parser.add_argument(
+        "--benchmark-sizes",
+        type=str,
+        default="10,25,50,100",
+        help="Comma-separated variable sizes for the benchmark.",
+    )
+    parser.add_argument(
+        "--benchmark-row-ratio",
+        type=float,
+        default=0.5,
+        help="Ratio of rows to columns for benchmark LPs.",
+    )
+    parser.add_argument(
+        "--benchmark-density",
+        type=float,
+        default=0.25,
+        help="Density of the random benchmark LP coefficient matrix.",
+    )
+    parser.add_argument(
+        "--benchmark-runs",
+        type=int,
+        default=5,
+        help="Number of benchmark repetitions per size.",
+    )
     return parser.parse_args(list(argv))
 
 
 def main(argv: Iterable[str]) -> int:
     args = parse_args(argv)
+    if args.benchmark:
+        return run_benchmark(args)
     return run_suite(args)
 
 

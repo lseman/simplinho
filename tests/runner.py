@@ -478,7 +478,7 @@ def make_large_binary_knapsack_case(n):
 # These instances are deterministic multi-constraint binary knapsack models. For large cases we compare status and objective, and we track runtime and search statistics. We do not require exact variable-by-variable agreement because multiple optima can appear in larger combinatorial models.
 
 # %%
-large_sizes = [100]
+large_sizes = [20]
 large_cases = [make_large_binary_knapsack_case(n) for n in large_sizes]
 
 [

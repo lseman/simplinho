@@ -165,6 +165,22 @@ class DegeneracyManager {
         return event;
     }
 
+    bool would_repeat_basis_change(const std::vector<int>& basis,
+                                   int leaving_rel,
+                                   int entering_abs) const {
+        if (!basis_hash_initialized_ || leaving_rel < 0 ||
+            leaving_rel >= static_cast<int>(basis.size()) || entering_abs < 0) {
+            return false;
+        }
+        const int leaving_abs = basis[leaving_rel];
+        if (leaving_abs < 0 || leaving_abs == entering_abs) {
+            return false;
+        }
+        const std::uint64_t next_hash =
+            current_basis_hash_ ^ basis_token_(leaving_abs) ^ basis_token_(entering_abs);
+        return visited_basis_hashes_.find(next_hash) != visited_basis_hashes_.end();
+    }
+
     // Compatibility: does not modify A,b,c anymore
     std::tuple<std::optional<Eigen::MatrixXd>, std::optional<Eigen::VectorXd>,
                std::optional<Eigen::VectorXd>>

@@ -1,0 +1,6 @@
+[  0%] Built target stdexec
+[  9%] Building CXX object CMakeFiles/simplinho.dir/bindings/bnb_bindings.cpp.o
+[ 27%] Building CXX object CMakeFiles/simplinho.dir/bindings/model_bindings.cpp.o
+Linking CXX shared module simplinho.cpython-313-x86_64-linux-gnu.so
+Built target simplinho
+BUILD_RC:0

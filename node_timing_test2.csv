@@ -1,0 +1,2 @@
+node_id,depth,parent_id,status,bound,estimate,node_total_s,node_presolve_s,lp_assembly_s,lp_solve_s,lp_core_s,lp_internal_presolve_s,lp_internal_crash_s,lp_internal_iters_s,lp_internal_serialize_s,lp_iterations,node_snapshot_s,node_materialize_s,node_branching_s,node_cut_generation_s,node_cut_management_s,node_conflict_learning_s
+0,0,-1,fathomed,0,0,0.000126477,0.000000000,0.000000000,0.001765820,0.001765820,0.000027936,0.001214851,0.000195621,0.000008384,1,0.000011356,0.000000000,0.000001718,0.000031069,0.000000258,0.000000000

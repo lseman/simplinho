@@ -20,6 +20,8 @@ BUILD_DIR = Path.cwd()
 # go up one dir
 BUILD_DIR = BUILD_DIR.parent
 
+print(BUILD_DIR)
+
 # add /build to path
 BUILD_DIR = BUILD_DIR / "build"
 print(f"Looking for simplinho in {BUILD_DIR}")
