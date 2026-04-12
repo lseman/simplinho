@@ -229,8 +229,10 @@ class SteepestEdgePricer {
 
         const int total_candidates = (int)N.size();
         const int pool_size = partial_pool_size_(total_candidates, partial_pricing);
-        const int scan_count = partial_pricing ? std::min(pool_size, total_candidates) : total_candidates;
-        const int start = partial_pricing && total_candidates > 0 ? (partial_cursor_ % total_candidates) : 0;
+        const int scan_count =
+            partial_pricing ? std::min(pool_size, total_candidates) : total_candidates;
+        const int start =
+            partial_pricing && total_candidates > 0 ? (partial_cursor_ % total_candidates) : 0;
 
         for (int k = 0; k < scan_count; ++k) {
             const int idx = partial_pricing ? ((start + k) % total_candidates) : k;
@@ -464,8 +466,10 @@ class DevexPricer {
 
         const int total_candidates = (int)N.size();
         const int pool_size = partial_pool_size_(total_candidates, partial_pricing);
-        const int scan_count = partial_pricing ? std::min(pool_size, total_candidates) : total_candidates;
-        const int start = partial_pricing && total_candidates > 0 ? (partial_cursor_ % total_candidates) : 0;
+        const int scan_count =
+            partial_pricing ? std::min(pool_size, total_candidates) : total_candidates;
+        const int start =
+            partial_pricing && total_candidates > 0 ? (partial_cursor_ % total_candidates) : 0;
         int best_rel = -1;
         double best_crit = -1.0;
         for (int k = 0; k < scan_count; ++k) {
@@ -781,8 +785,7 @@ class DualSteepestEdgePricer {
         for (auto& E : dual_pool_) {
             if (E.jN == e_abs)
                 continue;
-            const Eigen::VectorXd Aj = pricing_detail::dense_column(A, E.jN);
-            const double beta = s_minus_er.dot(Aj) * inv_alpha;
+            const double beta = pricing_detail::column_dot(A, E.jN, s_minus_er) * inv_alpha;
             if (beta != 0.0) {
                 const double old_weight = E.dual_weight;
                 E.w.noalias() -= psi_r * beta;
@@ -821,8 +824,7 @@ class DualSteepestEdgePricer {
             DualEntry E;
             E.jN = old_abs;
             E.w = e_r;
-            const Eigen::VectorXd Aold = pricing_detail::dense_column(A, old_abs);
-            const double beta_old = s_minus_er.dot(Aold) * inv_alpha;
+            const double beta_old = pricing_detail::column_dot(A, old_abs, s_minus_er) * inv_alpha;
             if (beta_old != 0.0)
                 E.w.noalias() -= psi_r * beta_old;
             E.dual_weight =

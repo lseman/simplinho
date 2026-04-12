@@ -219,11 +219,12 @@ RevisedSimplexOptions tune_mip_lp_options(const RevisedSimplexOptions& base_opti
     tuned.max_basis_rebuilds = std::max(tuned.max_basis_rebuilds, 5);
     tuned.crash_attempts = std::max(tuned.crash_attempts, 5);
     tuned.crash_markowitz_tol = std::min(tuned.crash_markowitz_tol, 0.15);
-
     if (warm_start_expected) {
-        tuned.devex_reset = std::max(50, std::min(tuned.devex_reset, 100));
-        tuned.adaptive_reset_freq = std::min(tuned.adaptive_reset_freq, 350);
+        tuned.crash_attempts = std::min(tuned.crash_attempts, 1);
+        tuned.crash_markowitz_tol = std::min(tuned.crash_markowitz_tol, 0.10);
     }
+    tuned.devex_reset = std::max(50, std::min(tuned.devex_reset, 100));
+    tuned.adaptive_reset_freq = std::min(tuned.adaptive_reset_freq, 350);
 
     return tuned;
 }
@@ -1974,8 +1975,8 @@ class Model {
                             std::string_view::npos ||
                         msg.find("SparseForrestTomlinLU: sparse fallback factorization failed") !=
                             std::string_view::npos ||
-                        msg.find("SparseForrestTomlinLU: sparse transpose fallback factorization failed") !=
-                            std::string_view::npos ||
+                        msg.find("SparseForrestTomlinLU: sparse transpose fallback factorization "
+                                 "failed") != std::string_view::npos ||
                         msg.find("SparseForrestTomlinLU: fallback solve failed") !=
                             std::string_view::npos ||
                         msg.find("SparseForrestTomlinLU: fallback transpose solve failed") !=
@@ -2196,10 +2197,9 @@ class Model {
                 }
 
                 if (raw_opt.has_value()) {
-                    const bool has_valid_primal =
-                        raw_opt->x.size() == node_data.total_vars && raw_opt->x.array().isFinite().all();
-                    const bool terminal_optimal =
-                        raw_opt->status == LPSolution::Status::Optimal;
+                    const bool has_valid_primal = raw_opt->x.size() == node_data.total_vars &&
+                                                  raw_opt->x.array().isFinite().all();
+                    const bool terminal_optimal = raw_opt->status == LPSolution::Status::Optimal;
                     const bool terminal_unbounded =
                         raw_opt->status == LPSolution::Status::Unbounded;
                     out.status = raw_opt->status == LPSolution::Status::Optimal
@@ -2207,13 +2207,14 @@ class Model {
                                  : raw_opt->status == LPSolution::Status::Unbounded
                                      ? simplex_bnb::RelaxationStatus::Unbounded
                                      : simplex_bnb::RelaxationStatus::Infeasible;
-                    out.primal = has_valid_primal
-                                     ? raw_opt->x
-                                     : Eigen::VectorXd::Constant(
-                                           node_data.total_vars,
-                                           std::numeric_limits<double>::quiet_NaN());
+                    out.primal =
+                        has_valid_primal
+                            ? raw_opt->x
+                            : Eigen::VectorXd::Constant(node_data.total_vars,
+                                                        std::numeric_limits<double>::quiet_NaN());
                     if (terminal_optimal || terminal_unbounded) {
-                        out.objective = node_data.objective_sign * raw_opt->obj + objective_constant_;
+                        out.objective =
+                            node_data.objective_sign * raw_opt->obj + objective_constant_;
                     } else {
                         out.objective = maximize_ ? -std::numeric_limits<double>::infinity()
                                                   : std::numeric_limits<double>::infinity();
@@ -2570,6 +2571,13 @@ class Model {
 
         int next_slack = base_data.total_vars;
         int row = base_data.rows;
+        std::vector<Eigen::Triplet<double>> trips;
+        trips.reserve(base_data.A_sparse.nonZeros() + cuts.size() * 8 + cut_slack_count);
+        for (int col = 0; col < base_data.A_sparse.outerSize(); ++col) {
+            for (Eigen::SparseMatrix<double>::InnerIterator it(base_data.A_sparse, col); it; ++it) {
+                trips.emplace_back(it.row(), it.col(), it.value());
+            }
+        }
         for (const auto& cut : cuts) {
             for (int k = 0; k < static_cast<int>(cut.indices.size()) &&
                             k < static_cast<int>(cut.values.size());
@@ -2579,10 +2587,12 @@ class Model {
                     throw std::out_of_range("simplex: cut references invalid base variable");
                 }
                 out.A(row, index) = cut.values[k];
+                trips.emplace_back(row, index, cut.values[k]);
             }
             out.b(row) = cut.rhs;
             if (cut.sense == simplex_bnb::LinearConstraintSense::LessEqual) {
                 out.A(row, next_slack) = 1.0;
+                trips.emplace_back(row, next_slack, 1.0);
                 if (!out.warm_start_basis.empty()) {
                     out.warm_start_basis.push_back(next_slack);
                 }
@@ -2592,6 +2602,7 @@ class Model {
                 next_slack++;
             } else if (cut.sense == simplex_bnb::LinearConstraintSense::GreaterEqual) {
                 out.A(row, next_slack) = -1.0;
+                trips.emplace_back(row, next_slack, -1.0);
                 if (!out.warm_start_basis.empty()) {
                     out.warm_start_basis.push_back(next_slack);
                 }
@@ -2603,7 +2614,12 @@ class Model {
             ++row;
         }
 
-        out.A_sparse = out.A.sparseView(kCoeffTol, 1.0);
+        out.A_sparse.resize(out.rows, out.total_vars);
+        if (!trips.empty())
+            out.A_sparse.setFromTriplets(trips.begin(), trips.end());
+        else
+            out.A_sparse.setZero();
+        out.A_sparse.makeCompressed();
         return out;
     }
 

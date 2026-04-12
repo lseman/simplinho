@@ -3,7 +3,7 @@
 #include <type_traits>
 
 class RevisedSimplexDualEngine {
-   public:
+  public:
     using SparseRowMatrix = Eigen::SparseMatrix<double, Eigen::RowMajor, int>;
     enum class BoundView { Lower, Upper, Fixed };
 
@@ -18,14 +18,14 @@ class RevisedSimplexDualEngine {
         std::vector<int> flip_rels;
     };
 
-    static BoundView default_bound_view(int j, const Eigen::VectorXd& l,
-                                        const Eigen::VectorXd& u) {
+    static BoundView default_bound_view(int j, const Eigen::VectorXd& l, const Eigen::VectorXd& u) {
         const bool has_l = (j < l.size()) && std::isfinite(l(j));
         const bool has_u = (j < u.size()) && std::isfinite(u(j));
         if (has_l && has_u && std::abs(u(j) - l(j)) <= 1e-12) {
             return BoundView::Fixed;
         }
-        if (has_u && !has_l) return BoundView::Upper;
+        if (has_u && !has_l)
+            return BoundView::Upper;
         return BoundView::Lower;
     }
 
@@ -41,26 +41,19 @@ class RevisedSimplexDualEngine {
         }
     }
 
-    static int view_sign(BoundView view) {
-        return (view == BoundView::Upper) ? -1 : 1;
-    }
+    static int view_sign(BoundView view) { return (view == BoundView::Upper) ? -1 : 1; }
 
-    static double bound_range(int j, const Eigen::VectorXd& l,
-                              const Eigen::VectorXd& u) {
-        if (j >= l.size() || j >= u.size() || !std::isfinite(l(j)) ||
-            !std::isfinite(u(j))) {
+    static double bound_range(int j, const Eigen::VectorXd& l, const Eigen::VectorXd& u) {
+        if (j >= l.size() || j >= u.size() || !std::isfinite(l(j)) || !std::isfinite(u(j))) {
             return std::numeric_limits<double>::infinity();
         }
         return std::max(0.0, u(j) - l(j));
     }
 
     template <class MatrixType>
-    static Eigen::VectorXd transformed_rhs(const MatrixType& A,
-                                           const std::vector<BoundView>& view,
-                                           const Eigen::VectorXd& l,
-                                           const Eigen::VectorXd& u) {
-        Eigen::VectorXd rhs = A.rows() ? Eigen::VectorXd::Zero(A.rows())
-                                       : Eigen::VectorXd{};
+    static Eigen::VectorXd transformed_rhs(const MatrixType& A, const std::vector<BoundView>& view,
+                                           const Eigen::VectorXd& l, const Eigen::VectorXd& u) {
+        Eigen::VectorXd rhs = A.rows() ? Eigen::VectorXd::Zero(A.rows()) : Eigen::VectorXd{};
         for (int j = 0; j < A.cols(); ++j) {
             const double anchor = bound_anchor(view[j], j, l, u);
             if (anchor != 0.0) {
@@ -72,13 +65,14 @@ class RevisedSimplexDualEngine {
     }
 
     static void scale_column(Eigen::MatrixXd& A, int j, double scale) {
-        if (scale == 1.0) return;
+        if (scale == 1.0)
+            return;
         A.col(j) *= scale;
     }
 
-    static void scale_column(RevisedSimplex::SparseMatrix& A, int j,
-                             double scale) {
-        if (scale == 1.0) return;
+    static void scale_column(RevisedSimplex::SparseMatrix& A, int j, double scale) {
+        if (scale == 1.0)
+            return;
         for (RevisedSimplex::SparseMatrix::InnerIterator it(A, j); it; ++it) {
             it.valueRef() *= scale;
         }
@@ -89,16 +83,16 @@ class RevisedSimplexDualEngine {
     }
 
     static void scale_rowwise_column(SparseRowMatrix& A_row,
-                                     const RevisedSimplex::SparseMatrix& A_col,
-                                     int j, double scale) {
-        if (scale == 1.0) return;
+                                     const RevisedSimplex::SparseMatrix& A_col, int j,
+                                     double scale) {
+        if (scale == 1.0)
+            return;
         for (RevisedSimplex::SparseMatrix::InnerIterator it(A_col, j); it; ++it) {
             A_row.coeffRef(it.row(), j) *= scale;
         }
     }
 
-    static double column_dot(const Eigen::MatrixXd& A, int j,
-                             const Eigen::VectorXd& v) {
+    static double column_dot(const Eigen::MatrixXd& A, int j, const Eigen::VectorXd& v) {
         return A.col(j).dot(v);
     }
 
@@ -111,10 +105,20 @@ class RevisedSimplexDualEngine {
         return dot;
     }
 
-    static void compute_pricing_products(
-        const Eigen::MatrixXd& Ahat, const std::vector<int>& N,
-        const Eigen::VectorXd& w, const Eigen::VectorXd& ydual,
-        const Eigen::VectorXd& chat, Eigen::VectorXd& pN, Eigen::VectorXd& rN) {
+    static Eigen::VectorXd dense_column(const Eigen::MatrixXd& A, int j) { return A.col(j); }
+
+    static Eigen::VectorXd dense_column(const RevisedSimplex::SparseMatrix& A, int j) {
+        Eigen::VectorXd col = Eigen::VectorXd::Zero(A.rows());
+        for (typename RevisedSimplex::SparseMatrix::InnerIterator it(A, j); it; ++it) {
+            col(it.row()) = it.value();
+        }
+        return col;
+    }
+
+    static void compute_pricing_products(const Eigen::MatrixXd& Ahat, const std::vector<int>& N,
+                                         const Eigen::VectorXd& w, const Eigen::VectorXd& ydual,
+                                         const Eigen::VectorXd& chat, Eigen::VectorXd& pN,
+                                         Eigen::VectorXd& rN) {
         pN.resize(N.size());
         rN.resize(N.size());
         for (int k = 0; k < (int)N.size(); ++k) {
@@ -125,11 +129,11 @@ class RevisedSimplexDualEngine {
         }
     }
 
-    static void compute_pricing_products(
-        const RevisedSimplex::SparseMatrix& Ahat, const SparseRowMatrix& Ahat_row,
-        const std::vector<int>& N, const Eigen::VectorXd& w,
-        const Eigen::VectorXd& ydual, const Eigen::VectorXd& chat,
-        Eigen::VectorXd& pN, Eigen::VectorXd& rN) {
+    static void compute_pricing_products(const RevisedSimplex::SparseMatrix& Ahat,
+                                         const SparseRowMatrix& Ahat_row, const std::vector<int>& N,
+                                         const Eigen::VectorXd& w, const Eigen::VectorXd& ydual,
+                                         const Eigen::VectorXd& chat, Eigen::VectorXd& pN,
+                                         Eigen::VectorXd& rN) {
         pN = Eigen::VectorXd::Zero(N.size());
         rN.resize(N.size());
         for (int k = 0; k < (int)N.size(); ++k) {
@@ -137,40 +141,47 @@ class RevisedSimplexDualEngine {
         }
 
         std::vector<int> rel_of_col(Ahat.cols(), -1);
-        for (int k = 0; k < (int)N.size(); ++k) rel_of_col[N[k]] = k;
+        for (int k = 0; k < (int)N.size(); ++k)
+            rel_of_col[N[k]] = k;
 
         for (int i = 0; i < Ahat_row.rows(); ++i) {
             const double wi = (i < w.size()) ? w(i) : 0.0;
             const double yi = (i < ydual.size()) ? ydual(i) : 0.0;
-            if (wi == 0.0 && yi == 0.0) continue;
+            if (wi == 0.0 && yi == 0.0)
+                continue;
             for (SparseRowMatrix::InnerIterator it(Ahat_row, i); it; ++it) {
                 const int rel = rel_of_col[it.col()];
-                if (rel < 0) continue;
-                if (wi != 0.0) pN(rel) += wi * it.value();
-                if (yi != 0.0) rN(rel) -= yi * it.value();
+                if (rel < 0)
+                    continue;
+                if (wi != 0.0)
+                    pN(rel) += wi * it.value();
+                if (yi != 0.0)
+                    rN(rel) -= yi * it.value();
             }
         }
     }
 
     template <class MatrixType>
-    static MatrixType signed_matrix_copy(const MatrixType& A,
-                                         const std::vector<BoundView>& view) {
+    static MatrixType signed_matrix_copy(const MatrixType& A, const std::vector<BoundView>& view) {
         MatrixType out = A;
         for (int j = 0; j < out.cols(); ++j) {
-            if (view_sign(view[j]) < 0) scale_column(out, j, -1.0);
+            if (view_sign(view[j]) < 0)
+                scale_column(out, j, -1.0);
         }
         return out;
     }
 
-    static Eigen::VectorXd assemble_transformed_primal(
-        int n, const std::vector<int>& basis, const Eigen::VectorXd& yB,
-        const Eigen::VectorXd& l, const Eigen::VectorXd& u,
-        const std::vector<BoundView>& view) {
+    static Eigen::VectorXd assemble_transformed_primal(int n, const std::vector<int>& basis,
+                                                       const Eigen::VectorXd& yB,
+                                                       const Eigen::VectorXd& l,
+                                                       const Eigen::VectorXd& u,
+                                                       const std::vector<BoundView>& view) {
         Eigen::VectorXd x = Eigen::VectorXd::Zero(n);
         std::vector<char> inB(n, 0);
         for (int i = 0; i < (int)basis.size(); ++i) {
             const int j = basis[i];
-            if (j < 0 || j >= n) continue;
+            if (j < 0 || j >= n)
+                continue;
             inB[j] = 1;
             const double anchor = bound_anchor(view[j], j, l, u);
             if (view_sign(view[j]) > 0) {
@@ -181,27 +192,31 @@ class RevisedSimplexDualEngine {
         }
 
         for (int j = 0; j < n; ++j) {
-            if (!inB[j]) x(j) = bound_anchor(view[j], j, l, u);
+            if (!inB[j])
+                x(j) = bound_anchor(view[j], j, l, u);
         }
         return RevisedSimplex::clip_small_(x);
     }
 
-    static DualChoose dual_harris_choose(const Eigen::VectorXd& rN,
-                                         const Eigen::VectorXd& pN, double delta,
-                                         double eta) {
+    static DualChoose dual_harris_choose(const Eigen::VectorXd& rN, const Eigen::VectorXd& pN,
+                                         double delta, double eta) {
         std::vector<int> E;
         E.reserve((int)pN.size());
         for (int k = 0; k < pN.size(); ++k)
-            if (pN(k) < -delta) E.push_back(k);
-        if (E.empty()) return {};
+            if (pN(k) < -delta)
+                E.push_back(k);
+        if (E.empty())
+            return {};
 
         double tau_star = std::numeric_limits<double>::infinity();
-        for (int k : E) tau_star = std::min(tau_star, rN(k) / (-pN(k)));
+        for (int k : E)
+            tau_star = std::min(tau_star, rN(k) / (-pN(k)));
 
         const double kappa = std::max(eta, eta * std::abs(tau_star));
         std::vector<int> candidates;
         for (int k : E) {
-            if ((rN(k) / (-pN(k))) <= tau_star + kappa) candidates.push_back(k);
+            if ((rN(k) / (-pN(k))) <= tau_star + kappa)
+                candidates.push_back(k);
         }
         if (!candidates.empty()) {
             int best = candidates.front();
@@ -230,17 +245,17 @@ class RevisedSimplexDualEngine {
         return {best, std::max(0.0, best_ratio)};
     }
 
-    static DualBFRTDecision dual_bfrt_decide(
-        const RevisedSimplex& self, const Eigen::VectorXd& rN,
-        const Eigen::VectorXd& pN, const std::vector<int>& N,
-        const std::vector<BoundView>& view, const Eigen::VectorXd& l,
-        const Eigen::VectorXd& u, int max_flips) {
+    static DualBFRTDecision dual_bfrt_decide(const RevisedSimplex& self, const Eigen::VectorXd& rN,
+                                             const Eigen::VectorXd& pN, const std::vector<int>& N,
+                                             const std::vector<BoundView>& view,
+                                             const Eigen::VectorXd& l, const Eigen::VectorXd& u,
+                                             int max_flips) {
         DualBFRTDecision out;
-        DualChoose dc = dual_harris_choose(
-            rN, pN, self.opt_.ratio_delta, self.opt_.ratio_eta);
+        DualChoose dc = dual_harris_choose(rN, pN, self.opt_.ratio_delta, self.opt_.ratio_eta);
         out.pivot_rel = dc.e_rel;
         out.tau = dc.tau;
-        if (!dc.e_rel || !std::isfinite(dc.tau) || max_flips <= 0) return out;
+        if (!dc.e_rel || !std::isfinite(dc.tau) || max_flips <= 0)
+            return out;
 
         struct Event {
             double tau;
@@ -248,17 +263,20 @@ class RevisedSimplexDualEngine {
         };
         std::vector<Event> events;
         events.reserve(N.size());
-        const double tau_cap =
-            dc.tau + std::max(self.opt_.ratio_eta, 1e-12 * (1.0 + dc.tau));
+        const double tau_cap = dc.tau + std::max(self.opt_.ratio_eta, 1e-12 * (1.0 + dc.tau));
 
         for (int k = 0; k < (int)N.size(); ++k) {
-            if (k == *dc.e_rel) continue;
-            if (!(pN(k) < -self.opt_.ratio_delta)) continue;
+            if (k == *dc.e_rel)
+                continue;
+            if (!(pN(k) < -self.opt_.ratio_delta))
+                continue;
 
             const int j = N[k];
             const double range = bound_range(j, l, u);
-            if (!std::isfinite(range) || range <= self.opt_.tol) continue;
-            if (view[j] == BoundView::Fixed) continue;
+            if (!std::isfinite(range) || range <= self.opt_.tol)
+                continue;
+            if (view[j] == BoundView::Fixed)
+                continue;
 
             const double tau_k = rN(k) / (-pN(k));
             if (!std::isfinite(tau_k) || tau_k < 0.0 || tau_k > tau_cap) {
@@ -267,9 +285,9 @@ class RevisedSimplexDualEngine {
             events.push_back({tau_k, k});
         }
 
-        std::sort(events.begin(), events.end(), [](const Event& a,
-                                                   const Event& b) {
-            if (std::abs(a.tau - b.tau) > 1e-16) return a.tau < b.tau;
+        std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) {
+            if (std::abs(a.tau - b.tau) > 1e-16)
+                return a.tau < b.tau;
             return a.rel < b.rel;
         });
 
@@ -280,8 +298,8 @@ class RevisedSimplexDualEngine {
     }
 
     template <class MatrixType>
-    static RevisedSimplex::PhaseResult run(
-        RevisedSimplex& self, const MatrixType& A, const Eigen::VectorXd& b,
+    static RevisedSimplex::PhaseResult
+    run(RevisedSimplex& self, const MatrixType& A, const Eigen::VectorXd& b,
         const Eigen::VectorXd& c, std::optional<std::vector<int>> basis_opt,
         const Eigen::VectorXd& l, const Eigen::VectorXd& u,
         std::optional<std::vector<LPBasisStatus>> warm_status = std::nullopt) {
@@ -325,23 +343,21 @@ class RevisedSimplexDualEngine {
                 inB[j] = 1;
             }
             for (int j = 0; j < n; ++j)
-                if (!inB[j]) N.push_back(j);
+                if (!inB[j])
+                    N.push_back(j);
         }
 
         std::vector<BoundView> view(n, BoundView::Lower);
-        for (int j = 0; j < n; ++j) view[j] = default_bound_view(j, l, u);
+        for (int j = 0; j < n; ++j)
+            view[j] = default_bound_view(j, l, u);
         const bool warm_views_provided =
             warm_status && warm_status->size() == static_cast<std::size_t>(n);
         self.bridge_.reset();
-        DualAdaptivePricer dual_pricer(self.opt_.pricing_rule,
-                                       self.opt_.devex_reset,
-                                       self.opt_.adaptive_reset_freq,
-                                       self.opt_.partial_pricing,
-                                       self.opt_.dual_pricing,
-                                       self.opt_.row_pricing_threshold,
+        DualAdaptivePricer dual_pricer(self.opt_.pricing_rule, self.opt_.devex_reset,
+                                       self.opt_.adaptive_reset_freq, self.opt_.partial_pricing,
+                                       self.opt_.dual_pricing, self.opt_.row_pricing_threshold,
                                        self.opt_.dual_edge_weight_strategy,
-                                       self.opt_
-                                           .dual_steepest_edge_weight_log_error_threshold);
+                                       self.opt_.dual_steepest_edge_weight_log_error_threshold);
 
         MatrixType Ahat = signed_matrix_copy(A, view);
         std::optional<SparseRowMatrix> Ahat_row;
@@ -349,13 +365,14 @@ class RevisedSimplexDualEngine {
         if (warm_views_provided) {
             std::vector<char> inB(n, 0);
             for (int j : basis)
-                if (j >= 0 && j < n) inB[j] = 1;
+                if (j >= 0 && j < n)
+                    inB[j] = 1;
             for (int j = 0; j < n; ++j) {
-                if (inB[j]) continue;
+                if (inB[j])
+                    continue;
                 switch ((*warm_status)[j]) {
                     case LPBasisStatus::AtUpper:
-                        view[j] = std::isfinite(u(j)) ? BoundView::Upper
-                                                      : BoundView::Lower;
+                        view[j] = std::isfinite(u(j)) ? BoundView::Upper : BoundView::Lower;
                         break;
                     case LPBasisStatus::Fixed:
                         view[j] = BoundView::Fixed;
@@ -375,12 +392,12 @@ class RevisedSimplexDualEngine {
         for (int j = 0; j < n; ++j)
             chat(j) = (view_sign(view[j]) > 0) ? c_work(j) : -c_work(j);
         for (int j : basis) {
-            if (j >= 0 && j < n) view[j] = BoundView::Lower;
+            if (j >= 0 && j < n)
+                view[j] = BoundView::Lower;
             if (j >= 0 && j < n) {
                 if (chat(j) != c_work(j)) {
                     scale_column(Ahat, j, -1.0);
-                    if constexpr (std::is_same_v<MatrixType,
-                                                 RevisedSimplex::SparseMatrix>) {
+                    if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
                         scale_rowwise_column(*Ahat_row, Ahat, j, -1.0);
                     }
                 }
@@ -396,8 +413,7 @@ class RevisedSimplexDualEngine {
                     Eigen::VectorXd::Zero(n),
                     basis,
                     0,
-                    {{"where", "dual initial basis factorization failed"},
-                     {"what", e.what()}}};
+                    {{"where", "dual initial basis factorization failed"}, {"what", e.what()}}};
         }
         FTBasis& B = *Bopt;
         self.degen_.start_basis_history(basis);
@@ -406,10 +422,12 @@ class RevisedSimplexDualEngine {
             bool changed = false;
             std::vector<char> inB(n, 0);
             for (int j : basis)
-                if (j >= 0 && j < n) inB[j] = 1;
+                if (j >= 0 && j < n)
+                    inB[j] = 1;
 
             for (int j = 0; j < n; ++j) {
-                if (inB[j]) continue;
+                if (inB[j])
+                    continue;
 
                 const double raw_rc = c_work(j) - column_dot(A, j, ydual);
                 const bool has_l = (j < l.size()) && std::isfinite(l(j));
@@ -420,8 +438,7 @@ class RevisedSimplexDualEngine {
                     if (std::abs(u(j) - l(j)) <= self.opt_.tol) {
                         next = BoundView::Fixed;
                     } else {
-                        next =
-                            (raw_rc < 0.0) ? BoundView::Upper : BoundView::Lower;
+                        next = (raw_rc < 0.0) ? BoundView::Upper : BoundView::Lower;
                     }
                 } else if (has_u && !has_l) {
                     next = BoundView::Upper;
@@ -431,8 +448,7 @@ class RevisedSimplexDualEngine {
 
                 if (next != view[j]) {
                     scale_column(Ahat, j, -1.0);
-                    if constexpr (std::is_same_v<MatrixType,
-                                                 RevisedSimplex::SparseMatrix>) {
+                    if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
                         scale_rowwise_column(*Ahat_row, Ahat, j, -1.0);
                     }
                     chat(j) = -chat(j);
@@ -445,7 +461,8 @@ class RevisedSimplexDualEngine {
 
         if (!warm_views_provided) {
             Eigen::VectorXd cB(m);
-            for (int i = 0; i < m; ++i) cB(i) = chat(basis[i]);
+            for (int i = 0; i < m; ++i)
+                cB(i) = chat(basis[i]);
             Eigen::VectorXd ydual = B.solve_BT(cB);
             apply_views_to_nonbasics(ydual);
         }
@@ -458,8 +475,8 @@ class RevisedSimplexDualEngine {
                     0,
                     {{"where", "dual initial refactor failed"}, {"what", e.what()}}};
         }
-        auto rebuild_dual_pool = [&](const char* where, int iter)
-            -> std::optional<RevisedSimplex::PhaseResult> {
+        auto rebuild_dual_pool = [&](const char* where,
+                                     int iter) -> std::optional<RevisedSimplex::PhaseResult> {
             try {
                 dual_pricer.build_dual_pool(B, Ahat, N);
                 return std::nullopt;
@@ -489,7 +506,8 @@ class RevisedSimplexDualEngine {
             oss.setf(std::ios::scientific);
             oss << std::setprecision(17);
             for (int i = 0; i < v.size(); ++i) {
-                if (i) oss << ",";
+                if (i)
+                    oss << ",";
                 oss << v(i);
             }
             return oss.str();
@@ -520,8 +538,8 @@ class RevisedSimplexDualEngine {
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after solve_B failure");
                         B.refactor();
-                        if (auto failed =
-                                rebuild_dual_pool("dual pricing rebuild failed after solve_B", iters)) {
+                        if (auto failed = rebuild_dual_pool(
+                                "dual pricing rebuild failed after solve_B", iters)) {
                             return *failed;
                         }
                         continue;
@@ -533,33 +551,31 @@ class RevisedSimplexDualEngine {
                             {{"where", "dual: solve(Bhat,rhs) repair failed"}}};
                 }
 
-                for (int i = 0; i < m; ++i) cB(i) = chat(basis[i]);
+                for (int i = 0; i < m; ++i)
+                    cB(i) = chat(basis[i]);
                 try {
                     ydual = B.solve_BT(cB);
                 } catch (...) {
                     self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                      " refactor after solve_BT failure");
                     B.refactor();
-                    if (auto failed =
-                            rebuild_dual_pool("dual pricing rebuild failed after solve_BT", iters)) {
+                    if (auto failed = rebuild_dual_pool(
+                            "dual pricing rebuild failed after solve_BT", iters)) {
                         return *failed;
                     }
                     ydual = B.solve_BT(cB);
                 }
 
-                if (!(warm_views_provided && iters == 1) &&
-                    apply_views_to_nonbasics(ydual)) {
+                if (!(warm_views_provided && iters == 1) && apply_views_to_nonbasics(ydual)) {
                     rhs_eff = b - transformed_rhs(A, view, l, u);
-                    if (auto failed =
-                            rebuild_dual_pool("dual pricing rebuild failed after bound view update",
-                                              iters)) {
+                    if (auto failed = rebuild_dual_pool(
+                            "dual pricing rebuild failed after bound view update", iters)) {
                         return *failed;
                     }
                     continue;
                 }
 
-                const auto leaving =
-                    dual_pricer.choose_dual_leaving(B, yB, self.opt_.tol);
+                const auto leaving = dual_pricer.choose_dual_leaving(B, yB, self.opt_.tol);
                 r_leave = leaving.row;
                 if (r_leave < 0) {
                     rN.resize(N.size());
@@ -567,21 +583,19 @@ class RevisedSimplexDualEngine {
                     for (int k = 0; k < (int)N.size(); ++k) {
                         const int j = N[k];
                         rN(k) = chat(j) - column_dot(Ahat, j, ydual);
-                        if (rN(k) < -self.opt_.tol) dual_feasible = false;
+                        if (rN(k) < -self.opt_.tol)
+                            dual_feasible = false;
                     }
                     if (dual_feasible) {
-                        Eigen::VectorXd x = assemble_transformed_primal(
-                            n, basis, yB.cwiseMax(0.0), l, u, view);
+                        Eigen::VectorXd x =
+                            assemble_transformed_primal(n, basis, yB.cwiseMax(0.0), l, u, view);
                         auto info_map = dm_stats_to_map(self.degen_.get_stats());
-                        info_map["dual_pricing"] =
-                            dual_pricer.current_strategy_name();
-                        info_map["dual_bfrt_flips"] =
-                            std::to_string(total_flips);
-                        self.trace_line_("[dual] optimal iter=" +
-                                         std::to_string(iters) +
+                        info_map["dual_pricing"] = dual_pricer.current_strategy_name();
+                        info_map["dual_bfrt_flips"] = std::to_string(total_flips);
+                        self.trace_line_("[dual] optimal iter=" + std::to_string(iters) +
                                          " basis=" + self.format_basis_(basis));
-                        return {LPSolution::Status::Optimal, std::move(x), basis,
-                                iters, std::move(info_map)};
+                        return {LPSolution::Status::Optimal, std::move(x), basis, iters,
+                                std::move(info_map)};
                     }
                     self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                      " primal-feasible but dual-infeasible");
@@ -589,30 +603,26 @@ class RevisedSimplexDualEngine {
                             Eigen::VectorXd::Zero(n),
                             basis,
                             iters,
-                            {{"reason",
-                              "dual_infeasible_at_primal_feasible"}}};
+                            {{"reason", "dual_infeasible_at_primal_feasible"}}};
                 }
 
                 w = leaving.dual_row;
-                if constexpr (std::is_same_v<MatrixType,
-                                             RevisedSimplex::SparseMatrix>) {
-                    compute_pricing_products(Ahat, *Ahat_row, N, w, ydual, chat, pN,
-                                             rN);
+                if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
+                    compute_pricing_products(Ahat, *Ahat_row, N, w, ydual, chat, pN, rN);
                 } else {
                     compute_pricing_products(Ahat, N, w, ydual, chat, pN, rN);
                 }
 
-                const DualBFRTDecision bfrt = dual_bfrt_decide(
-                    self, rN, pN, N, view, l, u,
-                    self.opt_.dual_allow_bound_flip
-                        ? (self.opt_.dual_flip_max_per_iter - flips_this_iter)
-                        : 0);
+                const DualBFRTDecision bfrt =
+                    dual_bfrt_decide(self, rN, pN, N, view, l, u,
+                                     self.opt_.dual_allow_bound_flip
+                                         ? (self.opt_.dual_flip_max_per_iter - flips_this_iter)
+                                         : 0);
                 if (!bfrt.pivot_rel) {
                     if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
                         ++rebuild_attempts;
-                        self.trace_line_(
-                            "[dual] iter=" + std::to_string(iters) +
-                            " refactor after no eligible entering");
+                        self.trace_line_("[dual] iter=" + std::to_string(iters) +
+                                         " refactor after no eligible entering");
                         B.refactor();
                         if (auto failed = rebuild_dual_pool(
                                 "dual pricing rebuild failed after no eligible entering", iters)) {
@@ -630,8 +640,7 @@ class RevisedSimplexDualEngine {
                 if (!bfrt.flip_rels.empty()) {
                     if (self.should_trace_iter_(iters)) {
                         std::ostringstream oss;
-                        oss << "[dual] iter=" << iters
-                            << " bound flips=" << bfrt.flip_rels.size();
+                        oss << "[dual] iter=" << iters << " bound flips=" << bfrt.flip_rels.size();
                         if (self.opt_.verbose_include_basis) {
                             oss << " basis=" << self.format_basis_(basis);
                         }
@@ -640,26 +649,39 @@ class RevisedSimplexDualEngine {
                     for (int rel_k : bfrt.flip_rels) {
                         const int j = N[rel_k];
                         const double old_anchor = bound_anchor(view[j], j, l, u);
-                        view[j] = (view[j] == BoundView::Upper)
-                                      ? BoundView::Lower
-                                      : BoundView::Upper;
+                        view[j] =
+                            (view[j] == BoundView::Upper) ? BoundView::Lower : BoundView::Upper;
                         const double new_anchor = bound_anchor(view[j], j, l, u);
                         const double delta_anchor = new_anchor - old_anchor;
                         if (delta_anchor != 0.0) {
-                            const Eigen::VectorXd col_j = A.col(j);
-                            rhs_eff.noalias() -= col_j * delta_anchor;
+                            if constexpr (std::is_same_v<MatrixType,
+                                                         RevisedSimplex::SparseMatrix>) {
+                                for (typename RevisedSimplex::SparseMatrix::InnerIterator it(A, j);
+                                     it; ++it) {
+                                    rhs_eff(it.row()) -= it.value() * delta_anchor;
+                                }
+                            } else {
+                                const Eigen::VectorXd col_j = A.col(j);
+                                rhs_eff.noalias() -= col_j * delta_anchor;
+                            }
                         }
-                        Ahat.col(j) = -Ahat.col(j);
-                        if constexpr (std::is_same_v<MatrixType,
-                                                     RevisedSimplex::SparseMatrix>) {
+                        if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
+                            for (typename RevisedSimplex::SparseMatrix::InnerIterator it(Ahat, j);
+                                 it; ++it) {
+                                it.valueRef() = -it.valueRef();
+                            }
+                        } else {
+                            Ahat.col(j) = -Ahat.col(j);
+                        }
+                        if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
                             scale_rowwise_column(*Ahat_row, Ahat, j, -1.0);
                         }
                         chat(j) = -chat(j);
                         ++flips_this_iter;
                         ++total_flips;
                     }
-                    if (auto failed =
-                            rebuild_dual_pool("dual pricing rebuild failed after bound flips", iters)) {
+                    if (auto failed = rebuild_dual_pool(
+                            "dual pricing rebuild failed after bound flips", iters)) {
                         return *failed;
                     }
                     continue;
@@ -697,8 +719,7 @@ class RevisedSimplexDualEngine {
                     }
                 }
                 try {
-                    const Eigen::VectorXd entering_col = Ahat.col(eAbs);
-                    s_enter = B.solve_B(entering_col);
+                    s_enter = B.solve_B(Ahat.col(eAbs));
                 } catch (...) {
                     if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
                         ++rebuild_attempts;
@@ -715,15 +736,15 @@ class RevisedSimplexDualEngine {
                             Eigen::VectorXd::Zero(n),
                             basis,
                             iters,
-                            {{"where",
-                              "dual: solve(Bhat,a_e) repair failed"}}};
+                            {{"where", "dual: solve(Bhat,a_e) repair failed"}}};
                 }
                 break;
             }
 
             if (!std::isfinite(tau)) {
                 Eigen::VectorXd yF = w;
-                if (yF.dot(rhs_eff) >= 0) yF = -yF;
+                if (yF.dot(rhs_eff) >= 0)
+                    yF = -yF;
 
                 auto info_map = dm_stats_to_map(self.degen_.get_stats());
                 info_map["where"] = "dual: infinite step";
@@ -733,44 +754,32 @@ class RevisedSimplexDualEngine {
                 info_map["farkas_has_cert"] = "1";
                 info_map["farkas_dim"] = std::to_string(m);
                 info_map["farkas_y"] = serialize_vec(yF);
-                self.trace_line_("[dual] infeasible iter=" +
-                                 std::to_string(iters) +
+                self.trace_line_("[dual] infeasible iter=" + std::to_string(iters) +
                                  " produced Farkas certificate");
 
-                return {LPSolution::Status::Infeasible,
-                        Eigen::VectorXd::Zero(n), basis, iters,
+                return {LPSolution::Status::Infeasible, Eigen::VectorXd::Zero(n), basis, iters,
                         std::move(info_map)};
             }
 
-            const bool is_degenerate =
-                self.degen_.detect_degeneracy(tau, self.opt_.deg_step_tol);
+            const bool is_degenerate = self.degen_.detect_degeneracy(tau, self.opt_.deg_step_tol);
             const int oldAbs = basis[r_leave];
-            const auto basis_cycle =
-                self.degen_.register_basis_change(basis, r_leave, eAbs, iters);
+            const auto basis_cycle = self.degen_.register_basis_change(basis, r_leave, eAbs, iters);
             if (basis_cycle.repeated_basis) {
-                self.trace_line_("[dual] iter=" + std::to_string(iters) +
-                                 " repeated basis candidate leave_var=" +
-                                 std::to_string(oldAbs) + " enter=" +
-                                 std::to_string(eAbs) +
-                                 (basis_cycle.cycling_detected
-                                      ? " cycle_detected=1"
-                                      : " cycle_detected=0"));
+                self.trace_line_(
+                    "[dual] iter=" + std::to_string(iters) +
+                    " repeated basis candidate leave_var=" + std::to_string(oldAbs) +
+                    " enter=" + std::to_string(eAbs) +
+                    (basis_cycle.cycling_detected ? " cycle_detected=1" : " cycle_detected=0"));
             }
             if (basis_cycle.cycling_detected ||
                 (is_degenerate && self.degen_.should_apply_perturbation())) {
                 if (!costs_perturbed) {
                     const double rel_multiplier =
-                        1e-8 *
-                        std::max(1e-6,
-                                 self.opt_.dual_simplex_cost_perturbation_multiplier);
+                        1e-8 * std::max(1e-6, self.opt_.dual_simplex_cost_perturbation_multiplier);
                     const double abs_multiplier =
-                        1e-10 *
-                        std::max(1e-6,
-                                 self.opt_.dual_simplex_cost_perturbation_multiplier);
-                    degeneracy_helpers::perturbCosts(c_work, self.rng_,
-                                                     rel_multiplier);
-                    degeneracy_helpers::perturbCostsAbsolute(c_work, self.rng_,
-                                                             abs_multiplier);
+                        1e-10 * std::max(1e-6, self.opt_.dual_simplex_cost_perturbation_multiplier);
+                    degeneracy_helpers::perturbCosts(c_work, self.rng_, rel_multiplier);
+                    degeneracy_helpers::perturbCostsAbsolute(c_work, self.rng_, abs_multiplier);
                     for (int j = 0; j < n; ++j) {
                         chat(j) = (view_sign(view[j]) > 0) ? c_work(j) : -c_work(j);
                     }
@@ -790,12 +799,11 @@ class RevisedSimplexDualEngine {
                                     std::isfinite(tau) ? std::abs(tau) : 0.0);
 
             if (self.should_trace_iter_(iters)) {
-                Eigen::VectorXd xcur = assemble_transformed_primal(
-                    n, basis, yB.cwiseMax(0.0), l, u, view);
+                Eigen::VectorXd xcur =
+                    assemble_transformed_primal(n, basis, yB.cwiseMax(0.0), l, u, view);
                 std::ostringstream oss;
-                oss << "[dual] iter=" << iters << " obj=" << c.dot(xcur)
-                    << " leave_row=" << r_leave << " leave_var=" << oldAbs
-                    << " enter=" << eAbs << " tau=" << tau;
+                oss << "[dual] iter=" << iters << " obj=" << c.dot(xcur) << " leave_row=" << r_leave
+                    << " leave_var=" << oldAbs << " enter=" << eAbs << " tau=" << tau;
                 if (self.opt_.verbose_include_basis) {
                     oss << " basis_before=" << self.format_basis_(basis);
                 }
@@ -805,30 +813,27 @@ class RevisedSimplexDualEngine {
             N[e_rel] = oldAbs;
 
             try {
-                const Eigen::VectorXd entering_col = Ahat.col(eAbs);
-                B.replace_column(r_leave, entering_col);
+                B.replace_column(r_leave, Ahat.col(eAbs));
             } catch (...) {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
                 B.refactor();
-                if (auto failed =
-                        rebuild_dual_pool("dual pricing rebuild failed after replace_column", iters)) {
+                if (auto failed = rebuild_dual_pool(
+                        "dual pricing rebuild failed after replace_column", iters)) {
                     return *failed;
                 }
             }
 
-            dual_pricer.update_after_dual_pivot(r_leave, eAbs, oldAbs, s_enter,
-                                                s_enter(r_leave), Ahat, N, w,
-                                                true);
+            dual_pricer.update_after_dual_pivot(r_leave, eAbs, oldAbs, s_enter, s_enter(r_leave),
+                                                Ahat, N, w, true);
             if (dual_pricer.needs_rebuild()) {
-                if (auto failed =
-                        rebuild_dual_pool("dual pricing rebuild failed after pivot update", iters)) {
+                if (auto failed = rebuild_dual_pool(
+                        "dual pricing rebuild failed after pivot update", iters)) {
                     return *failed;
                 }
                 dual_pricer.clear_rebuild_flag();
             }
-            if (self.should_trace_iter_(iters) &&
-                self.opt_.verbose_include_basis) {
+            if (self.should_trace_iter_(iters) && self.opt_.verbose_include_basis) {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                  " basis_after=" + self.format_basis_(basis));
             }
@@ -838,7 +843,7 @@ class RevisedSimplexDualEngine {
         info_map["dual_pricing"] = dual_pricer.current_strategy_name();
         info_map["dual_bfrt_flips"] = std::to_string(total_flips);
         self.trace_line_("[dual] iterlimit basis=" + self.format_basis_(basis));
-        return {LPSolution::Status::IterLimit, Eigen::VectorXd::Zero(n), basis,
-                iters, std::move(info_map)};
+        return {LPSolution::Status::IterLimit, Eigen::VectorXd::Zero(n), basis, iters,
+                std::move(info_map)};
     }
 };

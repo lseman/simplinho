@@ -169,6 +169,7 @@ class SparseForrestTomlinLU {
         if (config_.diagonal_equilibration)
             factor_matrix = equilibrate_inf_norm_(A);
         load_initial_U_(factor_matrix);
+        ensure_U_cols_ready_();
         symbolic_analyze_();
         initialize_active_stats_();
         try {
@@ -188,6 +189,11 @@ class SparseForrestTomlinLU {
         updates_.clear();
         last_update_failure_reason_ = UpdateFailureReason::None;
         norm_growth_estimate_ = 1.0;
+        updates_count_ = 0;
+        updates_max_z_inf_ = 0.0;
+        updates_max_w_inf_ = 0.0;
+        updates_cumulative_z_inf_ = 0.0;
+        updates_density_sum_ = 0.0;
     }
 
     UpdateFailureReason last_update_failure_reason() const noexcept {
@@ -211,21 +217,13 @@ class SparseForrestTomlinLU {
 
     UpdateStats update_stats() const noexcept {
         UpdateStats stats;
-        stats.count = static_cast<int>(updates_.size());
+        stats.count = updates_count_;
+        stats.max_z_inf = updates_max_z_inf_;
+        stats.max_w_inf = updates_max_w_inf_;
+        stats.cumulative_z_inf = updates_cumulative_z_inf_;
+        stats.avg_z_density =
+            updates_count_ > 0 ? updates_density_sum_ / static_cast<double>(updates_count_) : 0.0;
         stats.norm_growth_estimate = norm_growth_estimate_;
-        if (updates_.empty())
-            return stats;
-
-        double density_sum = 0.0;
-        for (const auto& update : updates_) {
-            const double z_inf = update.z.inf_norm();
-            const double w_inf = update.w.inf_norm();
-            stats.max_z_inf = std::max(stats.max_z_inf, z_inf);
-            stats.max_w_inf = std::max(stats.max_w_inf, w_inf);
-            stats.cumulative_z_inf += z_inf;
-            density_sum += update.z.density(n_);
-        }
-        stats.avg_z_density = density_sum / static_cast<double>(updates_.size());
         return stats;
     }
 
@@ -250,6 +248,7 @@ class SparseForrestTomlinLU {
                                         dense_to_sparse_update_(z, eps),
                                         dense_to_sparse_update_(w, eps), alpha});
         update_norm_growth_estimate_(updates_.back());
+        update_cached_stats_(updates_.back());
         return true;
     }
 
@@ -286,8 +285,9 @@ class SparseForrestTomlinLU {
         permute_and_scale_rhs_(b, permuted_rhs_scratch_, Pr_, row_scale_);
         Eigen::VectorXd& Pb = permuted_rhs_scratch_;
 
-        Eigen::VectorXd z = forward_solve_L_(Pb);
-        Eigen::VectorXd w = back_solve_U_(z);
+        const bool use_sparse_rhs = is_hyper_sparse_rhs_(Pb);
+        Eigen::VectorXd z = use_sparse_rhs ? forward_solve_L_sparse_(Pb) : forward_solve_L_(Pb);
+        Eigen::VectorXd w = use_sparse_rhs ? back_solve_U_sparse_(z) : back_solve_U_(z);
 
         Eigen::VectorXd x(n_);
         for (int i = 0; i < n_; ++i)
@@ -319,8 +319,10 @@ class SparseForrestTomlinLU {
         permute_and_scale_rhs_(c, permuted_transpose_rhs_scratch_, Pc_, col_scale_);
         Eigen::VectorXd& PcTc = permuted_transpose_rhs_scratch_;
 
-        Eigen::VectorXd t = forward_solve_UT_(PcTc);
-        Eigen::VectorXd s = back_solve_LT_(t);
+        const bool use_sparse_rhs = is_hyper_sparse_rhs_(PcTc);
+        Eigen::VectorXd t =
+            use_sparse_rhs ? forward_solve_UT_sparse_(PcTc) : forward_solve_UT_(PcTc);
+        Eigen::VectorXd s = use_sparse_rhs ? back_solve_LT_sparse_(t) : back_solve_LT_(t);
 
         Eigen::VectorXd y(n_);
         for (int i = 0; i < n_; ++i)
@@ -419,8 +421,22 @@ class SparseForrestTomlinLU {
     };
 
     static constexpr double kZeroTol_ = 1e-16;
+    static constexpr double kHyperSparseDensityThreshold_ = 0.02;
     static constexpr long kEarlyAcceptMarkowitzScore_ = 1;
     static constexpr double kEarlyAcceptPivotRatio_ = 0.9;
+
+    static bool is_hyper_sparse_rhs_(const Eigen::VectorXd& rhs) {
+        if (rhs.size() == 0)
+            return false;
+        const int threshold =
+            std::max(1, static_cast<int>(rhs.size() * kHyperSparseDensityThreshold_));
+        int nz = 0;
+        for (int i = 0; i < rhs.size() && nz <= threshold; ++i) {
+            if (std::abs(rhs(i)) > kZeroTol_)
+                ++nz;
+        }
+        return nz <= threshold;
+    }
 
     static double get_entry_(const SparseRow& entries, int idx) {
         const auto it = lower_bound_entry_(entries, idx);
@@ -609,15 +625,6 @@ class SparseForrestTomlinLU {
     void apply_row_unscaling_(Eigen::VectorXd& y) const {
         for (int i = 0; i < y.size(); ++i)
             y(i) *= row_scale_[static_cast<size_t>(i)];
-    }
-
-    static void logical_sorted_entries_into_(const SparseRow& entries, const std::vector<int>& inv,
-                                             std::vector<IndexedValue>& ordered) {
-        ordered.clear();
-        ordered.reserve(entries.size());
-        for (const auto& entry : entries)
-            ordered.push_back(IndexedValue{inv[entry.idx], entry.val});
-        std::sort(ordered.begin(), ordered.end());
     }
 
     void symbolic_analyze_() {
@@ -827,6 +834,7 @@ class SparseForrestTomlinLU {
     }
 
     void flush_column_candidate_invalidations_() {
+        ensure_U_cols_ready_();
         for (const int col : dirty_cols_scratch_) {
             col_candidate_dirty_[col] = false;
             for (const auto& [phys_row, val] : U_cols_[col_map_[col]]) {
@@ -960,116 +968,68 @@ class SparseForrestTomlinLU {
         const int phys_row = row_map_[i];
         const int phys_col = col_map_[j];
         set_entry_(U_rows_[phys_row], phys_col, v);
-        set_entry_(U_cols_[phys_col], phys_row, v);
+        U_cols_dirty_ = true;
         invalidate_row_candidate_(i);
         queue_column_candidate_invalidation_(j);
     }
 
-    void merge_update_U_row_active_(int row, int pivot_col, double lik,
-                                    const std::vector<IndexedValue>& pivot_row) {
+    void merge_update_U_row_active_(int row, int pivot_col_phys, double lik,
+                                    const SparseRow& pivot_row_phys) {
         const int phys_row = row_map_[row];
-        logical_sorted_entries_into_(U_rows_[phys_row], col_inv_, target_row_sorted_scratch_);
+        const SparseRow& target_row = U_rows_[phys_row];
 
-        merged_row_sorted_scratch_.clear();
-        merged_row_sorted_scratch_.reserve(target_row_sorted_scratch_.size() + pivot_row.size());
+        SparseRow new_row_entries;
+        new_row_entries.reserve(target_row.size() + pivot_row_phys.size());
 
         std::size_t target_pos = 0;
-        while (target_pos < target_row_sorted_scratch_.size() &&
-               target_row_sorted_scratch_[target_pos].idx < pivot_col) {
-            merged_row_sorted_scratch_.push_back(target_row_sorted_scratch_[target_pos]);
-            ++target_pos;
-        }
-        while (target_pos < target_row_sorted_scratch_.size() &&
-               target_row_sorted_scratch_[target_pos].idx == pivot_col) {
-            ++target_pos;
-        }
-
         std::size_t pivot_pos = 0;
-        while (pivot_pos < pivot_row.size() && pivot_row[pivot_pos].idx <= pivot_col)
-            ++pivot_pos;
-
-        while (target_pos < target_row_sorted_scratch_.size() || pivot_pos < pivot_row.size()) {
-            const int target_col = target_pos < target_row_sorted_scratch_.size()
-                                       ? target_row_sorted_scratch_[target_pos].idx
+        while (target_pos < target_row.size() || pivot_pos < pivot_row_phys.size()) {
+            const int target_col = target_pos < target_row.size()
+                                       ? target_row[target_pos].idx
                                        : std::numeric_limits<int>::max();
-            const int pivot_row_col = pivot_pos < pivot_row.size()
-                                          ? pivot_row[pivot_pos].idx
-                                          : std::numeric_limits<int>::max();
+            const int pivot_col = pivot_pos < pivot_row_phys.size()
+                                       ? pivot_row_phys[pivot_pos].idx
+                                       : std::numeric_limits<int>::max();
 
-            if (target_col < pivot_row_col) {
-                merged_row_sorted_scratch_.push_back(target_row_sorted_scratch_[target_pos]);
+            if (target_col < pivot_col) {
+                new_row_entries.push_back(target_row[target_pos]);
                 ++target_pos;
                 continue;
             }
 
-            if (pivot_row_col < target_col) {
-                const double new_val = -lik * pivot_row[pivot_pos].val;
-                if (std::abs(new_val) > kZeroTol_)
-                    merged_row_sorted_scratch_.push_back(IndexedValue{pivot_row_col, new_val});
+            if (pivot_col < target_col) {
+                const double new_val = -lik * pivot_row_phys[pivot_pos].val;
+                if (std::abs(new_val) > kZeroTol_) {
+                    new_row_entries.push_back(IndexedValue{pivot_col, new_val});
+                    const int logical_col = col_inv_[pivot_col];
+                    note_U_entry_change_(row, logical_col, 0.0, new_val);
+                    queue_column_candidate_invalidation_(logical_col);
+                }
                 ++pivot_pos;
                 continue;
             }
 
-            const double new_val =
-                target_row_sorted_scratch_[target_pos].val - lik * pivot_row[pivot_pos].val;
+            const double old_val = target_row[target_pos].val;
+            const double new_val = old_val - lik * pivot_row_phys[pivot_pos].val;
             if (std::abs(new_val) > kZeroTol_)
-                merged_row_sorted_scratch_.push_back(IndexedValue{target_col, new_val});
+                new_row_entries.push_back(IndexedValue{target_col, new_val});
+            if (std::abs(new_val - old_val) > kZeroTol_) {
+                const int logical_col = col_inv_[target_col];
+                note_U_entry_change_(row, logical_col, old_val, new_val);
+                queue_column_candidate_invalidation_(logical_col);
+            }
             ++target_pos;
             ++pivot_pos;
         }
 
-        SparseRow new_row_entries;
-        new_row_entries.reserve(merged_row_sorted_scratch_.size());
-        for (const auto& entry : merged_row_sorted_scratch_) {
-            set_entry_(new_row_entries, col_map_[entry.idx], entry.val);
-        }
-
-        std::size_t old_pos = 0;
-        std::size_t new_pos = 0;
-        while (old_pos < target_row_sorted_scratch_.size() ||
-               new_pos < merged_row_sorted_scratch_.size()) {
-            const int old_col = old_pos < target_row_sorted_scratch_.size()
-                                    ? target_row_sorted_scratch_[old_pos].idx
-                                    : std::numeric_limits<int>::max();
-            const int new_col = new_pos < merged_row_sorted_scratch_.size()
-                                    ? merged_row_sorted_scratch_[new_pos].idx
-                                    : std::numeric_limits<int>::max();
-
-            if (old_col == new_col) {
-                const double old_val = target_row_sorted_scratch_[old_pos].val;
-                const double new_val = merged_row_sorted_scratch_[new_pos].val;
-                if (std::abs(new_val - old_val) > kZeroTol_) {
-                    note_U_entry_change_(row, old_col, old_val, new_val);
-                    set_entry_(U_cols_[col_map_[old_col]], phys_row, new_val);
-                    queue_column_candidate_invalidation_(old_col);
-                }
-                ++old_pos;
-                ++new_pos;
-                continue;
-            }
-
-            if (old_col < new_col) {
-                const double old_val = target_row_sorted_scratch_[old_pos].val;
-                note_U_entry_change_(row, old_col, old_val, 0.0);
-                set_entry_(U_cols_[col_map_[old_col]], phys_row, 0.0);
-                queue_column_candidate_invalidation_(old_col);
-                ++old_pos;
-                continue;
-            }
-
-            const double new_val = merged_row_sorted_scratch_[new_pos].val;
-            note_U_entry_change_(row, new_col, 0.0, new_val);
-            set_entry_(U_cols_[col_map_[new_col]], phys_row, new_val);
-            queue_column_candidate_invalidation_(new_col);
-            ++new_pos;
-        }
-
         U_rows_[phys_row] = std::move(new_row_entries);
+        U_cols_dirty_ = true;
         invalidate_row_candidate_(row);
     }
 
     double active_col_max_(int col) const {
         if (col_max_dirty_[col]) {
+            ensure_U_cols_ready_();
             double col_max = 0.0;
             for (const auto& [phys_row, val] : U_cols_[col_map_[col]]) {
                 const int logical_row = row_inv_[phys_row];
@@ -1092,6 +1052,7 @@ class SparseForrestTomlinLU {
                 col_max_dirty_[col] = true;
         }
 
+        ensure_U_cols_ready_();
         for (const auto& [phys_row, val] : U_cols_[col_map_[k]]) {
             const int row = row_inv_[phys_row];
             if (row <= k || std::abs(val) <= abs_floor_)
@@ -1152,6 +1113,7 @@ class SparseForrestTomlinLU {
             U_upper_ptr_[i + 1] = static_cast<int>(U_upper_idx_.size());
 
             UT_lower_ptr_[i] = static_cast<int>(UT_lower_idx_.size());
+            ensure_U_cols_ready_();
             for (const auto& entry : logical_sorted_entries_(U_cols_[phys_col], row_inv_)) {
                 if (entry.idx < i) {
                     UT_lower_idx_.push_back(entry.idx);
@@ -1163,6 +1125,7 @@ class SparseForrestTomlinLU {
             UT_lower_ptr_[i + 1] = static_cast<int>(UT_lower_idx_.size());
 
             LT_upper_ptr_[i] = static_cast<int>(LT_upper_idx_.size());
+            ensure_L_cols_ready_();
             for (const auto& entry : sorted_entries_(L_cols_[i])) {
                 if (entry.idx > i) {
                     LT_upper_idx_.push_back(entry.idx);
@@ -1182,6 +1145,38 @@ class SparseForrestTomlinLU {
         }
     }
 
+    void rebuild_U_cols_() const {
+        auto& cols = const_cast<std::vector<SparseRow>&>(U_cols_);
+        cols.assign(n_, {});
+        for (int phys_row = 0; phys_row < n_; ++phys_row) {
+            for (const auto& entry : U_rows_[phys_row])
+                set_entry_(cols[entry.idx], phys_row, entry.val);
+        }
+        const_cast<bool&>(U_cols_dirty_) = false;
+    }
+
+    void ensure_U_cols_ready_() const {
+        if (!U_cols_dirty_)
+            return;
+        rebuild_U_cols_();
+    }
+
+    void rebuild_L_cols_() const {
+        auto& cols = const_cast<std::vector<SparseRow>&>(L_cols_);
+        cols.assign(n_, {});
+        for (int phys_row = 0; phys_row < n_; ++phys_row) {
+            for (const auto& entry : L_rows_[phys_row])
+                set_entry_(cols[entry.idx], phys_row, entry.val);
+        }
+        const_cast<bool&>(L_cols_dirty_) = false;
+    }
+
+    void ensure_L_cols_ready_() const {
+        if (!L_cols_dirty_)
+            return;
+        rebuild_L_cols_();
+    }
+
     double get_U_(int i, int j) const { return get_entry_(U_rows_[row_map_[i]], col_map_[j]); }
 
     double get_L_(int i, int j) const { return get_entry_(L_rows_[i], j); }
@@ -1190,12 +1185,12 @@ class SparseForrestTomlinLU {
         const int phys_row = row_map_[i];
         const int phys_col = col_map_[j];
         set_entry_(U_rows_[phys_row], phys_col, v);
-        set_entry_(U_cols_[phys_col], phys_row, v);
+        U_cols_dirty_ = true;
     }
 
     void set_L_(int i, int j, double v) {
         set_entry_(L_rows_[i], j, v);
-        set_entry_(L_cols_[j], i, v);
+        L_cols_dirty_ = true;
     }
 
     void swap_U_rows_(int a, int b) {
@@ -1279,6 +1274,7 @@ class SparseForrestTomlinLU {
             return {candidate.row, candidate.col};
         }
 
+        ensure_U_cols_ready_();
         int i = k;
         double best_in_col = -1.0;
         for (const auto& [phys_row, val] : U_cols_[col_map_[k]]) {
@@ -1311,6 +1307,7 @@ class SparseForrestTomlinLU {
 
             int new_i = i;
             double best_col = -1.0;
+            ensure_U_cols_ready_();
             for (const auto& [phys_row, val] : U_cols_[col_map_[j]]) {
                 const int logical_row = row_inv_[phys_row];
                 if (logical_row < k)
@@ -1347,8 +1344,7 @@ class SparseForrestTomlinLU {
                 throw std::runtime_error("SparseForrestTomlinLU: singular pivot");
 
             set_L_(k, k, 1.0);
-            logical_sorted_entries_into_(U_rows_[row_map_[k]], col_inv_, pivot_row_sorted_scratch_);
-
+            ensure_U_cols_ready_();
             affected_rows_scratch_.clear();
             for (const auto& [phys_row, val] : U_cols_[col_map_[k]]) {
                 const int logical_row = row_inv_[phys_row];
@@ -1363,7 +1359,7 @@ class SparseForrestTomlinLU {
 
                 const double lik = uik / piv;
                 set_L_(i, k, lik);
-                merge_update_U_row_active_(i, k, lik, pivot_row_sorted_scratch_);
+                merge_update_U_row_active_(i, col_map_[k], lik, U_rows_[row_map_[k]]);
             }
 
             finalize_pivot_step_(k);
@@ -1405,6 +1401,29 @@ class SparseForrestTomlinLU {
         return x;
     }
 
+    Eigen::VectorXd forward_solve_L_sparse_(const Eigen::VectorXd& b) const {
+        if (n_ == 0) [[unlikely]]
+            return b;
+        SIMPLEX_ASSUME(n_ > 0);
+        Eigen::VectorXd x = Eigen::VectorXd::Zero(n_);
+        for (int i = 0; i < n_; ++i) {
+            double rhs_i = b(i);
+            for (int pos = L_lower_ptr_[i]; pos < L_lower_ptr_[i + 1]; ++pos) {
+                const int idx = L_lower_idx_[pos];
+                const double xidx = x(idx);
+                if (xidx != 0.0)
+                    rhs_i -= L_lower_val_[pos] * xidx;
+            }
+            const double piv = L_diag_[i];
+            if (!std::isfinite(piv) || std::abs(piv) < abs_floor_) [[unlikely]]
+                throw std::runtime_error("SparseForrestTomlinLU: bad L diagonal");
+            const double xi = rhs_i / piv;
+            if (std::abs(xi) > kZeroTol_)
+                x(i) = xi;
+        }
+        return x;
+    }
+
     Eigen::VectorXd back_solve_U_(const Eigen::VectorXd& b) const {
         if (n_ == 0) [[unlikely]]
             return b;
@@ -1420,6 +1439,30 @@ class SparseForrestTomlinLU {
             if (!std::isfinite(piv) || std::abs(piv) < abs_floor_) [[unlikely]]
                 throw std::runtime_error("SparseForrestTomlinLU: bad U diagonal");
             x(i) = (x(i) - s) / piv;
+        }
+        return x;
+    }
+
+    Eigen::VectorXd back_solve_U_sparse_(const Eigen::VectorXd& b) const {
+        if (n_ == 0) [[unlikely]]
+            return b;
+        SIMPLEX_ASSUME(n_ > 0);
+        Eigen::VectorXd x = Eigen::VectorXd::Zero(n_);
+        for (int i = n_ - 1; i >= 0; --i) {
+            double rhs_i = b(i);
+            for (int pos = U_upper_ptr_[i]; pos < U_upper_ptr_[i + 1]; ++pos) {
+                const int idx = U_upper_idx_[pos];
+                const double xidx = x(idx);
+                if (xidx != 0.0)
+                    rhs_i -= U_upper_val_[pos] * xidx;
+            }
+
+            const double piv = U_diag_[i];
+            if (!std::isfinite(piv) || std::abs(piv) < abs_floor_) [[unlikely]]
+                throw std::runtime_error("SparseForrestTomlinLU: bad U diagonal");
+            const double xi = rhs_i / piv;
+            if (std::abs(xi) > kZeroTol_)
+                x(i) = xi;
         }
         return x;
     }
@@ -1442,6 +1485,29 @@ class SparseForrestTomlinLU {
         return x;
     }
 
+    Eigen::VectorXd forward_solve_UT_sparse_(const Eigen::VectorXd& b) const {
+        if (n_ == 0) [[unlikely]]
+            return b;
+        SIMPLEX_ASSUME(n_ > 0);
+        Eigen::VectorXd x = Eigen::VectorXd::Zero(n_);
+        for (int i = 0; i < n_; ++i) {
+            double rhs_i = b(i);
+            for (int pos = UT_lower_ptr_[i]; pos < UT_lower_ptr_[i + 1]; ++pos) {
+                const int idx = UT_lower_idx_[pos];
+                const double xidx = x(idx);
+                if (xidx != 0.0)
+                    rhs_i -= UT_lower_val_[pos] * xidx;
+            }
+            const double piv = U_diag_[i];
+            if (!std::isfinite(piv) || std::abs(piv) < abs_floor_) [[unlikely]]
+                throw std::runtime_error("SparseForrestTomlinLU: bad U diagonal");
+            const double xi = rhs_i / piv;
+            if (std::abs(xi) > kZeroTol_)
+                x(i) = xi;
+        }
+        return x;
+    }
+
     Eigen::VectorXd back_solve_LT_(const Eigen::VectorXd& b) const {
         if (n_ == 0) [[unlikely]]
             return b;
@@ -1457,6 +1523,29 @@ class SparseForrestTomlinLU {
             if (!std::isfinite(piv) || std::abs(piv) < abs_floor_) [[unlikely]]
                 throw std::runtime_error("SparseForrestTomlinLU: bad L diagonal");
             x(i) = (x(i) - s) / piv;
+        }
+        return x;
+    }
+
+    Eigen::VectorXd back_solve_LT_sparse_(const Eigen::VectorXd& b) const {
+        if (n_ == 0) [[unlikely]]
+            return b;
+        SIMPLEX_ASSUME(n_ > 0);
+        Eigen::VectorXd x = Eigen::VectorXd::Zero(n_);
+        for (int i = n_ - 1; i >= 0; --i) {
+            double rhs_i = b(i);
+            for (int pos = LT_upper_ptr_[i]; pos < LT_upper_ptr_[i + 1]; ++pos) {
+                const int idx = LT_upper_idx_[pos];
+                const double xidx = x(idx);
+                if (xidx != 0.0)
+                    rhs_i -= LT_upper_val_[pos] * xidx;
+            }
+            const double piv = L_diag_[i];
+            if (!std::isfinite(piv) || std::abs(piv) < abs_floor_) [[unlikely]]
+                throw std::runtime_error("SparseForrestTomlinLU: bad L diagonal");
+            const double xi = rhs_i / piv;
+            if (std::abs(xi) > kZeroTol_)
+                x(i) = xi;
         }
         return x;
     }
@@ -1550,6 +1639,16 @@ class SparseForrestTomlinLU {
         norm_growth_estimate_ *= proxy;
     }
 
+    void update_cached_stats_(const SparseUpdate& update) {
+        const double z_inf = update.z.inf_norm();
+        const double w_inf = update.w.inf_norm();
+        updates_count_ += 1;
+        updates_max_z_inf_ = std::max(updates_max_z_inf_, z_inf);
+        updates_max_w_inf_ = std::max(updates_max_w_inf_, w_inf);
+        updates_cumulative_z_inf_ += z_inf;
+        updates_density_sum_ += update.z.density(n_);
+    }
+
   private:
     int n_{0};
     double pivot_rel_{1e-12};
@@ -1594,12 +1693,16 @@ class SparseForrestTomlinLU {
     std::vector<int> L_lower_idx_, U_upper_idx_, UT_lower_idx_, LT_upper_idx_;
     std::vector<double> L_lower_val_, U_upper_val_, UT_lower_val_, LT_upper_val_;
     std::vector<int> affected_rows_scratch_;
-    std::vector<IndexedValue> pivot_row_sorted_scratch_;
-    std::vector<IndexedValue> target_row_sorted_scratch_;
-    std::vector<IndexedValue> merged_row_sorted_scratch_;
     std::vector<SparseUpdate> updates_;
+    int updates_count_{0};
+    double updates_max_z_inf_{0.0};
+    double updates_max_w_inf_{0.0};
+    double updates_cumulative_z_inf_{0.0};
+    double updates_density_sum_{0.0};
 
     std::vector<int> Pr_, Pc_;
     std::vector<SparseRow> U_rows_, L_rows_, U_cols_, L_cols_;
+    mutable bool U_cols_dirty_{false};
+    mutable bool L_cols_dirty_{false};
     UpdateFailureReason last_update_failure_reason_{UpdateFailureReason::None};
 };

@@ -88,7 +88,8 @@ class CutPool {
 
     std::vector<Cut> select_violated_cuts(const Eigen::VectorXd& primal,
                                           const Eigen::VectorXd& lower_bounds,
-                                          const Eigen::VectorXd& upper_bounds, int max_cuts);
+                                          const Eigen::VectorXd& upper_bounds, int max_cuts,
+                                          double density_penalty_scale = 1.0);
 
     void reset(const Options& options);
 

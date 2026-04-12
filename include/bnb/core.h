@@ -2450,7 +2450,7 @@ class Solver {
                 const auto selection_start = SteadyClock::now();
                 selected = cut_pool_.select_violated_cuts(relaxation.primal, node.lower_bounds,
                                                           node.upper_bounds,
-                                                          options_.max_cuts_added_per_round);
+                                                          options_.max_cuts_added_per_round, 1.0);
                 timing.root_cut_selection_wall_ns +=
                     elapsed_ns_(selection_start, SteadyClock::now());
                 timing.root_cuts_selected += static_cast<int>(selected.size());
@@ -2552,7 +2552,7 @@ class Solver {
                 const auto selection_start = SteadyClock::now();
                 selected = cut_pool_.select_violated_cuts(relaxation.primal, node.lower_bounds,
                                                           node.upper_bounds,
-                                                          options_.max_cuts_added_per_round);
+                                                          options_.max_cuts_added_per_round, 1.6);
                 timing.node_cut_selection_wall_ns +=
                     elapsed_ns_(selection_start, SteadyClock::now());
                 timing.node_cuts_selected += static_cast<int>(selected.size());

@@ -76,7 +76,8 @@ const std::vector<std::unique_ptr<CutSeparator>>& default_cut_separators_() {
             }));
 
         built.push_back(std::make_unique<FunctionCutSeparator>(
-            "Clique", [](const SeparatorContext& context) { return context.options.use_clique_cuts; },
+            "Clique",
+            [](const SeparatorContext& context) { return context.options.use_clique_cuts; },
             [](const SeparatorContext& context) {
                 return generate_clique_cuts(context.problem, context.relaxation, context.options,
                                             context.learned_implications, context.structural_cuts);
@@ -272,11 +273,13 @@ double fractional_focus_(const Cut& cut, const Eigen::VectorXd& primal) {
     return total_weight > 0.0 ? weighted_sum / total_weight : 0.0;
 }
 
-double density_adjusted_efficacy_(double violation, double norm, int nnz, double fractional_focus) {
+double density_adjusted_efficacy_(double violation, double norm, int nnz, double fractional_focus,
+                                  double density_penalty_scale) {
     if (norm <= 1e-16)
         return 0.0;
     const double efficacy = violation / norm;
-    const double density_penalty = std::sqrt(static_cast<double>(std::max(1, nnz)));
+    const double density_penalty =
+        density_penalty_scale * std::sqrt(static_cast<double>(std::max(1, nnz)));
     return efficacy * (0.7 + 0.3 * fractional_focus) / density_penalty;
 }
 
@@ -2042,8 +2045,8 @@ bool add_cut_locked_(const Problem& problem, const Cut& cut, double min_violatio
                      std::unordered_set<CutSignature, CutSignatureHash>* signatures,
                      std::unordered_map<std::uint64_t, std::vector<int>>* support_buckets,
                      std::unordered_map<std::string, int>* generated_counts,
-                     std::unordered_map<std::string, int>* type_usage_stats,
-                     int* cuts_generated, int* duplicate_cuts) {
+                     std::unordered_map<std::string, int>* type_usage_stats, int* cuts_generated,
+                     int* duplicate_cuts) {
     if (!validate_cut_indices_(cut, static_cast<int>(problem.variable_types.size()))) {
         return false;
     }
@@ -2100,10 +2103,9 @@ bool CutPool::add_cut(const Problem& problem, const Cut& cut) {
     detail::LockTrace lock_trace("cuts_mutex_");
     std::unique_lock<std::shared_mutex> lock(cuts_mutex_);
     lock_trace.acquired_lock();
-    const bool added =
-        add_cut_locked_(problem, cut, min_violation_, &cuts_, &row_norms_, &signatures_,
-                        &support_buckets_, &generated_counts_, &type_usage_stats_,
-                        &cuts_generated_, &duplicate_cuts_);
+    const bool added = add_cut_locked_(problem, cut, min_violation_, &cuts_, &row_norms_,
+                                       &signatures_, &support_buckets_, &generated_counts_,
+                                       &type_usage_stats_, &cuts_generated_, &duplicate_cuts_);
     const bool should_manage =
         cuts_.size() > static_cast<std::size_t>(max_pool_size_ + std::max(8, max_pool_size_ / 8));
     lock.unlock();
@@ -2115,7 +2117,8 @@ bool CutPool::add_cut(const Problem& problem, const Cut& cut) {
 
 std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
                                                const Eigen::VectorXd& lower_bounds,
-                                               const Eigen::VectorXd& upper_bounds, int max_cuts) {
+                                               const Eigen::VectorXd& upper_bounds, int max_cuts,
+                                               double density_penalty_scale) {
     detail::TimingTrace timing_trace("cutpool_select_violated_cuts");
     detail::LockTrace lock_trace("cuts_mutex_");
     std::unique_lock<std::shared_mutex> lock(cuts_mutex_);
@@ -2151,7 +2154,7 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
             const double density_adj = density_adjusted_efficacy_(
                 violation, norm,
                 active_stats.nnz > 0 ? active_stats.nnz : static_cast<int>(cuts_[i].indices.size()),
-                focus);
+                focus, density_penalty_scale);
             const double dynamism = cut_dynamism_(cuts_[i], primal, violation, norm);
             candidates.push_back(Candidate{
                 index : i,
@@ -2394,7 +2397,8 @@ double gmi_cut_quality_score_(const Cut& cut, const Eigen::VectorXd& primal, dou
     if (norm <= 1e-16)
         return 0.0;
     const double focus = fractional_focus_(cut, primal);
-    return density_adjusted_efficacy_(violation, norm, static_cast<int>(cut.indices.size()), focus);
+    return density_adjusted_efficacy_(violation, norm, static_cast<int>(cut.indices.size()), focus,
+                                      1.0);
 }
 
 bool scale_integral_support_gmi_cut_(const Problem& problem, const Options& options, Cut* cut) {
@@ -2897,9 +2901,9 @@ std::optional<Cut> build_mir_cut_from_canonical_row_(const Problem& problem,
             if (violation <= options.min_cut_violation)
                 continue;
 
-            cut.strength = density_adjusted_efficacy_(violation, cut_norm_(cut),
-                                                      static_cast<int>(cut.indices.size()),
-                                                      fractional_focus_(cut, relaxation.primal));
+            cut.strength = density_adjusted_efficacy_(
+                violation, cut_norm_(cut), static_cast<int>(cut.indices.size()),
+                fractional_focus_(cut, relaxation.primal), 1.0);
             if (cut.strength <= best_score)
                 continue;
             best_score = cut.strength;
@@ -3662,7 +3666,7 @@ std::vector<Cut> generate_odd_cycle_cuts(const Problem& problem,
             continue;
         cut.strength = density_adjusted_efficacy_(violation, cut_norm_(cut),
                                                   static_cast<int>(cut.indices.size()),
-                                                  fractional_focus_(cut, relaxation.primal));
+                                                  fractional_focus_(cut, relaxation.primal), 1.0);
         const CutSignature signature = cut_signature(cut);
         if (!signatures.insert(signature).second)
             continue;
@@ -3722,8 +3726,7 @@ std::vector<Cut> generate_cuts(const Problem& problem, const RelaxationSolution&
     }
 
     if (options.parallel_workers > 1 && enabled_separators.size() > 1) {
-        const int worker_count = std::min<int>(options.parallel_workers,
-                                               enabled_separators.size());
+        const int worker_count = std::min<int>(options.parallel_workers, enabled_separators.size());
         detail::ParallelDispatcher dispatcher(worker_count);
         std::vector<std::vector<Cut>> family_cuts(enabled_separators.size());
         dispatcher.run(static_cast<int>(enabled_separators.size()), [&](int index) {

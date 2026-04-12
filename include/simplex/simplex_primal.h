@@ -312,14 +312,13 @@ class RevisedSimplexPrimalEngine {
             }
 
             const int e = N[*e_rel];
-            const Eigen::VectorXd aE = A.col(e);
 
             Eigen::VectorXd dB;
             try {
-                dB = B.solve_B(aE);
+                dB = B.solve_B(A.col(e));
             } catch (...) {
                 B.refactor();
-                dB = B.solve_B(aE);
+                dB = B.solve_B(A.col(e));
                 if (self.opt_.pricing_rule == "adaptive") {
                     self.adaptive_pricer_.build_primal_pools(B, A, N);
                     self.adaptive_pricer_.clear_rebuild_flag();
@@ -427,7 +426,7 @@ class RevisedSimplexPrimalEngine {
             N[idxN] = oldAbs;
 
             try {
-                B.replace_column(r, aE);
+                B.replace_column(r, A.col(e));
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
