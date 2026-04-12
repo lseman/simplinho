@@ -300,8 +300,8 @@ class SparseForrestTomlinLU {
         Eigen::VectorXd& Pb = permuted_rhs_scratch_;
 
         // Adaptive threshold (Item 9): skip hyper-sparse if recent reach has been dense.
-        const bool use_sparse_rhs =
-            ema_reach_ratio_ < kHyperSparseFallbackRatio_ && is_hyper_sparse_rhs_(Pb);
+        const bool use_sparse_rhs = false;
+        //            ema_reach_ratio_ < kHyperSparseFallbackRatio_ && is_hyper_sparse_rhs_(Pb);
         if (use_sparse_rhs) {
             // Chain L-reach as seeds for U solve (Item 1): eliminates second O(n) scan.
             Eigen::VectorXd z = forward_solve_L_sparse_(Pb, nullptr);

@@ -2096,16 +2096,17 @@ class Model {
                         accumulated_internal_iters_ns += attempt->timing.simplex_iters_ns;
                         accumulated_internal_serialize_ns += attempt->timing.serialization_ns;
                     }
-                    if (verbose_ && cuts.empty() &&
-                        node_data.original_vars == base_data.original_vars) {
-                        std::cerr << "[MIP Root Debug] LP attempt=" << solver_name
-                                  << " basis=" << (basis_arg != nullptr) << " result="
-                                  << (attempt.has_value() ? ::to_string(attempt->status) : "none")
-                                  << " iters=" << (attempt.has_value() ? attempt->iters : 0)
-                                  << " has_update="
-                                  << (attempt.has_value() && attempt->has_internal_tableau)
-                                  << std::endl;
-                    }
+                    // if (verbose_ && cuts.empty() &&
+                    //     node_data.original_vars == base_data.original_vars) {
+                    //     std::cerr << "[MIP Root Debug] LP attempt=" << solver_name
+                    //               << " basis=" << (basis_arg != nullptr) << " result="
+                    //               << (attempt.has_value() ? ::to_string(attempt->status) :
+                    //               "none")
+                    //               << " iters=" << (attempt.has_value() ? attempt->iters : 0)
+                    //               << " has_update="
+                    //               << (attempt.has_value() && attempt->has_internal_tableau)
+                    //               << std::endl;
+                    // }
                     return attempt;
                 };
                 const std::optional<std::vector<int>> slack_basis_guess =
@@ -2120,11 +2121,7 @@ class Model {
                             try {
                                 attempt = solver.solve(node_data.A_sparse, node_data.b, node_data.c,
                                                        solve_l, solve_u, *basis_guess);
-                            } catch (const std::runtime_error& err) {
-                                if (verbose_ && cuts.empty() && node_data.original_vars == base_data.original_vars) {
-                                    std::cerr << "[MIP Root Debug] slack-basis solve runtime error: "
-                                              << err.what() << std::endl;
-                                }
+                            } catch (const std::runtime_error&) {
                                 attempt.reset();
                             }
                         } else {
@@ -2140,15 +2137,6 @@ class Model {
                             accumulated_internal_crash_ns += attempt->timing.crash_ns;
                             accumulated_internal_iters_ns += attempt->timing.simplex_iters_ns;
                             accumulated_internal_serialize_ns += attempt->timing.serialization_ns;
-                        }
-                        if (verbose_ && cuts.empty() && node_data.original_vars == base_data.original_vars) {
-                            std::cerr << "[MIP Root Debug] slack-basis attempt="
-                                      << (basis_guess.has_value() ? "yes" : "no")
-                                      << " result="
-                                      << (attempt.has_value() ? ::to_string(attempt->status)
-                                                             : "none")
-                                      << " iters=" << (attempt.has_value() ? attempt->iters : 0)
-                                      << std::endl;
                         }
                         return attempt;
                     };
@@ -2250,33 +2238,21 @@ class Model {
                     if (verbose_ && cuts.empty() &&
                         node_data.original_vars == base_data.original_vars) {
                         const char* raw_status = ::to_string(raw_opt->status);
-                        std::cerr << "[MIP Root Debug] root LP raw status=" << raw_status
-                                  << " obj=" << raw_opt->obj << " iters=" << raw_opt->iters
-                                  << " terminal_optimal=" << terminal_optimal
-                                  << " terminal_unbounded=" << terminal_unbounded
-                                  << " has_farkas=" << raw_opt->farkas_has_cert
-                                  << " has_primal_ray=" << raw_opt->primal_ray_has_cert
-                                  << " primal_valid=" << has_valid_primal
-                                  << " warm_basis_source=" << static_cast<int>(warm_start_source)
-                                  << " attempted_warm=" << out.attempted_warm_start_basis_state
-                                  << " used_warm=" << used_warm_start_result
-                                  << " cold_retry=" << cold_retried_after_warm_start
-                                  << " fallback_solver="
-                                  << (entry.fallback_solver->has_value() ? 1 : 0)
-                                  << " slack_basis_guess="
-                                  << (slack_basis_guess.has_value() ? 1 : 0);
-                        if (raw_opt->status == LPSolution::Status::Singular) {
-                            if (auto reason = find_info_string(raw_opt->info, "reason")) {
-                                std::cerr << " reason=" << *reason;
-                            }
-                            if (auto where = find_info_string(raw_opt->info, "where")) {
-                                std::cerr << " where=" << *where;
-                            }
-                            if (auto what = find_info_string(raw_opt->info, "what")) {
-                                std::cerr << " what=" << *what;
-                            }
-                        }
-                        std::cerr << std::endl;
+                        // std::cerr << "[MIP Root Debug] root LP raw status=" << raw_status
+                        //           << " obj=" << raw_opt->obj << " iters=" << raw_opt->iters
+                        //           << " terminal_optimal=" << terminal_optimal
+                        //           << " terminal_unbounded=" << terminal_unbounded
+                        //           << " has_farkas=" << raw_opt->farkas_has_cert
+                        //           << " has_primal_ray=" << raw_opt->primal_ray_has_cert
+                        //           << " primal_valid=" << has_valid_primal
+                        //           << " warm_basis_source=" << static_cast<int>(warm_start_source)
+                        //           << " attempted_warm=" << out.attempted_warm_start_basis_state
+                        //           << " used_warm=" << used_warm_start_result
+                        //           << " cold_retry=" << cold_retried_after_warm_start
+                        //           << " fallback_solver="
+                        //           << (entry.fallback_solver->has_value() ? 1 : 0)
+                        //           << " slack_basis_guess="
+                        //           << (slack_basis_guess.has_value() ? 1 : 0) << std::endl;
                     }
                     out.lp_solution = *raw_opt;
                     if (terminal_optimal && !raw_opt->basis_state.column_status.empty() &&
@@ -2371,13 +2347,15 @@ class Model {
                 const SimplifiedCutsResult simplified_presolve_cuts =
                     simplify_cuts_for_bounds(presolve_only_cuts, node_l, node_u);
                 if (simplified_presolve_cuts.infeasible) {
-                    if (mip_options.verbose) {
-                        std::cerr << "[MIP Root Debug] root simplified cut presolve infeasible: "
-                                  << "bounds [" << node_l.head(data.original_vars).minCoeff()
-                                  << ", " << node_l.head(data.original_vars).maxCoeff() << "] / ["
-                                  << node_u.head(data.original_vars).minCoeff() << ", "
-                                  << node_u.head(data.original_vars).maxCoeff() << "]" << std::endl;
-                    }
+                    // if (mip_options.verbose) {
+                    //     std::cerr << "[MIP Root Debug] root simplified cut presolve infeasible: "
+                    //               << "bounds [" << node_l.head(data.original_vars).minCoeff()
+                    //               << ", " << node_l.head(data.original_vars).maxCoeff() << "] /
+                    //               ["
+                    //               << node_u.head(data.original_vars).minCoeff() << ", "
+                    //               << node_u.head(data.original_vars).maxCoeff() << "]" <<
+                    //               std::endl;
+                    // }
                     simplex_bnb::RelaxationSolution out;
                     out.status = simplex_bnb::RelaxationStatus::Infeasible;
                     out.primal = Eigen::VectorXd::Constant(
@@ -2390,11 +2368,11 @@ class Model {
                     problem, node_l.head(data.original_vars), node_u.head(data.original_vars),
                     simplified_presolve_cuts.cuts);
                 if (node_presolve.infeasible) {
-                    if (mip_options.verbose) {
-                        std::cerr << "[MIP Root Debug] node bound presolve infeasible after "
-                                  << simplified_presolve_cuts.cuts.size()
-                                  << " simplified presolve cuts" << std::endl;
-                    }
+                    // if (mip_options.verbose) {
+                    //     std::cerr << "[MIP Root Debug] node bound presolve infeasible after "
+                    //               << simplified_presolve_cuts.cuts.size()
+                    //               << " simplified presolve cuts" << std::endl;
+                    // }
                     simplex_bnb::RelaxationSolution out;
                     out.status = simplex_bnb::RelaxationStatus::Infeasible;
                     out.primal = Eigen::VectorXd::Constant(
@@ -2403,15 +2381,16 @@ class Model {
                                                      : std::numeric_limits<double>::infinity();
                     return out;
                 }
-                if (mip_options.verbose && cuts.empty()) {
-                    std::cerr << "[MIP Root Debug] root LP assembled total_vars=" << data.total_vars
-                              << " rows=" << data.rows << " original_vars=" << data.original_vars
-                              << " warm_basis=" << (basis != nullptr)
-                              << " simplified_presolve_cuts="
-                              << simplified_presolve_cuts.cuts.size()
-                              << " node_presolve_tightened_bounds="
-                              << node_presolve.tightened_bounds << std::endl;
-                }
+                // if (mip_options.verbose && cuts.empty()) {
+                //     std::cerr << "[MIP Root Debug] root LP assembled total_vars=" <<
+                //     data.total_vars
+                //               << " rows=" << data.rows << " original_vars=" << data.original_vars
+                //               << " warm_basis=" << (basis != nullptr)
+                //               << " simplified_presolve_cuts="
+                //               << simplified_presolve_cuts.cuts.size()
+                //               << " node_presolve_tightened_bounds="
+                //               << node_presolve.tightened_bounds << std::endl;
+                // }
                 simplex_bnb::RelaxationSolution relaxation =
                     thread_context.solve_node(node_presolve.lower, node_presolve.upper,
                                               simplified_structural_cuts.cuts, basis);
@@ -2419,15 +2398,16 @@ class Model {
                     const int lp_iters = relaxation.lp_solution ? relaxation.lp_solution->iters : 0;
                     const bool primal_valid = (relaxation.primal.size() == data.total_vars &&
                                                relaxation.primal.array().isFinite().all());
-                    std::cerr << "[MIP Root Debug] root relaxation status="
-                              << static_cast<int>(relaxation.status)
-                              << " objective=" << relaxation.objective
-                              << " attempted_warm=" << relaxation.attempted_warm_start_basis_state
-                              << " used_warm=" << relaxation.used_warm_start_basis_state
-                              << " cold_retried_after_warm="
-                              << relaxation.cold_retried_after_warm_start
-                              << " lp_iters=" << lp_iters << " primal_valid=" << primal_valid
-                              << std::endl;
+                    // std::cerr << "[MIP Root Debug] root relaxation status="
+                    //           << static_cast<int>(relaxation.status)
+                    //           << " objective=" << relaxation.objective
+                    //           << " attempted_warm=" <<
+                    //           relaxation.attempted_warm_start_basis_state
+                    //           << " used_warm=" << relaxation.used_warm_start_basis_state
+                    //           << " cold_retried_after_warm="
+                    //           << relaxation.cold_retried_after_warm_start
+                    //           << " lp_iters=" << lp_iters << " primal_valid=" << primal_valid
+                    //           << std::endl;
                 }
                 if (relaxation.used_warm_start_basis_state) {
                     any_warm_start_basis_state_used.store(true, std::memory_order_relaxed);
