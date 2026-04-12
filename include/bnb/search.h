@@ -372,33 +372,49 @@ class WorkerLocalQueue {
     WorkerLocalQueue(const WorkerLocalQueue&) = delete;
     WorkerLocalQueue& operator=(const WorkerLocalQueue&) = delete;
 
-    WorkerLocalQueue(WorkerLocalQueue&& other) noexcept
-        : nodes_(std::move(other.nodes_)), local_heap_(std::move(other.local_heap_)),
-          stealing_heap_(std::move(other.stealing_heap_)), next_handle_(other.next_handle_),
-          next_stamp_(other.next_stamp_),
-          frontier_root_lower_bounds_(std::move(other.frontier_root_lower_bounds_)),
-          frontier_root_upper_bounds_(std::move(other.frontier_root_upper_bounds_)),
-          frontier_root_domain_(std::move(other.frontier_root_domain_)),
-          lower_changed_counts_(std::move(other.lower_changed_counts_)),
-          upper_changed_counts_(std::move(other.upper_changed_counts_)),
-          lower_changed_values_(std::move(other.lower_changed_values_)),
-          upper_changed_values_(std::move(other.upper_changed_values_)) {}
+    WorkerLocalQueue(WorkerLocalQueue&& other) noexcept {
+        std::scoped_lock lock(other.mutex_);
+        slots_ = std::move(other.slots_);
+        free_handles_ = std::move(other.free_handles_);
+        lifo_stack_ = std::move(other.lifo_stack_);
+        best_heap_ = std::move(other.best_heap_);
+        stealing_heap_ = std::move(other.stealing_heap_);
+        next_stamp_ = other.next_stamp_;
+        active_count_ = other.active_count_;
+
+        frontier_root_lower_bounds_ = std::move(other.frontier_root_lower_bounds_);
+        frontier_root_upper_bounds_ = std::move(other.frontier_root_upper_bounds_);
+        frontier_root_domain_ = std::move(other.frontier_root_domain_);
+
+        lower_changed_counts_ = std::move(other.lower_changed_counts_);
+        upper_changed_counts_ = std::move(other.upper_changed_counts_);
+        frontier_max_lower_bounds_ = std::move(other.frontier_max_lower_bounds_);
+        frontier_min_upper_bounds_ = std::move(other.frontier_min_upper_bounds_);
+        frontier_lower_dirty_ = std::move(other.frontier_lower_dirty_);
+        frontier_upper_dirty_ = std::move(other.frontier_upper_dirty_);
+    }
 
     WorkerLocalQueue& operator=(WorkerLocalQueue&& other) noexcept {
         if (this != &other) {
             std::scoped_lock lock(mutex_, other.mutex_);
-            nodes_ = std::move(other.nodes_);
-            local_heap_ = std::move(other.local_heap_);
+            slots_ = std::move(other.slots_);
+            free_handles_ = std::move(other.free_handles_);
+            lifo_stack_ = std::move(other.lifo_stack_);
+            best_heap_ = std::move(other.best_heap_);
             stealing_heap_ = std::move(other.stealing_heap_);
-            next_handle_ = other.next_handle_;
             next_stamp_ = other.next_stamp_;
+            active_count_ = other.active_count_;
+
             frontier_root_lower_bounds_ = std::move(other.frontier_root_lower_bounds_);
             frontier_root_upper_bounds_ = std::move(other.frontier_root_upper_bounds_);
             frontier_root_domain_ = std::move(other.frontier_root_domain_);
+
             lower_changed_counts_ = std::move(other.lower_changed_counts_);
             upper_changed_counts_ = std::move(other.upper_changed_counts_);
-            lower_changed_values_ = std::move(other.lower_changed_values_);
-            upper_changed_values_ = std::move(other.upper_changed_values_);
+            frontier_max_lower_bounds_ = std::move(other.frontier_max_lower_bounds_);
+            frontier_min_upper_bounds_ = std::move(other.frontier_min_upper_bounds_);
+            frontier_lower_dirty_ = std::move(other.frontier_lower_dirty_);
+            frontier_upper_dirty_ = std::move(other.frontier_upper_dirty_);
         }
         return *this;
     }
@@ -414,7 +430,17 @@ class WorkerLocalQueue {
         std::vector<DomainChange> root_domain_changes;
     };
 
-    struct QueueKey {
+    struct Slot {
+        bool alive = false;
+        NodeEntry entry;
+    };
+
+    struct HandleStamp {
+        int handle = -1;
+        std::uint64_t stamp = 0;
+    };
+
+    struct BestKey {
         int handle = -1;
         std::uint64_t stamp = 0;
         double normalized_score = -std::numeric_limits<double>::infinity();
@@ -423,8 +449,8 @@ class WorkerLocalQueue {
         std::uint64_t order = 0;
     };
 
-    struct QueueKeyLess {
-        bool operator()(const QueueKey& lhs, const QueueKey& rhs) const noexcept {
+    struct BestKeyLess {
+        bool operator()(const BestKey& lhs, const BestKey& rhs) const noexcept {
             if (std::abs(lhs.normalized_score - rhs.normalized_score) > 1e-12) {
                 return lhs.normalized_score < rhs.normalized_score;
             }
@@ -441,15 +467,10 @@ class WorkerLocalQueue {
         }
     };
 
-    struct StealEntry {
-        ActiveNode node;
-        std::uint64_t stamp = 0;
-    };
-
     struct StealKey {
         int handle = -1;
         std::uint64_t stamp = 0;
-        double score = -std::numeric_limits<double>::infinity();
+        double normalized_score = -std::numeric_limits<double>::infinity();
         int depth = 0;
         int domain_change_count = 0;
         std::uint64_t order = 0;
@@ -457,8 +478,8 @@ class WorkerLocalQueue {
 
     struct StealKeyLess {
         bool operator()(const StealKey& lhs, const StealKey& rhs) const noexcept {
-            if (std::abs(lhs.score - rhs.score) > 1e-12) {
-                return lhs.score < rhs.score;
+            if (std::abs(lhs.normalized_score - rhs.normalized_score) > 1e-12) {
+                return lhs.normalized_score < rhs.normalized_score;
             }
             if (lhs.depth != rhs.depth) {
                 return lhs.depth < rhs.depth;
@@ -473,39 +494,39 @@ class WorkerLocalQueue {
         }
     };
 
-    std::unordered_map<int, NodeEntry> nodes_;
-    std::priority_queue<QueueKey, std::vector<QueueKey>, QueueKeyLess> local_heap_;
+    std::vector<Slot> slots_;
+    std::vector<int> free_handles_;
+    std::vector<HandleStamp> lifo_stack_;
+    std::priority_queue<BestKey, std::vector<BestKey>, BestKeyLess> best_heap_;
     std::priority_queue<StealKey, std::vector<StealKey>, StealKeyLess> stealing_heap_;
     mutable std::mutex mutex_;
-    int next_handle_ = 0;
+
     std::uint64_t next_stamp_ = 1;
+    int active_count_ = 0;
 
   public:
     bool empty() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return nodes_.empty();
+        return active_count_ == 0;
     }
 
     int size() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return static_cast<int>(nodes_.size());
+        return active_count_;
     }
 
     template <typename Fn> void for_each_mutable(Fn&& fn) {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& [handle, entry] : nodes_) {
-            fn(entry.node);
+        for (auto& slot : slots_) {
+            if (slot.alive) {
+                fn(slot.entry.node);
+            }
         }
     }
 
     void push(ActiveNode node, NodeSelectionStrategy strategy, bool maximize) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const int handle = next_handle_++;
-        const std::uint64_t stamp = next_stamp_++;
-
         NodeEntry entry;
         entry.node = std::move(node);
-        entry.stamp = stamp;
 
         if (entry.node.domain == nullptr &&
             has_materialized_bounds(entry.node.lower_bounds, entry.node.upper_bounds)) {
@@ -514,119 +535,93 @@ class WorkerLocalQueue {
         }
         dematerialize_active_node(&entry.node);
 
-        initialize_frontier_root_(entry.node);
+        std::shared_ptr<const Eigen::VectorXd> init_lower;
+        std::shared_ptr<const Eigen::VectorXd> init_upper;
+        resolve_root_bounds_(entry.node.domain, &init_lower, &init_upper);
+
         entry.root_domain_changes =
             collect_root_domain_changes_(entry.node.domain, kQueueDomainTol_);
-        update_frontier_summary_(entry.root_domain_changes, true);
 
-        const ActiveNode& stored = entry.node;
-        local_heap_.push(make_score_key_(handle, stamp, stored.bound, stored, maximize));
+        std::lock_guard<std::mutex> lock(mutex_);
 
-        const double estimate = std::isfinite(stored.estimate) ? stored.estimate : stored.bound;
-        local_heap_.push(make_score_key_(handle, stamp, estimate, stored, maximize));
+        initialize_frontier_root_locked_(init_lower, init_upper);
 
-        local_heap_.push(
-            make_score_key_(handle, stamp, hybrid_node_score(stored), stored, maximize));
+        const int handle = allocate_handle_locked_();
+        const std::uint64_t stamp = next_stamp_++;
+        entry.stamp = stamp;
 
-        local_heap_.push(make_depth_key_(handle, stamp, stored, strategy, maximize));
+        update_frontier_summary_locked_(entry.root_domain_changes, true);
 
-        nodes_.emplace(handle, std::move(entry));
+        slots_[handle].alive = true;
+        slots_[handle].entry = std::move(entry);
+        ++active_count_;
+
+        const ActiveNode& stored = slots_[handle].entry.node;
+        lifo_stack_.push_back(HandleStamp{handle, stamp});
+        best_heap_.push(make_best_key_(handle, stamp, stored, strategy, maximize));
     }
 
     std::optional<ActiveNode> pop(NodeSelectionStrategy strategy, bool maximize,
                                   int hybrid_depth_bias = 5, int plunging_bestfreq = 10,
                                   std::uint64_t* hybrid_counter = nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);
-
-        if (nodes_.empty()) {
+        if (active_count_ == 0) {
             return std::nullopt;
         }
 
-        std::optional<ActiveNode> result;
+        const bool prefer_depth =
+            should_prefer_depth_(strategy, hybrid_depth_bias, plunging_bestfreq, hybrid_counter);
+
         if (strategy == NodeSelectionStrategy::DepthFirst) {
-            result = extract_valid_lifo_node_();
-        } else if (strategy == NodeSelectionStrategy::BestBound) {
-            result = extract_valid_node_(local_heap_);
-        } else if (strategy == NodeSelectionStrategy::BestEstimate) {
-            result = extract_valid_node_(local_heap_);
-        } else if (strategy == NodeSelectionStrategy::Hybrid) {
-            bool use_depth = true;
-            if (hybrid_counter != nullptr) {
-                ++(*hybrid_counter);
-                use_depth =
-                    ((*hybrid_counter) % static_cast<std::uint64_t>(hybrid_depth_bias + 1)) != 0;
-            }
-            result =
-                use_depth ? extract_valid_node_(local_heap_) : extract_valid_node_(local_heap_);
-        } else if (is_plunging_strategy(strategy)) {
-            bool use_depth = true;
-            if (hybrid_counter != nullptr) {
-                ++(*hybrid_counter);
-                use_depth =
-                    ((*hybrid_counter) % static_cast<std::uint64_t>(hybrid_depth_bias + 1)) != 0;
-            }
-            if (use_depth) {
-                result = extract_valid_node_(local_heap_);
-            } else {
-                bool use_best_bound = strategy == NodeSelectionStrategy::BestFirstPlunging;
-                if (strategy == NodeSelectionStrategy::InterleavedBestFirstBestEstimatePlunging &&
-                    hybrid_counter != nullptr && plunging_bestfreq > 0) {
-                    use_best_bound =
-                        ((*hybrid_counter) % static_cast<std::uint64_t>(plunging_bestfreq)) == 0;
-                }
-                result = use_best_bound ? extract_valid_node_(local_heap_)
-                                        : extract_valid_node_(local_heap_);
-            }
-        } else {
-            result = extract_valid_node_(local_heap_);
+            return extract_valid_lifo_node_locked_();
         }
 
-        if (result.has_value()) {
-            update_frontier_summary_(collect_root_domain_changes_(result->domain, kQueueDomainTol_),
-                                     false);
+        if (prefer_depth && is_plunging_strategy(strategy)) {
+            if (auto node = extract_valid_lifo_node_locked_()) {
+                return node;
+            }
+            return extract_valid_best_node_locked_();
         }
 
-        return result;
+        if (auto node = extract_valid_best_node_locked_()) {
+            return node;
+        }
+
+        if (is_plunging_strategy(strategy)) {
+            return extract_valid_lifo_node_locked_();
+        }
+
+        return std::nullopt;
     }
 
     std::optional<ActiveNode> steal(NodeSelectionStrategy strategy, bool maximize,
                                     int hybrid_depth_bias = 5, int plunging_bestfreq = 10,
                                     std::uint64_t* hybrid_counter = nullptr) {
+        (void)strategy;
+        (void)maximize;
+        (void)hybrid_depth_bias;
+        (void)plunging_bestfreq;
+        (void)hybrid_counter;
+
         std::lock_guard<std::mutex> lock(mutex_);
-
-        std::optional<ActiveNode> result = extract_valid_node_(local_heap_);
-        if (result.has_value()) {
-            update_frontier_summary_(collect_root_domain_changes_(result->domain, kQueueDomainTol_),
-                                     false);
-            return result;
+        if (active_count_ == 0) {
+            return std::nullopt;
         }
 
-        result = extract_valid_node_(stealing_heap_);
-        if (result.has_value()) {
-            update_frontier_summary_(collect_root_domain_changes_(result->domain, kQueueDomainTol_),
-                                     false);
+        if (auto node = extract_valid_steal_node_locked_()) {
+            return node;
         }
-        return result;
+        if (auto node = extract_valid_best_node_locked_()) {
+            return node;
+        }
+        return extract_valid_lifo_node_locked_();
     }
 
     void contribute_to_stealing_heap(ActiveNode node, NodeSelectionStrategy strategy,
                                      bool maximize) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const int handle = next_handle_++;
-        const std::uint64_t stamp = next_stamp_++;
-
-        StealKey key;
-        key.handle = handle;
-        key.stamp = stamp;
-        const double score = node_selection_score(node, strategy);
-        key.score = maximize ? score : -score;
-        key.depth = node.depth;
-        key.domain_change_count = node.domain_change_count;
-        key.order = node.order;
-
         NodeEntry entry;
         entry.node = std::move(node);
-        entry.stamp = stamp;
+
         if (entry.node.domain == nullptr &&
             has_materialized_bounds(entry.node.lower_bounds, entry.node.upper_bounds)) {
             entry.node.domain =
@@ -634,13 +629,29 @@ class WorkerLocalQueue {
         }
         dematerialize_active_node(&entry.node);
 
-        initialize_frontier_root_(entry.node);
+        std::shared_ptr<const Eigen::VectorXd> init_lower;
+        std::shared_ptr<const Eigen::VectorXd> init_upper;
+        resolve_root_bounds_(entry.node.domain, &init_lower, &init_upper);
+
         entry.root_domain_changes =
             collect_root_domain_changes_(entry.node.domain, kQueueDomainTol_);
-        update_frontier_summary_(entry.root_domain_changes, true);
 
-        nodes_.emplace(handle, std::move(entry));
-        stealing_heap_.push(key);
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        initialize_frontier_root_locked_(init_lower, init_upper);
+
+        const int handle = allocate_handle_locked_();
+        const std::uint64_t stamp = next_stamp_++;
+        entry.stamp = stamp;
+
+        update_frontier_summary_locked_(entry.root_domain_changes, true);
+
+        slots_[handle].alive = true;
+        slots_[handle].entry = std::move(entry);
+        ++active_count_;
+
+        const ActiveNode& stored = slots_[handle].entry.node;
+        stealing_heap_.push(make_steal_key_(handle, stamp, stored, strategy, maximize));
     }
 
     int stealing_heap_size() const {
@@ -650,38 +661,64 @@ class WorkerLocalQueue {
 
     void clear() noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        nodes_.clear();
-        while (!local_heap_.empty()) {
-            local_heap_.pop();
+
+        slots_.clear();
+        free_handles_.clear();
+        lifo_stack_.clear();
+        while (!best_heap_.empty()) {
+            best_heap_.pop();
         }
         while (!stealing_heap_.empty()) {
             stealing_heap_.pop();
         }
-        next_handle_ = 0;
+
         next_stamp_ = 1;
+        active_count_ = 0;
 
         frontier_root_lower_bounds_.reset();
         frontier_root_upper_bounds_.reset();
         frontier_root_domain_.reset();
+
         lower_changed_counts_.clear();
         upper_changed_counts_.clear();
-        lower_changed_values_.clear();
-        upper_changed_values_.clear();
+        frontier_max_lower_bounds_.clear();
+        frontier_min_upper_bounds_.clear();
+        frontier_lower_dirty_.clear();
+        frontier_upper_dirty_.clear();
+    }
+
+    const ActiveNode* peek_valid_node() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        const ActiveNode* best = peek_valid_best_node_locked_();
+        if (best != nullptr) {
+            return best;
+        }
+        return peek_valid_steal_node_locked_();
     }
 
     double compute_best_bound(bool has_incumbent, double incumbent_objective, bool maximize,
                               const std::optional<double>& root_relaxation_objective) const {
         std::lock_guard<std::mutex> lock(mutex_);
+
         double best =
             has_incumbent ? incumbent_objective : std::numeric_limits<double>::quiet_NaN();
 
-        const ActiveNode* best_local_node = peek_valid_node_(local_heap_);
-        if (best_local_node != nullptr) {
+        if (const ActiveNode* best_local_node = peek_valid_best_node_locked_()) {
             if (!std::isfinite(best)) {
                 best = best_local_node->bound;
             } else {
                 best = maximize ? std::max(best, best_local_node->bound)
                                 : std::min(best, best_local_node->bound);
+            }
+        }
+
+        if (const ActiveNode* best_steal_node = peek_valid_steal_node_locked_()) {
+            if (!std::isfinite(best)) {
+                best = best_steal_node->bound;
+            } else {
+                best = maximize ? std::max(best, best_steal_node->bound)
+                                : std::min(best, best_steal_node->bound);
             }
         }
 
@@ -692,6 +729,22 @@ class WorkerLocalQueue {
     }
 
   private:
+    int allocate_handle_locked_() {
+        if (!free_handles_.empty()) {
+            const int handle = free_handles_.back();
+            free_handles_.pop_back();
+            return handle;
+        }
+        slots_.push_back(Slot{});
+        return static_cast<int>(slots_.size()) - 1;
+    }
+
+    void release_handle_locked_(int handle) {
+        if (handle >= 0) {
+            free_handles_.push_back(handle);
+        }
+    }
+
     static void resolve_root_bounds_(const std::shared_ptr<const NodeDomain>& domain,
                                      std::shared_ptr<const Eigen::VectorXd>* lower_bounds,
                                      std::shared_ptr<const Eigen::VectorXd>* upper_bounds) {
@@ -735,6 +788,7 @@ class WorkerLocalQueue {
 
         std::unordered_map<int, DomainChange> merged_changes;
         merged_changes.reserve(static_cast<std::size_t>(domain->total_change_count + 1));
+
         for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
             const NodeDomain* current = *it;
             for (const DomainChange& change : current->changes) {
@@ -742,10 +796,10 @@ class WorkerLocalQueue {
                     change.variable >= root_upper_bounds->size()) {
                     continue;
                 }
-                const auto existing = merged_changes.find(change.variable);
-                if (existing == merged_changes.end() ||
-                    change.lower_bound > existing->second.lower_bound ||
-                    change.upper_bound < existing->second.upper_bound) {
+                auto found = merged_changes.find(change.variable);
+                if (found == merged_changes.end() ||
+                    change.lower_bound > found->second.lower_bound ||
+                    change.upper_bound < found->second.upper_bound) {
                     merged_changes[change.variable] = change;
                 }
             }
@@ -753,8 +807,8 @@ class WorkerLocalQueue {
 
         std::vector<DomainChange> result;
         result.reserve(merged_changes.size());
-        for (auto& change_entry : merged_changes) {
-            const DomainChange& change = change_entry.second;
+        for (auto& kv : merged_changes) {
+            const DomainChange& change = kv.second;
             const double root_lower = (*root_lower_bounds)(change.variable);
             const double root_upper = (*root_upper_bounds)(change.variable);
             const bool lower_changed = change.lower_bound > root_lower + tol;
@@ -766,84 +820,183 @@ class WorkerLocalQueue {
         return result;
     }
 
-    void initialize_frontier_root_(const ActiveNode& node) {
+    void initialize_frontier_root_locked_(const std::shared_ptr<const Eigen::VectorXd>& lower,
+                                          const std::shared_ptr<const Eigen::VectorXd>& upper) {
         if (frontier_root_lower_bounds_ != nullptr && frontier_root_upper_bounds_ != nullptr &&
             frontier_root_domain_ != nullptr) {
             return;
         }
-
-        resolve_root_bounds_(node.domain, &frontier_root_lower_bounds_,
-                             &frontier_root_upper_bounds_);
-        if (frontier_root_lower_bounds_ == nullptr || frontier_root_upper_bounds_ == nullptr) {
+        if (lower == nullptr || upper == nullptr) {
             return;
         }
+
+        frontier_root_lower_bounds_ = lower;
+        frontier_root_upper_bounds_ = upper;
         frontier_root_domain_ =
             make_materialized_domain(*frontier_root_lower_bounds_, *frontier_root_upper_bounds_);
-        lower_changed_counts_.assign(frontier_root_lower_bounds_->size(), 0);
-        upper_changed_counts_.assign(frontier_root_upper_bounds_->size(), 0);
+
+        const int n =
+            std::min<int>(frontier_root_lower_bounds_->size(), frontier_root_upper_bounds_->size());
+
+        lower_changed_counts_.assign(n, 0);
+        upper_changed_counts_.assign(n, 0);
+        frontier_max_lower_bounds_.assign(n, -std::numeric_limits<double>::infinity());
+        frontier_min_upper_bounds_.assign(n, std::numeric_limits<double>::infinity());
+        frontier_lower_dirty_.assign(n, false);
+        frontier_upper_dirty_.assign(n, false);
     }
 
-    void update_frontier_summary_(const std::vector<DomainChange>& changes, bool add) {
+    void update_frontier_summary_locked_(const std::vector<DomainChange>& changes, bool add) {
         if (frontier_root_lower_bounds_ == nullptr || frontier_root_upper_bounds_ == nullptr) {
             return;
         }
+
         for (const DomainChange& change : changes) {
             if (change.variable < 0 || change.variable >= frontier_root_lower_bounds_->size() ||
                 change.variable >= frontier_root_upper_bounds_->size()) {
                 continue;
             }
-            const double root_lower = (*frontier_root_lower_bounds_)(change.variable);
-            const double root_upper = (*frontier_root_upper_bounds_)(change.variable);
+
+            const int j = change.variable;
+            const double root_lower = (*frontier_root_lower_bounds_)(j);
+            const double root_upper = (*frontier_root_upper_bounds_)(j);
+
             const bool lower_changed = change.lower_bound > root_lower + kQueueDomainTol_;
             const bool upper_changed = change.upper_bound < root_upper - kQueueDomainTol_;
+
             if (lower_changed) {
                 if (add) {
-                    ++lower_changed_counts_[change.variable];
-                    lower_changed_values_[change.variable][change.lower_bound] += 1;
-                } else if (lower_changed_counts_[change.variable] > 0) {
-                    --lower_changed_counts_[change.variable];
-                    auto map_it = lower_changed_values_.find(change.variable);
-                    if (map_it != lower_changed_values_.end()) {
-                        auto value_it = map_it->second.find(change.lower_bound);
-                        if (value_it != map_it->second.end()) {
-                            if (--value_it->second == 0) {
-                                map_it->second.erase(value_it);
-                            }
-                        }
-                        if (map_it->second.empty()) {
-                            lower_changed_values_.erase(map_it);
-                        }
+                    ++lower_changed_counts_[j];
+                    frontier_max_lower_bounds_[j] =
+                        std::max(frontier_max_lower_bounds_[j], change.lower_bound);
+                } else if (lower_changed_counts_[j] > 0) {
+                    --lower_changed_counts_[j];
+                    if (lower_changed_counts_[j] == 0) {
+                        frontier_max_lower_bounds_[j] = -std::numeric_limits<double>::infinity();
+                        frontier_lower_dirty_[j] = false;
+                    } else if (std::abs(change.lower_bound - frontier_max_lower_bounds_[j]) <=
+                               kQueueDomainTol_) {
+                        frontier_lower_dirty_[j] = true;
                     }
                 }
             }
+
             if (upper_changed) {
                 if (add) {
-                    ++upper_changed_counts_[change.variable];
-                    upper_changed_values_[change.variable][change.upper_bound] += 1;
-                } else if (upper_changed_counts_[change.variable] > 0) {
-                    --upper_changed_counts_[change.variable];
-                    auto map_it = upper_changed_values_.find(change.variable);
-                    if (map_it != upper_changed_values_.end()) {
-                        auto value_it = map_it->second.find(change.upper_bound);
-                        if (value_it != map_it->second.end()) {
-                            if (--value_it->second == 0) {
-                                map_it->second.erase(value_it);
-                            }
-                        }
-                        if (map_it->second.empty()) {
-                            upper_changed_values_.erase(map_it);
-                        }
+                    ++upper_changed_counts_[j];
+                    frontier_min_upper_bounds_[j] =
+                        std::min(frontier_min_upper_bounds_[j], change.upper_bound);
+                } else if (upper_changed_counts_[j] > 0) {
+                    --upper_changed_counts_[j];
+                    if (upper_changed_counts_[j] == 0) {
+                        frontier_min_upper_bounds_[j] = std::numeric_limits<double>::infinity();
+                        frontier_upper_dirty_[j] = false;
+                    } else if (std::abs(change.upper_bound - frontier_min_upper_bounds_[j]) <=
+                               kQueueDomainTol_) {
+                        frontier_upper_dirty_[j] = true;
                     }
                 }
             }
         }
     }
 
-    static QueueKey make_score_key_(int handle, std::uint64_t stamp, double score,
-                                    const ActiveNode& node, bool maximize) {
-        QueueKey key;
+    void rebuild_frontier_extrema_locked_(int variable) const {
+        if (frontier_root_lower_bounds_ == nullptr || frontier_root_upper_bounds_ == nullptr) {
+            return;
+        }
+        if (variable < 0 || variable >= frontier_root_lower_bounds_->size() ||
+            variable >= frontier_root_upper_bounds_->size()) {
+            return;
+        }
+
+        const double root_lower = (*frontier_root_lower_bounds_)(variable);
+        const double root_upper = (*frontier_root_upper_bounds_)(variable);
+
+        double best_lower = -std::numeric_limits<double>::infinity();
+        double best_upper = std::numeric_limits<double>::infinity();
+
+        for (const auto& slot : slots_) {
+            if (!slot.alive) {
+                continue;
+            }
+            for (const DomainChange& change : slot.entry.root_domain_changes) {
+                if (change.variable != variable) {
+                    continue;
+                }
+                if (change.lower_bound > root_lower + kQueueDomainTol_) {
+                    best_lower = std::max(best_lower, change.lower_bound);
+                }
+                if (change.upper_bound < root_upper - kQueueDomainTol_) {
+                    best_upper = std::min(best_upper, change.upper_bound);
+                }
+            }
+        }
+
+        frontier_max_lower_bounds_[variable] = best_lower;
+        frontier_min_upper_bounds_[variable] = best_upper;
+        frontier_lower_dirty_[variable] = false;
+        frontier_upper_dirty_[variable] = false;
+    }
+
+    double frontier_max_lower_bound_locked_(int variable) const {
+        if (variable < 0 || variable >= static_cast<int>(frontier_max_lower_bounds_.size())) {
+            return -std::numeric_limits<double>::infinity();
+        }
+        if (frontier_lower_dirty_[variable]) {
+            rebuild_frontier_extrema_locked_(variable);
+        }
+        return frontier_max_lower_bounds_[variable];
+    }
+
+    double frontier_min_upper_bound_locked_(int variable) const {
+        if (variable < 0 || variable >= static_cast<int>(frontier_min_upper_bounds_.size())) {
+            return std::numeric_limits<double>::infinity();
+        }
+        if (frontier_upper_dirty_[variable]) {
+            rebuild_frontier_extrema_locked_(variable);
+        }
+        return frontier_min_upper_bounds_[variable];
+    }
+
+    static bool should_prefer_depth_(NodeSelectionStrategy strategy, int hybrid_depth_bias,
+                                     int plunging_bestfreq, std::uint64_t* hybrid_counter) {
+        if (!is_plunging_strategy(strategy)) {
+            return false;
+        }
+
+        if (hybrid_counter == nullptr) {
+            return true;
+        }
+
+        ++(*hybrid_counter);
+
+        if (strategy == NodeSelectionStrategy::InterleavedBestFirstBestEstimatePlunging) {
+            if (plunging_bestfreq <= 0) {
+                return true;
+            }
+            return ((*hybrid_counter) % static_cast<std::uint64_t>(plunging_bestfreq)) != 0;
+        }
+
+        return ((*hybrid_counter) % static_cast<std::uint64_t>(hybrid_depth_bias + 1)) != 0;
+    }
+
+    static double score_for_strategy_(const ActiveNode& node, NodeSelectionStrategy strategy) {
+        if (strategy == NodeSelectionStrategy::BestBound ||
+            strategy == NodeSelectionStrategy::BestFirstPlunging) {
+            return node.bound;
+        }
+        if (strategy == NodeSelectionStrategy::Hybrid) {
+            return hybrid_node_score(node);
+        }
+        return std::isfinite(node.estimate) ? node.estimate : node.bound;
+    }
+
+    static BestKey make_best_key_(int handle, std::uint64_t stamp, const ActiveNode& node,
+                                  NodeSelectionStrategy strategy, bool maximize) {
+        BestKey key;
         key.handle = handle;
         key.stamp = stamp;
+        const double score = score_for_strategy_(node, strategy);
         key.normalized_score = maximize ? score : -score;
         key.depth = node.depth;
         key.domain_change_count = node.domain_change_count;
@@ -851,81 +1004,101 @@ class WorkerLocalQueue {
         return key;
     }
 
-    static QueueKey make_depth_key_(int handle, std::uint64_t stamp, const ActiveNode& node,
+    static StealKey make_steal_key_(int handle, std::uint64_t stamp, const ActiveNode& node,
                                     NodeSelectionStrategy strategy, bool maximize) {
-        QueueKey key;
+        StealKey key;
         key.handle = handle;
         key.stamp = stamp;
-        key.normalized_score =
-            maximize ? node_selection_score(node, strategy) : -node_selection_score(node, strategy);
+        const double score = score_for_strategy_(node, strategy);
+        key.normalized_score = maximize ? score : -score;
         key.depth = node.depth;
         key.domain_change_count = node.domain_change_count;
         key.order = node.order;
         return key;
     }
 
-    template <typename Heap> const ActiveNode* peek_valid_node_(const Heap& heap) const {
-        Heap scratch = heap;
-        while (!scratch.empty()) {
-            const auto key = scratch.top();
-            scratch.pop();
-            auto it = nodes_.find(key.handle);
-            if (it == nodes_.end() || it->second.stamp != key.stamp) {
+    bool is_valid_locked_(int handle, std::uint64_t stamp) const {
+        return handle >= 0 && handle < static_cast<int>(slots_.size()) && slots_[handle].alive &&
+               slots_[handle].entry.stamp == stamp;
+    }
+
+    std::optional<ActiveNode> remove_slot_locked_(int handle) {
+        if (handle < 0 || handle >= static_cast<int>(slots_.size()) || !slots_[handle].alive) {
+            return std::nullopt;
+        }
+
+        Slot& slot = slots_[handle];
+        update_frontier_summary_locked_(slot.entry.root_domain_changes, false);
+
+        ActiveNode result = std::move(slot.entry.node);
+        slot.alive = false;
+        slot.entry = NodeEntry{};
+        --active_count_;
+        release_handle_locked_(handle);
+        return result;
+    }
+
+    std::optional<ActiveNode> extract_valid_lifo_node_locked_() {
+        while (!lifo_stack_.empty()) {
+            const HandleStamp hs = lifo_stack_.back();
+            lifo_stack_.pop_back();
+            if (!is_valid_locked_(hs.handle, hs.stamp)) {
                 continue;
             }
-            return &it->second.node;
+            return remove_slot_locked_(hs.handle);
+        }
+        return std::nullopt;
+    }
+
+    std::optional<ActiveNode> extract_valid_best_node_locked_() {
+        while (!best_heap_.empty()) {
+            const BestKey key = best_heap_.top();
+            best_heap_.pop();
+            if (!is_valid_locked_(key.handle, key.stamp)) {
+                continue;
+            }
+            return remove_slot_locked_(key.handle);
+        }
+        return std::nullopt;
+    }
+
+    std::optional<ActiveNode> extract_valid_steal_node_locked_() {
+        while (!stealing_heap_.empty()) {
+            const StealKey key = stealing_heap_.top();
+            stealing_heap_.pop();
+            if (!is_valid_locked_(key.handle, key.stamp)) {
+                continue;
+            }
+            return remove_slot_locked_(key.handle);
+        }
+        return std::nullopt;
+    }
+
+    const ActiveNode* peek_valid_best_node_locked_() const {
+        auto& heap = const_cast<std::priority_queue<BestKey, std::vector<BestKey>, BestKeyLess>&>(
+            best_heap_);
+        while (!heap.empty()) {
+            const BestKey& key = heap.top();
+            if (!is_valid_locked_(key.handle, key.stamp)) {
+                heap.pop();
+                continue;
+            }
+            return &slots_[key.handle].entry.node;
         }
         return nullptr;
     }
 
-    template <typename Heap> std::optional<ActiveNode> extract_valid_node_(Heap& heap) {
+    const ActiveNode* peek_valid_steal_node_locked_() const {
+        auto& heap =
+            const_cast<std::priority_queue<StealKey, std::vector<StealKey>, StealKeyLess>&>(
+                stealing_heap_);
         while (!heap.empty()) {
-            const auto key = heap.top();
-            heap.pop();
-
-            auto it = nodes_.find(key.handle);
-            if (it == nodes_.end() || it->second.stamp != key.stamp) {
+            const StealKey& key = heap.top();
+            if (!is_valid_locked_(key.handle, key.stamp)) {
+                heap.pop();
                 continue;
             }
-
-            ActiveNode node = std::move(it->second.node);
-            nodes_.erase(it);
-            return node;
-        }
-        return std::nullopt;
-    }
-
-    std::optional<ActiveNode> extract_valid_lifo_node_() {
-        while (!nodes_.empty()) {
-            auto it = nodes_.begin();
-            ActiveNode node = std::move(it->second.node);
-            nodes_.erase(it);
-            return node;
-        }
-        return std::nullopt;
-    }
-
-    const ActiveNode* peek_valid_node() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto scratch = local_heap_;
-        while (!scratch.empty()) {
-            QueueKey key = scratch.top();
-            scratch.pop();
-            auto it = nodes_.find(key.handle);
-            if (it == nodes_.end() || it->second.stamp != key.stamp) {
-                continue;
-            }
-            return &it->second.node;
-        }
-        auto scratch_steal = stealing_heap_;
-        while (!scratch_steal.empty()) {
-            StealKey key = scratch_steal.top();
-            scratch_steal.pop();
-            auto it = nodes_.find(key.handle);
-            if (it == nodes_.end() || it->second.stamp != key.stamp) {
-                continue;
-            }
-            return &it->second.node;
+            return &slots_[key.handle].entry.node;
         }
         return nullptr;
     }
@@ -933,12 +1106,15 @@ class WorkerLocalQueue {
     std::shared_ptr<const Eigen::VectorXd> frontier_root_lower_bounds_;
     std::shared_ptr<const Eigen::VectorXd> frontier_root_upper_bounds_;
     std::shared_ptr<const NodeDomain> frontier_root_domain_;
+
     std::vector<int> lower_changed_counts_;
     std::vector<int> upper_changed_counts_;
-    std::unordered_map<int, std::map<double, int>> lower_changed_values_;
-    std::unordered_map<int, std::map<double, int>> upper_changed_values_;
-};
 
+    mutable std::vector<double> frontier_max_lower_bounds_;
+    mutable std::vector<double> frontier_min_upper_bounds_;
+    mutable std::vector<bool> frontier_lower_dirty_;
+    mutable std::vector<bool> frontier_upper_dirty_;
+};
 // ============================================================================
 // Worker Local Queue (finalizing OpenNodeQueue for backward compatibility)
 // ============================================================================

@@ -244,7 +244,7 @@ class RevisedSimplexPrimalEngine {
             Eigen::VectorXd rN_select(N.size());
             for (int k = 0; k < (int)N.size(); ++k) {
                 const int j = N[k];
-                rN(k) = c_work(j) - A.col(j).dot(y);
+                rN(k) = c_work(j) - pricing_detail::column_dot(A, j, y);
                 rN_select(k) = self.can_increase_from_lower_(j, l, u, self.opt_.tol) ? rN(k) : 0.0;
             }
 
@@ -267,8 +267,24 @@ class RevisedSimplexPrimalEngine {
                 e_rel = idx;
             } else {
                 if (self.opt_.pricing_rule == "adaptive") {
-                    Eigen::VectorXd xcur = self.assemble_primal_(n, basis, xB, l, u);
-                    const double current_obj = c_work.dot(xcur);
+                    double current_obj = 0.0;
+                    {
+                        std::vector<char> inB(n, 0);
+                        for (int i = 0; i < (int)basis.size(); ++i) {
+                            const int j = basis[i];
+                            if (j >= 0 && j < n) {
+                                inB[j] = 1;
+                                current_obj += c_work(j) * xB(i);
+                            }
+                        }
+                        for (int j = 0; j < n; ++j) {
+                            if (inB[j])
+                                continue;
+                            if (j < l.size() && std::isfinite(l(j))) {
+                                current_obj += c_work(j) * l(j);
+                            }
+                        }
+                    }
                     e_rel = self.bridge_->choose_primal_entering(rN_select, N, self.opt_.tol, iters,
                                                                  current_obj, B, A,
                                                                  self.opt_.partial_pricing);

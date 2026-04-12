@@ -119,8 +119,7 @@ std::string feature_token_(std::string_view name, bool enabled) {
     return enabled ? good_(name) : dim_(name);
 }
 
-template <typename Features>
-std::string join_feature_tokens_(const Features& features) {
+template <typename Features> std::string join_feature_tokens_(const Features& features) {
     std::ostringstream oss;
     bool first = true;
     for (const auto& [name, enabled] : features) {
@@ -134,8 +133,9 @@ std::string join_feature_tokens_(const Features& features) {
 }
 
 void print_verbose_solver_configuration(const BranchAndBoundOptions& options) {
-    std::cout << accent_("MIP Search") << "   | node " << simplex_bnb::to_string(options.node_selection)
-              << "  branch " << simplex_bnb::to_string(options.branching_strategy) << "  dive "
+    std::cout << accent_("MIP Search") << "   | node "
+              << simplex_bnb::to_string(options.node_selection) << "  branch "
+              << simplex_bnb::to_string(options.branching_strategy) << "  dive "
               << simplex_bnb::to_string(options.diving_strategy) << "  workers "
               << options.parallel_workers << "  async "
               << feature_token_("heuristics", options.use_async_heuristics) << std::endl;
@@ -150,8 +150,7 @@ void print_verbose_solver_configuration(const BranchAndBoundOptions& options) {
         {"local-search", options.use_local_search},
         {"local-branch", options.use_local_branching},
     };
-    std::cout << accent_("MIP Heur") << "     | " << join_feature_tokens_(heuristics)
-              << std::endl;
+    std::cout << accent_("MIP Heur") << "     | " << join_feature_tokens_(heuristics) << std::endl;
 
     const std::vector<std::pair<std::string_view, bool>> cuts = {
         {"pool", options.use_cut_pool},
@@ -195,14 +194,10 @@ RevisedSimplexOptions tune_mip_lp_options(const RevisedSimplexOptions& base_opti
     tuned.pricing_rule = "adaptive";
     tuned.partial_pricing = true;
     tuned.dual_pricing = "switch";
-    tuned.row_pricing_threshold = std::max(tuned.row_pricing_threshold, 32);
+    tuned.row_pricing_threshold = std::max(tuned.row_pricing_threshold, 40);
 
-    if (tuned.primal_edge_weight_strategy == "dense") {
-        tuned.primal_edge_weight_strategy = "dense_diagonal";
-    }
-    if (tuned.dual_edge_weight_strategy == "dense") {
-        tuned.dual_edge_weight_strategy = "dense_diagonal";
-    }
+    tuned.primal_edge_weight_strategy = "dense_diagonal";
+    tuned.dual_edge_weight_strategy = "dense_diagonal";
 
     tuned.primal_simplex_cost_perturbation_multiplier =
         std::max(tuned.primal_simplex_cost_perturbation_multiplier, 1.5);
@@ -211,8 +206,14 @@ RevisedSimplexOptions tune_mip_lp_options(const RevisedSimplexOptions& base_opti
     tuned.dual_steepest_edge_weight_log_error_threshold =
         std::max(tuned.dual_steepest_edge_weight_log_error_threshold, 1.3862943611198906);
 
+    tuned.adaptive_reset_freq = std::min(tuned.adaptive_reset_freq, 500);
+    tuned.max_basis_rebuilds = std::max(tuned.max_basis_rebuilds, 5);
+    tuned.crash_attempts = std::max(tuned.crash_attempts, 5);
+    tuned.crash_markowitz_tol = std::min(tuned.crash_markowitz_tol, 0.15);
+
     if (warm_start_expected) {
-        tuned.devex_reset = std::max(50, std::min(tuned.devex_reset, 200));
+        tuned.devex_reset = std::max(50, std::min(tuned.devex_reset, 100));
+        tuned.adaptive_reset_freq = std::min(tuned.adaptive_reset_freq, 350);
     }
 
     return tuned;
@@ -2118,10 +2119,10 @@ class Model {
                 if (effective_basis != nullptr) {
                     std::optional<LPSolution> warm_opt =
                         try_solver(*entry.warm_solver, effective_basis);
-                    const bool warm_failed =
-                        !warm_opt.has_value() || status_requires_warm_start_retry(warm_opt->status) ||
-                        warm_opt->status == LPSolution::Status::Infeasible ||
-                        warm_opt->status == LPSolution::Status::Unbounded;
+                    const bool warm_failed = !warm_opt.has_value() ||
+                                             status_requires_warm_start_retry(warm_opt->status) ||
+                                             warm_opt->status == LPSolution::Status::Infeasible ||
+                                             warm_opt->status == LPSolution::Status::Unbounded;
                     if (!warm_failed) {
                         raw_opt = std::move(warm_opt);
                         used_warm_start_result = true;

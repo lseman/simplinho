@@ -252,14 +252,32 @@ class SteepestEdgePricer {
             ++candidates_priced;
         }
 
-        // Track no-improvement count for adaptive pool sizing
         if (best_rel >= 0) {
             no_improvement_count_ = 0;
-        } else if (partial_pricing) {
+            return std::optional<int>(best_rel);
+        }
+
+        if (partial_pricing) {
+            // Fall back to a full scan if the partial prefix missed the best entering column.
+            for (int k = 0; k < (int)N.size(); ++k) {
+                if (rcN(k) >= -tol)
+                    continue;
+                const int j = N[k];
+                double w = 1.0;
+                if (auto it = pos_.find(j); it != pos_.end())
+                    w = pool_[it->second].weight;
+                const double score = (rcN(k) * rcN(k)) / w;
+                if (score > best_score) {
+                    best_score = score;
+                    best_rel = k;
+                }
+            }
+            if (best_rel >= 0)
+                return std::optional<int>(best_rel);
             ++no_improvement_count_;
         }
 
-        return (best_rel >= 0) ? std::optional<int>(best_rel) : std::nullopt;
+        return std::nullopt;
     }
 
     template <class MatrixLike>
@@ -429,11 +447,28 @@ class DevexPricer {
 
         if (best_rel >= 0) {
             no_improvement_count_ = 0;
-        } else if (partial_pricing) {
+            return std::optional<int>(best_rel);
+        }
+
+        if (partial_pricing) {
+            // Fall back to a full scan if the partial prefix missed the best entering column.
+            for (int k = 0; k < (int)N.size(); ++k) {
+                if (rcN(k) >= -tol)
+                    continue;
+                const int j = N[k];
+                const double w = (weights_.count(j) ? weights_.at(j) : 1.0);
+                const double crit = (rcN(k) * rcN(k)) / w;
+                if (crit > best_crit) {
+                    best_crit = crit;
+                    best_rel = k;
+                }
+            }
+            if (best_rel >= 0)
+                return std::optional<int>(best_rel);
             ++no_improvement_count_;
         }
 
-        return (best_rel >= 0) ? std::optional<int>(best_rel) : std::nullopt;
+        return std::nullopt;
     }
 
     template <class MatrixLike>
@@ -1040,9 +1075,10 @@ class DualAdaptivePricer {
 
     template <class MatrixLike>
     bool row_pricing_is_beneficial(const MatrixLike& A, const std::vector<int>& N) const {
-        if (partial_pricing_enabled_)
-            return true;
         const double avg_row_nnz = average_row_nonzeros(A, N);
+        if (partial_pricing_enabled_) {
+            return avg_row_nnz <= static_cast<double>(row_pricing_threshold_) * 2.0;
+        }
         return avg_row_nnz <= static_cast<double>(row_pricing_threshold_);
     }
 
@@ -1193,17 +1229,17 @@ class AdaptivePricer {
     static constexpr int kNumStrategies = 4;
 
     struct PricingOptions {
-        Strategy initial_strategy = STEEPEST_EDGE;
-        int switch_threshold = 100;
+        Strategy initial_strategy = PARTIAL_PRICING;
+        int switch_threshold = 50;
         int performance_window = 50;
         double improvement_factor = 1.2;
-        int partial_block_factor = 10;
-        int min_partial_block = 10;
+        int partial_block_factor = 20;
+        int min_partial_block = 8;
         bool enable_adaptive_switching = true;
         int steepest_pool_max = 0;
         int steepest_reset_freq = 1000;
         int devex_reset_freq = 1000;
-        std::string primal_edge_weight_strategy = "dense";
+        std::string primal_edge_weight_strategy = "dense_diagonal";
         double primal_weight_log_error_threshold = 1.3862943611198906;
     };
 
@@ -1428,6 +1464,17 @@ class AdaptivePricer {
             if (rN(idx) < -tol && rN(idx) < best_rc) {
                 best_rc = rN(idx);
                 best_idx = idx;
+            }
+        }
+        if (best_idx >= 0)
+            return std::optional<int>(best_idx);
+
+        // Fall back to a full scan if the sample block contains no improving column.
+        // This preserves correctness for partial pricing mode.
+        for (int k = 0; k < (int)N.size(); ++k) {
+            if (rN(k) < -tol && rN(k) < best_rc) {
+                best_rc = rN(k);
+                best_idx = k;
             }
         }
         return (best_idx >= 0) ? std::optional<int>(best_idx) : std::nullopt;
