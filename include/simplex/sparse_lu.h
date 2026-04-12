@@ -154,8 +154,10 @@ class SparseForrestTomlinLU {
         // Build permutation inverses for sparse RHS and FT update reach filtering (Items 1, 6).
         Pr_inv_.resize(n_);
         Pc_inv_.resize(n_);
-        for (int i = 0; i < n_; ++i) Pr_inv_[Pr_[i]] = i;
-        for (int i = 0; i < n_; ++i) Pc_inv_[Pc_[i]] = i;
+        for (int i = 0; i < n_; ++i)
+            Pr_inv_[Pr_[i]] = i;
+        for (int i = 0; i < n_; ++i)
+            Pc_inv_[Pc_[i]] = i;
 
         U_rows_.assign(n_, {});
         U_cols_.assign(n_, {});
@@ -274,12 +276,12 @@ class SparseForrestTomlinLU {
     // of b directly, avoiding the O(n) scan inside the triangular solves.
     // seed_idx: original (pre-permutation) nonzero positions in b.
     Eigen::VectorXd solve_sparse(const std::vector<int>& seed_idx,
-                                  const std::vector<double>& seed_val) const {
+                                 const std::vector<double>& seed_val) const {
         return solve_sparse_impl_(seed_idx, seed_val, config_.iterative_refinement);
     }
 
     Eigen::VectorXd solveT_sparse(const std::vector<int>& seed_idx,
-                                   const std::vector<double>& seed_val) const {
+                                  const std::vector<double>& seed_val) const {
         return solveT_sparse_impl_(seed_idx, seed_val, config_.iterative_refinement);
     }
 
@@ -309,13 +311,14 @@ class SparseForrestTomlinLU {
         if (use_sparse_rhs) {
             // Chain L-reach as seeds for U solve (Item 1): eliminates second O(n) scan.
             Eigen::VectorXd z = forward_solve_L_sparse_(Pb, nullptr);
-            l_reach_seeds_scratch_ = reach_scratch_;
+            l_reach_seeds_scratch_ = std::move(reach_scratch_);
             Eigen::VectorXd w = back_solve_U_sparse_(z, &l_reach_seeds_scratch_);
             hyper_solve_reach_valid_ = true;
-            Eigen::VectorXd x(n_);
-            for (int i = 0; i < n_; ++i)
-                x(Pc_[i]) = w(i);
-            apply_col_unscaling_(x);
+            Eigen::VectorXd x = Eigen::VectorXd::Zero(n_);
+            for (const int i : reach_scratch_) {
+                const int xi = Pc_[i];
+                x(xi) = w(i) * col_scale_[static_cast<size_t>(xi)];
+            }
             if (!updates_.empty())
                 x = apply_updates_solve_(x);
             if (enable_refinement)
@@ -358,13 +361,14 @@ class SparseForrestTomlinLU {
             ema_reach_ratio_ < kHyperSparseFallbackRatio_ && is_hyper_sparse_rhs_(PcTc);
         if (use_sparse_rhs) {
             Eigen::VectorXd t = forward_solve_UT_sparse_(PcTc, nullptr);
-            l_reach_seeds_scratch_ = reach_scratch_;
+            l_reach_seeds_scratch_ = std::move(reach_scratch_);
             Eigen::VectorXd s = back_solve_LT_sparse_(t, &l_reach_seeds_scratch_);
             hyper_solve_reach_valid_ = true;
-            Eigen::VectorXd y(n_);
-            for (int i = 0; i < n_; ++i)
-                y(Pr_[i]) = s(i);
-            apply_row_unscaling_(y);
+            Eigen::VectorXd y = Eigen::VectorXd::Zero(n_);
+            for (const int i : reach_scratch_) {
+                const int yi = Pr_[i];
+                y(yi) = s(i) * row_scale_[static_cast<size_t>(yi)];
+            }
             if (!updates_.empty())
                 y = apply_updates_solve_T_(y);
             if (enable_refinement)
@@ -387,8 +391,8 @@ class SparseForrestTomlinLU {
     // Sparse RHS implementations (Item 1): seed known nonzero positions directly,
     // bypassing the O(n) scan entirely for both L and U solves.
     Eigen::VectorXd solve_sparse_impl_(const std::vector<int>& seed_idx,
-                                        const std::vector<double>& seed_val,
-                                        bool enable_refinement) const {
+                                       const std::vector<double>& seed_val,
+                                       bool enable_refinement) const {
         if (n_ == 0) [[unlikely]]
             return Eigen::VectorXd::Zero(0);
         if (use_fallback_sparse_lu_) {
@@ -411,13 +415,14 @@ class SparseForrestTomlinLU {
         Eigen::VectorXd& Pb = permuted_rhs_scratch_;
         // Feed known permuted seeds directly — no scan (Item 1).
         Eigen::VectorXd z = forward_solve_L_sparse_(Pb, &perm_seeds_scratch_);
-        l_reach_seeds_scratch_ = reach_scratch_;
+        l_reach_seeds_scratch_ = std::move(reach_scratch_);
         Eigen::VectorXd w = back_solve_U_sparse_(z, &l_reach_seeds_scratch_);
         hyper_solve_reach_valid_ = true;
-        Eigen::VectorXd x(n_);
-        for (int i = 0; i < n_; ++i)
-            x(Pc_[i]) = w(i);
-        apply_col_unscaling_(x);
+        Eigen::VectorXd x = Eigen::VectorXd::Zero(n_);
+        for (const int i : reach_scratch_) {
+            const int xi = Pc_[i];
+            x(xi) = w(i) * col_scale_[static_cast<size_t>(xi)];
+        }
         if (!updates_.empty())
             x = apply_updates_solve_(x);
         if (enable_refinement) {
@@ -430,8 +435,8 @@ class SparseForrestTomlinLU {
     }
 
     Eigen::VectorXd solveT_sparse_impl_(const std::vector<int>& seed_idx,
-                                         const std::vector<double>& seed_val,
-                                         bool enable_refinement) const {
+                                        const std::vector<double>& seed_val,
+                                        bool enable_refinement) const {
         if (n_ == 0) [[unlikely]]
             return Eigen::VectorXd::Zero(0);
         if (use_fallback_sparse_lu_) {
@@ -453,13 +458,14 @@ class SparseForrestTomlinLU {
         }
         Eigen::VectorXd& PcTc = permuted_transpose_rhs_scratch_;
         Eigen::VectorXd t = forward_solve_UT_sparse_(PcTc, &perm_seeds_scratch_);
-        l_reach_seeds_scratch_ = reach_scratch_;
+        l_reach_seeds_scratch_ = std::move(reach_scratch_);
         Eigen::VectorXd s = back_solve_LT_sparse_(t, &l_reach_seeds_scratch_);
         hyper_solve_reach_valid_ = true;
-        Eigen::VectorXd y(n_);
-        for (int i = 0; i < n_; ++i)
-            y(Pr_[i]) = s(i);
-        apply_row_unscaling_(y);
+        Eigen::VectorXd y = Eigen::VectorXd::Zero(n_);
+        for (const int i : reach_scratch_) {
+            const int yi = Pr_[i];
+            y(yi) = s(i) * row_scale_[static_cast<size_t>(yi)];
+        }
         if (!updates_.empty())
             y = apply_updates_solve_T_(y);
         if (enable_refinement) {
@@ -763,6 +769,28 @@ class SparseForrestTomlinLU {
     void apply_row_unscaling_(Eigen::VectorXd& y) const {
         for (int i = 0; i < y.size(); ++i)
             y(i) *= row_scale_[static_cast<size_t>(i)];
+    }
+
+    void clear_reach_flags_scratch_(const std::vector<int>* extra = nullptr) const {
+        for (const int j : reach_scratch_)
+            reach_flag_scratch_[j] = false;
+        if (extra) {
+            for (const int j : *extra)
+                reach_flag_scratch_[j] = false;
+        }
+        reach_scratch_.clear();
+    }
+
+    void clear_sparse_solve_scratch_entries_(Eigen::VectorXd& x) const {
+        for (const int i : reach_scratch_)
+            x(i) = 0.0;
+    }
+
+    void ensure_sparse_scratch_size_(Eigen::VectorXd& x) const {
+        if (x.size() != n_) {
+            x.resize(n_);
+            x.setZero();
+        }
     }
 
     void symbolic_analyze_() {
@@ -1116,18 +1144,18 @@ class SparseForrestTomlinLU {
         const int phys_row = row_map_[row];
         const SparseRow& target_row = U_rows_[phys_row];
 
-        SparseRow new_row_entries;
+        SparseRow& new_row_entries = merge_scratch_;
+        new_row_entries.clear();
         new_row_entries.reserve(target_row.size() + pivot_row_phys.size());
 
         std::size_t target_pos = 0;
         std::size_t pivot_pos = 0;
         while (target_pos < target_row.size() || pivot_pos < pivot_row_phys.size()) {
-            const int target_col = target_pos < target_row.size()
-                                       ? target_row[target_pos].idx
-                                       : std::numeric_limits<int>::max();
+            const int target_col = target_pos < target_row.size() ? target_row[target_pos].idx
+                                                                  : std::numeric_limits<int>::max();
             const int pivot_col = pivot_pos < pivot_row_phys.size()
-                                       ? pivot_row_phys[pivot_pos].idx
-                                       : std::numeric_limits<int>::max();
+                                      ? pivot_row_phys[pivot_pos].idx
+                                      : std::numeric_limits<int>::max();
 
             if (target_col < pivot_col) {
                 new_row_entries.push_back(target_row[target_pos]);
@@ -1299,14 +1327,16 @@ class SparseForrestTomlinLU {
         ut_etree_.resize(n_);
         lt_etree_.resize(n_);
         for (int j = 0; j < n_; ++j) {
-            l_etree_[j] = (LT_upper_ptr_[j + 1] > LT_upper_ptr_[j])
-                          ? LT_upper_idx_[LT_upper_ptr_[j]] : -1;
+            l_etree_[j] =
+                (LT_upper_ptr_[j + 1] > LT_upper_ptr_[j]) ? LT_upper_idx_[LT_upper_ptr_[j]] : -1;
             u_etree_[j] = (UT_lower_ptr_[j + 1] > UT_lower_ptr_[j])
-                          ? UT_lower_idx_[UT_lower_ptr_[j + 1] - 1] : -1;
-            ut_etree_[j] = (U_upper_ptr_[j + 1] > U_upper_ptr_[j])
-                           ? U_upper_idx_[U_upper_ptr_[j]] : -1;
+                              ? UT_lower_idx_[UT_lower_ptr_[j + 1] - 1]
+                              : -1;
+            ut_etree_[j] =
+                (U_upper_ptr_[j + 1] > U_upper_ptr_[j]) ? U_upper_idx_[U_upper_ptr_[j]] : -1;
             lt_etree_[j] = (L_lower_ptr_[j + 1] > L_lower_ptr_[j])
-                           ? L_lower_idx_[L_lower_ptr_[j + 1] - 1] : -1;
+                               ? L_lower_idx_[L_lower_ptr_[j + 1] - 1]
+                               : -1;
         }
 
         // Pre-allocate hyper-sparse solve scratch; reset adaptive EMA on refactor (Item 9).
@@ -1599,13 +1629,12 @@ class SparseForrestTomlinLU {
     //
     // EMA update (Item 9): tracks reach density to drive the adaptive fallback.
     Eigen::VectorXd forward_solve_L_sparse_(const Eigen::VectorXd& b,
-                                             const std::vector<int>* seeds) const {
+                                            const std::vector<int>* seeds) const {
         if (n_ == 0) [[unlikely]]
             return b;
         SIMPLEX_ASSUME(n_ > 0);
 
-        reach_flag_scratch_.assign(n_, false);
-        reach_scratch_.clear();
+        clear_reach_flags_scratch_(seeds);
         dfs_stack_scratch_.clear();
 
         // Etree path tracer: walk l_etree_ from start, queueing fill-in nodes (Phase 2).
@@ -1614,16 +1643,18 @@ class SparseForrestTomlinLU {
                 reach_flag_scratch_[j] = true;
                 reach_scratch_.push_back(j);
                 if (LT_upper_ptr_[j + 1] - LT_upper_ptr_[j] > 1)
-                    dfs_stack_scratch_.push_back(j);  // has extra fill-in entries
+                    dfs_stack_scratch_.push_back(j); // has extra fill-in entries
             }
         };
 
         // Phase 1: etree paths from seeds.
         if (seeds) {
-            for (const int k : *seeds) trace_L(k);
+            for (const int k : *seeds)
+                trace_L(k);
         } else {
             for (int k = 0; k < n_; ++k)
-                if (std::abs(b(k)) > kZeroTol_) trace_L(k);
+                if (std::abs(b(k)) > kZeroTol_)
+                    trace_L(k);
         }
 
         // Phase 2: expand non-etree fill-in (extra column entries beyond the single parent).
@@ -1640,7 +1671,8 @@ class SparseForrestTomlinLU {
         ema_reach_ratio_ +=
             0.1 * (static_cast<double>(reach_scratch_.size()) / n_ - ema_reach_ratio_);
 
-        Eigen::VectorXd x = Eigen::VectorXd::Zero(n_);
+        Eigen::VectorXd& x = sparse_l_scratch_;
+        ensure_sparse_scratch_size_(x);
         for (const int i : reach_scratch_) {
             double rhs = b(i);
             for (int pos = L_lower_ptr_[i]; pos < L_lower_ptr_[i + 1]; ++pos)
@@ -1650,7 +1682,9 @@ class SparseForrestTomlinLU {
                 throw std::runtime_error("SparseForrestTomlinLU: bad L diagonal");
             x(i) = rhs / piv;
         }
-        return x;
+        Eigen::VectorXd result = x;
+        clear_sparse_solve_scratch_entries_(x);
+        return result;
     }
 
     Eigen::VectorXd back_solve_U_(const Eigen::VectorXd& b) const {
@@ -1679,13 +1713,12 @@ class SparseForrestTomlinLU {
     //          u_etree_[j] and also need tracing.
     // seeds: when provided (L-reach from prior solve), no O(n) scan needed (Item 1).
     Eigen::VectorXd back_solve_U_sparse_(const Eigen::VectorXd& b,
-                                          const std::vector<int>* seeds) const {
+                                         const std::vector<int>* seeds) const {
         if (n_ == 0) [[unlikely]]
             return b;
         SIMPLEX_ASSUME(n_ > 0);
 
-        reach_flag_scratch_.assign(n_, false);
-        reach_scratch_.clear();
+        clear_reach_flags_scratch_(seeds);
         dfs_stack_scratch_.clear();
 
         const auto trace_U = [&](int start) {
@@ -1698,10 +1731,12 @@ class SparseForrestTomlinLU {
         };
 
         if (seeds) {
-            for (const int k : *seeds) trace_U(k);
+            for (const int k : *seeds)
+                trace_U(k);
         } else {
             for (int k = 0; k < n_; ++k)
-                if (std::abs(b(k)) > kZeroTol_) trace_U(k);
+                if (std::abs(b(k)) > kZeroTol_)
+                    trace_U(k);
         }
 
         // Extra fill-in: all entries in column j of U *except* the last (= u_etree_[j]).
@@ -1714,7 +1749,8 @@ class SparseForrestTomlinLU {
 
         std::sort(reach_scratch_.begin(), reach_scratch_.end(), std::greater<int>{});
 
-        Eigen::VectorXd x = Eigen::VectorXd::Zero(n_);
+        Eigen::VectorXd& x = sparse_u_scratch_;
+        ensure_sparse_scratch_size_(x);
         for (const int i : reach_scratch_) {
             double rhs = b(i);
             for (int pos = U_upper_ptr_[i]; pos < U_upper_ptr_[i + 1]; ++pos)
@@ -1724,7 +1760,9 @@ class SparseForrestTomlinLU {
                 throw std::runtime_error("SparseForrestTomlinLU: bad U diagonal");
             x(i) = rhs / piv;
         }
-        return x;
+        Eigen::VectorXd result = x;
+        clear_sparse_solve_scratch_entries_(x);
+        return result;
     }
 
     Eigen::VectorXd forward_solve_UT_(const Eigen::VectorXd& b) const {
@@ -1750,13 +1788,12 @@ class SparseForrestTomlinLU {
     // Phase 2 extra fill-in: entries in row j of U beyond the first (= ut_etree_[j]).
     // seeds (Item 1): UT-reach left in reach_scratch_ for chaining into LT solve.
     Eigen::VectorXd forward_solve_UT_sparse_(const Eigen::VectorXd& b,
-                                              const std::vector<int>* seeds) const {
+                                             const std::vector<int>* seeds) const {
         if (n_ == 0) [[unlikely]]
             return b;
         SIMPLEX_ASSUME(n_ > 0);
 
-        reach_flag_scratch_.assign(n_, false);
-        reach_scratch_.clear();
+        clear_reach_flags_scratch_(seeds);
         dfs_stack_scratch_.clear();
 
         const auto trace_UT = [&](int start) {
@@ -1769,10 +1806,12 @@ class SparseForrestTomlinLU {
         };
 
         if (seeds) {
-            for (const int k : *seeds) trace_UT(k);
+            for (const int k : *seeds)
+                trace_UT(k);
         } else {
             for (int k = 0; k < n_; ++k)
-                if (std::abs(b(k)) > kZeroTol_) trace_UT(k);
+                if (std::abs(b(k)) > kZeroTol_)
+                    trace_UT(k);
         }
 
         // Extra fill-in: entries in row j of U beyond the first (ut_etree_[j]).
@@ -1788,7 +1827,8 @@ class SparseForrestTomlinLU {
         ema_reach_ratio_ +=
             0.1 * (static_cast<double>(reach_scratch_.size()) / n_ - ema_reach_ratio_);
 
-        Eigen::VectorXd x = Eigen::VectorXd::Zero(n_);
+        Eigen::VectorXd& x = sparse_u_scratch_;
+        ensure_sparse_scratch_size_(x);
         for (const int i : reach_scratch_) {
             double rhs = b(i);
             for (int pos = UT_lower_ptr_[i]; pos < UT_lower_ptr_[i + 1]; ++pos)
@@ -1798,7 +1838,9 @@ class SparseForrestTomlinLU {
                 throw std::runtime_error("SparseForrestTomlinLU: bad U diagonal");
             x(i) = rhs / piv;
         }
-        return x;
+        Eigen::VectorXd result = x;
+        clear_sparse_solve_scratch_entries_(x);
+        return result;
     }
 
     Eigen::VectorXd back_solve_LT_(const Eigen::VectorXd& b) const {
@@ -1825,13 +1867,12 @@ class SparseForrestTomlinLU {
     // Phase 2 extra fill-in: entries in row j of L *except* the last (= lt_etree_[j]).
     // seeds (Item 1): UT-reach from prior solve, no O(n) scan needed.
     Eigen::VectorXd back_solve_LT_sparse_(const Eigen::VectorXd& b,
-                                           const std::vector<int>* seeds) const {
+                                          const std::vector<int>* seeds) const {
         if (n_ == 0) [[unlikely]]
             return b;
         SIMPLEX_ASSUME(n_ > 0);
 
-        reach_flag_scratch_.assign(n_, false);
-        reach_scratch_.clear();
+        clear_reach_flags_scratch_(seeds);
         dfs_stack_scratch_.clear();
 
         const auto trace_LT = [&](int start) {
@@ -1844,10 +1885,12 @@ class SparseForrestTomlinLU {
         };
 
         if (seeds) {
-            for (const int k : *seeds) trace_LT(k);
+            for (const int k : *seeds)
+                trace_LT(k);
         } else {
             for (int k = 0; k < n_; ++k)
-                if (std::abs(b(k)) > kZeroTol_) trace_LT(k);
+                if (std::abs(b(k)) > kZeroTol_)
+                    trace_LT(k);
         }
 
         // Extra fill-in: entries in row j of L except the last (= lt_etree_[j]).
@@ -1860,7 +1903,8 @@ class SparseForrestTomlinLU {
 
         std::sort(reach_scratch_.begin(), reach_scratch_.end(), std::greater<int>{});
 
-        Eigen::VectorXd x = Eigen::VectorXd::Zero(n_);
+        Eigen::VectorXd& x = sparse_l_scratch_;
+        ensure_sparse_scratch_size_(x);
         for (const int i : reach_scratch_) {
             double rhs = b(i);
             for (int pos = LT_upper_ptr_[i]; pos < LT_upper_ptr_[i + 1]; ++pos)
@@ -1870,7 +1914,9 @@ class SparseForrestTomlinLU {
                 throw std::runtime_error("SparseForrestTomlinLU: bad L diagonal");
             x(i) = rhs / piv;
         }
-        return x;
+        Eigen::VectorXd result = x;
+        clear_sparse_solve_scratch_entries_(x);
+        return result;
     }
 
     Eigen::VectorXd apply_updates_solve_(Eigen::VectorXd x) const {
@@ -2052,6 +2098,9 @@ class SparseForrestTomlinLU {
     mutable std::vector<int> l_reach_seeds_scratch_;
     // Permuted seed positions for sparse RHS interface (Item 1).
     mutable std::vector<int> perm_seeds_scratch_;
+    mutable Eigen::VectorXd sparse_l_scratch_;
+    mutable Eigen::VectorXd sparse_u_scratch_;
+    mutable SparseRow merge_scratch_;
     // Adaptive reach-density EMA — drives hyper-sparse fallback decision (Item 9).
     mutable double ema_reach_ratio_{kHyperSparseDensityThreshold_};
     // True when reach_flag_scratch_ reflects the last hyper-sparse solve output (Item 6).

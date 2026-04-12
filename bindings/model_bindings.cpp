@@ -96,6 +96,7 @@ void print_verbose_solver_banner() {
     std::cout << bold_("Simplinho") << " " << SIMPLEX_PROJECT_VERSION << "  " << dim_("git") << " "
               << SIMPLEX_GIT_DESCRIBE << "  " << dim_("branch") << " " << SIMPLEX_GIT_BRANCH
               << std::endl;
+    std::cout << dim_(rule_('-')) << std::endl << std::endl;
 }
 
 enum class ConstraintSense { LessEqual, Equal, GreaterEqual };
@@ -165,6 +166,7 @@ void print_verbose_solver_configuration(const BranchAndBoundOptions& options) {
         {"dual-proof", options.use_dual_proof_cuts},
     };
     std::cout << accent_("MIP Cuts") << "     | " << join_feature_tokens_(cuts) << std::endl;
+    std::cout << dim_(rule_('-')) << std::endl << std::endl;
 }
 
 const char* simplex_mode_name(SimplexMode mode) {
