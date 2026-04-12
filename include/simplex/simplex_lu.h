@@ -32,8 +32,8 @@ class FTBasis {
     using Permutation = Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int>;
 
     struct Options {
-        int refactor_every = 64;
-        int compress_every = 32;
+        int refactor_every = 32;
+        int compress_every = 16;
         double pivot_rel = 1e-12;
         double abs_floor = 1e-16;
         double alpha_tol = 1e-10;
@@ -42,11 +42,11 @@ class FTBasis {
         double sparse_drop_tol = 0.0;
 
         enum class UpdateMode { EtaStack, ForrestTomlin, Hybrid };
-        UpdateMode update_mode = UpdateMode::ForrestTomlin;
+        UpdateMode update_mode = UpdateMode::Hybrid;
 
-        int ft_bandwidth_cap = 16;
-        double max_growth_tol = 1e4;
-        double min_dynamic_growth_tol = 1e3;
+        int ft_bandwidth_cap = 12;
+        double max_growth_tol = 1e3;
+        double min_dynamic_growth_tol = 500;
         double min_refactor_interval_fraction = 0.35;
         double max_condition_estimate = 1e13;
         double ft_multiplier_guard = 1e8;
@@ -59,8 +59,8 @@ class FTBasis {
         double residual_abs_refactor_tol = 1e-10;
         int refinement_max_steps = 6;
         double refinement_slow_progress_ratio = 0.5;
-        double refinement_stall_progress_ratio = 0.1;
-        int refinement_stall_limit = 2;
+        double refinement_stall_progress_ratio = 0.8;
+        int refinement_stall_limit = 3;
         int max_eta_count = 128;
         bool refactor_on_solve_failure = true;
         bool aggressive_refactor_on_suspicious_residual = true;
@@ -153,25 +153,30 @@ class FTBasis {
         if (b.size() != m_)
             throw std::invalid_argument("FTBasis::solve_B size mismatch");
 
-        try {
-            Eigen::VectorXd x = base_solve_B_(b);
-            if (!A_is_sparse_ && !etas_.empty()) {
-                x = apply_etas_solve_(x);
+        auto* self = const_cast<FTBasis*>(this);
+        auto do_solve = [&]() {
+            Eigen::VectorXd x = self->base_solve_B_(b);
+            if (!self->A_is_sparse_ && !self->etas_.empty()) {
+                x = self->apply_etas_solve_(x);
             }
-            if (opt_.enable_iterative_refinement && !A_is_sparse_)
-                x = refine_solve_B_(b, x);
+            if (self->opt_.enable_iterative_refinement && !self->A_is_sparse_)
+                x = self->refine_solve_B_(b, x);
+            return x;
+        };
+
+        try {
+            Eigen::VectorXd x = do_solve();
+            self->verify_solve_quality_B_(b, x, "FTBasis::solve_B");
             return x;
         } catch (const std::exception& err) {
             if (!opt_.refactor_on_solve_failure)
                 throw;
 
-            auto* self = const_cast<FTBasis*>(this);
             self->last_update_diagnostic_ = err.what();
             self->refactor();
 
-            Eigen::VectorXd x = self->base_solve_B_(b);
-            if (self->opt_.enable_iterative_refinement && !self->A_is_sparse_)
-                x = self->refine_solve_B_(b, x);
+            Eigen::VectorXd x = do_solve();
+            self->verify_solve_quality_B_(b, x, "FTBasis::solve_B after refactor");
             return x;
         }
     }
@@ -180,25 +185,30 @@ class FTBasis {
         if (c.size() != m_)
             throw std::invalid_argument("FTBasis::solve_BT size mismatch");
 
-        try {
-            Eigen::VectorXd y = base_solve_BT_(c);
-            if (!A_is_sparse_ && !etas_.empty()) {
-                y = apply_etas_solve_T_(y);
+        auto* self = const_cast<FTBasis*>(this);
+        auto do_solve = [&]() {
+            Eigen::VectorXd y = self->base_solve_BT_(c);
+            if (!self->A_is_sparse_ && !self->etas_.empty()) {
+                y = self->apply_etas_solve_T_(y);
             }
-            if (opt_.enable_iterative_refinement && !A_is_sparse_)
-                y = refine_solve_BT_(c, y);
+            if (self->opt_.enable_iterative_refinement && !self->A_is_sparse_)
+                y = self->refine_solve_BT_(c, y);
+            return y;
+        };
+
+        try {
+            Eigen::VectorXd y = do_solve();
+            self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT");
             return y;
         } catch (const std::exception& err) {
             if (!opt_.refactor_on_solve_failure)
                 throw;
 
-            auto* self = const_cast<FTBasis*>(this);
             self->last_update_diagnostic_ = err.what();
             self->refactor();
 
-            Eigen::VectorXd y = self->base_solve_BT_(c);
-            if (self->opt_.enable_iterative_refinement && !self->A_is_sparse_)
-                y = self->refine_solve_BT_(c, y);
+            Eigen::VectorXd y = do_solve();
+            self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT after refactor");
             return y;
         }
     }
@@ -329,12 +339,11 @@ class FTBasis {
         return oss.str();
     }
 
-    std::string make_update_diagnostic_(const std::string& reason, double alpha,
-                                        const Eigen::VectorXd* z = nullptr,
-                                        const Eigen::VectorXd* w = nullptr,
-                                        double growth = std::numeric_limits<double>::quiet_NaN(),
-                                        double residual =
-                                            std::numeric_limits<double>::quiet_NaN()) const {
+    std::string
+    make_update_diagnostic_(const std::string& reason, double alpha,
+                            const Eigen::VectorXd* z = nullptr, const Eigen::VectorXd* w = nullptr,
+                            double growth = std::numeric_limits<double>::quiet_NaN(),
+                            double residual = std::numeric_limits<double>::quiet_NaN()) const {
         std::ostringstream oss;
         oss << reason;
         oss << " alpha=" << format_metric_(alpha);
@@ -377,20 +386,22 @@ class FTBasis {
         double score = 0.0;
         score = std::max(score, ratio(stats_.last_column_residual, opt_.column_residual_tol));
         score = std::max(score, ratio(stats_.growth_from_last_refactor, opt_.max_growth_tol));
-        score = std::max(score, ratio(stats_.cumulative_eta_z_inf, opt_.eta_cumulative_inf_norm_guard));
+        score =
+            std::max(score, ratio(stats_.cumulative_eta_z_inf, opt_.eta_cumulative_inf_norm_guard));
         score = std::max(score, ratio(stats_.estimated_condition, opt_.max_condition_estimate));
         return score;
     }
 
     double dynamic_growth_tol_() const noexcept {
-        const double chain_progress =
-            (opt_.refactor_every > 0)
-                ? std::clamp(static_cast<double>(update_count_) / static_cast<double>(opt_.refactor_every),
-                             0.0, 1.0)
-                : 1.0;
+        const double chain_progress = (opt_.refactor_every > 0)
+                                          ? std::clamp(static_cast<double>(update_count_) /
+                                                           static_cast<double>(opt_.refactor_every),
+                                                       0.0, 1.0)
+                                          : 1.0;
         const double eta_pressure =
             (opt_.eta_cumulative_inf_norm_guard > 0.0)
-                ? std::clamp(stats_.cumulative_eta_z_inf / opt_.eta_cumulative_inf_norm_guard, 0.0, 1.0)
+                ? std::clamp(stats_.cumulative_eta_z_inf / opt_.eta_cumulative_inf_norm_guard, 0.0,
+                             1.0)
                 : 0.0;
         const double pressure = std::max(chain_progress, eta_pressure);
         const double tightened = opt_.max_growth_tol * (1.0 - 0.75 * pressure);
@@ -442,6 +453,67 @@ class FTBasis {
         return residual.lpNorm<Eigen::Infinity>() / denom;
     }
 
+    bool should_verify_solve_quality_() const noexcept {
+        if (m_ <= 0)
+            return false;
+        if (A_is_sparse_) {
+            if (!lu_sparse_.has_updates())
+                return false;
+            if (lu_sparse_.needs_refactor())
+                return true;
+            if (update_count_ >= std::max(1, adaptive_refactor_limit_() / 2))
+                return true;
+            return stats_.stability_score >= 0.5;
+        }
+        if (etas_.empty())
+            return false;
+        if (update_count_ >= std::max(1, adaptive_refactor_limit_() / 2))
+            return true;
+        if (stats_.stability_score >= 0.5)
+            return true;
+        return stats_.estimated_condition > 0.5 * opt_.max_condition_estimate;
+    }
+
+    static double relative_residual_(const Eigen::VectorXd& residual,
+                                     const Eigen::VectorXd& rhs) noexcept {
+        const double denom = std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
+        return residual.lpNorm<Eigen::Infinity>() / denom;
+    }
+
+    bool solve_residual_ok_(double berr, double abs_residual) const noexcept {
+        return std::isfinite(berr) && std::isfinite(abs_residual) &&
+               (berr <= opt_.residual_refactor_tol ||
+                abs_residual <= opt_.residual_abs_refactor_tol);
+    }
+
+    void verify_solve_quality_B_(const Eigen::VectorXd& rhs, const Eigen::VectorXd& x,
+                                 const char* label) {
+        if (!should_verify_solve_quality_())
+            return;
+        const Eigen::VectorXd residual = rhs - multiply_B_(x);
+        const double abs_residual = residual.lpNorm<Eigen::Infinity>();
+        const double berr = relative_residual_(residual, rhs);
+        if (solve_residual_ok_(berr, abs_residual))
+            return;
+        throw std::runtime_error(std::string(label) + " suspicious residual berr=" +
+                                 format_metric_(berr) +
+                                 " abs_residual=" + format_metric_(abs_residual));
+    }
+
+    void verify_solve_quality_BT_(const Eigen::VectorXd& rhs, const Eigen::VectorXd& y,
+                                  const char* label) {
+        if (!should_verify_solve_quality_())
+            return;
+        const Eigen::VectorXd residual = rhs - multiply_BT_(y);
+        const double abs_residual = residual.lpNorm<Eigen::Infinity>();
+        const double berr = relative_residual_(residual, rhs);
+        if (solve_residual_ok_(berr, abs_residual))
+            return;
+        throw std::runtime_error(std::string(label) + " suspicious residual berr=" +
+                                 format_metric_(berr) +
+                                 " abs_residual=" + format_metric_(abs_residual));
+    }
+
     void refresh_refactor_diagnostics_() {
         stats_.growth_factor = 1.0;
         stats_.growth_from_last_refactor = 1.0;
@@ -455,8 +527,9 @@ class FTBasis {
         }
         stats_.stability_score = stability_score_();
         if (!A_is_sparse_ && stats_.estimated_condition > opt_.max_condition_estimate) {
-            last_update_diagnostic_ = "Dense refactor produced a poorly conditioned basis est_cond=" +
-                                      format_metric_(stats_.estimated_condition);
+            last_update_diagnostic_ =
+                "Dense refactor produced a poorly conditioned basis est_cond=" +
+                format_metric_(stats_.estimated_condition);
         }
     }
 
@@ -598,9 +671,9 @@ class FTBasis {
                     stall_steps = 0;
                 }
                 if (stall_steps >= std::max(1, opt_.refinement_stall_limit)) {
-                    throw std::runtime_error("FTBasis::refine_solve_B stalled berr=" +
-                                             format_metric_(berr) +
-                                             " abs_residual=" + format_metric_(final_abs_residual));
+                    throw std::runtime_error(
+                        "FTBasis::refine_solve_B stalled berr=" + format_metric_(berr) +
+                        " abs_residual=" + format_metric_(final_abs_residual));
                 }
             }
 
@@ -622,9 +695,10 @@ class FTBasis {
 
         if (!std::isfinite(final_berr) || (final_berr > opt_.residual_refactor_tol &&
                                            final_abs_residual > opt_.residual_abs_refactor_tol)) {
-            throw std::runtime_error("FTBasis::refine_solve_B residual remained large after refinement"
-                                     " berr=" + format_metric_(final_berr) +
-                                     " abs_residual=" + format_metric_(final_abs_residual));
+            throw std::runtime_error(
+                "FTBasis::refine_solve_B residual remained large after refinement"
+                " berr=" +
+                format_metric_(final_berr) + " abs_residual=" + format_metric_(final_abs_residual));
         }
         return x;
     }
@@ -656,9 +730,9 @@ class FTBasis {
                     stall_steps = 0;
                 }
                 if (stall_steps >= std::max(1, opt_.refinement_stall_limit)) {
-                    throw std::runtime_error("FTBasis::refine_solve_BT stalled berr=" +
-                                             format_metric_(berr) +
-                                             " abs_residual=" + format_metric_(final_abs_residual));
+                    throw std::runtime_error(
+                        "FTBasis::refine_solve_BT stalled berr=" + format_metric_(berr) +
+                        " abs_residual=" + format_metric_(final_abs_residual));
                 }
             }
 
@@ -682,8 +756,7 @@ class FTBasis {
                                            final_abs_residual > opt_.residual_abs_refactor_tol)) {
             throw std::runtime_error(
                 "FTBasis::refine_solve_BT residual remained large after refinement berr=" +
-                format_metric_(final_berr) +
-                " abs_residual=" + format_metric_(final_abs_residual));
+                format_metric_(final_berr) + " abs_residual=" + format_metric_(final_abs_residual));
         }
         return y;
     }
@@ -704,10 +777,9 @@ class FTBasis {
 
         Eigen::VectorXd contrib = U * z;
         const double contrib_floor =
-            std::max(opt_.abs_floor,
-                     1e-14 * std::max({1.0, U.col(j).lpNorm<Eigen::Infinity>(),
-                                       incoming_col.lpNorm<Eigen::Infinity>(),
-                                       z.lpNorm<Eigen::Infinity>()}));
+            std::max(opt_.abs_floor, 1e-14 * std::max({1.0, U.col(j).lpNorm<Eigen::Infinity>(),
+                                                       incoming_col.lpNorm<Eigen::Infinity>(),
+                                                       z.lpNorm<Eigen::Infinity>()}));
         for (int i = 0; i < contrib.size(); ++i) {
             if (std::abs(contrib(i)) < contrib_floor)
                 contrib(i) = 0.0;
@@ -828,8 +900,10 @@ class FTBasis {
         }
         stats_.avg_eta_density =
             etas_.empty() ? 0.0 : density_sum / static_cast<double>(etas_.size());
-        stats_.growth_from_last_refactor = max_element_ / std::max(1.0, refactor_baseline_max_element_);
-        stats_.growth_from_initial_refactor = max_element_ / std::max(1.0, initial_refactor_max_element_);
+        stats_.growth_from_last_refactor =
+            max_element_ / std::max(1.0, refactor_baseline_max_element_);
+        stats_.growth_from_initial_refactor =
+            max_element_ / std::max(1.0, initial_refactor_max_element_);
         stats_.growth_factor = stats_.growth_from_last_refactor;
         stats_.estimated_condition = dense_condition_estimate_();
         stats_.sparse_norm_growth_estimate = 1.0;
@@ -874,7 +948,8 @@ class FTBasis {
             return true;
         if (stats_.growth_from_last_refactor > dynamic_growth_tol_())
             return true;
-        if (stats_.growth_from_initial_refactor > dynamic_growth_tol_() * std::max(10.0, opt_.max_growth_tol))
+        if (stats_.growth_from_initial_refactor >
+            dynamic_growth_tol_() * std::max(10.0, opt_.max_growth_tol))
             return true;
         if (stats_.estimated_condition > opt_.max_condition_estimate)
             return true;
@@ -898,6 +973,11 @@ class FTBasis {
 
         if (A_is_sparse_) {
             const Eigen::VectorXd old_dense = Eigen::VectorXd(current_B_sparse_.col(j));
+            if (!lu_sparse_.supports_inplace_updates()) {
+                set_sparse_column_(j, new_col_dense);
+                sparse_refactor_();
+                return;
+            }
             if (lu_sparse_.needs_refactor()) {
                 last_update_diagnostic_ = "Sparse FT update chain exceeded norm-growth guard";
                 set_sparse_column_(j, new_col_dense);
@@ -937,8 +1017,8 @@ class FTBasis {
 
             if (!lu_sparse_.append_forrest_tomlin_update(j, u, z, w, alpha,
                                                          std::max(opt_.abs_floor, 1e-14))) {
-                last_update_diagnostic_ =
-                    make_update_diagnostic_(lu_sparse_.last_update_failure_reason_message(), alpha, &z, &w);
+                last_update_diagnostic_ = make_update_diagnostic_(
+                    lu_sparse_.last_update_failure_reason_message(), alpha, &z, &w);
                 sparse_refactor_();
                 return;
             }
@@ -971,18 +1051,15 @@ class FTBasis {
             return;
         }
 
-        const bool allow_ft_mode =
-            opt_.update_mode == Options::UpdateMode::ForrestTomlin ||
-            opt_.update_mode == Options::UpdateMode::Hybrid;
-        const bool hybrid_prefers_ft =
-            opt_.update_mode != Options::UpdateMode::Hybrid ||
-            (stats_.estimated_condition <= opt_.max_condition_estimate &&
-             stats_.stability_score < 0.75);
-        const bool try_ft = lu_dense_.supports_inplace_updates() && allow_ft_mode && hybrid_prefers_ft &&
-                            std::abs(alpha) >= alpha_floor &&
-                            update_count_ < adaptive_refactor_limit_() &&
-                            z.cwiseAbs().maxCoeff() <= opt_.z_inf_guard &&
-                            w.array().isFinite().all();
+        const bool allow_ft_mode = opt_.update_mode == Options::UpdateMode::ForrestTomlin ||
+                                   opt_.update_mode == Options::UpdateMode::Hybrid;
+        const bool hybrid_prefers_ft = opt_.update_mode != Options::UpdateMode::Hybrid ||
+                                       (stats_.estimated_condition <= opt_.max_condition_estimate &&
+                                        stats_.stability_score < 0.75);
+        const bool try_ft =
+            lu_dense_.supports_inplace_updates() && allow_ft_mode && hybrid_prefers_ft &&
+            std::abs(alpha) >= alpha_floor && update_count_ < adaptive_refactor_limit_() &&
+            z.cwiseAbs().maxCoeff() <= opt_.z_inf_guard && w.array().isFinite().all();
 
         if (try_ft) {
             bool ok = true;
@@ -990,16 +1067,18 @@ class FTBasis {
                 forrest_tomlin_update_dense_(j, new_col_dense, z, alpha);
                 const double current_max = lu_dense_.U().cwiseAbs().maxCoeff();
                 const double dynamic_growth_tol = dynamic_growth_tol_();
-                const double baseline_growth = current_max / std::max(1.0, refactor_baseline_max_element_);
-                const double initial_growth = current_max / std::max(1.0, initial_refactor_max_element_);
+                const double baseline_growth =
+                    current_max / std::max(1.0, refactor_baseline_max_element_);
+                const double initial_growth =
+                    current_max / std::max(1.0, initial_refactor_max_element_);
                 const double cond_estimate = dense_condition_estimate_();
                 if (current_max > std::max(1.0, max_element_) * dynamic_growth_tol ||
                     baseline_growth > dynamic_growth_tol ||
                     initial_growth > dynamic_growth_tol * std::max(dynamic_growth_tol, 10.0) ||
                     cond_estimate > opt_.max_condition_estimate) {
                     last_update_diagnostic_ = make_update_diagnostic_(
-                        "Dense FT update exceeded stability guards", alpha, &z, &w,
-                        baseline_growth, stats_.last_column_residual);
+                        "Dense FT update exceeded stability guards", alpha, &z, &w, baseline_growth,
+                        stats_.last_column_residual);
                     ok = false;
                 } else {
                     max_element_ = std::max(max_element_, current_max);
@@ -1014,10 +1093,9 @@ class FTBasis {
 
             if (!ok || (opt_.aggressive_refactor_on_suspicious_residual && bad_residual)) {
                 if (!ok && last_update_diagnostic_.empty())
-                    last_update_diagnostic_ =
-                        make_update_diagnostic_("Dense FT update failed numerical stability checks",
-                                                alpha, &z, &w, stats_.growth_from_last_refactor,
-                                                stats_.last_column_residual);
+                    last_update_diagnostic_ = make_update_diagnostic_(
+                        "Dense FT update failed numerical stability checks", alpha, &z, &w,
+                        stats_.growth_from_last_refactor, stats_.last_column_residual);
                 dense_refactor_();
                 return;
             }
@@ -1029,15 +1107,13 @@ class FTBasis {
             return;
         }
 
-        const bool refactor_now = (std::abs(alpha) < alpha_floor) ||
-                                  (update_count_ >= adaptive_refactor_limit_()) ||
-                                  (!std::isfinite(alpha)) ||
-                                  (stats_.estimated_condition > opt_.max_condition_estimate);
+        const bool refactor_now =
+            (std::abs(alpha) < alpha_floor) || (update_count_ >= adaptive_refactor_limit_()) ||
+            (!std::isfinite(alpha)) || (stats_.estimated_condition > opt_.max_condition_estimate);
 
         if (refactor_now) {
-            last_update_diagnostic_ =
-                make_update_diagnostic_("Dense update fell back to refactor due to stability guards",
-                                        alpha, &z, &w);
+            last_update_diagnostic_ = make_update_diagnostic_(
+                "Dense update fell back to refactor due to stability guards", alpha, &z, &w);
             set_dense_basis_column_(j, new_col_dense);
             dense_refactor_();
             return;

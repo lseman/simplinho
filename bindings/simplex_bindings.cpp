@@ -496,6 +496,21 @@ void bind_simplex_bindings(py::module_& m) {
         .def_readwrite("z_inf_guard", &RevisedSimplexOptions::z_inf_guard)
         .def_readwrite("basis_update", &RevisedSimplexOptions::basis_update)
         .def_readwrite("ft_bandwidth_cap", &RevisedSimplexOptions::ft_bandwidth_cap)
+        .def_readwrite("max_growth_tol", &RevisedSimplexOptions::max_growth_tol)
+        .def_readwrite("min_dynamic_growth_tol", &RevisedSimplexOptions::min_dynamic_growth_tol)
+        .def_readwrite("max_condition_estimate", &RevisedSimplexOptions::max_condition_estimate)
+        .def_readwrite("basis_refinement_steps", &RevisedSimplexOptions::basis_refinement_steps)
+        .def_readwrite("basis_residual_refactor_tol",
+                       &RevisedSimplexOptions::basis_residual_refactor_tol)
+        .def_readwrite("basis_refinement_stall_progress_ratio",
+                       &RevisedSimplexOptions::basis_refinement_stall_progress_ratio)
+        .def_readwrite("basis_refinement_stall_limit",
+                       &RevisedSimplexOptions::basis_refinement_stall_limit)
+        .def_readwrite("basis_max_eta_count", &RevisedSimplexOptions::basis_max_eta_count)
+        .def_readwrite("basis_column_residual_tol",
+                       &RevisedSimplexOptions::basis_column_residual_tol)
+        .def_readwrite("basis_aggressive_residual_rebuild",
+                       &RevisedSimplexOptions::basis_aggressive_residual_rebuild)
         .def_readwrite("devex_reset", &RevisedSimplexOptions::devex_reset)
         .def_readwrite("pricing_rule", &RevisedSimplexOptions::pricing_rule)
         .def_readwrite("adaptive_reset_freq", &RevisedSimplexOptions::adaptive_reset_freq)

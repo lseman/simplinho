@@ -91,28 +91,38 @@ struct RevisedSimplexOptions {
     int rng_seed = 13;
 
     // Basis / LU
-    int refactor_every = 128; // FT hard cap
-    int compress_every = 64;  // FT soft cap
+    int refactor_every = 64; // FT hard cap
+    int compress_every = 32; // FT soft cap
     double lu_pivot_rel = 1e-12;
     double lu_abs_floor = 1e-16;
     double alpha_tol = 1e-10;
     double z_inf_guard = 1e6;
     double ft_multiplier_guard = 1e8;
-    std::string basis_update = "forrest_tomlin"; // or "eta"
-    int ft_bandwidth_cap = 16;
-    double max_growth_tol = 1e4;
+    std::string basis_update = "hybrid"; // "forrest_tomlin" | "eta" | "hybrid"
+    int ft_bandwidth_cap = 12;
+    double max_growth_tol = 1e3;
+    double min_dynamic_growth_tol = 500;
+    double max_condition_estimate = 1e13;
+    int basis_refinement_steps = 3;
+    double basis_residual_refactor_tol = 1e-9;
+    double basis_refinement_stall_progress_ratio = 0.8;
+    int basis_refinement_stall_limit = 3;
+    int basis_max_eta_count = 128;
+    double basis_column_residual_tol = 1e-8;
+    bool basis_aggressive_residual_rebuild = true;
 
     // Pricing
     int devex_reset = 100;
     std::string pricing_rule = "adaptive"; // or "devex" / "most_negative"
-    int adaptive_reset_freq = 500;
+    int adaptive_reset_freq = 400;
     bool partial_pricing = true;         // HiGHS-inspired partial pricing
     std::string dual_pricing = "switch"; // "row" | "col" | "switch" (HiGHS-inspired)
-    int row_pricing_threshold = 20;      // switch if row density < this
+    int row_pricing_threshold = 40;      // switch if row density < this
     std::string primal_edge_weight_strategy =
         "dense_diagonal"; // "dense" | "diagonal" | "dense_diagonal"
     std::string dual_edge_weight_strategy =
-        "dense_diagonal"; // "dense" | "diagonal" | "dense_diagonal"
+        "dense_diagonal";           // "dense" | "diagonal" | "dense_diagonal"
+    int dual_flip_max_per_iter = 4; // avoid pathological flip storms
     double primal_steepest_edge_weight_log_error_threshold =
         1.3862943611198906; // log(4), equivalent to 25% acceptance
     double dual_steepest_edge_weight_log_error_threshold =
@@ -136,7 +146,6 @@ struct RevisedSimplexOptions {
     bool dual_allow_bound_flip = true;  // enable Beale bound-flipping
     double dual_flip_pivot_tol = 1e-10; // |pN(e)| below this ⇒ consider flip
     double dual_flip_rc_tol = 1e-10;    // |rN(e)| “near dual-feasible”
-    int dual_flip_max_per_iter = 2;     // avoid pathological flip storms
 
     // Algorithm selection
     SimplexMode mode = SimplexMode::Auto; // Auto | Primal | Dual

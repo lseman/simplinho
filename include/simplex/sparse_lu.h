@@ -130,6 +130,7 @@ class SparseForrestTomlinLU {
         base_matrix_original_ = A;
         base_matrix_original_.makeCompressed();
         base_matrix_one_norm_ = matrix_one_norm_(base_matrix_original_);
+        use_fallback_sparse_lu_ = false;
         row_scale_.assign(n_, 1.0);
         col_scale_.assign(n_, 1.0);
         norm_growth_estimate_ = 1.0;
@@ -170,12 +171,16 @@ class SparseForrestTomlinLU {
         load_initial_U_(factor_matrix);
         symbolic_analyze_();
         initialize_active_stats_();
-        factorize_sparse_();
-        build_solve_metadata_();
+        try {
+            factorize_sparse_();
+            build_solve_metadata_();
+        } catch (const std::runtime_error&) {
+            activate_sparse_lu_fallback_(base_matrix_original_);
+        }
         clear_updates();
     }
 
-    bool supports_inplace_updates() const noexcept { return n_ > 0; }
+    bool supports_inplace_updates() const noexcept { return n_ > 0 && !use_fallback_sparse_lu_; }
 
     bool has_updates() const noexcept { return !updates_.empty(); }
 
@@ -269,6 +274,15 @@ class SparseForrestTomlinLU {
             return b;
         SIMPLEX_ASSUME(n_ > 0);
 
+        if (use_fallback_sparse_lu_) {
+            Eigen::VectorXd x = fallback_sparse_lu_.solve(b);
+            if (!x.array().isFinite().all())
+                throw std::runtime_error("SparseForrestTomlinLU: fallback solve failed");
+            if (enable_refinement)
+                x = iterative_refine_(b, x);
+            return x;
+        }
+
         permute_and_scale_rhs_(b, permuted_rhs_scratch_, Pr_, row_scale_);
         Eigen::VectorXd& Pb = permuted_rhs_scratch_;
 
@@ -292,6 +306,15 @@ class SparseForrestTomlinLU {
         if (n_ == 0) [[unlikely]]
             return c;
         SIMPLEX_ASSUME(n_ > 0);
+
+        if (use_fallback_sparse_lu_) {
+            Eigen::VectorXd y = fallback_sparse_lu_t_.solve(c);
+            if (!y.array().isFinite().all())
+                throw std::runtime_error("SparseForrestTomlinLU: fallback transpose solve failed");
+            if (enable_refinement)
+                y = iterative_refine_T_(c, y);
+            return y;
+        }
 
         permute_and_scale_rhs_(c, permuted_transpose_rhs_scratch_, Pc_, col_scale_);
         Eigen::VectorXd& PcTc = permuted_transpose_rhs_scratch_;
@@ -1347,6 +1370,23 @@ class SparseForrestTomlinLU {
         }
     }
 
+    void activate_sparse_lu_fallback_(const SparseMat& A) {
+        fallback_sparse_lu_.analyzePattern(A);
+        fallback_sparse_lu_.factorize(A);
+        if (fallback_sparse_lu_.info() != Eigen::Success)
+            throw std::runtime_error("SparseForrestTomlinLU: sparse fallback factorization failed");
+
+        const SparseMat AT = A.transpose();
+        fallback_sparse_lu_t_.analyzePattern(AT);
+        fallback_sparse_lu_t_.factorize(AT);
+        if (fallback_sparse_lu_t_.info() != Eigen::Success) {
+            throw std::runtime_error(
+                "SparseForrestTomlinLU: sparse transpose fallback factorization failed");
+        }
+
+        use_fallback_sparse_lu_ = true;
+    }
+
     Eigen::VectorXd forward_solve_L_(const Eigen::VectorXd& b) const {
         if (n_ == 0) [[unlikely]]
             return b;
@@ -1457,29 +1497,47 @@ class SparseForrestTomlinLU {
     }
 
     Eigen::VectorXd iterative_refine_(const Eigen::VectorXd& rhs, Eigen::VectorXd x) const {
-        const int max_steps = std::min(config_.iterative_refinement_steps, 2);
-        for (int step = 0; step < std::max(0, max_steps); ++step) {
+        const int max_steps = std::max(0, config_.iterative_refinement_steps);
+        double previous_rel_residual = std::numeric_limits<double>::infinity();
+        for (int step = 0; step < max_steps; ++step) {
             const Eigen::VectorXd residual = rhs - multiply_current_matrix_(x);
             const double rel_residual =
                 residual.lpNorm<Eigen::Infinity>() / std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
             if (!std::isfinite(rel_residual) || rel_residual <= config_.iterative_refinement_tol) {
                 break;
             }
-            x += solve_impl_(residual, false);
+            if (std::isfinite(previous_rel_residual) &&
+                rel_residual > previous_rel_residual * 0.95) {
+                break;
+            }
+            Eigen::VectorXd dx = solve_impl_(residual, false);
+            if (!dx.array().isFinite().all() || dx.lpNorm<Eigen::Infinity>() < 1e-16)
+                break;
+            x += dx;
+            previous_rel_residual = rel_residual;
         }
         return x;
     }
 
     Eigen::VectorXd iterative_refine_T_(const Eigen::VectorXd& rhs, Eigen::VectorXd y) const {
-        const int max_steps = std::min(config_.iterative_refinement_steps, 2);
-        for (int step = 0; step < std::max(0, max_steps); ++step) {
+        const int max_steps = std::max(0, config_.iterative_refinement_steps);
+        double previous_rel_residual = std::numeric_limits<double>::infinity();
+        for (int step = 0; step < max_steps; ++step) {
             const Eigen::VectorXd residual = rhs - multiply_current_matrix_T_(y);
             const double rel_residual =
                 residual.lpNorm<Eigen::Infinity>() / std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
             if (!std::isfinite(rel_residual) || rel_residual <= config_.iterative_refinement_tol) {
                 break;
             }
-            y += solveT_impl_(residual, false);
+            if (std::isfinite(previous_rel_residual) &&
+                rel_residual > previous_rel_residual * 0.95) {
+                break;
+            }
+            Eigen::VectorXd dy = solveT_impl_(residual, false);
+            if (!dy.array().isFinite().all() || dy.lpNorm<Eigen::Infinity>() < 1e-16)
+                break;
+            y += dy;
+            previous_rel_residual = rel_residual;
         }
         return y;
     }
@@ -1500,8 +1558,11 @@ class SparseForrestTomlinLU {
     Config config_{};
     double base_matrix_one_norm_{1.0};
     double norm_growth_estimate_{1.0};
+    bool use_fallback_sparse_lu_{false};
     std::vector<double> row_scale_, col_scale_;
     SparseMat base_matrix_original_;
+    Eigen::SparseLU<SparseMat, Eigen::COLAMDOrdering<int>> fallback_sparse_lu_;
+    Eigen::SparseLU<SparseMat, Eigen::COLAMDOrdering<int>> fallback_sparse_lu_t_;
     mutable Eigen::VectorXd permuted_rhs_scratch_;
     mutable Eigen::VectorXd permuted_transpose_rhs_scratch_;
     mutable int active_k_{0};

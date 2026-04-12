@@ -35,3 +35,5 @@ scip-source/
 .claude/
 bnb_website/
 Cgl/
+highs-source/
+.cache/

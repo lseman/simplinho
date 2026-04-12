@@ -53,6 +53,17 @@ RevisedSimplex::evaluate_basis_quality_(const Eigen::MatrixXd& A, const Eigen::V
     const Eigen::VectorXd xB = lu.solve(b);
     if (xB.size() != m)
         return q;
+    {
+        Eigen::VectorXd rhs(m);
+        for (int i = 0; i < m; ++i)
+            rhs(i) = (i % 2 == 0) ? 1.0 : -1.0;
+        const Eigen::VectorXd sanity_x = lu.solve(rhs);
+        if (sanity_x.size() != m || !sanity_x.allFinite())
+            return q;
+        const Eigen::VectorXd sanity_residual = rhs - B * sanity_x;
+        q.solve_residual =
+            sanity_residual.lpNorm<Eigen::Infinity>() / std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
+    }
     q.primal_violation = positive_violation_max_(-xB, tol);
     q.primal_feasible = xB.allFinite() && q.primal_violation <= tol;
 
@@ -122,6 +133,17 @@ RevisedSimplex::evaluate_basis_quality_(const SparseMatrix& A, const Eigen::Vect
         return q;
     if (lu.info() != Eigen::Success)
         return q;
+    {
+        Eigen::VectorXd rhs(m);
+        for (int i = 0; i < m; ++i)
+            rhs(i) = (i % 2 == 0) ? 1.0 : -1.0;
+        const Eigen::VectorXd sanity_x = lu.solve(rhs);
+        if (sanity_x.size() != m || lu.info() != Eigen::Success || !sanity_x.allFinite())
+            return q;
+        const Eigen::VectorXd sanity_residual = rhs - B * sanity_x;
+        q.solve_residual =
+            sanity_residual.lpNorm<Eigen::Infinity>() / std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
+    }
     q.primal_violation = positive_violation_max_(-xB, tol);
     q.primal_feasible = xB.allFinite() && q.primal_violation <= tol;
 
@@ -175,6 +197,9 @@ inline bool RevisedSimplex::better_basis_quality_(const CrashSelection& lhs,
         if (std::abs(a_total - b_total) > 1e-12)
             return a_total < b_total;
     }
+
+    if (std::abs(a.solve_residual - b.solve_residual) > 1e-12)
+        return a.solve_residual < b.solve_residual;
 
     const bool a_primary = (mode == SimplexMode::Dual) ? a.dual_feasible : a.primal_feasible;
     const bool b_primary = (mode == SimplexMode::Dual) ? b.dual_feasible : b.primal_feasible;
@@ -442,19 +467,18 @@ inline bool RevisedSimplex::try_add_basis_column_(const SparseMatrix& A, std::ve
     for (SparseMatrix::InnerIterator it(A, col); it; ++it)
         col_vec(it.row()) = it.value();
 
-    Eigen::MatrixXd B = Eigen::MatrixXd::Zero(m, static_cast<int>(basis.size()));
-    for (int k = 0; k < static_cast<int>(basis.size()); ++k) {
-        for (SparseMatrix::InnerIterator it(A, basis[k]); it; ++it) {
-            B(it.row(), k) = it.value();
-        }
-    }
-
-    Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(B);
-    if (qr.rank() != current_rank)
+    SparseMatrix B = sparse_basis_copy_(A, basis);
+    Eigen::SparseQR<SparseMatrix, Eigen::COLAMDOrdering<int>> qr;
+    qr.compute(B);
+    if (qr.info() != Eigen::Success || qr.rank() != current_rank)
         return false;
 
     const Eigen::VectorXd x = qr.solve(col_vec);
-    const double residual = (B * x - col_vec).norm();
+    if (x.size() != current_rank || qr.info() != Eigen::Success || !x.allFinite())
+        return false;
+
+    const Eigen::VectorXd residual_vec = B * x - col_vec;
+    const double residual = residual_vec.lpNorm<Eigen::Infinity>();
     if (residual <= tol * (1.0 + col_vec.lpNorm<Eigen::Infinity>()))
         return false;
 
@@ -740,6 +764,58 @@ RevisedSimplex::choose_sprint_column_(const Eigen::MatrixXd& A, const Eigen::Vec
     return best;
 }
 
+inline RevisedSimplex::CrashCandidate
+RevisedSimplex::choose_sprint_column_(const SparseMatrix& A, const Eigen::VectorXd& b,
+                                      const Eigen::VectorXd& c, const std::vector<char>& used_row,
+                                      const std::vector<char>& used_col,
+                                      const CrashAttemptConfig& cfg) {
+    CrashCandidate best;
+    const int n = static_cast<int>(A.cols());
+    double c_scale = 1.0;
+    if (c.size() > 0)
+        c_scale = std::max(1.0, c.cwiseAbs().maxCoeff());
+
+    for (int j = 0; j < n; ++j) {
+        if (used_col[j])
+            continue;
+
+        int pivot_row = -1;
+        double pivot_abs = 0.0;
+        double uncovered_sum = 0.0;
+        double total_sum = 0.0;
+        int total_nnz = 0;
+        for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
+            const double aa = std::abs(it.value());
+            if (aa <= 1e-12)
+                continue;
+            ++total_nnz;
+            total_sum += aa;
+            if (used_row[it.row()])
+                continue;
+            uncovered_sum += aa;
+            if (aa > pivot_abs) {
+                pivot_abs = aa;
+                pivot_row = it.row();
+            }
+        }
+        if (pivot_row < 0 || pivot_abs <= 1e-12)
+            continue;
+
+        const double coverage = uncovered_sum / std::max(1e-12, total_sum);
+        const double sparsity_bonus = 1.0 / (1.0 + total_nnz);
+        const double rhs_bonus =
+            (pivot_row < b.size() && b(pivot_row) >= -1e-10) ? cfg.rhs_bonus : 0.0;
+        const double cost_penalty = cfg.cost_penalty * (std::abs(c(j)) / c_scale);
+        const double jitter = cfg.jitter * std::cos(static_cast<double>((j + 1) * (pivot_row + 1)));
+        const double score = 90.0 * cfg.coverage_weight * coverage + 25.0 * sparsity_bonus +
+                             5.0 * pivot_abs + rhs_bonus - cost_penalty -
+                             0.001 * static_cast<double>(j) + jitter;
+        if (score > best.score)
+            best = {j, pivot_row, score};
+    }
+    return best;
+}
+
 inline std::vector<int> RevisedSimplex::find_logical_basis_(const Eigen::MatrixXd& A) {
     const int m = static_cast<int>(A.rows());
     const int n = static_cast<int>(A.cols());
@@ -890,6 +966,91 @@ inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_triangular_column_(
     return best;
 }
 
+inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_triangular_column_(
+    const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
+    const std::vector<char>& used_row, const std::vector<char>& used_col,
+    const CrashAttemptConfig& cfg) {
+    CrashCandidate best;
+    const int m = static_cast<int>(A.rows());
+    const int n = static_cast<int>(A.cols());
+    double c_scale = 1.0;
+    if (c.size() > 0)
+        c_scale = std::max(1.0, c.cwiseAbs().maxCoeff());
+
+    const double tol_nz = 1e-12;
+    std::vector<int> row_nnz(m, 0);
+    std::vector<int> col_nnz(n, 0);
+    for (int j = 0; j < n; ++j) {
+        if (used_col[j])
+            continue;
+        for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
+            if (used_row[it.row()] || std::abs(it.value()) <= tol_nz)
+                continue;
+            ++row_nnz[it.row()];
+            ++col_nnz[j];
+        }
+    }
+
+    for (int j = 0; j < n; ++j) {
+        if (used_col[j])
+            continue;
+
+        int pivot_row = -1;
+        double pivot_abs = 0.0;
+        double uncovered_sum = 0.0;
+        double covered_sum = 0.0;
+        int uncovered_nnz = 0;
+        int total_nnz = 0;
+        int best_row_degree = std::numeric_limits<int>::max();
+        for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
+            const double aa = std::abs(it.value());
+            if (aa <= tol_nz)
+                continue;
+            ++total_nnz;
+            if (used_row[it.row()]) {
+                covered_sum += aa;
+                continue;
+            }
+            ++uncovered_nnz;
+            uncovered_sum += aa;
+            const int row_degree = row_nnz[it.row()];
+            if (row_degree < best_row_degree || (row_degree == best_row_degree && aa > pivot_abs)) {
+                pivot_row = it.row();
+                pivot_abs = aa;
+                best_row_degree = row_degree;
+            }
+        }
+        if (pivot_row < 0 || pivot_abs <= tol_nz)
+            continue;
+
+        if (pivot_abs + tol_nz < cfg.markowitz_threshold * row_nnz[pivot_row])
+            continue;
+
+        const double dominance = pivot_abs / std::max(1e-12, uncovered_sum);
+        const double triangularity = pivot_abs / std::max(1e-12, covered_sum + uncovered_sum);
+        const double sparsity_bonus = 1.0 / (1.0 + total_nnz);
+        const double row_bonus = 5.0 / (1.0 + static_cast<double>(row_nnz[pivot_row]));
+        const double col_bonus = 5.0 / (1.0 + static_cast<double>(col_nnz[j]));
+        const double rhs_bonus = (pivot_row < b.size() && b(pivot_row) >= -1e-10) ? cfg.rhs_bonus
+                                                                                    : 0.0;
+        const double cost_penalty = cfg.cost_penalty * (std::abs(c(j)) / c_scale);
+        const double markowitz_penalty = static_cast<double>(std::max(0, row_nnz[pivot_row] - 1) *
+                                                             std::max(0, uncovered_nnz - 1));
+        const double markowitz_bonus = 1.0 / (1.0 + markowitz_penalty);
+        const double dense_penalty = cfg.dense_penalty * (covered_sum / std::max(1e-12, pivot_abs));
+        const double jitter = cfg.jitter * std::sin(static_cast<double>((j + 1) * (pivot_row + 1)));
+
+        const double score = 100.0 * dominance * cfg.coverage_weight + 30.0 * triangularity +
+                             25.0 * markowitz_bonus + 15.0 * sparsity_bonus + 10.0 * row_bonus +
+                             10.0 * col_bonus + rhs_bonus - cost_penalty - dense_penalty -
+                             0.001 * static_cast<double>(j) + jitter;
+        if (score > best.score) {
+            best = {j, pivot_row, score};
+        }
+    }
+    return best;
+}
+
 inline std::vector<int> RevisedSimplex::rank_remaining_columns_(const Eigen::MatrixXd& A,
                                                                 const Eigen::VectorXd& c,
                                                                 const std::vector<char>& used_col,
@@ -963,6 +1124,116 @@ RevisedSimplex::improve_basis_by_swaps_(const Eigen::MatrixXd& A, const Eigen::V
     std::vector<int> col_nnz(n, 0);
     for (int j = 0; j < n; ++j) {
         col_nnz[j] = (A.col(j).array().abs() > 1e-12).cast<int>().sum();
+    }
+    std::vector<double> col_weight(n, 0.0);
+    for (int j = 0; j < n; ++j) {
+        col_weight[j] = cfg.cost_penalty * std::abs(c(j));
+    }
+
+    std::vector<char> seeded(n, 0);
+    if (seed_basis) {
+        for (int j : *seed_basis) {
+            if (j >= 0 && j < n)
+                seeded[j] = 1;
+        }
+    }
+
+    CrashSelection best;
+    best.basis = basis;
+    best.quality = evaluate_basis_quality_(A, b, c, basis, tol);
+
+    auto promising_swap = [&](int entering, int leaving) {
+        const double score_enter = col_nnz[entering] + col_weight[entering];
+        const double score_leave = col_nnz[leaving] + col_weight[leaving];
+        return score_enter <= score_leave;
+    };
+
+    for (int pass = 0; pass < cfg.local_search_passes; ++pass) {
+        std::vector<char> in_basis(n, 0);
+        for (int j : basis)
+            if (j >= 0 && j < n)
+                in_basis[j] = 1;
+
+        std::vector<int> nonbasic;
+        nonbasic.reserve(std::max(0, n - m));
+        for (int j = 0; j < n; ++j)
+            if (!in_basis[j])
+                nonbasic.push_back(j);
+        std::sort(nonbasic.begin(), nonbasic.end(), [&](int a, int b_idx) {
+            const double score_a = col_nnz[a] + col_weight[a];
+            const double score_b = col_nnz[b_idx] + col_weight[b_idx];
+            if (std::abs(score_a - score_b) > 1e-12)
+                return score_a < score_b;
+            return a < b_idx;
+        });
+        if ((int)nonbasic.size() > cfg.max_swap_candidates) {
+            nonbasic.resize(cfg.max_swap_candidates);
+        }
+
+        std::vector<std::pair<double, int>> position_priority;
+        position_priority.reserve(m);
+        for (int p = 0; p < m; ++p) {
+            const int col = basis[p];
+            double score = col_nnz[col] + col_weight[col];
+            if (seeded[col])
+                score *= 0.75;
+            position_priority.emplace_back(score, p);
+        }
+        std::sort(position_priority.begin(), position_priority.end(), std::greater<>());
+        const int position_limit = std::min(m, cfg.max_swap_candidates);
+        std::vector<int> positions;
+        positions.reserve(position_limit);
+        for (int idx = 0; idx < position_limit; ++idx)
+            positions.push_back(position_priority[idx].second);
+
+        bool improved = false;
+        for (int entering : nonbasic) {
+            for (int pos : positions) {
+                if (!promising_swap(entering, basis[pos]))
+                    continue;
+
+                std::vector<int> cand = basis;
+                cand[pos] = entering;
+
+                CrashSelection trial;
+                trial.basis = std::move(cand);
+                trial.quality = evaluate_basis_quality_(A, b, c, trial.basis, tol);
+                if (!trial.quality.valid)
+                    continue;
+                if (!better_basis_quality_(trial, best, mode))
+                    continue;
+                basis = trial.basis;
+                best = std::move(trial);
+                improved = true;
+                break;
+            }
+            if (improved)
+                break;
+        }
+        if (!improved)
+            break;
+    }
+
+    return basis;
+}
+
+inline std::vector<int>
+RevisedSimplex::improve_basis_by_swaps_(const SparseMatrix& A, const Eigen::VectorXd& b,
+                                        const Eigen::VectorXd& c, std::vector<int> basis,
+                                        const CrashAttemptConfig& cfg, double tol, SimplexMode mode,
+                                        std::optional<std::vector<int>> seed_basis) {
+    const int m = static_cast<int>(A.rows());
+    const int n = static_cast<int>(A.cols());
+    if ((int)basis.size() != m || cfg.local_search_passes <= 0) {
+        return basis;
+    }
+
+    std::vector<int> col_nnz(n, 0);
+    for (int j = 0; j < n; ++j) {
+        for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
+            if (std::abs(it.value()) > 1e-12)
+                ++col_nnz[j];
+        }
     }
     std::vector<double> col_weight(n, 0.0);
     for (int j = 0; j < n; ++j) {
@@ -1213,8 +1484,7 @@ RevisedSimplex::build_basis_attempt_(const SparseMatrix& A, const Eigen::VectorX
 
     if ((int)basis.size() != m)
         return {};
-    return improve_basis_by_swaps_(Eigen::MatrixXd(A), b, c, std::move(basis), cfg, tol, mode,
-                                   seed_basis);
+    return improve_basis_by_swaps_(A, b, c, std::move(basis), cfg, tol, mode, seed_basis);
 }
 
 inline RevisedSimplex::CrashSelection
@@ -1246,6 +1516,9 @@ RevisedSimplex::choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::Vec
         if (!q.valid) {
             return false;
         }
+        const double solve_residual_guard = std::max(1e-7, 100.0 * opt.tol);
+        if (!std::isfinite(q.solve_residual) || q.solve_residual > solve_residual_guard)
+            return false;
         switch (opt.mode) {
             case SimplexMode::Dual:
                 return q.dual_feasible;
@@ -1316,6 +1589,9 @@ RevisedSimplex::choose_initial_basis_(const SparseMatrix& A, const Eigen::Vector
         if (!q.valid) {
             return false;
         }
+        const double solve_residual_guard = std::max(1e-7, 100.0 * opt.tol);
+        if (!std::isfinite(q.solve_residual) || q.solve_residual > solve_residual_guard)
+            return false;
         switch (opt.mode) {
             case SimplexMode::Dual:
                 return q.dual_feasible;

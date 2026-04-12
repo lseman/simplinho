@@ -196,8 +196,17 @@ RevisedSimplexOptions tune_mip_lp_options(const RevisedSimplexOptions& base_opti
     tuned.dual_pricing = "switch";
     tuned.row_pricing_threshold = std::max(tuned.row_pricing_threshold, 40);
 
+    tuned.basis_update = "hybrid";
     tuned.primal_edge_weight_strategy = "dense_diagonal";
     tuned.dual_edge_weight_strategy = "dense_diagonal";
+    tuned.basis_refinement_steps = std::max(tuned.basis_refinement_steps, 3);
+    tuned.basis_refinement_stall_progress_ratio =
+        std::min(tuned.basis_refinement_stall_progress_ratio, 0.8);
+    tuned.basis_refinement_stall_limit = std::max(tuned.basis_refinement_stall_limit, 3);
+    tuned.min_dynamic_growth_tol = std::min(tuned.min_dynamic_growth_tol, 500.0);
+    tuned.max_condition_estimate = std::min(tuned.max_condition_estimate, 1e13);
+    tuned.basis_column_residual_tol = std::min(tuned.basis_column_residual_tol, 1e-8);
+    tuned.basis_aggressive_residual_rebuild = true;
 
     tuned.primal_simplex_cost_perturbation_multiplier =
         std::max(tuned.primal_simplex_cost_perturbation_multiplier, 1.5);
@@ -1958,14 +1967,27 @@ class Model {
                     if (msg.find("MarkowitzLU: singular matrix") != std::string_view::npos ||
                         msg.find("MarkowitzLU: numerically singular pivot") !=
                             std::string_view::npos ||
+                        msg.find("MarkowitzLU:") != std::string_view::npos ||
                         msg.find("SparseForrestTomlinLU: no pivot found") !=
                             std::string_view::npos ||
                         msg.find("SparseForrestTomlinLU: singular pivot") !=
                             std::string_view::npos ||
+                        msg.find("SparseForrestTomlinLU: sparse fallback factorization failed") !=
+                            std::string_view::npos ||
+                        msg.find("SparseForrestTomlinLU: sparse transpose fallback factorization failed") !=
+                            std::string_view::npos ||
+                        msg.find("SparseForrestTomlinLU: fallback solve failed") !=
+                            std::string_view::npos ||
+                        msg.find("SparseForrestTomlinLU: fallback transpose solve failed") !=
+                            std::string_view::npos ||
+                        msg.find("SparseForrestTomlinLU:") != std::string_view::npos ||
                         msg.find("FTBasis::refine_solve_B residual remained large") !=
                             std::string_view::npos ||
                         msg.find("FTBasis::refine_solve_BT residual remained large") !=
-                            std::string_view::npos) {
+                            std::string_view::npos ||
+                        msg.find("FTBasis::solve_B") != std::string_view::npos ||
+                        msg.find("FTBasis::solve_BT") != std::string_view::npos ||
+                        msg.find("Forrest-Tomlin:") != std::string_view::npos) {
                         return std::nullopt;
                     }
                     throw;
@@ -2174,20 +2196,35 @@ class Model {
                 }
 
                 if (raw_opt.has_value()) {
+                    const bool has_valid_primal =
+                        raw_opt->x.size() == node_data.total_vars && raw_opt->x.array().isFinite().all();
+                    const bool terminal_optimal =
+                        raw_opt->status == LPSolution::Status::Optimal;
+                    const bool terminal_unbounded =
+                        raw_opt->status == LPSolution::Status::Unbounded;
                     out.status = raw_opt->status == LPSolution::Status::Optimal
                                      ? simplex_bnb::RelaxationStatus::Optimal
                                  : raw_opt->status == LPSolution::Status::Unbounded
                                      ? simplex_bnb::RelaxationStatus::Unbounded
                                      : simplex_bnb::RelaxationStatus::Infeasible;
-                    out.primal = raw_opt->x;
-                    out.objective = node_data.objective_sign * raw_opt->obj + objective_constant_;
+                    out.primal = has_valid_primal
+                                     ? raw_opt->x
+                                     : Eigen::VectorXd::Constant(
+                                           node_data.total_vars,
+                                           std::numeric_limits<double>::quiet_NaN());
+                    if (terminal_optimal || terminal_unbounded) {
+                        out.objective = node_data.objective_sign * raw_opt->obj + objective_constant_;
+                    } else {
+                        out.objective = maximize_ ? -std::numeric_limits<double>::infinity()
+                                                  : std::numeric_limits<double>::infinity();
+                    }
                     out.iterations = raw_opt->iters;
                     out.lp_solution = *raw_opt;
-                    if (!raw_opt->basis_state.column_status.empty() &&
+                    if (terminal_optimal && !raw_opt->basis_state.column_status.empty() &&
                         basis_matches_dimensions(raw_opt->basis_state, node_data.total_vars,
                                                  node_data.rows)) {
                         out.basis = raw_opt->basis_state;
-                    } else {
+                    } else if (terminal_optimal) {
                         const LPBasis rebuilt_basis = rebuild_basis_from_solution(*raw_opt);
                         if (basis_matches_dimensions(rebuilt_basis, node_data.total_vars,
                                                      node_data.rows)) {

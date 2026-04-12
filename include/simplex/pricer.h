@@ -199,7 +199,7 @@ class SteepestEdgePricer {
     template <class BasisLike, class MatrixLike>
     void build_primal_pool(const BasisLike& B, const MatrixLike& A, const std::vector<int>& N) {
         pool_.clear();
-        pos_.clear();
+        initialize_positions_(N);
         const int take = (pool_max_ > 0) ? std::min<int>(pool_max_, (int)N.size()) : (int)N.size();
         pool_.reserve(take);
         for (int k = 0; k < take; ++k) {
@@ -209,10 +209,12 @@ class SteepestEdgePricer {
             const Eigen::VectorXd Aj = pricing_detail::dense_column(A, j);
             e.t = B.solve_B(Aj); // caller-provided
             e.weight = pricing_detail::edge_weight_from_direction(e.t, weight_strategy_);
-            pos_[j] = (int)pool_.size();
+            set_position_(j, (int)pool_.size());
             pool_.push_back(std::move(e));
         }
         iter_count_ = 0;
+        no_improvement_count_ = 0;
+        partial_cursor_ = 0;
         need_rebuild_ = false;
     }
 
@@ -225,47 +227,36 @@ class SteepestEdgePricer {
         int best_rel = -1;
         double best_score = -1.0;
 
-        // Determine pool size: partial pricing or full scan
-        int pool_size = (int)N.size();
-        if (partial_pricing && pool_size > 10) {
-            // Start with 10% of nonbasic vars, grow if no improvement
-            pool_size = std::min<int>(pool_size, std::max(10, pool_size / 10));
-            // Grow pool after several iterations without improvement
-            if (no_improvement_count_ > 5) {
-                pool_size = std::min<int>(pool_size * 2, pool_size + 50);
-            }
-        }
+        const int total_candidates = (int)N.size();
+        const int pool_size = partial_pool_size_(total_candidates, partial_pricing);
+        const int scan_count = partial_pricing ? std::min(pool_size, total_candidates) : total_candidates;
+        const int start = partial_pricing && total_candidates > 0 ? (partial_cursor_ % total_candidates) : 0;
 
-        int candidates_priced = 0;
-        for (int k = 0; k < std::min(pool_size, (int)N.size()); ++k) {
-            if (rcN(k) >= -tol)
+        for (int k = 0; k < scan_count; ++k) {
+            const int idx = partial_pricing ? ((start + k) % total_candidates) : k;
+            if (rcN(idx) >= -tol)
                 continue;
-            const int j = N[k];
-            double w = 1.0;
-            if (auto it = pos_.find(j); it != pos_.end())
-                w = pool_[it->second].weight;
-            const double score = (rcN(k) * rcN(k)) / w;
+            const int j = N[idx];
+            const double w = weight_for_column_(j);
+            const double score = (rcN(idx) * rcN(idx)) / w;
             if (score > best_score) {
                 best_score = score;
-                best_rel = k;
+                best_rel = idx;
             }
-            ++candidates_priced;
         }
 
+        advance_partial_cursor_(partial_pricing, total_candidates, start, scan_count);
         if (best_rel >= 0) {
             no_improvement_count_ = 0;
             return std::optional<int>(best_rel);
         }
 
         if (partial_pricing) {
-            // Fall back to a full scan if the partial prefix missed the best entering column.
             for (int k = 0; k < (int)N.size(); ++k) {
                 if (rcN(k) >= -tol)
                     continue;
                 const int j = N[k];
-                double w = 1.0;
-                if (auto it = pos_.find(j); it != pos_.end())
-                    w = pool_[it->second].weight;
+                const double w = weight_for_column_(j);
                 const double score = (rcN(k) * rcN(k)) / w;
                 if (score > best_score) {
                     best_score = score;
@@ -322,15 +313,16 @@ class SteepestEdgePricer {
         }
 
         // Remove entering from pool
-        if (auto itE = pos_.find(e_abs); itE != pos_.end()) {
-            const int idx = itE->second;
+        const int entering_pos = position_of_(e_abs);
+        if (entering_pos >= 0) {
+            const int idx = entering_pos;
             const int last = (int)pool_.size() - 1;
             if (idx != last) {
-                pos_[pool_[last].jN] = idx;
+                set_position_(pool_[last].jN, idx);
                 std::swap(pool_[idx], pool_[last]);
             }
             pool_.pop_back();
-            pos_.erase(itE);
+            set_position_(e_abs, -1);
         }
 
         // Optionally add leaving
@@ -353,11 +345,11 @@ class SteepestEdgePricer {
                         evict = i;
                     }
                 }
-                pos_.erase(pool_[evict].jN);
+                set_position_(pool_[evict].jN, -1);
                 pool_[evict] = std::move(E);
-                pos_[pool_[evict].jN] = evict;
+                set_position_(pool_[evict].jN, evict);
             } else {
-                pos_[E.jN] = (int)pool_.size();
+                set_position_(E.jN, (int)pool_.size());
                 pool_.push_back(std::move(E));
             }
         }
@@ -378,8 +370,56 @@ class SteepestEdgePricer {
     }
 
   private:
+    static int max_column_index_(const std::vector<int>& N) {
+        int max_index = -1;
+        for (const int j : N)
+            max_index = std::max(max_index, j);
+        return max_index;
+    }
+
+    void initialize_positions_(const std::vector<int>& N) {
+        const int max_index = max_column_index_(N);
+        pos_.assign(static_cast<size_t>(std::max(0, max_index) + 1), -1);
+    }
+
+    int position_of_(int j) const {
+        if (j < 0 || static_cast<size_t>(j) >= pos_.size())
+            return -1;
+        return pos_[static_cast<size_t>(j)];
+    }
+
+    void set_position_(int j, int pos) {
+        if (j < 0)
+            return;
+        if (static_cast<size_t>(j) >= pos_.size())
+            pos_.resize(static_cast<size_t>(j) + 1, -1);
+        pos_[static_cast<size_t>(j)] = pos;
+    }
+
+    double weight_for_column_(int j) const {
+        const int pos = position_of_(j);
+        return pos >= 0 ? pool_[static_cast<size_t>(pos)].weight : 1.0;
+    }
+
+    int partial_pool_size_(int total_candidates, bool partial_pricing) const {
+        int pool_size = total_candidates;
+        if (partial_pricing && pool_size > 10) {
+            pool_size = std::min<int>(pool_size, std::max(10, pool_size / 10));
+            if (no_improvement_count_ > 5)
+                pool_size = std::min<int>(pool_size * 2, pool_size + 50);
+        }
+        return pool_size;
+    }
+
+    void advance_partial_cursor_(bool partial_pricing, int total_candidates, int start,
+                                 int scan_count) {
+        if (!partial_pricing || total_candidates <= 0)
+            return;
+        partial_cursor_ = (start + std::max(1, scan_count)) % total_candidates;
+    }
+
     std::vector<Entry> pool_;
-    std::unordered_map<int, int> pos_;
+    std::vector<int> pos_;
     int pool_max_{0};
     int reset_freq_{1000};
     int iter_count_{0};
@@ -388,6 +428,7 @@ class SteepestEdgePricer {
     double log_error_threshold_{1.3862943611198906};
     // HiGHS-inspired: track no-improvement iterations for adaptive pool sizing
     int no_improvement_count_{0};
+    int partial_cursor_{0};
     double average_log_low_weight_error_{0.0};
     double average_log_high_weight_error_{0.0};
 };
@@ -406,11 +447,11 @@ class DevexPricer {
     template <class BasisLike, class MatrixLike>
     void build_primal_pool(const BasisLike& /*B*/, const MatrixLike& /*A*/,
                            const std::vector<int>& N) {
-        weights_.clear();
-        for (int j : N)
-            weights_[j] = 1.0;
+        initialize_weights_(N);
         iter_count_ = 0;
         no_improvement_count_ = 0;
+        partial_cursor_ = 0;
+        need_rebuild_ = false;
     }
 
     // HiGHS-inspired: partial pricing with adaptive pool
@@ -418,45 +459,40 @@ class DevexPricer {
                                               double tol, bool partial_pricing = false) {
         ++iter_count_;
         if (iter_count_ % reset_freq_ == 0) {
-            for (auto& p : weights_)
-                p.second = 1.0;
+            reset_weights_(N);
         }
 
-        // Partial pricing: only price subset of nonbasic vars
-        int pool_size = (int)N.size();
-        if (partial_pricing && pool_size > 10) {
-            pool_size = std::min<int>(pool_size, std::max(10, pool_size / 10));
-            if (no_improvement_count_ > 5) {
-                pool_size = std::min<int>(pool_size * 2, pool_size + 50);
-            }
-        }
-
+        const int total_candidates = (int)N.size();
+        const int pool_size = partial_pool_size_(total_candidates, partial_pricing);
+        const int scan_count = partial_pricing ? std::min(pool_size, total_candidates) : total_candidates;
+        const int start = partial_pricing && total_candidates > 0 ? (partial_cursor_ % total_candidates) : 0;
         int best_rel = -1;
         double best_crit = -1.0;
-        for (int k = 0; k < std::min(pool_size, (int)N.size()); ++k) {
-            if (rcN(k) >= -tol)
+        for (int k = 0; k < scan_count; ++k) {
+            const int idx = partial_pricing ? ((start + k) % total_candidates) : k;
+            if (rcN(idx) >= -tol)
                 continue;
-            const int j = N[k];
-            const double w = (weights_.count(j) ? weights_.at(j) : 1.0);
-            const double crit = (rcN(k) * rcN(k)) / w;
+            const int j = N[idx];
+            const double w = weight_for_(j);
+            const double crit = (rcN(idx) * rcN(idx)) / w;
             if (crit > best_crit) {
                 best_crit = crit;
-                best_rel = k;
+                best_rel = idx;
             }
         }
 
+        advance_partial_cursor_(partial_pricing, total_candidates, start, scan_count);
         if (best_rel >= 0) {
             no_improvement_count_ = 0;
             return std::optional<int>(best_rel);
         }
 
         if (partial_pricing) {
-            // Fall back to a full scan if the partial prefix missed the best entering column.
             for (int k = 0; k < (int)N.size(); ++k) {
                 if (rcN(k) >= -tol)
                     continue;
                 const int j = N[k];
-                const double w = (weights_.count(j) ? weights_.at(j) : 1.0);
+                const double w = weight_for_(j);
                 const double crit = (rcN(k) * rcN(k)) / w;
                 if (crit > best_crit) {
                     best_crit = crit;
@@ -481,7 +517,7 @@ class DevexPricer {
 
         // Entering weight: keep bounded to avoid runaway (HiGHS style)
         const double a2 = alpha * alpha;
-        weights_[e_abs] = std::min(std::max(a2, 1e-4), 1e6);
+        set_weight_(e_abs, std::min(std::max(a2, 1e-4), 1e6));
 
         // Update others (classic Devex-like) with error checking
         if (leave_rel < pivot_column.size()) {
@@ -491,9 +527,7 @@ class DevexPricer {
                 const int j = N[k];
                 if (j == e_abs)
                     continue;
-                double& w = weights_[j];
-                if (!weights_.count(j))
-                    w = 1.0;
+                double& w = weight_ref_(j);
                 const double old_w = w;
                 const double nw = w + add;
                 w = std::max(nw, threshold_ * w);
@@ -507,19 +541,97 @@ class DevexPricer {
 
         // Ensure leaving has a slot
         (void)old_abs;
-        if (!weights_.count(old_abs))
-            weights_[old_abs] = 1.0;
+        if (!has_weight_(old_abs))
+            set_weight_(old_abs, 1.0);
     }
 
     bool needs_rebuild() const { return need_rebuild_; }
     void clear_rebuild_flag() { need_rebuild_ = false; }
 
   private:
-    std::unordered_map<int, double> weights_;
+    static int max_column_index_(const std::vector<int>& N) {
+        int max_index = -1;
+        for (const int j : N)
+            max_index = std::max(max_index, j);
+        return max_index;
+    }
+
+    void ensure_weight_capacity_(int j) {
+        if (j < 0)
+            return;
+        const size_t required_size = static_cast<size_t>(j) + 1;
+        if (required_size <= weights_.size())
+            return;
+        weights_.resize(required_size, 1.0);
+        weight_present_.resize(required_size, 0);
+    }
+
+    void initialize_weights_(const std::vector<int>& N) {
+        const int max_index = max_column_index_(N);
+        weights_.assign(static_cast<size_t>(std::max(0, max_index) + 1), 1.0);
+        weight_present_.assign(weights_.size(), 0);
+        for (const int j : N) {
+            if (j < 0)
+                continue;
+            weight_present_[static_cast<size_t>(j)] = 1;
+        }
+    }
+
+    bool has_weight_(int j) const {
+        return j >= 0 && static_cast<size_t>(j) < weight_present_.size() &&
+               weight_present_[static_cast<size_t>(j)] != 0;
+    }
+
+    double weight_for_(int j) const {
+        return has_weight_(j) ? weights_[static_cast<size_t>(j)] : 1.0;
+    }
+
+    double& weight_ref_(int j) {
+        ensure_weight_capacity_(j);
+        weight_present_[static_cast<size_t>(j)] = 1;
+        return weights_[static_cast<size_t>(j)];
+    }
+
+    void set_weight_(int j, double value) {
+        ensure_weight_capacity_(j);
+        weight_present_[static_cast<size_t>(j)] = 1;
+        weights_[static_cast<size_t>(j)] = value;
+    }
+
+    void reset_weights_(const std::vector<int>& N) {
+        for (const int j : N) {
+            if (j < 0)
+                continue;
+            ensure_weight_capacity_(j);
+            weight_present_[static_cast<size_t>(j)] = 1;
+            weights_[static_cast<size_t>(j)] = 1.0;
+        }
+    }
+
+    int partial_pool_size_(int total_candidates, bool partial_pricing) const {
+        int pool_size = total_candidates;
+        if (partial_pricing && pool_size > 10) {
+            pool_size = std::min<int>(pool_size, std::max(10, pool_size / 10));
+            if (no_improvement_count_ > 5)
+                pool_size = std::min<int>(pool_size * 2, pool_size + 50);
+        }
+        return pool_size;
+    }
+
+    void advance_partial_cursor_(bool partial_pricing, int total_candidates, int start,
+                                 int scan_count) {
+        if (!partial_pricing || total_candidates <= 0)
+            return;
+        partial_cursor_ = (start + std::max(1, scan_count)) % total_candidates;
+    }
+
+    std::vector<double> weights_;
+    std::vector<char> weight_present_;
     double threshold_{0.99};
     int reset_freq_{1000};
     int iter_count_{0};
     int no_improvement_count_{0};
+    int partial_cursor_{0};
     bool need_rebuild_{false};
 };
 
@@ -1077,7 +1189,7 @@ class DualAdaptivePricer {
     bool row_pricing_is_beneficial(const MatrixLike& A, const std::vector<int>& N) const {
         const double avg_row_nnz = average_row_nonzeros(A, N);
         if (partial_pricing_enabled_) {
-            return avg_row_nnz <= static_cast<double>(row_pricing_threshold_) * 2.0;
+            return avg_row_nnz <= static_cast<double>(row_pricing_threshold_) * 4.0;
         }
         return avg_row_nnz <= static_cast<double>(row_pricing_threshold_);
     }
@@ -1203,6 +1315,9 @@ class DualAdaptivePricer {
         if (requested_rule_ == "most_negative")
             return Rule::MostInfeasible;
         if (requested_rule_ == "adaptive") {
+            if (row_pricing_is_beneficial(A, N)) {
+                return Rule::RowPricing;
+            }
             return (basis_rows > 256) ? Rule::Devex : Rule::SteepestEdge;
         }
         return Rule::SteepestEdge;
