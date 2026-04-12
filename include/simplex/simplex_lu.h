@@ -490,7 +490,7 @@ class FTBasis {
             return stats_.stability_score >= 0.5;
         }
         if (etas_.empty())
-            return false;
+            return true; // verify full refactor results even when no dense update chain exists
         if (update_count_ >= std::max(1, adaptive_refactor_limit_() / 2))
             return true;
         if (stats_.stability_score >= 0.5)
@@ -1098,9 +1098,16 @@ class FTBasis {
             throw std::invalid_argument("FTBasis::replace_column size mismatch");
 
         last_update_diagnostic_.clear();
-
-        if (entering_col.has_value())
-            basis_[j] = *entering_col;
+        const std::optional<int> pending_basis = entering_col;
+        struct BasisCommit {
+            FTBasis* self;
+            int j;
+            const std::optional<int> pending_basis;
+            ~BasisCommit() {
+                if (pending_basis.has_value())
+                    self->basis_[j] = *pending_basis;
+            }
+        } basis_commit{this, j, pending_basis};
 
         if (A_is_sparse_) {
             ensure_sparse_basis_current_();

@@ -151,13 +151,7 @@ class SparseForrestTomlinLU {
         } else {
             std::iota(Pc_.begin(), Pc_.end(), 0);
         }
-        // Build permutation inverses for sparse RHS and FT update reach filtering (Items 1, 6).
-        Pr_inv_.resize(n_);
-        Pc_inv_.resize(n_);
-        for (int i = 0; i < n_; ++i)
-            Pr_inv_[Pr_[i]] = i;
-        for (int i = 0; i < n_; ++i)
-            Pc_inv_[Pc_[i]] = i;
+        rebuild_perm_inverses_();
 
         U_rows_.assign(n_, {});
         U_cols_.assign(n_, {});
@@ -759,6 +753,15 @@ class SparseForrestTomlinLU {
             dst.resize(n_);
         for (int i = 0; i < n_; ++i)
             dst(i) = src(perm[i]) * scale[static_cast<size_t>(perm[i])];
+    }
+
+    void rebuild_perm_inverses_() {
+        Pr_inv_.resize(n_);
+        Pc_inv_.resize(n_);
+        for (int i = 0; i < n_; ++i)
+            Pr_inv_[Pr_[i]] = i;
+        for (int i = 0; i < n_; ++i)
+            Pc_inv_[Pc_[i]] = i;
     }
 
     void apply_col_unscaling_(Eigen::VectorXd& x) const {
@@ -1549,8 +1552,15 @@ class SparseForrestTomlinLU {
             swap_U_rows_(k, pi);
             swap_U_cols_(k, pj);
             swap_L_prefix_rows_(k, pi, k);
+            const int old_Pr_k = Pr_[k];
+            const int old_Pr_pi = Pr_[pi];
+            const int old_Pc_k = Pc_[k];
+            const int old_Pc_pj = Pc_[pj];
+
             std::swap(Pr_[k], Pr_[pi]);
             std::swap(Pc_[k], Pc_[pj]);
+            std::swap(Pr_inv_[old_Pr_k], Pr_inv_[old_Pr_pi]);
+            std::swap(Pc_inv_[old_Pc_k], Pc_inv_[old_Pc_pj]);
 
             const double piv = get_U_(k, k);
             if (!std::isfinite(piv) || std::abs(piv) < abs_floor_)
@@ -1577,6 +1587,7 @@ class SparseForrestTomlinLU {
 
             finalize_pivot_step_(k);
         }
+        rebuild_perm_inverses_();
     }
 
     void activate_sparse_lu_fallback_(const SparseMat& A) {
