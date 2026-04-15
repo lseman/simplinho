@@ -166,7 +166,8 @@ void print_verbose_solver_configuration(const BranchAndBoundOptions& options) {
         {"local-search", options.use_local_search},
         {"local-branch", options.use_local_branching},
     };
-    std::cout << accent_("Heur")   << "   " << dim_("|") << " " << join_feature_tokens_(heuristics) << "\n";
+    std::cout << accent_("Heur") << "   " << dim_("|") << " " << join_feature_tokens_(heuristics)
+              << "\n";
 
     const std::vector<std::pair<std::string_view, bool>> cuts = {
         {"pool", options.use_cut_pool},
@@ -180,7 +181,7 @@ void print_verbose_solver_configuration(const BranchAndBoundOptions& options) {
         {"conflict", options.use_conflict_cuts},
         {"dual-proof", options.use_dual_proof_cuts},
     };
-    std::cout << accent_("Cuts")   << "   " << dim_("|") << " " << join_feature_tokens_(cuts) << "\n";
+    std::cout << accent_("Cuts") << "   " << dim_("|") << " " << join_feature_tokens_(cuts) << "\n";
     std::cout << "\n" << thin_rule_() << "\n";
 }
 
@@ -236,6 +237,7 @@ RevisedSimplexOptions tune_mip_lp_options(const RevisedSimplexOptions& base_opti
     tuned.max_basis_rebuilds = std::max(tuned.max_basis_rebuilds, 5);
     tuned.crash_attempts = std::max(tuned.crash_attempts, 5);
     tuned.crash_markowitz_tol = std::min(tuned.crash_markowitz_tol, 0.15);
+    tuned.use_quadratic_warm_start_repair = mip_options.use_quadratic_warm_start_repair;
     if (warm_start_expected) {
         tuned.crash_attempts = std::min(tuned.crash_attempts, 1);
         tuned.crash_markowitz_tol = std::min(tuned.crash_markowitz_tol, 0.10);
@@ -426,12 +428,9 @@ ProblemDimensionSummary summarize_problem_dimensions(const simplex_bnb::Problem&
 void print_verbose_problem_summary(const char* label, const simplex_bnb::Problem& problem) {
     const ProblemDimensionSummary summary = summarize_problem_dimensions(problem);
     std::cout << accent_("Model") << "  " << dim_("|") << " " << std::left << std::setw(10) << label
-              << dim_("|") << " vars "    << bold_(std::to_string(summary.variables))
-              << " (cont "                << summary.continuous
-              << "  int "                 << summary.integer
-              << "  bin "                 << summary.binary
-              << ")  rows "              << bold_(std::to_string(summary.constraints))
-              << "\n";
+              << dim_("|") << " vars " << bold_(std::to_string(summary.variables)) << " (cont "
+              << summary.continuous << "  int " << summary.integer << "  bin " << summary.binary
+              << ")  rows " << bold_(std::to_string(summary.constraints)) << "\n";
 }
 
 std::string expr_repr(const LinearExprData& data, const std::shared_ptr<ModelState>& state) {
@@ -1787,10 +1786,10 @@ class Model {
             infeasible_result.root_presolve_aggregations = root_presolve.aggregations;
             if (mip_options.verbose) {
                 std::cout << warn_("Presolve") << " " << dim_("|") << " INFEASIBLE"
-                          << "  tightened " << root_presolve.tightened_bounds
-                          << "  removed rows " << root_presolve.removed_rows
-                          << "  removed coeffs " << root_presolve.removed_coeffs
-                          << "  aggregations " << root_presolve.aggregations << "\n";
+                          << "  tightened " << root_presolve.tightened_bounds << "  removed rows "
+                          << root_presolve.removed_rows << "  removed coeffs "
+                          << root_presolve.removed_coeffs << "  aggregations "
+                          << root_presolve.aggregations << "\n";
             }
             return MIPSolution(state_, std::move(infeasible_result), original_vars);
         }
@@ -1798,11 +1797,12 @@ class Model {
         if (mip_options.verbose) {
             print_verbose_problem_summary("Presolved", problem);
             std::cout << accent_("Presolve") << " " << dim_("|") << " "
-                      << "tightened " << root_presolve.tightened_bounds
-                      << "  removed rows " << root_presolve.removed_rows
-                      << "  removed coeffs " << root_presolve.removed_coeffs
-                      << "  aggregations " << root_presolve.aggregations << "\n"
-                      << "\n" << thin_rule_() << "\n";
+                      << "tightened " << root_presolve.tightened_bounds << "  removed rows "
+                      << root_presolve.removed_rows << "  removed coeffs "
+                      << root_presolve.removed_coeffs << "  aggregations "
+                      << root_presolve.aggregations << "\n"
+                      << "\n"
+                      << thin_rule_() << "\n";
         }
         ModelLPData data = build_lp_data_from_problem_(problem);
         problem.lower_bounds = data.l;
@@ -1861,11 +1861,12 @@ class Model {
                 }
                 std::vector<int> basis;
                 basis.reserve(static_cast<std::size_t>(node_data.rows));
-                // For each slack column (original_vars to total_vars), find which row it's basic in.
-                // Iterate over slack columns and find the row where coefficient is ±1.
+                // For each slack column (original_vars to total_vars), find which row it's basic
+                // in. Iterate over slack columns and find the row where coefficient is ±1.
                 for (int j = node_data.original_vars; j < node_data.total_vars; ++j) {
                     int found_row = -1;
-                    for (Eigen::SparseMatrix<double>::InnerIterator it(node_data.A_sparse, j); it; ++it) {
+                    for (Eigen::SparseMatrix<double>::InnerIterator it(node_data.A_sparse, j); it;
+                         ++it) {
                         if (std::abs(it.value() - 1.0) <= 1e-12) {
                             found_row = it.row();
                             break;
@@ -1880,7 +1881,7 @@ class Model {
                     }
                     // Ensure we don't have duplicate row assignments
                     if (found_row < static_cast<int>(basis.size()) && basis[found_row] >= 0) {
-                        return std::nullopt;  // Row already assigned
+                        return std::nullopt; // Row already assigned
                     }
                     if (found_row >= static_cast<int>(basis.size())) {
                         basis.resize(found_row + 1, -1);

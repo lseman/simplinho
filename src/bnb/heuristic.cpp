@@ -1773,11 +1773,16 @@ run_local_branching_heuristic(const Problem& problem, const Options& options,
     }
     const SolveResult subproblem = solve_submip_with_cuts(lower, upper, local_cuts);
     result.lp_iterations += subproblem.lp_iterations;
-    if (!subproblem.has_solution ||
+    if (!subproblem.has_solution || subproblem.status == Status::Infeasible ||
+        subproblem.status == Status::Unbounded || !std::isfinite(subproblem.objective) ||
         !is_integer_feasible_solution(subproblem.primal, problem.variable_types,
                                       options.integrality_tol) ||
         !objective_improves_for_problem(subproblem.objective, incumbent_objective, problem.maximize,
                                         options.integrality_tol)) {
+        return result;
+    }
+    if (!std::all_of(subproblem.primal.data(), subproblem.primal.data() + subproblem.primal.size(),
+                     [](double value) { return std::isfinite(value); })) {
         return result;
     }
     ++result.successes;

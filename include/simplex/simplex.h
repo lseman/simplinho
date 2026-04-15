@@ -2111,6 +2111,8 @@ class RevisedSimplex {
     static const char* crash_style_name_(CrashStyle style);
 
     static CrashAttemptConfig crash_attempt_config_(const RevisedSimplexOptions& opt, int attempt);
+    static CrashAttemptConfig
+    quadratic_warm_start_repair_attempt_config_(const RevisedSimplexOptions& opt, int attempt);
 
     static void mark_pivot_row_(const Eigen::MatrixXd& A, int col, int pivot_row_hint,
                                 std::vector<char>& used_row);

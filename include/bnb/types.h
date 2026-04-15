@@ -165,16 +165,16 @@ struct Options {
     int plunging_bestfreq = 10;
     BranchingStrategy branching_strategy = BranchingStrategy::PseudoCost;
     DivingStrategy diving_strategy = DivingStrategy::Disabled;
-    int strong_branching_candidates = 4;  // Max candidates for strong branching
-    int strong_branching_k = 2;  // Number of candidates for reduced strong branching (Highs-like)
+    int strong_branching_candidates = 4; // Max candidates for strong branching
+    int strong_branching_k = 2; // Number of candidates for reduced strong branching (Highs-like)
     int strong_branching_max_depth = 1;
     int pseudocost_reliability = 2;
-    int max_dive_depth = 15;  // Reduced from 25 for faster heuristics
-    int max_dive_lp_solves = 32;  // Reduced from 64 for faster heuristics
+    int max_dive_depth = 15;     // Reduced from 25 for faster heuristics
+    int max_dive_lp_solves = 32; // Reduced from 64 for faster heuristics
     int heuristic_frequency = 8;
     int heuristic_max_depth = 12;
     bool use_rounding = true;
-    bool use_diving = true;  // enable/disable all diving heuristics (sync and async)
+    bool use_diving = true; // enable/disable all diving heuristics (sync and async)
     bool use_rins = false;
     double rins_fix_ratio = 0.7;
     double rins_tolerance = 1e-4;
@@ -200,12 +200,12 @@ struct Options {
     int heuristic_subproblem_max_nodes = 64;
     bool use_cut_pool = true;
     int max_cut_rounds_per_node = 1;  // Reduced from 2 for faster solving
-    int max_cuts_added_per_round = 4;  // Reduced from 8 for faster cut selection
-    int max_cut_pool_size = 128;  // Reduced from 256 for faster cut management
+    int max_cuts_added_per_round = 4; // Reduced from 8 for faster cut selection
+    int max_cut_pool_size = 128;      // Reduced from 256 for faster cut management
     double min_cut_violation = 1e-4;
     int max_cut_age = 5;
     bool use_gomory_cuts = true;
-    bool use_mir_cuts = true;  // Enable MIR cuts (more powerful than Gomory cover)
+    bool use_mir_cuts = true; // Enable MIR cuts (more powerful than Gomory cover)
     bool use_cover_cuts = true;
     bool use_implied_bound_cuts = true;
     bool use_clique_cuts = true;
@@ -218,6 +218,7 @@ struct Options {
     double cut_max_parallelism = 0.98;
     bool use_dual_proof_cuts = true;
     bool use_lp_reoptimization_profile = true;
+    bool use_quadratic_warm_start_repair = false;
     bool use_node_presolve = true;
     // HiGHS-inspired separate tolerances
     double feasibility_tol = 1e-7; // Feasibility checks in relaxation

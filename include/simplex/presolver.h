@@ -471,6 +471,11 @@ class Presolver {
             //  - structural      => erase column and shift
             changed |= fixed_variable_detection(P);
 
+            // Tighten singleton rows first, then general row-based bound tightening.
+            changed |= singleton_row_elimination(P);
+            if (res_.proven_infeasible)
+                break;
+
             // Tighten bounds by row activities (no c changes)
             changed |= tighten_bounds_by_rows(P);
             if (res_.proven_infeasible)
@@ -952,6 +957,147 @@ class Presolver {
                 P.l(j) = xfix;
                 P.u(j) = xfix;
                 changed = true;
+            }
+        }
+        return changed;
+    }
+
+    bool fix_singleton_row_variable(LP& P, int j, double xfix) {
+        if (!is_finite(xfix)) {
+            res_.proven_infeasible = true;
+            return true;
+        }
+        if ((is_finite(P.l(j)) && xfix < P.l(j) - opt_.infeas_tol) ||
+            (is_finite(P.u(j)) && xfix > P.u(j) + opt_.infeas_tol)) {
+            res_.proven_infeasible = true;
+            return true;
+        }
+        P.b.noalias() -= P.A.col(j) * xfix;
+        res_.stack.emplace_back(ActTightenBound{j, P.l(j), P.u(j)});
+        P.A.col(j).setZero();
+        P.l(j) = xfix;
+        P.u(j) = xfix;
+        return false;
+    }
+
+    bool singleton_row_elimination(LP& P) {
+        bool changed = false;
+        const int m = (int)P.A.rows();
+        const int n = (int)P.A.cols();
+        for (int i = 0; i < m; ++i) {
+            int j = -1;
+            int count = 0;
+            for (int k = 0; k < n; ++k) {
+                if (std::abs(P.A(i, k)) <= opt_.zero_tol)
+                    continue;
+                j = k;
+                ++count;
+                if (count > 1)
+                    break;
+            }
+            if (count != 1)
+                continue;
+
+            const double aij = P.A(i, j);
+            const double rhs = P.b(i);
+            double bound_value = std::numeric_limits<double>::quiet_NaN();
+            bool tighten_lower = false;
+            bool tighten_upper = false;
+            bool fix_value = false;
+
+            if (P.sense[i] == RowSense::EQ) {
+                bound_value = rhs / aij;
+                fix_value = true;
+            } else if (P.sense[i] == RowSense::LE) {
+                if (aij > 0.0) {
+                    bound_value = rhs / aij;
+                    tighten_upper = true;
+                } else {
+                    bound_value = rhs / aij;
+                    tighten_lower = true;
+                }
+            } else if (P.sense[i] == RowSense::GE) {
+                if (aij > 0.0) {
+                    bound_value = rhs / aij;
+                    tighten_lower = true;
+                } else {
+                    bound_value = rhs / aij;
+                    tighten_upper = true;
+                }
+            }
+
+            if (fix_value) {
+                if (opt_.allow_structural_changes && !opt_.non_destructive) {
+                    if (apply_structural_fix(P, j, bound_value))
+                        return true;
+                    changed = true;
+                    continue;
+                }
+                if (fix_singleton_row_variable(P, j, bound_value))
+                    return true;
+                changed = true;
+                continue;
+            }
+
+            const double oldL = P.l(j);
+            const double oldU = P.u(j);
+            double newL = oldL;
+            double newU = oldU;
+            if (tighten_lower) {
+                newL = std::max(newL, bound_value);
+            }
+            if (tighten_upper) {
+                newU = std::min(newU, bound_value);
+            }
+            if (newL > newU + opt_.infeas_tol) {
+                res_.proven_infeasible = true;
+                return true;
+            }
+            const bool lower_unchanged = (is_finite(newL) && is_finite(oldL)
+                                              ? std::abs(newL - oldL) <= opt_.zero_tol
+                                              : (!is_finite(newL) && !is_finite(oldL)));
+            const bool upper_unchanged = (is_finite(newU) && is_finite(oldU)
+                                              ? std::abs(newU - oldU) <= opt_.zero_tol
+                                              : (!is_finite(newU) && !is_finite(oldU)));
+            if (lower_unchanged && upper_unchanged)
+                continue;
+
+            if (is_finite(newL) && is_finite(newU) && std::abs(newU - newL) <= opt_.zero_tol) {
+                const double xfix = 0.5 * (newL + newU);
+                if (opt_.allow_structural_changes && !opt_.non_destructive) {
+                    if (apply_structural_fix(P, j, xfix))
+                        return true;
+                    changed = true;
+                    continue;
+                }
+                if (fix_singleton_row_variable(P, j, xfix))
+                    return true;
+                changed = true;
+                continue;
+            }
+
+            if (!is_finite(newL) && is_finite(newU)) {
+                if (!is_finite(oldL) || newU < oldU - opt_.zero_tol) {
+                    res_.stack.emplace_back(ActTightenBound{j, oldL, oldU});
+                    P.u(j) = newU;
+                    res_.implied_bound_updates += 1;
+                    changed = true;
+                }
+            } else if (is_finite(newL) && !is_finite(newU)) {
+                if (!is_finite(oldU) || newL > oldL + opt_.zero_tol) {
+                    res_.stack.emplace_back(ActTightenBound{j, oldL, oldU});
+                    P.l(j) = newL;
+                    res_.implied_bound_updates += 1;
+                    changed = true;
+                }
+            } else if (is_finite(newL) && is_finite(newU)) {
+                if (newL > oldL + opt_.zero_tol || newU < oldU - opt_.zero_tol) {
+                    res_.stack.emplace_back(ActTightenBound{j, oldL, oldU});
+                    P.l(j) = newL;
+                    P.u(j) = newU;
+                    res_.implied_bound_updates += 1;
+                    changed = true;
+                }
             }
         }
         return changed;

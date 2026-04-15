@@ -141,6 +141,7 @@ struct RevisedSimplexOptions {
     double crash_markowitz_tol = 0.2;
     std::string crash_strategy = "hybrid";
     bool repair_mapped_basis = true;
+    bool use_quadratic_warm_start_repair = false;
 
     // Algorithm selection/tuning
     bool dual_allow_bound_flip = true;  // enable Beale bound-flipping

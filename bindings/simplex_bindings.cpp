@@ -534,6 +534,8 @@ void bind_simplex_bindings(py::module_& m) {
         .def_readwrite("crash_markowitz_tol", &RevisedSimplexOptions::crash_markowitz_tol)
         .def_readwrite("crash_strategy", &RevisedSimplexOptions::crash_strategy)
         .def_readwrite("repair_mapped_basis", &RevisedSimplexOptions::repair_mapped_basis)
+        .def_readwrite("use_quadratic_warm_start_repair",
+                       &RevisedSimplexOptions::use_quadratic_warm_start_repair)
         .def_readwrite("dual_allow_bound_flip", &RevisedSimplexOptions::dual_allow_bound_flip)
         .def_readwrite("dual_flip_pivot_tol", &RevisedSimplexOptions::dual_flip_pivot_tol)
         .def_readwrite("dual_flip_rc_tol", &RevisedSimplexOptions::dual_flip_rc_tol)

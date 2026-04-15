@@ -347,6 +347,25 @@ RevisedSimplex::crash_attempt_config_(const RevisedSimplexOptions& opt, int atte
     return cfg;
 }
 
+inline RevisedSimplex::CrashAttemptConfig
+RevisedSimplex::quadratic_warm_start_repair_attempt_config_(const RevisedSimplexOptions& opt,
+                                                            int attempt) {
+    CrashAttemptConfig cfg = crash_attempt_config_(opt, attempt);
+    cfg.style_name = "quadratic_repair";
+    const double base = std::clamp(opt.crash_markowitz_tol, 1e-3, 0.95);
+    cfg.markowitz_threshold = std::max(1e-3, 0.35 * base);
+    cfg.cost_penalty = 0.01;
+    cfg.rhs_bonus = 0.55;
+    cfg.dense_penalty = 0.20;
+    cfg.coverage_weight = 1.40;
+    cfg.seed_penalty = 16.0;
+    cfg.prefer_seed_columns = true;
+    cfg.local_search_passes = 3;
+    cfg.max_swap_candidates = 16;
+    cfg.jitter = 1e-6 * static_cast<double>(attempt + 1);
+    return cfg;
+}
+
 inline void RevisedSimplex::mark_pivot_row_(const Eigen::MatrixXd& A, int col, int pivot_row_hint,
                                             std::vector<char>& used_row) {
     if (pivot_row_hint >= 0 && pivot_row_hint < (int)used_row.size() && !used_row[pivot_row_hint]) {
@@ -1585,6 +1604,18 @@ RevisedSimplex::choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::Vec
                     return best;
                 }
             }
+            if (opt.use_quadratic_warm_start_repair) {
+                const int attempts = std::max(1, opt.crash_attempts);
+                for (int k = 0; k < attempts; ++k) {
+                    consider(build_basis_attempt_(
+                                 A, b, c, quadratic_warm_start_repair_attempt_config_(opt, k),
+                                 opt.tol, opt.mode, seed_basis),
+                             "quadratic_repaired_warm_start", k);
+                    if (can_accept_early(best.quality)) {
+                        return best;
+                    }
+                }
+            }
         }
     }
 
@@ -1663,6 +1694,18 @@ RevisedSimplex::choose_initial_basis_(const SparseMatrix& A, const Eigen::Vector
                          "repaired_warm_start", k);
                 if (can_accept_early(best.quality)) {
                     return best;
+                }
+            }
+            if (opt.use_quadratic_warm_start_repair) {
+                const int attempts = std::max(1, opt.crash_attempts);
+                for (int k = 0; k < attempts; ++k) {
+                    consider(build_basis_attempt_(
+                                 A, b, c, quadratic_warm_start_repair_attempt_config_(opt, k),
+                                 opt.tol, opt.mode, seed_basis),
+                             "quadratic_repaired_warm_start", k);
+                    if (can_accept_early(best.quality)) {
+                        return best;
+                    }
                 }
             }
         }

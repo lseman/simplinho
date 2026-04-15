@@ -176,6 +176,8 @@ void bind_bnb_bindings(py::module_& m) {
         .def_readwrite("cut_max_parallelism", &BranchAndBoundOptions::cut_max_parallelism)
         .def_readwrite("use_lp_reoptimization_profile",
                        &BranchAndBoundOptions::use_lp_reoptimization_profile)
+        .def_readwrite("use_quadratic_warm_start_repair",
+                       &BranchAndBoundOptions::use_quadratic_warm_start_repair)
         .def_readwrite("use_node_presolve", &BranchAndBoundOptions::use_node_presolve)
         .def("__repr__", [](const BranchAndBoundOptions& self) {
             std::ostringstream oss;
