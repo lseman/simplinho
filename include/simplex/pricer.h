@@ -51,8 +51,7 @@ inline double edge_weight_from_direction(const Eigen::VectorXd& direction,
     return dense_weight;
 }
 
-template <class MatrixLike>
-inline Eigen::VectorXd dense_column(const MatrixLike& A, int j) {
+template <class MatrixLike> inline Eigen::VectorXd dense_column(const MatrixLike& A, int j) {
     return A.col(j);
 }
 
@@ -70,8 +69,8 @@ inline Eigen::VectorXd dense_column(const Eigen::SparseMatrix<double, Eigen::Col
     return out;
 }
 
-inline void dense_column(const Eigen::SparseMatrix<double, Eigen::ColMajor, int>& A,
-                         int j, Eigen::VectorXd& out) {
+inline void dense_column(const Eigen::SparseMatrix<double, Eigen::ColMajor, int>& A, int j,
+                         Eigen::VectorXd& out) {
     if (out.size() != A.rows())
         out.resize(A.rows());
     out.setZero();

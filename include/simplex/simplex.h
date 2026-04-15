@@ -740,6 +740,9 @@ class RevisedSimplex {
         // mode) ----
         std::vector<int> basis_guess;
         std::optional<std::vector<int>> crash_seed_basis_opt = red_basis_opt;
+        const bool seed_basis_from_state = (!basis_opt || basis_opt->empty()) &&
+                                           red_basis_state_opt &&
+                                           !red_basis_state_opt->column_status.empty();
         if ((!crash_seed_basis_opt || crash_seed_basis_opt->empty()) && red_basis_state_opt &&
             !red_basis_state_opt->column_status.empty()) {
             auto partial_seed = basis_columns_from_basis_state_(*red_basis_state_opt, -1);
@@ -748,8 +751,8 @@ class RevisedSimplex {
             }
         }
         auto t0_crash = std::chrono::steady_clock::now();
-        CrashSelection basis_choice =
-            choose_initial_basis_(Ared, bred, cred, opt_, crash_seed_basis_opt);
+        CrashSelection basis_choice = choose_initial_basis_(
+            Ared, bred, cred, opt_, crash_seed_basis_opt, !seed_basis_from_state);
         auto t1_crash = std::chrono::steady_clock::now();
         current_timing_.crash_ns +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1_crash - t0_crash).count();
@@ -829,18 +832,21 @@ class RevisedSimplex {
                 try {
                     auto res = phase_(Ared, bred, cred, basis_guess, l_eff, u_eff);
                     auto t1_iter = std::chrono::steady_clock::now();
-                    current_timing_.simplex_iters_ns += std::chrono::duration_cast<
-                        std::chrono::nanoseconds>(t1_iter - t0_iter)
-                                                            .count();
+                    current_timing_.simplex_iters_ns +=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(t1_iter - t0_iter)
+                            .count();
                     return res;
                 } catch (const std::runtime_error& e) {
                     auto t1_iter = std::chrono::steady_clock::now();
-                    current_timing_.simplex_iters_ns += std::chrono::duration_cast<
-                        std::chrono::nanoseconds>(t1_iter - t0_iter)
-                                                            .count();
+                    current_timing_.simplex_iters_ns +=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(t1_iter - t0_iter)
+                            .count();
                     if (!is_recoverable_basis_runtime_(e.what()))
                         throw;
-                    return PhaseResult{LPSolution::Status::Singular, Eigen::VectorXd{}, {}, 0,
+                    return PhaseResult{LPSolution::Status::Singular,
+                                       Eigen::VectorXd{},
+                                       {},
+                                       0,
                                        {{"reason", "basis_factorization_failure"},
                                         {"what", e.what()},
                                         {"where", "dense_direct_primal"}}};
@@ -854,24 +860,27 @@ class RevisedSimplex {
                     red_basis_state_opt->column_status.size() == static_cast<std::size_t>(n_eff);
                 auto t0_iter = std::chrono::steady_clock::now();
                 try {
-                    auto res = dual_phase_(
-                        Ared, bred, cred, basis_guess, l_eff, u_eff,
-                        use_warm_status ? std::optional<std::vector<LPBasisStatus>>(
-                                              red_basis_state_opt->column_status)
-                                        : std::nullopt);
+                    auto res =
+                        dual_phase_(Ared, bred, cred, basis_guess, l_eff, u_eff,
+                                    use_warm_status ? std::optional<std::vector<LPBasisStatus>>(
+                                                          red_basis_state_opt->column_status)
+                                                    : std::nullopt);
                     auto t1_iter = std::chrono::steady_clock::now();
-                    current_timing_.simplex_iters_ns += std::chrono::duration_cast<
-                        std::chrono::nanoseconds>(t1_iter - t0_iter)
-                                                            .count();
+                    current_timing_.simplex_iters_ns +=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(t1_iter - t0_iter)
+                            .count();
                     return res;
                 } catch (const std::runtime_error& e) {
                     auto t1_iter = std::chrono::steady_clock::now();
-                    current_timing_.simplex_iters_ns += std::chrono::duration_cast<
-                        std::chrono::nanoseconds>(t1_iter - t0_iter)
-                                                            .count();
+                    current_timing_.simplex_iters_ns +=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(t1_iter - t0_iter)
+                            .count();
                     if (!is_recoverable_basis_runtime_(e.what()))
                         throw;
-                    return PhaseResult{LPSolution::Status::Singular, Eigen::VectorXd{}, {}, 0,
+                    return PhaseResult{LPSolution::Status::Singular,
+                                       Eigen::VectorXd{},
+                                       {},
+                                       0,
                                        {{"reason", "basis_factorization_failure"},
                                         {"what", e.what()},
                                         {"where", "dense_direct_dual"}}};
@@ -1936,8 +1945,7 @@ class RevisedSimplex {
         bopt.refinement_stall_limit = opt_.basis_refinement_stall_limit;
         bopt.max_eta_count = opt_.basis_max_eta_count;
         bopt.column_residual_tol = opt_.basis_column_residual_tol;
-        bopt.aggressive_refactor_on_suspicious_residual =
-            opt_.basis_aggressive_residual_rebuild;
+        bopt.aggressive_refactor_on_suspicious_residual = opt_.basis_aggressive_residual_rebuild;
 
         std::string mode = opt_.basis_update;
         std::transform(mode.begin(), mode.end(), mode.begin(),
@@ -2118,39 +2126,46 @@ class RevisedSimplex {
                                       std::vector<char>& used_row, std::vector<char>& used_col,
                                       int& current_rank, int col, int pivot_row_hint, double tol);
 
-    static CrashCandidate choose_slack_like_column_(const Eigen::MatrixXd& A,
-                                                    const Eigen::VectorXd& b,
-                                                    const Eigen::VectorXd& c,
-                                                    const std::vector<char>& used_row,
-                                                    const std::vector<char>& used_col);
+    static double seed_column_bonus_(int col, const std::vector<char>& seeded,
+                                     const CrashAttemptConfig& cfg);
+
+    static CrashCandidate
+    choose_slack_like_column_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
+                              const Eigen::VectorXd& c, const std::vector<char>& used_row,
+                              const std::vector<char>& used_col, const std::vector<char>& seeded,
+                              const CrashAttemptConfig& cfg);
 
     static CrashCandidate choose_slack_like_column_(const SparseMatrix& A, const Eigen::VectorXd& b,
                                                     const Eigen::VectorXd& c,
                                                     const std::vector<char>& used_row,
-                                                    const std::vector<char>& used_col);
+                                                    const std::vector<char>& used_col,
+                                                    const std::vector<char>& seeded,
+                                                    const CrashAttemptConfig& cfg);
 
     static CrashCandidate
     choose_free_like_column_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                              const Eigen::VectorXd& c, const std::vector<char>& used_row,
-                             const std::vector<char>& used_col, const CrashAttemptConfig& cfg);
+                             const std::vector<char>& used_col, const std::vector<char>& seeded,
+                             const CrashAttemptConfig& cfg);
 
     static CrashCandidate choose_free_like_column_(const SparseMatrix& A, const Eigen::VectorXd& b,
                                                    const Eigen::VectorXd& c,
                                                    const std::vector<char>& used_row,
                                                    const std::vector<char>& used_col,
+                                                   const std::vector<char>& seeded,
                                                    const CrashAttemptConfig& cfg);
 
     static CrashCandidate choose_sprint_column_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                                                 const Eigen::VectorXd& c,
                                                 const std::vector<char>& used_row,
                                                 const std::vector<char>& used_col,
+                                                const std::vector<char>& seeded,
                                                 const CrashAttemptConfig& cfg);
 
-    static CrashCandidate choose_sprint_column_(const SparseMatrix& A, const Eigen::VectorXd& b,
-                                                const Eigen::VectorXd& c,
-                                                const std::vector<char>& used_row,
-                                                const std::vector<char>& used_col,
-                                                const CrashAttemptConfig& cfg);
+    static CrashCandidate
+    choose_sprint_column_(const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
+                          const std::vector<char>& used_row, const std::vector<char>& used_col,
+                          const std::vector<char>& seeded, const CrashAttemptConfig& cfg);
 
     static std::vector<int> find_logical_basis_(const Eigen::MatrixXd& A);
 
@@ -2159,20 +2174,25 @@ class RevisedSimplex {
     static CrashCandidate
     choose_triangular_column_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                               const Eigen::VectorXd& c, const std::vector<char>& used_row,
-                              const std::vector<char>& used_col, const CrashAttemptConfig& cfg);
+                              const std::vector<char>& used_col, const std::vector<char>& seeded,
+                              const CrashAttemptConfig& cfg);
 
-    static CrashCandidate
-    choose_triangular_column_(const SparseMatrix& A, const Eigen::VectorXd& b,
-                              const Eigen::VectorXd& c, const std::vector<char>& used_row,
-                              const std::vector<char>& used_col, const CrashAttemptConfig& cfg);
+    static CrashCandidate choose_triangular_column_(const SparseMatrix& A, const Eigen::VectorXd& b,
+                                                    const Eigen::VectorXd& c,
+                                                    const std::vector<char>& used_row,
+                                                    const std::vector<char>& used_col,
+                                                    const std::vector<char>& seeded,
+                                                    const CrashAttemptConfig& cfg);
 
     static std::vector<int> rank_remaining_columns_(const Eigen::MatrixXd& A,
                                                     const Eigen::VectorXd& c,
                                                     const std::vector<char>& used_col,
+                                                    const std::vector<char>& seeded,
                                                     const CrashAttemptConfig& cfg);
 
     static std::vector<int> rank_remaining_columns_(const SparseMatrix& A, const Eigen::VectorXd& c,
                                                     const std::vector<char>& used_col,
+                                                    const std::vector<char>& seeded,
                                                     const CrashAttemptConfig& cfg);
 
     static std::vector<int>
@@ -2201,12 +2221,14 @@ class RevisedSimplex {
     static CrashSelection
     choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                           const Eigen::VectorXd& c, const RevisedSimplexOptions& opt,
-                          std::optional<std::vector<int>> seed_basis = std::nullopt);
+                          std::optional<std::vector<int>> seed_basis = std::nullopt,
+                          bool allow_direct_warm_start = true);
 
     static CrashSelection
     choose_initial_basis_(const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
                           const RevisedSimplexOptions& opt,
-                          std::optional<std::vector<int>> seed_basis = std::nullopt);
+                          std::optional<std::vector<int>> seed_basis = std::nullopt,
+                          bool allow_direct_warm_start = true);
 
     static std::optional<std::vector<int>>
     find_initial_basis_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
@@ -2670,9 +2692,8 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     // variable shifting (y = x - lb) and the dual simplex's BoundView
     // mechanism, which preserves dual feasibility across bound changes.
     // For cold Dual starts, the reformulation path is used as before.
-    const bool has_warm_basis_for_dual =
-        opt_.mode == SimplexMode::Dual && basis_state_opt &&
-        !basis_state_opt->column_status.empty();
+    const bool has_warm_basis_for_dual = opt_.mode == SimplexMode::Dual && basis_state_opt &&
+                                         !basis_state_opt->column_status.empty();
     if (!is_nonnegative_standard && !has_warm_basis_for_dual) {
         struct ReformVar {
             int y = -1;
@@ -3063,27 +3084,14 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         !red_basis_state_opt->column_status.empty() &&
         static_cast<int>(red_basis_state_opt->column_status.size()) == n;
 
+    const bool seed_basis_from_state = (!basis_opt || basis_opt->empty()) && red_basis_state_opt &&
+                                       !red_basis_state_opt->column_status.empty();
     auto t0_crash = std::chrono::steady_clock::now();
     CrashSelection basis_choice =
-        choose_initial_basis_(Ared, bred, cred, opt_, crash_seed_basis_opt);
+        choose_initial_basis_(Ared, bred, cred, opt_, crash_seed_basis_opt, !seed_basis_from_state);
     auto t1_crash = std::chrono::steady_clock::now();
     current_timing_.crash_ns +=
         std::chrono::duration_cast<std::chrono::nanoseconds>(t1_crash - t0_crash).count();
-
-    // For Dual mode with warm-start column_status, force the warm-start basis
-    // even if choose_initial_basis_ preferred a crash basis (due to incorrect
-    // dual feasibility evaluation). The dual engine will use column_status to
-    // set correct views and iterate from there.
-    if (has_warm_column_status_for_dual && basis_choice.source != "warm_start" &&
-        basis_choice.source != "repaired_warm_start") {
-        CrashSelection warm_sel;
-        warm_sel.basis = *crash_seed_basis_opt;
-        warm_sel.quality = evaluate_basis_quality_(Ared, bred, cred, warm_sel.basis, opt_.tol);
-        warm_sel.source = "warm_start";
-        warm_sel.style = "mapped";
-        warm_sel.attempt = -1;
-        basis_choice = std::move(warm_sel);
-    }
 
     std::vector<int> basis_guess = basis_choice.basis;
     const bool basis_guess_from_warm_start =
@@ -3095,9 +3103,9 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         red_basis_state_opt && !red_basis_state_opt->column_status.empty() &&
         static_cast<int>(red_basis_state_opt->column_status.size()) == n;
     const bool allow_direct_dual =
-        basis_valid && (basis_choice.quality.dual_feasible ||
-                        (opt_.mode == SimplexMode::Dual && basis_guess_from_warm_start &&
-                         warm_has_column_status));
+        basis_valid &&
+        (basis_choice.quality.dual_feasible ||
+         (opt_.mode == SimplexMode::Dual && basis_guess_from_warm_start && warm_has_column_status));
 
     auto add_sparse_info = [&](std::unordered_map<std::string, std::string> info) {
         info["sparse_pipeline"] = "1";
@@ -3158,7 +3166,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
             if (!is_recoverable_basis_runtime_(e.what()))
                 throw;
-            return PhaseResult{LPSolution::Status::Singular, Eigen::VectorXd{}, {}, 0,
+            return PhaseResult{LPSolution::Status::Singular,
+                               Eigen::VectorXd{},
+                               {},
+                               0,
                                {{"reason", "basis_factorization_failure"},
                                 {"what", e.what()},
                                 {"where", "sparse_direct_primal"}}};
@@ -3185,7 +3196,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
             if (!is_recoverable_basis_runtime_(e.what()))
                 throw;
-            return PhaseResult{LPSolution::Status::Singular, Eigen::VectorXd{}, {}, 0,
+            return PhaseResult{LPSolution::Status::Singular,
+                               Eigen::VectorXd{},
+                               {},
+                               0,
                                {{"reason", "basis_factorization_failure"},
                                 {"what", e.what()},
                                 {"where", "sparse_direct_dual"}}};
@@ -3241,7 +3255,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     } catch (const std::runtime_error& e) {
         if (!is_recoverable_basis_runtime_(e.what()))
             throw;
-        phase1_result = PhaseResult{LPSolution::Status::Singular, Eigen::VectorXd{}, {}, 0,
+        phase1_result = PhaseResult{LPSolution::Status::Singular,
+                                    Eigen::VectorXd{},
+                                    {},
+                                    0,
                                     {{"reason", "basis_factorization_failure"},
                                      {"what", e.what()},
                                      {"where", "sparse_phase1_primal"}}};
@@ -3250,10 +3267,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     if (status1 == LPSolution::Status::NeedPhase1 && info1.count("reason") &&
         info1.at("reason") == std::string("negative_basic_vars")) {
         try {
-            std::tie(status1, v1, basis1_out, it1, info1) = dual_phase_(
-                A1, b1, c1, basis1_out.empty() ? basis1 : basis1_out,
-                Eigen::VectorXd::Zero(A1.cols()),
-                Eigen::VectorXd::Constant(A1.cols(), presolve::inf()));
+            std::tie(status1, v1, basis1_out, it1, info1) =
+                dual_phase_(A1, b1, c1, basis1_out.empty() ? basis1 : basis1_out,
+                            Eigen::VectorXd::Zero(A1.cols()),
+                            Eigen::VectorXd::Constant(A1.cols(), presolve::inf()));
         } catch (const std::runtime_error& e) {
             if (!is_recoverable_basis_runtime_(e.what()))
                 throw;
@@ -3320,10 +3337,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             const CrashSelection repaired_phase2_start =
                 choose_initial_basis_(Ared, bred, cred, opt_, red_basis2);
             if (repaired_phase2_start.quality.valid &&
-                better_basis_quality_(repaired_phase2_start,
-                                      CrashSelection{red_basis2, phase2_start_quality,
-                                                     "phase1_basis", "phase1", -1},
-                                      opt_.mode)) {
+                better_basis_quality_(
+                    repaired_phase2_start,
+                    CrashSelection{red_basis2, phase2_start_quality, "phase1_basis", "phase1", -1},
+                    opt_.mode)) {
                 red_basis2 = repaired_phase2_start.basis;
             }
         }
@@ -3336,12 +3353,11 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     std::unordered_map<std::string, std::string> info2;
     auto phase2_result_needs_basis_repair = [&](LPSolution::Status status,
                                                 const Eigen::VectorXd& primal) {
-        return status == LPSolution::Status::Singular ||
-               status == LPSolution::Status::NeedPhase1 ||
+        return status == LPSolution::Status::Singular || status == LPSolution::Status::NeedPhase1 ||
                (status == LPSolution::Status::Optimal && primal.size() != n) ||
                (status == LPSolution::Status::Unbounded && primal.size() != n) ||
-               (status == LPSolution::Status::IterLimit &&
-                primal.size() != 0 && primal.size() != n);
+               (status == LPSolution::Status::IterLimit && primal.size() != 0 &&
+                primal.size() != n);
     };
     auto run_sparse_phase2_from_basis = [&](const std::vector<int>& basis) {
         if (opt_.mode == SimplexMode::Dual) {
@@ -3364,7 +3380,8 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         }
         auto res = run_phase2_p(basis);
         std::get<4>(res)["phase2_mode"] = "primal";
-        if (std::get<0>(res) == LPSolution::Status::NeedPhase1 && std::get<4>(res).count("reason") &&
+        if (std::get<0>(res) == LPSolution::Status::NeedPhase1 &&
+            std::get<4>(res).count("reason") &&
             std::get<4>(res).at("reason") == std::string("negative_basic_vars")) {
             res = run_phase2_d(basis);
             std::get<4>(res)["phase2_mode"] = "dual";
@@ -3402,8 +3419,8 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             std::vector<int> repaired_basis_out;
             int repaired_iters = 0;
             std::unordered_map<std::string, std::string> repaired_info;
-            std::tie(repaired_status, repaired_v, repaired_basis_out, repaired_iters, repaired_info) =
-                run_sparse_phase2_from_basis(repaired->basis);
+            std::tie(repaired_status, repaired_v, repaired_basis_out, repaired_iters,
+                     repaired_info) = run_sparse_phase2_from_basis(repaired->basis);
             if (!phase2_result_needs_basis_repair(repaired_status, repaired_v) ||
                 (repaired_status == LPSolution::Status::Optimal && repaired_v.size() == n)) {
                 status2 = repaired_status;

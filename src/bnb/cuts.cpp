@@ -773,12 +773,21 @@ MixedCoverContext build_mixed_cover_context_(const Problem& problem,
 }
 
 std::vector<int> greedy_cover_literals_(std::vector<CoverLiteralTerm> terms, double rhs,
-                                        bool prefer_activity) {
+                                        bool prefer_activity, bool prefer_ratio = false) {
     if (terms.size() < 2 || !std::isfinite(rhs))
         return {};
 
     std::sort(terms.begin(), terms.end(),
               [&](const CoverLiteralTerm& lhs, const CoverLiteralTerm& rhs_term) {
+                  if (prefer_ratio) {
+                      const double lhs_ratio = lhs.activity / lhs.coeff;
+                      const double rhs_ratio = rhs_term.activity / rhs_term.coeff;
+                      if (std::abs(lhs_ratio - rhs_ratio) > 1e-12)
+                          return lhs_ratio > rhs_ratio;
+                      if (std::abs(lhs.coeff - rhs_term.coeff) > 1e-12)
+                          return lhs.coeff > rhs_term.coeff;
+                      return lhs.literal < rhs_term.literal;
+                  }
                   if (prefer_activity && std::abs(lhs.activity - rhs_term.activity) > 1e-12)
                       return lhs.activity > rhs_term.activity;
                   if (std::abs(lhs.coeff - rhs_term.coeff) > 1e-12)
@@ -833,25 +842,24 @@ std::vector<int> extend_cover_literals_(const std::vector<CoverLiteralTerm>& all
 
     std::unordered_set<int> in_cover(base_cover.begin(), base_cover.end());
     double cover_sum = 0.0;
-    double cover_max_coeff = 0.0;
+    double cover_min_coeff = std::numeric_limits<double>::infinity();
     for (const CoverLiteralTerm& term : all_terms) {
-        if (in_cover.contains(term.literal)) {
-            cover_sum += term.coeff;
-            cover_max_coeff = std::max(cover_max_coeff, term.coeff);
-        }
+        if (!in_cover.contains(term.literal))
+            continue;
+        cover_sum += term.coeff;
+        cover_min_coeff = std::min(cover_min_coeff, term.coeff);
     }
 
     const double excess = cover_sum - rhs;
-    if (!(excess > 1e-9))
+    if (!(excess > 1e-9) || cover_min_coeff <= 0.0)
         return base_cover;
 
+    const double min_threshold = std::max(0.0, rhs - (cover_sum - cover_min_coeff));
     std::vector<int> lifted = base_cover;
     for (const CoverLiteralTerm& term : all_terms) {
         if (in_cover.contains(term.literal))
             continue;
-        // Safe unit lifting: if setting this variable to 1 together with any |C|-1
-        // variables from the cover still violates the knapsack, coefficient 1 is valid.
-        if (term.coeff > cover_max_coeff - excess + 1e-9)
+        if (term.coeff > min_threshold + 1e-9)
             lifted.push_back(term.literal);
     }
     std::sort(lifted.begin(), lifted.end());
@@ -2150,9 +2158,8 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         violated[i] = 1;
         const double full_norm =
             i < static_cast<int>(row_norms_.size()) ? row_norms_[i] : cut_norm_(cuts_[i]);
-        candidates.push_back(Candidate{
-            i, violation, full_norm, 0.0, 0.0, 0.0, 0.0, 0.0, cuts_[i].strength,
-            violation <= 2.5 * min_violation_});
+        candidates.push_back(Candidate{i, violation, full_norm, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                       cuts_[i].strength, violation <= 2.5 * min_violation_});
     }
 
     if (candidates.empty()) {
@@ -2161,15 +2168,16 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
 
     const int max_candidates = std::max(32, max_cuts * 8);
     if (static_cast<int>(candidates.size()) > max_candidates) {
-        std::nth_element(
-            candidates.begin(), candidates.begin() + max_candidates, candidates.end(),
-            [](const Candidate& lhs, const Candidate& rhs) {
-                const double lhs_ratio = lhs.full_norm > 1e-16 ? lhs.violation / lhs.full_norm
-                                                               : lhs.violation;
-                const double rhs_ratio = rhs.full_norm > 1e-16 ? rhs.violation / rhs.full_norm
-                                                               : rhs.violation;
-                return lhs_ratio > rhs_ratio;
-            });
+        std::nth_element(candidates.begin(), candidates.begin() + max_candidates, candidates.end(),
+                         [](const Candidate& lhs, const Candidate& rhs) {
+                             const double lhs_ratio = lhs.full_norm > 1e-16
+                                                          ? lhs.violation / lhs.full_norm
+                                                          : lhs.violation;
+                             const double rhs_ratio = rhs.full_norm > 1e-16
+                                                          ? rhs.violation / rhs.full_norm
+                                                          : rhs.violation;
+                             return lhs_ratio > rhs_ratio;
+                         });
         candidates.resize(max_candidates);
     }
 
@@ -2179,8 +2187,9 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
             active_support_stats_(cut, primal, lower_bounds, upper_bounds, min_violation_);
         const double norm = active_stats.norm > 1e-16 ? active_stats.norm : candidate.full_norm;
         candidate.efficacy = norm > 1e-16 ? candidate.violation / norm : 0.0;
-        candidate.active_efficacy = active_stats.norm > 1e-16 ? candidate.violation / active_stats.norm
-                                                               : candidate.efficacy;
+        candidate.active_efficacy = active_stats.norm > 1e-16
+                                        ? candidate.violation / active_stats.norm
+                                        : candidate.efficacy;
         candidate.fractional_focus = fractional_focus_(cut, primal);
         candidate.density_adjusted_efficacy = density_adjusted_efficacy_(
             candidate.violation, norm,
@@ -2686,6 +2695,75 @@ std::vector<int> select_gmi_rows_(const Problem& problem, const RelaxationSoluti
     return rows;
 }
 
+std::vector<int> select_mir_rows_(const Problem& problem, const RelaxationSolution& relaxation,
+                                  const Options& options) {
+    struct Candidate {
+        int row = -1;
+        double score = 0.0;
+    };
+
+    std::vector<Candidate> candidates;
+    if (relaxation.primal.size() != problem.lower_bounds.size())
+        return {};
+
+    for (int row_index = 0; row_index < static_cast<int>(problem.base_constraints.size());
+         ++row_index) {
+        const SparseLinearConstraint& row = problem.base_constraints[row_index];
+        if (row.indices.size() < 2)
+            continue;
+
+        double lhs = 0.0;
+        int fractional_support = 0;
+        int integer_support = 0;
+        for (int k = 0;
+             k < static_cast<int>(row.indices.size()) && k < static_cast<int>(row.values.size());
+             ++k) {
+            const int col = row.indices[k];
+            if (col < 0 || col >= static_cast<int>(relaxation.primal.size()))
+                continue;
+            const double value = relaxation.primal(col);
+            lhs += row.values[k] * value;
+            if (value > options.integrality_tol && value < 1.0 - options.integrality_tol)
+                ++fractional_support;
+            if (problem.variable_types[col] != VariableType::Continuous)
+                ++integer_support;
+        }
+
+        double violation = 0.0;
+        if (row.sense == LinearConstraintSense::LessEqual) {
+            violation = lhs - row.rhs;
+        } else if (row.sense == LinearConstraintSense::GreaterEqual) {
+            violation = row.rhs - lhs;
+        } else {
+            violation = std::abs(lhs - row.rhs);
+        }
+        if (violation <= std::max(options.min_cut_violation, 1e-9))
+            continue;
+
+        const double density_penalty = 1.0 + 0.1 * static_cast<double>(row.indices.size());
+        const double score = violation *
+                             (1.0 + 0.05 * fractional_support + 0.04 * integer_support) /
+                             density_penalty;
+        candidates.push_back(Candidate{row_index, score});
+    }
+
+    if (candidates.empty())
+        return {};
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& lhs, const Candidate& rhs) { return lhs.score > rhs.score; });
+
+    const int row_limit = std::max(16, 8 * options.max_cuts_added_per_round);
+    if (static_cast<int>(candidates.size()) > row_limit)
+        candidates.resize(static_cast<std::size_t>(row_limit));
+
+    std::vector<int> rows;
+    rows.reserve(candidates.size());
+    for (const Candidate& candidate : candidates)
+        rows.push_back(candidate.row);
+    return rows;
+}
+
 CanonicalMirRow build_canonical_mir_row_from_leq_(const Problem& problem,
                                                   const RelaxationSolution& relaxation,
                                                   const std::vector<int>& indices,
@@ -3036,10 +3114,14 @@ std::optional<int> choose_mir_aggregation_pivot_(const MirRowData& lhs, const Mi
         if (lhs_coeff * rhs_coeff >= 0.0)
             continue;
 
-        double score = std::abs(lhs_coeff * rhs_coeff);
+        const double abs_lhs = std::abs(lhs_coeff);
+        const double abs_rhs = std::abs(rhs_coeff);
+        const double balance = std::min(abs_lhs, abs_rhs) / std::max(abs_lhs, abs_rhs);
+        double score = std::abs(lhs_coeff * rhs_coeff) * (0.6 + 0.4 * balance);
         if (index >= 0 && index < primal.size()) {
             const double value = primal(index);
-            score *= 1.0 + std::abs(value - std::round(value));
+            const double frac_dist = std::abs(value - std::round(value));
+            score *= 1.0 + std::min(1.5, 2.0 * frac_dist);
         }
         if (score > best_score) {
             best_score = score;
@@ -3112,7 +3194,14 @@ std::vector<Cut> generate_mir_cuts(const Problem& problem, const RelaxationSolut
 
     std::vector<MirRowData> rows;
     rows.reserve(problem.base_constraints.size() * 2);
-    for (const SparseLinearConstraint& row : problem.base_constraints) {
+    const std::vector<int> selected_row_indices = select_mir_rows_(problem, relaxation, options);
+    std::vector<int> row_indices = selected_row_indices;
+    if (row_indices.empty()) {
+        row_indices.resize(static_cast<int>(problem.base_constraints.size()));
+        std::iota(row_indices.begin(), row_indices.end(), 0);
+    }
+    for (int row_index : row_indices) {
+        const SparseLinearConstraint& row = problem.base_constraints[row_index];
         if (row.sense == LinearConstraintSense::LessEqual) {
             rows.push_back(MirRowData{row.indices, row.values, row.rhs});
         } else if (row.sense == LinearConstraintSense::GreaterEqual) {
@@ -3220,19 +3309,21 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
         std::all_of(problem.variable_types.begin(), problem.variable_types.end(),
                     [](VariableType type) { return type == VariableType::Binary; });
     std::vector<int> selected_rows;
-    if (large_binary_dense && relaxation.primal.size() == problem.lower_bounds.size()) {
-        struct RankedRow {
-            int index = -1;
-            double score = -std::numeric_limits<double>::infinity();
-        };
-        std::vector<RankedRow> ranked_rows;
+    struct RankedRow {
+        int index = -1;
+        double score = -std::numeric_limits<double>::infinity();
+    };
+    std::vector<RankedRow> ranked_rows;
+    if (relaxation.primal.size() == problem.lower_bounds.size()) {
         ranked_rows.reserve(problem.base_constraints.size());
+        const double min_cover_violation = std::max(options.min_cut_violation, 1e-9);
         for (int row_index = 0; row_index < static_cast<int>(problem.base_constraints.size());
              ++row_index) {
             const SparseLinearConstraint& row = problem.base_constraints[row_index];
             if (row.sense != LinearConstraintSense::LessEqual || row.indices.size() < 2) {
                 continue;
             }
+
             double lhs = 0.0;
             int fractional_support = 0;
             for (int k = 0; k < static_cast<int>(row.indices.size()) &&
@@ -3249,10 +3340,10 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
                 }
             }
             const double violation = std::max(0.0, lhs - row.rhs);
-            if (violation <= 0.25 * options.min_cut_violation && fractional_support < 3) {
+            if (violation <= 0.25 * min_cover_violation && fractional_support < 3) {
                 continue;
             }
-            ranked_rows.push_back({row_index, violation + 0.01 * fractional_support});
+            ranked_rows.push_back({row_index, violation + 0.02 * fractional_support});
         }
         std::sort(ranked_rows.begin(), ranked_rows.end(),
                   [](const RankedRow& lhs, const RankedRow& rhs) {
@@ -3265,6 +3356,9 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
         if (static_cast<int>(ranked_rows.size()) > row_limit) {
             ranked_rows.resize(static_cast<std::size_t>(row_limit));
         }
+    }
+
+    if (!ranked_rows.empty()) {
         selected_rows.reserve(ranked_rows.size());
         for (const RankedRow& ranked : ranked_rows) {
             selected_rows.push_back(ranked.index);
@@ -3330,13 +3424,17 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
             greedy_cover_literals_(context.literals, context.rhs, true);
         const std::vector<int> coeff_cover =
             greedy_cover_literals_(context.literals, context.rhs, false);
-        if (activity_cover.size() < 2 && coeff_cover.size() < 2)
+        const std::vector<int> ratio_cover =
+            greedy_cover_literals_(context.literals, context.rhs, false, true);
+        if (activity_cover.size() < 2 && coeff_cover.size() < 2 && ratio_cover.size() < 2)
             return;
         const std::string base_type =
             context.has_nonbinary_component ? "MixedBinaryCover" : "Cover";
         maybe_add_cover_cut_(problem, relaxation, options, activity_cover, base_type, &signatures,
                              &cuts);
         maybe_add_cover_cut_(problem, relaxation, options, coeff_cover, base_type, &signatures,
+                             &cuts);
+        maybe_add_cover_cut_(problem, relaxation, options, ratio_cover, base_type, &signatures,
                              &cuts);
         const std::vector<int> lifted_activity =
             extend_cover_literals_(context.literals, activity_cover, context.rhs);

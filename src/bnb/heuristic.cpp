@@ -271,12 +271,14 @@ int max_submip_free_integers(const Problem& problem, int integer_count) {
     return 128;
 }
 
-bool should_attempt_submip_neighborhood(const Problem& problem, int integer_count, int fixed_count) {
+bool should_attempt_submip_neighborhood(const Problem& problem, int integer_count,
+                                        int fixed_count) {
     if (integer_count <= 0) {
         return false;
     }
     const int free_count = std::max(0, integer_count - fixed_count);
-    const double fixing_rate = static_cast<double>(fixed_count) / static_cast<double>(integer_count);
+    const double fixing_rate =
+        static_cast<double>(fixed_count) / static_cast<double>(integer_count);
     return fixing_rate >= min_submip_fixing_rate(problem, integer_count) &&
            free_count <= max_submip_free_integers(problem, integer_count);
 }
@@ -982,31 +984,75 @@ try_greedy_repair_rounding(const Problem& problem, const Options& options,
     const int n = std::min<int>(candidate.size(), static_cast<int>(problem.variable_types.size()));
 
     struct FlipCandidate {
-        double impact;
         int j;
+        double violation_score;
+        double objective_score;
+        double combined_score;
     };
     std::vector<FlipCandidate> flippable;
     flippable.reserve(n);
+
+    const double base_objective = compute_problem_objective(problem, candidate);
     for (int j = 0; j < n; ++j) {
         if (problem.variable_types[j] == VariableType::Continuous) {
             continue;
         }
         const double lb = problem.lower_bounds(j);
-        if (candidate(j) <= lb + options.integrality_tol) {
+        const double ub = problem.upper_bounds(j);
+        if (!std::isfinite(lb) || !std::isfinite(ub)) {
             continue;
         }
+        const double current = candidate(j);
+        if (std::abs(current - std::round(current)) <= options.integrality_tol) {
+            continue;
+        }
+
+        const double target = std::round(current);
+        const double candidate_value = std::min(ub, std::max(lb, target));
         const double coeff = j < static_cast<int>(problem.objective_coefficients.size())
                                  ? problem.objective_coefficients(j)
                                  : 0.0;
-        // Sort ascending by objective impact: flip cheapest first
-        const double impact = problem.maximize ? coeff : -coeff;
-        flippable.push_back({impact, j});
+        const double objective_impact = problem.maximize ? -coeff * (candidate_value - current)
+                                                         : coeff * (candidate_value - current);
+
+        double violation_score = 0.0;
+        for (const auto& row : problem.base_constraints) {
+            for (int k = 0; k < static_cast<int>(row.indices.size()) &&
+                            k < static_cast<int>(row.values.size());
+                 ++k) {
+                if (row.indices[k] != j) {
+                    continue;
+                }
+                const double old_activity = row.values[k] * current;
+                const double new_activity = row.values[k] * candidate_value;
+                const double old_violation = linear_constraint_violation_amount(row, candidate);
+                Eigen::VectorXd modified = candidate;
+                modified(j) = candidate_value;
+                const double new_violation = linear_constraint_violation_amount(row, modified);
+                violation_score += std::max(0.0, old_violation - new_violation);
+            }
+        }
+        const double combined = 0.75 * violation_score - 0.25 * objective_impact;
+        flippable.push_back({j, violation_score, objective_impact, combined});
+    }
+
+    if (flippable.empty()) {
+        return std::nullopt;
     }
     std::sort(flippable.begin(), flippable.end(),
-              [](const FlipCandidate& a, const FlipCandidate& b) { return a.impact < b.impact; });
+              [](const FlipCandidate& a, const FlipCandidate& b) {
+                  if (std::abs(a.combined_score - b.combined_score) > 1e-12)
+                      return a.combined_score > b.combined_score;
+                  if (std::abs(a.violation_score - b.violation_score) > 1e-12)
+                      return a.violation_score > b.violation_score;
+                  return a.objective_score < b.objective_score;
+              });
 
     for (const auto& fc : flippable) {
-        candidate(fc.j) = problem.lower_bounds(fc.j);
+        const double target = std::round(candidate(fc.j));
+        const double value =
+            std::min(problem.upper_bounds(fc.j), std::max(problem.lower_bounds(fc.j), target));
+        candidate(fc.j) = value;
         if (auto sol = make_incumbent_if_feasible(problem, options, candidate, active_cuts)) {
             return sol;
         }
@@ -1022,18 +1068,29 @@ std::optional<RelaxationSolution> run_rounding_heuristic(const Problem& problem,
         return std::nullopt;
     }
 
-    for (const bool objective_guided : {false, true}) {
-        const Eigen::VectorXd candidate =
-            build_projection(problem, lp_relaxation, lp_relaxation.primal,
-                             ProjectionStage::AllIntegers, objective_guided, 0.0, 0);
-        if (auto incumbent = make_incumbent_if_feasible(problem, options, candidate, active_cuts);
-            incumbent.has_value()) {
-            return incumbent;
-        }
-        // Direct rounding failed; try greedy repair by flipping overcommitted variables down
-        if (auto repaired =
-                try_greedy_repair_rounding(problem, options, candidate, active_cuts)) {
-            return repaired;
+    const std::array<bool, 2> objective_guided_choices = {false, true};
+    const std::array<ProjectionStage, 2> stages = {ProjectionStage::BinaryOnly,
+                                                   ProjectionStage::AllIntegers};
+    const std::array<double, 3> perturb_scales = {0.0, 0.25, 0.5};
+
+    for (const ProjectionStage stage : stages) {
+        for (const bool objective_guided : objective_guided_choices) {
+            for (double perturb_scale : perturb_scales) {
+                for (int variant = 0; variant < 3; ++variant) {
+                    const Eigen::VectorXd candidate =
+                        build_projection(problem, lp_relaxation, lp_relaxation.primal, stage,
+                                         objective_guided, perturb_scale, variant);
+                    if (auto incumbent =
+                            make_incumbent_if_feasible(problem, options, candidate, active_cuts);
+                        incumbent.has_value()) {
+                        return incumbent;
+                    }
+                    if (auto repaired =
+                            try_greedy_repair_rounding(problem, options, candidate, active_cuts)) {
+                        return repaired;
+                    }
+                }
+            }
         }
     }
 
@@ -1247,8 +1304,7 @@ run_feasibility_pump_heuristic(const Problem& problem, const Options& options,
             const int stage_target_fixed =
                 std::max(1, static_cast<int>(options.feasibility_pump_fix_ratio *
                                              static_cast<double>(stage_indices.size())));
-            if (should_attempt_submip_neighborhood(problem,
-                                                   static_cast<int>(stage_indices.size()),
+            if (should_attempt_submip_neighborhood(problem, static_cast<int>(stage_indices.size()),
                                                    stage_target_fixed)) {
                 if (auto incumbent = try_integer_subproblem(problem, options, lower, upper, &result,
                                                             solve_submip);
@@ -1581,9 +1637,9 @@ run_local_search_heuristic(const Problem& problem, const Options& options,
     if (!should_attempt_submip_neighborhood(problem, integer_count, integer_count - window)) {
         return result;
     }
-    const int max_iterations =
-        expensive_integer_model ? std::min(options.local_search_iterations, 2)
-                                : options.local_search_iterations;
+    const int max_iterations = expensive_integer_model
+                                   ? std::min(options.local_search_iterations, 2)
+                                   : options.local_search_iterations;
     double best_objective = incumbent_objective;
     for (int iteration = 0; iteration < max_iterations; ++iteration) {
         Eigen::VectorXd lower = problem.lower_bounds;
@@ -1666,8 +1722,8 @@ run_local_branching_heuristic(const Problem& problem, const Options& options,
     }
     Eigen::VectorXd lower = problem.lower_bounds;
     Eigen::VectorXd upper = problem.upper_bounds;
-    const int max_fix_agree = static_cast<int>(std::round(
-        options.local_branching_fix_agree_ratio * agreeing_integer_indices.size()));
+    const int max_fix_agree = static_cast<int>(
+        std::round(options.local_branching_fix_agree_ratio * agreeing_integer_indices.size()));
     int fixed_agree = 0;
     for (const int index : agreeing_integer_indices) {
         if (fixed_agree >= max_fix_agree) {
@@ -1702,9 +1758,8 @@ run_local_branching_heuristic(const Problem& problem, const Options& options,
     improving_cut.cut_type = "LocalBranchingObjective";
     improving_cut.sense =
         problem.maximize ? LinearConstraintSense::GreaterEqual : LinearConstraintSense::LessEqual;
-    improving_cut.rhs =
-        incumbent_objective - problem.objective_constant +
-        (problem.maximize ? options.integrality_tol : -options.integrality_tol);
+    improving_cut.rhs = incumbent_objective - problem.objective_constant +
+                        (problem.maximize ? options.integrality_tol : -options.integrality_tol);
     for (int j = 0; j < problem.objective_coefficients.size(); ++j) {
         const double coeff = problem.objective_coefficients(j);
         if (std::abs(coeff) <= 1e-12) {

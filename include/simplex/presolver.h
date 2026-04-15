@@ -349,14 +349,14 @@ class Presolver {
         double dual_fix_tol = 1e-10;
 
         // passes
-        int max_passes = 3;           // Reduced from 5
-        bool enable_rowreduce = false; // DISABLED by default for speed (turn ON for max reduction)
-        bool enable_scaling = true;   // row scaling only
+        int max_passes = 3;             // Reduced from 5
+        bool enable_rowreduce = false;  // DISABLED by default for speed (turn ON for max reduction)
+        bool enable_scaling = true;     // row scaling only
         bool enable_col_scaling = true; // OFF in non-destructive mode
         bool enable_dual_fixing = true;
 
         // behavior
-        bool non_destructive = true;          // DEFAULT: keep ranking stable for BNB
+        bool non_destructive = true;           // DEFAULT: keep ranking stable for BNB
         bool allow_structural_changes = false; // DEFAULT: OFF for speed (turn ON for max reduction)
 
         // row-reduce
@@ -367,15 +367,15 @@ class Presolver {
         // conservative extras
         bool classic_row_reduce = true;
         bool conservative_mode = false;
-        bool enable_huge_bound_relaxation = false;  // DISABLED by default for speed
+        bool enable_huge_bound_relaxation = false; // DISABLED by default for speed
         double huge_bound_factor = 1e6;
         double huge_bound_relax_gap = 1e6;
 
         // light objective-guided probing
-        bool enable_objective_probing = false;  // DISABLED by default for speed
-        int probing_max_vars = 3;               // Reduce from 6
-        int probing_max_rounds = 1;             // Reduce from 2
-        double probing_obj_tol = 1e-6;          // Relax tolerance
+        bool enable_objective_probing = false; // DISABLED by default for speed
+        int probing_max_vars = 3;              // Reduce from 6
+        int probing_max_rounds = 1;            // Reduce from 2
+        double probing_obj_tol = 1e-6;         // Relax tolerance
     };
 
     Presolver() : opt_() { domprop_min_delta_ = 1e3 * opt_.infeas_tol; }
@@ -458,6 +458,11 @@ class Presolver {
             // Zero-rows only (safe)
             changed |= remove_free_zero_rows(P);
             if (res_.proven_infeasible)
+                break;
+
+            // Zero-columns with no constraints can often be fixed directly.
+            changed |= remove_free_zero_columns(P);
+            if (res_.proven_unbounded || res_.proven_infeasible)
                 break;
 
             // Fixed variable handling:
@@ -864,6 +869,59 @@ class Presolver {
                 changed = true;
             } else
                 ++i;
+        }
+        return changed;
+    }
+
+    bool remove_free_zero_columns(LP& P) {
+        bool changed = false;
+        for (int j = 0; j < (int)P.A.cols();) {
+            if (j >= (int)P.A.cols())
+                break;
+            const auto col = P.A.col(j);
+            if (safe_abs_max(col) <= opt_.zero_tol) {
+                const double cj = P.c(j);
+                const bool has_l = is_finite(P.l(j));
+                const bool has_u = is_finite(P.u(j));
+                double xfix = std::numeric_limits<double>::quiet_NaN();
+                if (cj > opt_.zero_tol && has_l) {
+                    xfix = P.l(j);
+                } else if (cj < -opt_.zero_tol && has_u) {
+                    xfix = P.u(j);
+                } else if (std::abs(cj) <= opt_.zero_tol) {
+                    if (has_l)
+                        xfix = P.l(j);
+                    else if (has_u)
+                        xfix = P.u(j);
+                }
+                if (!is_finite(xfix)) {
+                    if ((cj > opt_.zero_tol && !has_l) || (cj < -opt_.zero_tol && !has_u)) {
+                        res_.proven_unbounded = true;
+                        return true;
+                    }
+                    ++j;
+                    continue;
+                }
+
+                if (opt_.allow_structural_changes && !opt_.non_destructive) {
+                    if (apply_structural_fix(P, j, xfix))
+                        return true;
+                    changed = true;
+                    --j;
+                    continue;
+                }
+
+                const double oldL = P.l(j);
+                const double oldU = P.u(j);
+                res_.stack.emplace_back(ActTightenBound{j, oldL, oldU});
+                P.l(j) = xfix;
+                P.u(j) = xfix;
+                P.A.col(j).setZero();
+                changed = true;
+                ++j;
+            } else {
+                ++j;
+            }
         }
         return changed;
     }

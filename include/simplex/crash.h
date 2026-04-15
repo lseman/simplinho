@@ -61,8 +61,8 @@ RevisedSimplex::evaluate_basis_quality_(const Eigen::MatrixXd& A, const Eigen::V
         if (sanity_x.size() != m || !sanity_x.allFinite())
             return q;
         const Eigen::VectorXd sanity_residual = rhs - B * sanity_x;
-        q.solve_residual =
-            sanity_residual.lpNorm<Eigen::Infinity>() / std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
+        q.solve_residual = sanity_residual.lpNorm<Eigen::Infinity>() /
+                           std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
     }
     q.primal_violation = positive_violation_max_(-xB, tol);
     q.primal_feasible = xB.allFinite() && q.primal_violation <= tol;
@@ -141,8 +141,8 @@ RevisedSimplex::evaluate_basis_quality_(const SparseMatrix& A, const Eigen::Vect
         if (sanity_x.size() != m || lu.info() != Eigen::Success || !sanity_x.allFinite())
             return q;
         const Eigen::VectorXd sanity_residual = rhs - B * sanity_x;
-        q.solve_residual =
-            sanity_residual.lpNorm<Eigen::Infinity>() / std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
+        q.solve_residual = sanity_residual.lpNorm<Eigen::Infinity>() /
+                           std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
     }
     q.primal_violation = positive_violation_max_(-xB, tol);
     q.primal_feasible = xB.allFinite() && q.primal_violation <= tol;
@@ -307,7 +307,7 @@ RevisedSimplex::crash_attempt_config_(const RevisedSimplexOptions& opt, int atte
             cfg.rhs_bonus = 0.45;
             cfg.dense_penalty = 0.25;
             cfg.coverage_weight = 1.20;
-            cfg.seed_penalty = 6.0;
+            cfg.seed_penalty = 10.0;
             cfg.local_search_passes = 2;
             cfg.max_swap_candidates = 12;
             cfg.prefer_seed_columns = true;
@@ -489,9 +489,19 @@ inline bool RevisedSimplex::try_add_basis_column_(const SparseMatrix& A, std::ve
     return true;
 }
 
+inline double RevisedSimplex::seed_column_bonus_(int col, const std::vector<char>& seeded,
+                                                 const CrashAttemptConfig& cfg) {
+    if (!cfg.prefer_seed_columns || seeded.empty())
+        return 0.0;
+    if (col < 0 || col >= (int)seeded.size())
+        return 0.0;
+    return seeded[col] ? cfg.seed_penalty : 0.0;
+}
+
 inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_slack_like_column_(
     const Eigen::MatrixXd& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
-    const std::vector<char>& used_row, const std::vector<char>& used_col) {
+    const std::vector<char>& used_row, const std::vector<char>& used_col,
+    const std::vector<char>& seeded, const CrashAttemptConfig& cfg) {
     CrashCandidate best;
     const int m = static_cast<int>(A.rows());
     const int n = static_cast<int>(A.cols());
@@ -550,6 +560,7 @@ inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_slack_like_column_(
         score += 10.0 / (1.0 + static_cast<double>(row_nnz));
         score -= 0.02 * (std::abs(c(j)) / c_scale);
         score -= 0.01 * static_cast<double>(j);
+        score += seed_column_bonus_(j, seeded, cfg);
 
         if (score > best.score) {
             best = {j, pivot_row, score};
@@ -560,7 +571,8 @@ inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_slack_like_column_(
 
 inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_slack_like_column_(
     const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
-    const std::vector<char>& used_row, const std::vector<char>& used_col) {
+    const std::vector<char>& used_row, const std::vector<char>& used_col,
+    const std::vector<char>& seeded, const CrashAttemptConfig& cfg) {
     CrashCandidate best;
     const int n = static_cast<int>(A.cols());
     double c_scale = 1.0;
@@ -622,6 +634,7 @@ inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_slack_like_column_(
         score += 10.0 / (1.0 + static_cast<double>(row_nnz));
         score -= 0.02 * (std::abs(c(j)) / c_scale);
         score -= 0.01 * static_cast<double>(j);
+        score += seed_column_bonus_(j, seeded, cfg);
 
         if (score > best.score) {
             best = {j, pivot_row, score};
@@ -633,7 +646,7 @@ inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_slack_like_column_(
 inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_free_like_column_(
     const Eigen::MatrixXd& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
     const std::vector<char>& used_row, const std::vector<char>& used_col,
-    const CrashAttemptConfig& cfg) {
+    const std::vector<char>& seeded, const CrashAttemptConfig& cfg) {
     CrashCandidate best;
     const int m = static_cast<int>(A.rows());
     const int n = static_cast<int>(A.cols());
@@ -662,9 +675,10 @@ inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_free_like_column_(
         if (pivot_row < 0 || pivot_abs <= 1e-12)
             continue;
 
-        const double score = 200.0 / (1.0 + static_cast<double>(nnz)) + 30.0 * pivot_abs -
-                             25.0 * (std::abs(c(j)) / c_scale) - 0.01 * static_cast<double>(j) +
-                             cfg.jitter;
+        double score = 200.0 / (1.0 + static_cast<double>(nnz)) + 30.0 * pivot_abs -
+                       25.0 * (std::abs(c(j)) / c_scale) - 0.01 * static_cast<double>(j) +
+                       cfg.jitter;
+        score += seed_column_bonus_(j, seeded, cfg);
         if (score > best.score) {
             best = {j, pivot_row, score};
         }
@@ -675,7 +689,7 @@ inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_free_like_column_(
 inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_free_like_column_(
     const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
     const std::vector<char>& used_row, const std::vector<char>& used_col,
-    const CrashAttemptConfig& cfg) {
+    const std::vector<char>& seeded, const CrashAttemptConfig& cfg) {
     CrashCandidate best;
     const int m = static_cast<int>(A.rows());
     const int n = static_cast<int>(A.cols());
@@ -704,9 +718,10 @@ inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_free_like_column_(
         if (pivot_row < 0 || pivot_abs <= 1e-12)
             continue;
 
-        const double score = 200.0 / (1.0 + static_cast<double>(nnz)) + 30.0 * pivot_abs -
-                             25.0 * (std::abs(c(j)) / c_scale) - 0.01 * static_cast<double>(j) +
-                             cfg.jitter;
+        double score = 200.0 / (1.0 + static_cast<double>(nnz)) + 30.0 * pivot_abs -
+                       25.0 * (std::abs(c(j)) / c_scale) - 0.01 * static_cast<double>(j) +
+                       cfg.jitter;
+        score += seed_column_bonus_(j, seeded, cfg);
         if (score > best.score) {
             best = {j, pivot_row, score};
         }
@@ -714,11 +729,10 @@ inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_free_like_column_(
     return best;
 }
 
-inline RevisedSimplex::CrashCandidate
-RevisedSimplex::choose_sprint_column_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
-                                      const Eigen::VectorXd& c, const std::vector<char>& used_row,
-                                      const std::vector<char>& used_col,
-                                      const CrashAttemptConfig& cfg) {
+inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_sprint_column_(
+    const Eigen::MatrixXd& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
+    const std::vector<char>& used_row, const std::vector<char>& used_col,
+    const std::vector<char>& seeded, const CrashAttemptConfig& cfg) {
     CrashCandidate best;
     const int m = static_cast<int>(A.rows());
     const int n = static_cast<int>(A.cols());
@@ -754,9 +768,10 @@ RevisedSimplex::choose_sprint_column_(const Eigen::MatrixXd& A, const Eigen::Vec
         const double sparsity_bonus = 1.0 / (1.0 + total_nnz);
         const double rhs_bonus = (b(pivot_row) >= -1e-10) ? cfg.rhs_bonus : 0.0;
         const double cost_penalty = cfg.cost_penalty * (std::abs(c(j)) / c_scale);
+        const double seed_bonus = seed_column_bonus_(j, seeded, cfg);
         const double jitter = cfg.jitter * std::cos(static_cast<double>((j + 1) * (pivot_row + 1)));
         const double score = 90.0 * cfg.coverage_weight * coverage + 25.0 * sparsity_bonus +
-                             5.0 * pivot_abs + rhs_bonus - cost_penalty -
+                             5.0 * pivot_abs + rhs_bonus + seed_bonus - cost_penalty -
                              0.001 * static_cast<double>(j) + jitter;
         if (score > best.score)
             best = {j, pivot_row, score};
@@ -764,11 +779,10 @@ RevisedSimplex::choose_sprint_column_(const Eigen::MatrixXd& A, const Eigen::Vec
     return best;
 }
 
-inline RevisedSimplex::CrashCandidate
-RevisedSimplex::choose_sprint_column_(const SparseMatrix& A, const Eigen::VectorXd& b,
-                                      const Eigen::VectorXd& c, const std::vector<char>& used_row,
-                                      const std::vector<char>& used_col,
-                                      const CrashAttemptConfig& cfg) {
+inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_sprint_column_(
+    const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
+    const std::vector<char>& used_row, const std::vector<char>& used_col,
+    const std::vector<char>& seeded, const CrashAttemptConfig& cfg) {
     CrashCandidate best;
     const int n = static_cast<int>(A.cols());
     double c_scale = 1.0;
@@ -806,9 +820,10 @@ RevisedSimplex::choose_sprint_column_(const SparseMatrix& A, const Eigen::Vector
         const double rhs_bonus =
             (pivot_row < b.size() && b(pivot_row) >= -1e-10) ? cfg.rhs_bonus : 0.0;
         const double cost_penalty = cfg.cost_penalty * (std::abs(c(j)) / c_scale);
+        const double seed_bonus = seed_column_bonus_(j, seeded, cfg);
         const double jitter = cfg.jitter * std::cos(static_cast<double>((j + 1) * (pivot_row + 1)));
         const double score = 90.0 * cfg.coverage_weight * coverage + 25.0 * sparsity_bonus +
-                             5.0 * pivot_abs + rhs_bonus - cost_penalty -
+                             5.0 * pivot_abs + rhs_bonus + seed_bonus - cost_penalty -
                              0.001 * static_cast<double>(j) + jitter;
         if (score > best.score)
             best = {j, pivot_row, score};
@@ -882,7 +897,7 @@ inline std::vector<int> RevisedSimplex::find_logical_basis_(const SparseMatrix& 
 inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_triangular_column_(
     const Eigen::MatrixXd& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
     const std::vector<char>& used_row, const std::vector<char>& used_col,
-    const CrashAttemptConfig& cfg) {
+    const std::vector<char>& seeded, const CrashAttemptConfig& cfg) {
     CrashCandidate best;
     const int m = static_cast<int>(A.rows());
     const int n = static_cast<int>(A.cols());
@@ -953,12 +968,13 @@ inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_triangular_column_(
                                                              std::max(0, uncovered_nnz - 1));
         const double markowitz_bonus = 1.0 / (1.0 + markowitz_penalty);
         const double dense_penalty = cfg.dense_penalty * (covered_sum / std::max(1e-12, pivot_abs));
+        const double seed_bonus = seed_column_bonus_(j, seeded, cfg);
         const double jitter = cfg.jitter * std::sin(static_cast<double>((j + 1) * (pivot_row + 1)));
 
         const double score = 100.0 * dominance * cfg.coverage_weight + 30.0 * triangularity +
                              25.0 * markowitz_bonus + 15.0 * sparsity_bonus + 10.0 * row_bonus +
-                             10.0 * col_bonus + rhs_bonus - cost_penalty - dense_penalty -
-                             0.001 * static_cast<double>(j) + jitter;
+                             10.0 * col_bonus + rhs_bonus - cost_penalty - dense_penalty +
+                             seed_bonus - 0.001 * static_cast<double>(j) + jitter;
         if (score > best.score) {
             best = {j, pivot_row, score};
         }
@@ -969,7 +985,7 @@ inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_triangular_column_(
 inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_triangular_column_(
     const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
     const std::vector<char>& used_row, const std::vector<char>& used_col,
-    const CrashAttemptConfig& cfg) {
+    const std::vector<char>& seeded, const CrashAttemptConfig& cfg) {
     CrashCandidate best;
     const int m = static_cast<int>(A.rows());
     const int n = static_cast<int>(A.cols());
@@ -1031,19 +1047,20 @@ inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_triangular_column_(
         const double sparsity_bonus = 1.0 / (1.0 + total_nnz);
         const double row_bonus = 5.0 / (1.0 + static_cast<double>(row_nnz[pivot_row]));
         const double col_bonus = 5.0 / (1.0 + static_cast<double>(col_nnz[j]));
-        const double rhs_bonus = (pivot_row < b.size() && b(pivot_row) >= -1e-10) ? cfg.rhs_bonus
-                                                                                    : 0.0;
+        const double rhs_bonus =
+            (pivot_row < b.size() && b(pivot_row) >= -1e-10) ? cfg.rhs_bonus : 0.0;
         const double cost_penalty = cfg.cost_penalty * (std::abs(c(j)) / c_scale);
         const double markowitz_penalty = static_cast<double>(std::max(0, row_nnz[pivot_row] - 1) *
                                                              std::max(0, uncovered_nnz - 1));
         const double markowitz_bonus = 1.0 / (1.0 + markowitz_penalty);
         const double dense_penalty = cfg.dense_penalty * (covered_sum / std::max(1e-12, pivot_abs));
+        const double seed_bonus = seed_column_bonus_(j, seeded, cfg);
         const double jitter = cfg.jitter * std::sin(static_cast<double>((j + 1) * (pivot_row + 1)));
 
         const double score = 100.0 * dominance * cfg.coverage_weight + 30.0 * triangularity +
                              25.0 * markowitz_bonus + 15.0 * sparsity_bonus + 10.0 * row_bonus +
-                             10.0 * col_bonus + rhs_bonus - cost_penalty - dense_penalty -
-                             0.001 * static_cast<double>(j) + jitter;
+                             10.0 * col_bonus + rhs_bonus - cost_penalty - dense_penalty +
+                             seed_bonus - 0.001 * static_cast<double>(j) + jitter;
         if (score > best.score) {
             best = {j, pivot_row, score};
         }
@@ -1054,6 +1071,7 @@ inline RevisedSimplex::CrashCandidate RevisedSimplex::choose_triangular_column_(
 inline std::vector<int> RevisedSimplex::rank_remaining_columns_(const Eigen::MatrixXd& A,
                                                                 const Eigen::VectorXd& c,
                                                                 const std::vector<char>& used_col,
+                                                                const std::vector<char>& seeded,
                                                                 const CrashAttemptConfig& cfg) {
     std::vector<int> ranked;
     ranked.reserve(A.cols());
@@ -1069,9 +1087,11 @@ inline std::vector<int> RevisedSimplex::rank_remaining_columns_(const Eigen::Mat
     }
     std::sort(ranked.begin(), ranked.end(), [&](int a, int b_idx) {
         const double score_a = col_nnz[a] + cfg.cost_penalty * std::abs(c(a)) +
-                               cfg.jitter * std::sin(static_cast<double>(a + 1));
+                               cfg.jitter * std::sin(static_cast<double>(a + 1)) +
+                               seed_column_bonus_(a, seeded, cfg);
         const double score_b = col_nnz[b_idx] + cfg.cost_penalty * std::abs(c(b_idx)) +
-                               cfg.jitter * std::sin(static_cast<double>(b_idx + 1));
+                               cfg.jitter * std::sin(static_cast<double>(b_idx + 1)) +
+                               seed_column_bonus_(b_idx, seeded, cfg);
         if (std::abs(score_a - score_b) > 1e-12)
             return score_a < score_b;
         return a < b_idx;
@@ -1082,6 +1102,7 @@ inline std::vector<int> RevisedSimplex::rank_remaining_columns_(const Eigen::Mat
 inline std::vector<int> RevisedSimplex::rank_remaining_columns_(const SparseMatrix& A,
                                                                 const Eigen::VectorXd& c,
                                                                 const std::vector<char>& used_col,
+                                                                const std::vector<char>& seeded,
                                                                 const CrashAttemptConfig& cfg) {
     std::vector<int> ranked;
     ranked.reserve(A.cols());
@@ -1100,9 +1121,11 @@ inline std::vector<int> RevisedSimplex::rank_remaining_columns_(const SparseMatr
     }
     std::sort(ranked.begin(), ranked.end(), [&](int a, int b_idx) {
         const double score_a = col_nnz[a] + cfg.cost_penalty * std::abs(c(a)) +
-                               cfg.jitter * std::sin(static_cast<double>(a + 1));
+                               cfg.jitter * std::sin(static_cast<double>(a + 1)) +
+                               seed_column_bonus_(a, seeded, cfg);
         const double score_b = col_nnz[b_idx] + cfg.cost_penalty * std::abs(c(b_idx)) +
-                               cfg.jitter * std::sin(static_cast<double>(b_idx + 1));
+                               cfg.jitter * std::sin(static_cast<double>(b_idx + 1)) +
+                               seed_column_bonus_(b_idx, seeded, cfg);
         if (std::abs(score_a - score_b) > 1e-12)
             return score_a < score_b;
         return a < b_idx;
@@ -1342,10 +1365,13 @@ RevisedSimplex::build_basis_attempt_(const Eigen::MatrixXd& A, const Eigen::Vect
     std::vector<int> basis;
     basis.reserve(m);
     std::vector<char> used_row(m, 0), used_col(n, 0);
+    std::vector<char> seeded(n, 0);
     int current_rank = 0;
 
     if (seed_basis) {
         for (int j : *seed_basis) {
+            if (j >= 0 && j < n)
+                seeded[j] = 1;
             if ((int)basis.size() == m)
                 break;
             (void)try_add_basis_column_(A, basis, used_row, used_col, current_rank, j, -1, tol);
@@ -1353,7 +1379,8 @@ RevisedSimplex::build_basis_attempt_(const Eigen::MatrixXd& A, const Eigen::Vect
     }
 
     while ((int)basis.size() < m) {
-        const CrashCandidate cand = choose_free_like_column_(A, b, c, used_row, used_col, cfg);
+        const CrashCandidate cand =
+            choose_free_like_column_(A, b, c, used_row, used_col, seeded, cfg);
         if (cand.col < 0)
             break;
         if (!try_add_basis_column_(A, basis, used_row, used_col, current_rank, cand.col,
@@ -1363,7 +1390,8 @@ RevisedSimplex::build_basis_attempt_(const Eigen::MatrixXd& A, const Eigen::Vect
     }
 
     while ((int)basis.size() < m) {
-        const CrashCandidate cand = choose_slack_like_column_(A, b, c, used_row, used_col);
+        const CrashCandidate cand =
+            choose_slack_like_column_(A, b, c, used_row, used_col, seeded, cfg);
         if (cand.col < 0)
             break;
         if (!try_add_basis_column_(A, basis, used_row, used_col, current_rank, cand.col,
@@ -1374,7 +1402,8 @@ RevisedSimplex::build_basis_attempt_(const Eigen::MatrixXd& A, const Eigen::Vect
 
     if (cfg.style == CrashStyle::Sprint) {
         while ((int)basis.size() < m) {
-            const CrashCandidate cand = choose_sprint_column_(A, b, c, used_row, used_col, cfg);
+            const CrashCandidate cand =
+                choose_sprint_column_(A, b, c, used_row, used_col, seeded, cfg);
             if (cand.col < 0)
                 break;
             if (!try_add_basis_column_(A, basis, used_row, used_col, current_rank, cand.col,
@@ -1385,7 +1414,8 @@ RevisedSimplex::build_basis_attempt_(const Eigen::MatrixXd& A, const Eigen::Vect
     }
 
     while ((int)basis.size() < m) {
-        const CrashCandidate cand = choose_triangular_column_(A, b, c, used_row, used_col, cfg);
+        const CrashCandidate cand =
+            choose_triangular_column_(A, b, c, used_row, used_col, seeded, cfg);
         if (cand.col < 0)
             break;
         if (!try_add_basis_column_(A, basis, used_row, used_col, current_rank, cand.col,
@@ -1395,7 +1425,7 @@ RevisedSimplex::build_basis_attempt_(const Eigen::MatrixXd& A, const Eigen::Vect
     }
 
     if ((int)basis.size() < m) {
-        for (int j : rank_remaining_columns_(A, c, used_col, cfg)) {
+        for (int j : rank_remaining_columns_(A, c, used_col, seeded, cfg)) {
             if ((int)basis.size() == m)
                 break;
             (void)try_add_basis_column_(A, basis, used_row, used_col, current_rank, j, -1, tol);
@@ -1422,10 +1452,13 @@ RevisedSimplex::build_basis_attempt_(const SparseMatrix& A, const Eigen::VectorX
     std::vector<int> basis;
     basis.reserve(m);
     std::vector<char> used_row(m, 0), used_col(n, 0);
+    std::vector<char> seeded(n, 0);
     int current_rank = 0;
 
     if (seed_basis) {
         for (int j : *seed_basis) {
+            if (j >= 0 && j < n)
+                seeded[j] = 1;
             if ((int)basis.size() == m)
                 break;
             (void)try_add_basis_column_(A, basis, used_row, used_col, current_rank, j, -1, tol);
@@ -1433,7 +1466,8 @@ RevisedSimplex::build_basis_attempt_(const SparseMatrix& A, const Eigen::VectorX
     }
 
     while ((int)basis.size() < m) {
-        const CrashCandidate cand = choose_free_like_column_(A, b, c, used_row, used_col, cfg);
+        const CrashCandidate cand =
+            choose_free_like_column_(A, b, c, used_row, used_col, seeded, cfg);
         if (cand.col < 0)
             break;
         if (!try_add_basis_column_(A, basis, used_row, used_col, current_rank, cand.col,
@@ -1443,7 +1477,8 @@ RevisedSimplex::build_basis_attempt_(const SparseMatrix& A, const Eigen::VectorX
     }
 
     while ((int)basis.size() < m) {
-        const CrashCandidate cand = choose_slack_like_column_(A, b, c, used_row, used_col);
+        const CrashCandidate cand =
+            choose_slack_like_column_(A, b, c, used_row, used_col, seeded, cfg);
         if (cand.col < 0)
             break;
         if (!try_add_basis_column_(A, basis, used_row, used_col, current_rank, cand.col,
@@ -1454,7 +1489,8 @@ RevisedSimplex::build_basis_attempt_(const SparseMatrix& A, const Eigen::VectorX
 
     if (cfg.style == CrashStyle::Sprint) {
         while ((int)basis.size() < m) {
-            const CrashCandidate cand = choose_sprint_column_(A, b, c, used_row, used_col, cfg);
+            const CrashCandidate cand =
+                choose_sprint_column_(A, b, c, used_row, used_col, seeded, cfg);
             if (cand.col < 0)
                 break;
             if (!try_add_basis_column_(A, basis, used_row, used_col, current_rank, cand.col,
@@ -1465,7 +1501,8 @@ RevisedSimplex::build_basis_attempt_(const SparseMatrix& A, const Eigen::VectorX
     }
 
     while ((int)basis.size() < m) {
-        const CrashCandidate cand = choose_triangular_column_(A, b, c, used_row, used_col, cfg);
+        const CrashCandidate cand =
+            choose_triangular_column_(A, b, c, used_row, used_col, seeded, cfg);
         if (cand.col < 0)
             break;
         if (!try_add_basis_column_(A, basis, used_row, used_col, current_rank, cand.col,
@@ -1475,7 +1512,7 @@ RevisedSimplex::build_basis_attempt_(const SparseMatrix& A, const Eigen::VectorX
     }
 
     if ((int)basis.size() < m) {
-        for (int j : rank_remaining_columns_(A, c, used_col, cfg)) {
+        for (int j : rank_remaining_columns_(A, c, used_col, seeded, cfg)) {
             if ((int)basis.size() == m)
                 break;
             (void)try_add_basis_column_(A, basis, used_row, used_col, current_rank, j, -1, tol);
@@ -1490,7 +1527,8 @@ RevisedSimplex::build_basis_attempt_(const SparseMatrix& A, const Eigen::VectorX
 inline RevisedSimplex::CrashSelection
 RevisedSimplex::choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                                       const Eigen::VectorXd& c, const RevisedSimplexOptions& opt,
-                                      std::optional<std::vector<int>> seed_basis) {
+                                      std::optional<std::vector<int>> seed_basis,
+                                      bool allow_direct_warm_start) {
     CrashSelection best;
 
     auto consider = [&](std::vector<int> candidate, std::string source, int attempt) {
@@ -1531,7 +1569,7 @@ RevisedSimplex::choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::Vec
     };
 
     if (seed_basis && !seed_basis->empty()) {
-        if ((int)seed_basis->size() == A.rows()) {
+        if (allow_direct_warm_start && (int)seed_basis->size() == A.rows()) {
             consider(*seed_basis, "warm_start", -1);
             if (can_accept_early(best.quality)) {
                 return best;
@@ -1569,7 +1607,8 @@ RevisedSimplex::choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::Vec
 inline RevisedSimplex::CrashSelection
 RevisedSimplex::choose_initial_basis_(const SparseMatrix& A, const Eigen::VectorXd& b,
                                       const Eigen::VectorXd& c, const RevisedSimplexOptions& opt,
-                                      std::optional<std::vector<int>> seed_basis) {
+                                      std::optional<std::vector<int>> seed_basis,
+                                      bool allow_direct_warm_start) {
     CrashSelection best;
 
     auto consider = [&](std::vector<int> candidate, std::string source, int attempt) {
@@ -1610,7 +1649,7 @@ RevisedSimplex::choose_initial_basis_(const SparseMatrix& A, const Eigen::Vector
     };
 
     if (seed_basis && !seed_basis->empty()) {
-        if ((int)seed_basis->size() == A.rows()) {
+        if (allow_direct_warm_start && (int)seed_basis->size() == A.rows()) {
             consider(*seed_basis, "warm_start", -1);
             if (can_accept_early(best.quality)) {
                 return best;

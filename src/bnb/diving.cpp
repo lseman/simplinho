@@ -9,6 +9,11 @@
 namespace simplex::bnb::detail {
 namespace {
 
+struct BranchingDecision {
+    DivingChoice chosen;
+    std::optional<DivingChoice> alternate;
+};
+
 std::optional<RelaxationSolution>
 solve_child_relaxation(ChildState* state, const LPBasis* basis, int& lp_iterations, int& lp_solves,
                        const RelaxationSolveCallback& relaxation_solver) {
@@ -21,11 +26,11 @@ solve_child_relaxation(ChildState* state, const LPBasis* basis, int& lp_iteratio
     return child;
 }
 
-DivingChoice select_objective_diving_choice(const ActiveNode& node,
-                                            const FractionalCandidate& candidate,
-                                            const Problem& problem, int& lp_iterations,
-                                            int& lp_solves,
-                                            const RelaxationSolveCallback& relaxation_solver) {
+BranchingDecision select_objective_diving_choice(const ActiveNode& node,
+                                                 const FractionalCandidate& candidate,
+                                                 const Problem& problem, int& lp_iterations,
+                                                 int& lp_solves,
+                                                 const RelaxationSolveCallback& relaxation_solver) {
     DivingChoice floor_choice{make_child_state(node, candidate.variable, false, candidate.value),
                               std::nullopt};
     DivingChoice ceil_choice{make_child_state(node, candidate.variable, true, candidate.value),
@@ -38,29 +43,47 @@ DivingChoice select_objective_diving_choice(const ActiveNode& node,
         solve_child_relaxation(&ceil_choice.state, node.basis ? &*node.basis : nullptr,
                                lp_iterations, lp_solves, relaxation_solver);
 
-    const bool floor_opt = floor_choice.relaxation->status == RelaxationStatus::Optimal;
-    const bool ceil_opt = ceil_choice.relaxation->status == RelaxationStatus::Optimal;
+    BranchingDecision decision;
+    const bool floor_opt = floor_choice.relaxation.has_value() &&
+                           floor_choice.relaxation->status == RelaxationStatus::Optimal;
+    const bool ceil_opt = ceil_choice.relaxation.has_value() &&
+                          ceil_choice.relaxation->status == RelaxationStatus::Optimal;
     if (floor_opt && ceil_opt) {
-        return objective_improves_for_problem(floor_choice.relaxation->objective,
-                                              ceil_choice.relaxation->objective, problem.maximize,
-                                              1e-12)
-                   ? floor_choice
-                   : ceil_choice;
+        if (objective_improves_for_problem(floor_choice.relaxation->objective,
+                                           ceil_choice.relaxation->objective, problem.maximize,
+                                           1e-12)) {
+            decision.chosen = std::move(floor_choice);
+            decision.alternate = std::move(ceil_choice);
+        } else {
+            decision.chosen = std::move(ceil_choice);
+            decision.alternate = std::move(floor_choice);
+        }
+        return decision;
     }
     if (floor_opt) {
-        return floor_choice;
+        decision.chosen = std::move(floor_choice);
+        decision.alternate = std::move(ceil_choice);
+        return decision;
     }
     if (ceil_opt) {
-        return ceil_choice;
+        decision.chosen = std::move(ceil_choice);
+        decision.alternate = std::move(floor_choice);
+        return decision;
     }
-    return candidate.down_distance <= candidate.up_distance ? floor_choice : ceil_choice;
+    if (candidate.down_distance <= candidate.up_distance) {
+        decision.chosen = std::move(floor_choice);
+        decision.alternate = std::move(ceil_choice);
+    } else {
+        decision.chosen = std::move(ceil_choice);
+        decision.alternate = std::move(floor_choice);
+    }
+    return decision;
 }
 
-DivingChoice select_coefficient_diving_choice(const ActiveNode& node,
-                                              const FractionalCandidate& candidate,
-                                              const Problem& problem, int& lp_iterations,
-                                              int& lp_solves,
-                                              const RelaxationSolveCallback& relaxation_solver) {
+BranchingDecision
+select_coefficient_diving_choice(const ActiveNode& node, const FractionalCandidate& candidate,
+                                 const Problem& problem, int& lp_iterations, int& lp_solves,
+                                 const RelaxationSolveCallback& relaxation_solver) {
     DivingChoice floor_choice{
         make_fixed_child_state(node, candidate.variable, false, candidate.value), std::nullopt};
     DivingChoice ceil_choice{
@@ -73,74 +96,138 @@ DivingChoice select_coefficient_diving_choice(const ActiveNode& node,
         solve_child_relaxation(&ceil_choice.state, node.basis ? &*node.basis : nullptr,
                                lp_iterations, lp_solves, relaxation_solver);
 
-    const bool floor_opt = floor_choice.relaxation->status == RelaxationStatus::Optimal;
-    const bool ceil_opt = ceil_choice.relaxation->status == RelaxationStatus::Optimal;
+    BranchingDecision decision;
+    const bool floor_opt = floor_choice.relaxation.has_value() &&
+                           floor_choice.relaxation->status == RelaxationStatus::Optimal;
+    const bool ceil_opt = ceil_choice.relaxation.has_value() &&
+                          ceil_choice.relaxation->status == RelaxationStatus::Optimal;
     if (floor_opt && ceil_opt) {
-        return objective_improves_for_problem(floor_choice.relaxation->objective,
-                                              ceil_choice.relaxation->objective, problem.maximize,
-                                              1e-12)
-                   ? floor_choice
-                   : ceil_choice;
+        if (objective_improves_for_problem(floor_choice.relaxation->objective,
+                                           ceil_choice.relaxation->objective, problem.maximize,
+                                           1e-12)) {
+            decision.chosen = std::move(floor_choice);
+            decision.alternate = std::move(ceil_choice);
+        } else {
+            decision.chosen = std::move(ceil_choice);
+            decision.alternate = std::move(floor_choice);
+        }
+        return decision;
     }
     if (floor_opt) {
-        return floor_choice;
+        decision.chosen = std::move(floor_choice);
+        decision.alternate = std::move(ceil_choice);
+        return decision;
     }
     if (ceil_opt) {
-        return ceil_choice;
+        decision.chosen = std::move(ceil_choice);
+        decision.alternate = std::move(floor_choice);
+        return decision;
     }
 
     if (candidate.variable < problem.objective_coefficients.size()) {
         const double coeff = problem.objective_coefficients(candidate.variable);
         const bool prefer_ceil = problem.maximize ? (coeff >= 0.0) : (coeff < 0.0);
-        return prefer_ceil ? ceil_choice : floor_choice;
+        if (prefer_ceil) {
+            decision.chosen = std::move(ceil_choice);
+            decision.alternate = std::move(floor_choice);
+        } else {
+            decision.chosen = std::move(floor_choice);
+            decision.alternate = std::move(ceil_choice);
+        }
+        return decision;
     }
-    return candidate.down_distance <= candidate.up_distance ? floor_choice : ceil_choice;
+    if (candidate.down_distance <= candidate.up_distance) {
+        decision.chosen = std::move(floor_choice);
+        decision.alternate = std::move(ceil_choice);
+    } else {
+        decision.chosen = std::move(ceil_choice);
+        decision.alternate = std::move(floor_choice);
+    }
+    return decision;
 }
 
-DivingChoice select_fractional_diving_choice(const ActiveNode& node,
-                                             const FractionalCandidate& candidate,
-                                             int& lp_iterations, int& lp_solves,
-                                             const RelaxationSolveCallback& relaxation_solver) {
+BranchingDecision
+select_fractional_diving_choice(const ActiveNode& node, const FractionalCandidate& candidate,
+                                int& lp_iterations, int& lp_solves,
+                                const RelaxationSolveCallback& relaxation_solver) {
     const bool prefer_ceil = candidate.down_distance > candidate.up_distance;
-    DivingChoice preferred{make_child_state(node, candidate.variable, prefer_ceil, candidate.value),
-                           std::nullopt};
-    preferred.relaxation =
-        solve_child_relaxation(&preferred.state, node.basis ? &*node.basis : nullptr, lp_iterations,
-                               lp_solves, relaxation_solver);
-    if (preferred.relaxation->status == RelaxationStatus::Optimal) {
-        return preferred;
-    }
+    DivingChoice floor_choice{make_child_state(node, candidate.variable, false, candidate.value),
+                              std::nullopt};
+    DivingChoice ceil_choice{make_child_state(node, candidate.variable, true, candidate.value),
+                             std::nullopt};
+    floor_choice.relaxation =
+        solve_child_relaxation(&floor_choice.state, node.basis ? &*node.basis : nullptr,
+                               lp_iterations, lp_solves, relaxation_solver);
+    ceil_choice.relaxation =
+        solve_child_relaxation(&ceil_choice.state, node.basis ? &*node.basis : nullptr,
+                               lp_iterations, lp_solves, relaxation_solver);
 
-    DivingChoice alternate{
-        make_child_state(node, candidate.variable, !prefer_ceil, candidate.value), std::nullopt};
-    alternate.relaxation =
-        solve_child_relaxation(&alternate.state, node.basis ? &*node.basis : nullptr, lp_iterations,
-                               lp_solves, relaxation_solver);
-    return alternate;
+    BranchingDecision decision;
+    const bool floor_opt = floor_choice.relaxation.has_value() &&
+                           floor_choice.relaxation->status == RelaxationStatus::Optimal;
+    const bool ceil_opt = ceil_choice.relaxation.has_value() &&
+                          ceil_choice.relaxation->status == RelaxationStatus::Optimal;
+    if (floor_opt && ceil_opt) {
+        if (prefer_ceil) {
+            decision.chosen = std::move(ceil_choice);
+            decision.alternate = std::move(floor_choice);
+        } else {
+            decision.chosen = std::move(floor_choice);
+            decision.alternate = std::move(ceil_choice);
+        }
+        return decision;
+    }
+    if (prefer_ceil) {
+        decision.chosen = std::move(ceil_choice);
+        decision.alternate = std::move(floor_choice);
+    } else {
+        decision.chosen = std::move(floor_choice);
+        decision.alternate = std::move(ceil_choice);
+    }
+    return decision;
 }
 
-DivingChoice select_vector_length_diving_choice(const ActiveNode& node,
-                                                const FractionalCandidate& candidate,
-                                                int& lp_iterations, int& lp_solves,
-                                                const RelaxationSolveCallback& relaxation_solver) {
+BranchingDecision
+select_vector_length_diving_choice(const ActiveNode& node, const FractionalCandidate& candidate,
+                                   int& lp_iterations, int& lp_solves,
+                                   const RelaxationSolveCallback& relaxation_solver) {
     const double floor_score = candidate.down_distance * candidate.down_distance;
     const double ceil_score = candidate.up_distance * candidate.up_distance;
     const bool prefer_ceil = ceil_score < floor_score;
-    DivingChoice preferred{make_child_state(node, candidate.variable, prefer_ceil, candidate.value),
-                           std::nullopt};
-    preferred.relaxation =
-        solve_child_relaxation(&preferred.state, node.basis ? &*node.basis : nullptr, lp_iterations,
-                               lp_solves, relaxation_solver);
-    if (preferred.relaxation->status == RelaxationStatus::Optimal) {
-        return preferred;
-    }
+    DivingChoice floor_choice{make_child_state(node, candidate.variable, false, candidate.value),
+                              std::nullopt};
+    DivingChoice ceil_choice{make_child_state(node, candidate.variable, true, candidate.value),
+                             std::nullopt};
+    floor_choice.relaxation =
+        solve_child_relaxation(&floor_choice.state, node.basis ? &*node.basis : nullptr,
+                               lp_iterations, lp_solves, relaxation_solver);
+    ceil_choice.relaxation =
+        solve_child_relaxation(&ceil_choice.state, node.basis ? &*node.basis : nullptr,
+                               lp_iterations, lp_solves, relaxation_solver);
 
-    DivingChoice alternate{
-        make_child_state(node, candidate.variable, !prefer_ceil, candidate.value), std::nullopt};
-    alternate.relaxation =
-        solve_child_relaxation(&alternate.state, node.basis ? &*node.basis : nullptr, lp_iterations,
-                               lp_solves, relaxation_solver);
-    return alternate;
+    BranchingDecision decision;
+    const bool floor_opt = floor_choice.relaxation.has_value() &&
+                           floor_choice.relaxation->status == RelaxationStatus::Optimal;
+    const bool ceil_opt = ceil_choice.relaxation.has_value() &&
+                          ceil_choice.relaxation->status == RelaxationStatus::Optimal;
+    if (floor_opt && ceil_opt) {
+        if (prefer_ceil) {
+            decision.chosen = std::move(ceil_choice);
+            decision.alternate = std::move(floor_choice);
+        } else {
+            decision.chosen = std::move(floor_choice);
+            decision.alternate = std::move(ceil_choice);
+        }
+        return decision;
+    }
+    if (prefer_ceil) {
+        decision.chosen = std::move(ceil_choice);
+        decision.alternate = std::move(floor_choice);
+    } else {
+        decision.chosen = std::move(floor_choice);
+        decision.alternate = std::move(ceil_choice);
+    }
+    return decision;
 }
 
 const FractionalCandidate*
@@ -166,30 +253,42 @@ select_guided_diving_candidate(const std::vector<FractionalCandidate>& candidate
     return best != nullptr ? best : (candidates.empty() ? nullptr : &candidates.front());
 }
 
-DivingChoice select_guided_diving_choice(const ActiveNode& node,
-                                         const FractionalCandidate& candidate,
-                                         const Eigen::VectorXd* incumbent_primal,
-                                         int& lp_iterations, int& lp_solves,
-                                         const RelaxationSolveCallback& relaxation_solver) {
+BranchingDecision select_guided_diving_choice(const ActiveNode& node,
+                                              const FractionalCandidate& candidate,
+                                              const Eigen::VectorXd* incumbent_primal,
+                                              int& lp_iterations, int& lp_solves,
+                                              const RelaxationSolveCallback& relaxation_solver) {
     if (incumbent_primal != nullptr && candidate.variable >= 0 &&
         candidate.variable < incumbent_primal->size()) {
         const double target = std::round((*incumbent_primal)(candidate.variable));
         const bool branch_up = target > candidate.value;
-        DivingChoice preferred{
-            make_child_state(node, candidate.variable, branch_up, candidate.value), std::nullopt};
-        preferred.relaxation =
-            solve_child_relaxation(&preferred.state, node.basis ? &*node.basis : nullptr,
-                                   lp_iterations, lp_solves, relaxation_solver);
-        if (preferred.relaxation->status == RelaxationStatus::Optimal) {
-            return preferred;
+        DivingChoice floor_choice{
+            make_child_state(node, candidate.variable, false, candidate.value), std::nullopt};
+        DivingChoice ceil_choice{make_child_state(node, candidate.variable, true, candidate.value),
+                                 std::nullopt};
+        if (branch_up) {
+            ceil_choice.relaxation =
+                solve_child_relaxation(&ceil_choice.state, node.basis ? &*node.basis : nullptr,
+                                       lp_iterations, lp_solves, relaxation_solver);
+            floor_choice.relaxation =
+                solve_child_relaxation(&floor_choice.state, node.basis ? &*node.basis : nullptr,
+                                       lp_iterations, lp_solves, relaxation_solver);
+            BranchingDecision decision;
+            decision.chosen = std::move(ceil_choice);
+            decision.alternate = std::move(floor_choice);
+            return decision;
+        } else {
+            floor_choice.relaxation =
+                solve_child_relaxation(&floor_choice.state, node.basis ? &*node.basis : nullptr,
+                                       lp_iterations, lp_solves, relaxation_solver);
+            ceil_choice.relaxation =
+                solve_child_relaxation(&ceil_choice.state, node.basis ? &*node.basis : nullptr,
+                                       lp_iterations, lp_solves, relaxation_solver);
+            BranchingDecision decision;
+            decision.chosen = std::move(floor_choice);
+            decision.alternate = std::move(ceil_choice);
+            return decision;
         }
-
-        DivingChoice alternate{
-            make_child_state(node, candidate.variable, !branch_up, candidate.value), std::nullopt};
-        alternate.relaxation =
-            solve_child_relaxation(&alternate.state, node.basis ? &*node.basis : nullptr,
-                                   lp_iterations, lp_solves, relaxation_solver);
-        return alternate;
     }
 
     return select_fractional_diving_choice(node, candidate, lp_iterations, lp_solves,
@@ -290,7 +389,15 @@ DivingHeuristicResult run_diving_heuristic(const ActiveNode& start_node,
     RelaxationSolution current = start_relaxation;
     std::optional<DivingStrategy> last_used_strategy;
 
-    for (int depth = 0; depth < options.max_dive_depth; ++depth) {
+    struct DiveFrame {
+        ActiveNode node;
+        RelaxationSolution current;
+        BranchingDecision decision;
+    };
+    std::vector<DiveFrame> stack;
+    int depth = 0;
+
+    while (depth < options.max_dive_depth) {
         const auto candidates = collect_fractional_candidates(
             current.primal, problem.variable_types, options.integrality_tol);
         if (candidates.empty()) {
@@ -330,26 +437,26 @@ DivingHeuristicResult run_diving_heuristic(const ActiveNode& start_node,
                 return result;
             case DivingStrategy::Fractional:
                 choice = select_fractional_diving_choice(node, *candidate, result.lp_iterations,
-                                                         result.lp_solves, relaxation_solver);
+                                                         result.lp_solves, relaxation_solver).chosen;
                 break;
             case DivingStrategy::VectorLength:
                 choice = select_vector_length_diving_choice(node, *candidate, result.lp_iterations,
-                                                            result.lp_solves, relaxation_solver);
+                                                            result.lp_solves, relaxation_solver).chosen;
                 break;
             case DivingStrategy::ObjectiveValue:
                 choice =
                     select_objective_diving_choice(node, *candidate, problem, result.lp_iterations,
-                                                   result.lp_solves, relaxation_solver);
+                                                   result.lp_solves, relaxation_solver).chosen;
                 break;
             case DivingStrategy::Coefficient:
                 choice = select_coefficient_diving_choice(node, *candidate, problem,
                                                           result.lp_iterations, result.lp_solves,
-                                                          relaxation_solver);
+                                                          relaxation_solver).chosen;
                 break;
             case DivingStrategy::Guided:
                 choice = select_guided_diving_choice(node, *candidate, incumbent_primal,
                                                      result.lp_iterations, result.lp_solves,
-                                                     relaxation_solver);
+                                                     relaxation_solver).chosen;
                 break;
             case DivingStrategy::Adaptive:
                 return result;
