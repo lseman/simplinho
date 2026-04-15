@@ -308,6 +308,7 @@ class RevisedSimplexDualEngine {
         int iters = 0;
         Eigen::VectorXd c_work = c;
         bool costs_perturbed = false;
+        bool cost_shift_phase1_used = false;
 
         std::vector<int> basis;
         if (basis_opt) {
@@ -599,6 +600,46 @@ class RevisedSimplexDualEngine {
                     }
                     self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                      " primal-feasible but dual-infeasible");
+                    if (!cost_shift_phase1_used) {
+                        cost_shift_phase1_used = true;
+                        double max_violation = 0.0;
+                        for (int k = 0; k < (int)N.size(); ++k) {
+                            if (rN(k) < -self.opt_.tol && -rN(k) > max_violation) {
+                                max_violation = -rN(k);
+                            }
+                        }
+                        if (max_violation > 0.0 && max_violation < 1e12) {
+                            Eigen::VectorXd shift = Eigen::VectorXd::Zero(n);
+                            for (int k = 0; k < (int)N.size(); ++k) {
+                                if (rN(k) < -self.opt_.tol) {
+                                    const int j = N[k];
+                                    shift(j) = -rN(k) * 1.5;
+                                }
+                            }
+                            Eigen::VectorXd c_shifted = c_work + shift;
+                            for (int k = 0; k < (int)N.size(); ++k) {
+                                const int j = N[k];
+                                chat(j) = (view_sign(view[j]) > 0) ? c_shifted(j) : -c_shifted(j);
+                            }
+                            for (int i = 0; i < m; ++i)
+                                chat(basis[i]) = c_work(basis[i]);
+                            self.trace_line_("[dual] cost-shift Phase 1 applied, refactoring");
+                            try {
+                                B.refactor();
+                            } catch (const std::exception&) {
+                                return {LPSolution::Status::NeedPhase1,
+                                        Eigen::VectorXd::Zero(n),
+                                        basis,
+                                        iters,
+                                        {{"reason", "cost_shift_refactor_failed"}}};
+                            }
+                            if (auto failed =
+                                    rebuild_dual_pool("cost-shift refactor failed", iters)) {
+                                return *failed;
+                            }
+                            continue;
+                        }
+                    }
                     return {LPSolution::Status::NeedPhase1,
                             Eigen::VectorXd::Zero(n),
                             basis,

@@ -1688,11 +1688,59 @@ inline std::optional<std::vector<int>>
 RevisedSimplex::find_initial_basis_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                                     const Eigen::VectorXd& c, const RevisedSimplexOptions& opt,
                                     std::optional<std::vector<int>> seed_basis) {
-    if (!seed_basis || seed_basis->empty()) {
+    // Logical slack basis: guaranteed dual-feasible start for dual mode.
+    if (opt.mode == SimplexMode::Dual) {
+        const int m = static_cast<int>(A.rows());
+        const int n = static_cast<int>(A.cols());
+
         std::vector<int> logical = find_logical_basis_(A);
         const BasisQuality logical_quality = evaluate_basis_quality_(A, b, c, logical, opt.tol);
-        if (logical_quality.valid && logical_quality.rank == static_cast<int>(A.rows())) {
+        if (logical_quality.valid && logical_quality.rank == m) {
             return logical;
+        }
+
+        // Inline rank repair: fill missing rows with slack or artificial columns.
+        if (!logical.empty() && logical.size() == static_cast<std::size_t>(m)) {
+            std::vector<char> has_unit(m, 0);
+            std::vector<char> used_col(A.cols(), 0);
+            for (int i = 0; i < m; ++i) {
+                const int j = logical[i];
+                if (j >= 0 && j < A.cols()) {
+                    has_unit[i] = 1;
+                    used_col[j] = 1;
+                }
+            }
+            int filled = 0;
+            for (int i = 0; i < m && filled < m; ++i) {
+                if (!has_unit[i]) {
+                    for (int j = 0; j < A.cols(); ++j) {
+                        if (used_col[j])
+                            continue;
+                        if (std::abs(A(i, j)) <= opt.tol)
+                            continue;
+                        bool single_nonzero = true;
+                        for (int ii = 0; ii < m; ++ii) {
+                            if (ii == i)
+                                continue;
+                            if (std::abs(A(ii, j)) > opt.tol) {
+                                single_nonzero = false;
+                                break;
+                            }
+                        }
+                        if (!single_nonzero)
+                            continue;
+                        logical[i] = j;
+                        has_unit[i] = 1;
+                        used_col[j] = 1;
+                        ++filled;
+                        break;
+                    }
+                }
+            }
+            BasisQuality repaired_q = evaluate_basis_quality_(A, b, c, logical, opt.tol);
+            if (repaired_q.valid && repaired_q.rank == m) {
+                return logical;
+            }
         }
     }
     CrashSelection sel = choose_initial_basis_(A, b, c, opt, seed_basis);
@@ -1705,11 +1753,64 @@ inline std::optional<std::vector<int>>
 RevisedSimplex::find_initial_basis_(const SparseMatrix& A, const Eigen::VectorXd& b,
                                     const Eigen::VectorXd& c, const RevisedSimplexOptions& opt,
                                     std::optional<std::vector<int>> seed_basis) {
-    if (!seed_basis || seed_basis->empty()) {
+    // Logical slack basis: guaranteed dual-feasible start for dual mode.
+    if (opt.mode == SimplexMode::Dual) {
+        const int m = static_cast<int>(A.rows());
+        const int n = static_cast<int>(A.cols());
+
         std::vector<int> logical = find_logical_basis_(A);
         const BasisQuality logical_quality = evaluate_basis_quality_(A, b, c, logical, opt.tol);
-        if (logical_quality.valid && logical_quality.rank == static_cast<int>(A.rows())) {
+        if (logical_quality.valid && logical_quality.rank == m) {
             return logical;
+        }
+
+        // Inline rank repair: fill missing rows with slack or artificial columns.
+        if (!logical.empty() && logical.size() == static_cast<std::size_t>(m)) {
+            std::vector<char> has_unit(m, 0);
+            std::vector<char> used_col(A.cols(), 0);
+            for (int i = 0; i < m; ++i) {
+                const int j = logical[i];
+                if (j >= 0 && j < A.cols()) {
+                    has_unit[i] = 1;
+                    used_col[j] = 1;
+                }
+            }
+            int filled = 0;
+            for (int i = 0; i < m && filled < m; ++i) {
+                if (!has_unit[i]) {
+                    for (int j = 0; j < A.cols(); ++j) {
+                        if (used_col[j])
+                            continue;
+                        bool found = false;
+                        bool single_nonzero = true;
+                        for (typename SparseMatrix::InnerIterator it(A, j); it; ++it) {
+                            if (std::abs(it.value()) <= opt.tol)
+                                continue;
+                            if (it.row() == i) {
+                                if (found) {
+                                    single_nonzero = false;
+                                    break;
+                                }
+                                found = true;
+                                continue;
+                            }
+                            single_nonzero = false;
+                            break;
+                        }
+                        if (!found || !single_nonzero)
+                            continue;
+                        logical[i] = j;
+                        has_unit[i] = 1;
+                        used_col[j] = 1;
+                        ++filled;
+                        break;
+                    }
+                }
+            }
+            BasisQuality repaired_q = evaluate_basis_quality_(A, b, c, logical, opt.tol);
+            if (repaired_q.valid && repaired_q.rank == m) {
+                return logical;
+            }
         }
     }
     CrashSelection sel = choose_initial_basis_(A, b, c, opt, seed_basis);
