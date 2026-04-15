@@ -392,21 +392,48 @@ DivingHeuristicResult run_diving_heuristic(const ActiveNode& start_node,
     struct DiveFrame {
         ActiveNode node;
         RelaxationSolution current;
-        BranchingDecision decision;
+        int depth = 0;
     };
     std::vector<DiveFrame> stack;
     int depth = 0;
 
-    while (depth < options.max_dive_depth) {
+    auto backtrack = [&]() -> bool {
+        if (stack.empty()) {
+            return false;
+        }
+        const DiveFrame frame = std::move(stack.back());
+        stack.pop_back();
+        node = std::move(frame.node);
+        current = std::move(frame.current);
+        depth = frame.depth;
+        return true;
+    };
+
+    while (true) {
         const auto candidates = collect_fractional_candidates(
             current.primal, problem.variable_types, options.integrality_tol);
-        if (candidates.empty()) {
+        if (candidates.empty() && current.status == RelaxationStatus::Optimal) {
             result.incumbent = current;
             ++result.successes;
+            const int strategy_index =
+                diving_strategy_index(last_used_strategy.value_or(options.diving_strategy));
+            if (strategy_index >= 0 && strategy_index < static_cast<int>(strategy_stats.size())) {
+                ++strategy_stats[strategy_index].successes;
+            }
             return result;
         }
-        if (result.lp_solves >= options.max_dive_lp_solves) {
-            break;
+        if (depth >= options.max_dive_depth || result.lp_solves >= options.max_dive_lp_solves) {
+            if (!backtrack()) {
+                break;
+            }
+            continue;
+        }
+
+        if (candidates.empty()) {
+            if (!backtrack()) {
+                break;
+            }
+            continue;
         }
 
         DivingStrategy active_strategy = options.diving_strategy;
@@ -420,7 +447,10 @@ DivingHeuristicResult run_diving_heuristic(const ActiveNode& start_node,
             candidate = select_guided_diving_candidate(candidates, incumbent_primal);
         }
         if (candidate == nullptr) {
-            break;
+            if (!backtrack()) {
+                break;
+            }
+            continue;
         }
 
         const int strategy_index = diving_strategy_index(active_strategy);
@@ -431,32 +461,32 @@ DivingHeuristicResult run_diving_heuristic(const ActiveNode& start_node,
 
         const int lp_iterations_before = result.lp_iterations;
         const int lp_solves_before = result.lp_solves;
-        DivingChoice choice;
+        BranchingDecision decision;
         switch (active_strategy) {
             case DivingStrategy::Disabled:
                 return result;
             case DivingStrategy::Fractional:
-                choice = select_fractional_diving_choice(node, *candidate, result.lp_iterations,
-                                                         result.lp_solves, relaxation_solver).chosen;
+                decision = select_fractional_diving_choice(node, *candidate, result.lp_iterations,
+                                                           result.lp_solves, relaxation_solver);
                 break;
             case DivingStrategy::VectorLength:
-                choice = select_vector_length_diving_choice(node, *candidate, result.lp_iterations,
-                                                            result.lp_solves, relaxation_solver).chosen;
+                decision = select_vector_length_diving_choice(
+                    node, *candidate, result.lp_iterations, result.lp_solves, relaxation_solver);
                 break;
             case DivingStrategy::ObjectiveValue:
-                choice =
+                decision =
                     select_objective_diving_choice(node, *candidate, problem, result.lp_iterations,
-                                                   result.lp_solves, relaxation_solver).chosen;
+                                                   result.lp_solves, relaxation_solver);
                 break;
             case DivingStrategy::Coefficient:
-                choice = select_coefficient_diving_choice(node, *candidate, problem,
-                                                          result.lp_iterations, result.lp_solves,
-                                                          relaxation_solver).chosen;
+                decision = select_coefficient_diving_choice(node, *candidate, problem,
+                                                            result.lp_iterations, result.lp_solves,
+                                                            relaxation_solver);
                 break;
             case DivingStrategy::Guided:
-                choice = select_guided_diving_choice(node, *candidate, incumbent_primal,
-                                                     result.lp_iterations, result.lp_solves,
-                                                     relaxation_solver).chosen;
+                decision = select_guided_diving_choice(node, *candidate, incumbent_primal,
+                                                       result.lp_iterations, result.lp_solves,
+                                                       relaxation_solver);
                 break;
             case DivingStrategy::Adaptive:
                 return result;
@@ -468,20 +498,47 @@ DivingHeuristicResult run_diving_heuristic(const ActiveNode& start_node,
             strategy_stats[strategy_index].lp_solves += result.lp_solves - lp_solves_before;
         }
 
-        if (!choice.relaxation.has_value() ||
-            choice.relaxation->status != RelaxationStatus::Optimal) {
-            break;
+        auto choose_preferred_choice = [&](BranchingDecision& decision) -> DivingChoice& {
+            if ((!decision.chosen.relaxation.has_value() ||
+                 decision.chosen.relaxation->status != RelaxationStatus::Optimal) &&
+                decision.alternate.has_value() && decision.alternate->relaxation.has_value() &&
+                decision.alternate->relaxation->status == RelaxationStatus::Optimal) {
+                decision.chosen = std::move(*decision.alternate);
+                decision.alternate.reset();
+            }
+            return decision.chosen;
+        };
+
+        DivingChoice chosen = choose_preferred_choice(decision);
+        if (decision.alternate.has_value() && decision.alternate->relaxation.has_value() &&
+            decision.alternate->relaxation->status == RelaxationStatus::Optimal) {
+            ActiveNode alternate_node = node;
+            alternate_node.lower_bounds = std::move(decision.alternate->state.lower_bounds);
+            alternate_node.upper_bounds = std::move(decision.alternate->state.upper_bounds);
+            alternate_node.domain = std::move(decision.alternate->state.domain);
+            alternate_node.reasons = std::move(decision.alternate->state.reasons);
+            stack.push_back(
+                DiveFrame{std::move(alternate_node), *decision.alternate->relaxation, depth + 1});
         }
 
-        current = *choice.relaxation;
-        materialize_child_state(&choice.state);
-        node.lower_bounds = std::move(choice.state.lower_bounds);
-        node.upper_bounds = std::move(choice.state.upper_bounds);
-        node.domain = choice.state.domain != nullptr
-                          ? std::move(choice.state.domain)
+        if (!chosen.relaxation.has_value() ||
+            chosen.relaxation->status != RelaxationStatus::Optimal) {
+            if (!backtrack()) {
+                break;
+            }
+            continue;
+        }
+
+        current = *chosen.relaxation;
+        materialize_child_state(&chosen.state);
+        node.lower_bounds = std::move(chosen.state.lower_bounds);
+        node.upper_bounds = std::move(chosen.state.upper_bounds);
+        node.domain = chosen.state.domain != nullptr
+                          ? std::move(chosen.state.domain)
                           : make_materialized_domain(node.lower_bounds, node.upper_bounds);
-        node.reasons = choice.state.reasons;
+        node.reasons = chosen.state.reasons;
         node.basis = current.basis;
+        ++depth;
     }
 
     const auto final_candidates = collect_fractional_candidates(
