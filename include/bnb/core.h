@@ -2008,10 +2008,44 @@ class Solver {
         return current_gap < previous_gap - std::max(1e-9, options_.integrality_tol) * scale;
     }
 
+    // Gurobi-style progress header:
+    // Expl  Unexpl  Obj     Bound   Gap    It/Node  Time
+    // ----  ------  ------  ------  -----  -------  ----
+    static void print_progress_header_() {
+        // clang-format off
+        std::cout
+            << "   "                                 // marker column (1 char + 2 pad)
+            << std::left  << std::setw(7)  << "Nodes"
+            << std::right << std::setw(7)  << "Left"
+            << std::setw(14) << "Incumbent"
+            << std::setw(14) << "BestBound"
+            << std::setw(8)  << "Gap"
+            << "  " << "Event"
+            << "\n";
+        // clang-format on
+        std::cout << "   "
+                  << std::string(7, '-') << std::string(7, '-')
+                  << std::string(14, '-') << std::string(14, '-')
+                  << std::string(8, '-')
+                  << "\n";
+    }
+
+    // Map event name → single-char marker (Gurobi style)
+    static char event_marker_(const char* event) {
+        std::string_view ev(event);
+        if (ev == "incumbent") return 'H';  // heuristic incumbent
+        if (ev == "root")      return 'R';  // root relaxation
+        if (ev == "cut")       return 'C';  // cutting plane tightened bound
+        if (ev == "node-cut")  return 'c';
+        if (ev == "bound")     return 'B';
+        if (ev == "done")      return ' ';
+        return ' ';
+    }
+
     void log_progress_locked_(const ProgressSnapshot& snapshot, const char* event, bool force,
                               const Status* final_status) {
         if (!progress_header_printed_) {
-            std::cout << "MIP Progress | Nodes  Active  Incumbent  BestBd  Gap  Event" << std::endl;
+            print_progress_header_();
             progress_header_printed_ = true;
         }
 
@@ -2028,24 +2062,35 @@ class Solver {
             return;
         }
 
+        const char marker = event_marker_(event);
         std::ostringstream oss;
-        oss << "MIP Progress | " << std::setw(6) << snapshot.node_count << "  " << std::setw(6)
-            << snapshot.active_nodes << "  " << std::setw(11)
+        // marker column
+        oss << ' ' << marker << ' ';
+        // Nodes explored / left
+        oss << std::left << std::setw(7) << snapshot.node_count;
+        oss << std::right << std::setw(7) << snapshot.active_nodes;
+        // Incumbent
+        oss << std::setw(14)
             << format_progress_value_(snapshot.has_incumbent
                                           ? snapshot.incumbent_objective
-                                          : std::numeric_limits<double>::quiet_NaN())
-            << "  " << std::setw(11) << format_progress_value_(best_bound) << "  ";
+                                          : std::numeric_limits<double>::quiet_NaN());
+        // Best bound
+        oss << std::setw(14) << format_progress_value_(best_bound);
+        // Gap
         if (gap.has_value()) {
-            oss << std::fixed << std::setprecision(2) << std::setw(6) << (100.0 * *gap) << "%";
+            std::ostringstream gap_str;
+            gap_str << std::fixed << std::setprecision(2) << (100.0 * *gap) << "%";
+            oss << std::setw(8) << gap_str.str();
         } else {
-            oss << std::setw(6) << "--";
+            oss << std::setw(8) << "--";
         }
+        // Event label
         oss << "  " << event;
         if (final_status) {
             oss << " [" << to_string(*final_status) << "]";
         }
 
-        std::cout << oss.str() << std::endl;
+        std::cout << oss.str() << "\n";
         last_logged_node_count_ = snapshot.node_count;
         last_logged_best_bound_ = best_bound;
         last_logged_incumbent_ = snapshot.incumbent_objective;
@@ -2072,24 +2117,37 @@ class Solver {
         return std::to_string(*value);
     }
 
+    // Print a section heading like:
+    //   --- Timing Summary ---
+    static void print_summary_section_(const char* title) {
+        // 79 chars wide: "--- Title ---" padded with dashes
+        const std::string t(title);
+        const int total = 79;
+        const int inner = static_cast<int>(t.size()) + 2; // " title "
+        const int left_dashes = std::max(3, (total - inner) / 2);
+        const int right_dashes = std::max(3, total - inner - left_dashes);
+        std::cout << "\n" << std::string(left_dashes, '-') << " " << t << " "
+                  << std::string(right_dashes, '-') << "\n";
+    }
+
     template <typename Left, typename Mid, typename Right>
-    static void print_three_column_summary_row_(const char* section, Left&& left, Mid&& mid,
-                                                Right&& right, int left_width = 20,
-                                                int value_width = 12) {
-        std::cout << section << " | " << std::left << std::setw(left_width)
+    static void print_three_column_summary_row_(const char* /*section*/, Left&& left, Mid&& mid,
+                                                Right&& right, int left_width = 22,
+                                                int value_width = 14) {
+        std::cout << "  " << std::left << std::setw(left_width)
                   << std::forward<Left>(left) << std::right << std::setw(value_width)
                   << std::forward<Mid>(mid) << std::setw(value_width) << std::forward<Right>(right)
-                  << std::endl;
+                  << "\n";
     }
 
     template <typename Left, typename Col1, typename Col2, typename Col3>
-    static void print_four_column_summary_row_(const char* section, Left&& left, Col1&& col1,
-                                               Col2&& col2, Col3&& col3, int left_width = 20,
-                                               int value_width = 11) {
-        std::cout << section << " | " << std::left << std::setw(left_width)
+    static void print_four_column_summary_row_(const char* /*section*/, Left&& left, Col1&& col1,
+                                               Col2&& col2, Col3&& col3, int left_width = 18,
+                                               int value_width = 12) {
+        std::cout << "  " << std::left << std::setw(left_width)
                   << std::forward<Left>(left) << std::right << std::setw(value_width)
                   << std::forward<Col1>(col1) << std::setw(value_width) << std::forward<Col2>(col2)
-                  << std::setw(value_width) << std::forward<Col3>(col3) << std::endl;
+                  << std::setw(value_width) << std::forward<Col3>(col3) << "\n";
     }
 
     static std::vector<std::tuple<std::string, int, int>>
@@ -2146,29 +2204,31 @@ class Solver {
     void log_timing_summary_() const {
         std::lock_guard<std::mutex> output_lock(progress_mutex_);
         std::scoped_lock lock(stats_mutex_, cuts_mutex_);
-        print_three_column_summary_row_("MIP Timing Summary", "Phase", "Root", "Node");
-        print_three_column_summary_row_("MIP Timing Summary", "Cut generation",
+
+        print_summary_section_("Timing");
+        print_three_column_summary_row_("", "Phase", "Root", "Node");
+        print_three_column_summary_row_("", "Cut generation",
                                         format_time_cell_(root_cut_generation_wall_ns_),
                                         format_time_cell_(node_cut_generation_wall_ns_));
-        print_three_column_summary_row_("MIP Timing Summary", "Cut selection",
+        print_three_column_summary_row_("", "Cut selection",
                                         format_time_cell_(root_cut_selection_wall_ns_),
                                         format_time_cell_(node_cut_selection_wall_ns_));
-        print_three_column_summary_row_("MIP Timing Summary", "Cut activation",
+        print_three_column_summary_row_("", "Cut activation",
                                         format_time_cell_(root_cut_activation_wall_ns_),
                                         format_time_cell_(std::nullopt));
-        print_three_column_summary_row_("MIP Timing Summary", "Cut resolve",
+        print_three_column_summary_row_("", "Cut resolve",
                                         format_time_cell_(root_cut_resolve_wall_ns_),
                                         format_time_cell_(node_cut_resolve_wall_ns_));
-        print_three_column_summary_row_("MIP Timing Summary", "Rounding",
+        print_three_column_summary_row_("", "Rounding",
                                         format_time_cell_(std::nullopt),
                                         format_time_cell_(rounding_heuristic_wall_ns_));
-        print_three_column_summary_row_("MIP Timing Summary", "Async heuristics",
+        print_three_column_summary_row_("", "Async heuristics",
                                         format_time_cell_(std::nullopt),
                                         format_time_cell_(heuristics_wall_ns_));
-        print_three_column_summary_row_("MIP Timing Summary", "Branching",
+        print_three_column_summary_row_("", "Branching",
                                         format_time_cell_(std::nullopt),
                                         format_time_cell_(branching_wall_ns_));
-        print_three_column_summary_row_("MIP Timing Summary", "Child processing",
+        print_three_column_summary_row_("", "Child processing",
                                         format_time_cell_(std::nullopt),
                                         format_time_cell_(child_processing_wall_ns_));
 
@@ -2176,44 +2236,44 @@ class Solver {
             std::max(0, heuristic_successes_ - feasibility_jump_successes_ -
                             feasibility_pump_successes_ - rens_successes_ - rins_successes_ -
                             local_search_successes_ - local_branching_successes_);
-        print_three_column_summary_row_("MIP Heuristic Summary", "Method", "Successes", "Time");
-        print_three_column_summary_row_(
-            "MIP Heuristic Summary", "Round + diving",
-            format_count_cell_(round_and_diving_successes),
-            format_time_cell_(rounding_heuristic_wall_ns_ + diving_wall_ns_));
-        print_three_column_summary_row_("MIP Heuristic Summary", "Feasibility jump",
+        print_summary_section_("Heuristics");
+        print_three_column_summary_row_("", "Method", "Successes", "Time");
+        print_three_column_summary_row_("", "Round + diving",
+                                        format_count_cell_(round_and_diving_successes),
+                                        format_time_cell_(rounding_heuristic_wall_ns_ + diving_wall_ns_));
+        print_three_column_summary_row_("", "Feasibility jump",
                                         format_count_cell_(feasibility_jump_successes_),
                                         format_time_cell_(feasibility_jump_wall_ns_));
-        print_three_column_summary_row_("MIP Heuristic Summary", "Feasibility pump",
+        print_three_column_summary_row_("", "Feasibility pump",
                                         format_count_cell_(feasibility_pump_successes_),
                                         format_time_cell_(feasibility_pump_wall_ns_));
-        print_three_column_summary_row_("MIP Heuristic Summary", "RENS",
+        print_three_column_summary_row_("", "RENS",
                                         format_count_cell_(rens_successes_),
                                         format_time_cell_(rens_wall_ns_));
-        print_three_column_summary_row_("MIP Heuristic Summary", "RINS",
+        print_three_column_summary_row_("", "RINS",
                                         format_count_cell_(rins_successes_),
                                         format_time_cell_(rins_wall_ns_));
-        print_three_column_summary_row_("MIP Heuristic Summary", "Local search",
+        print_three_column_summary_row_("", "Local search",
                                         format_count_cell_(local_search_successes_),
                                         format_time_cell_(local_search_wall_ns_));
-        print_three_column_summary_row_("MIP Heuristic Summary", "Local branching",
+        print_three_column_summary_row_("", "Local branching",
                                         format_count_cell_(local_branching_successes_),
                                         format_time_cell_(local_branching_wall_ns_));
-        print_three_column_summary_row_(
-            "MIP Heuristic Summary", "Total", format_count_cell_(heuristic_successes_),
-            format_time_cell_(rounding_heuristic_wall_ns_ + heuristics_wall_ns_));
+        print_three_column_summary_row_("", "Total",
+                                        format_count_cell_(heuristic_successes_),
+                                        format_time_cell_(rounding_heuristic_wall_ns_ + heuristics_wall_ns_));
 
-        print_four_column_summary_row_("MIP Cut Summary", "Family", "Generated", "Applied",
-                                       "Share");
+        print_summary_section_("Cuts");
+        print_four_column_summary_row_("", "Family", "Generated", "Applied", "Share");
         const int total_generated_cuts = cut_pool_.cuts_generated();
         const std::string all_share = total_generated_cuts > 0 ? "100.0%" : "--";
-        print_four_column_summary_row_("MIP Cut Summary", "All",
+        print_four_column_summary_row_("", "All",
                                        format_count_cell_(total_generated_cuts),
                                        format_count_cell_(cut_pool_.cuts_applied()), all_share);
-        print_four_column_summary_row_("MIP Cut Summary", "Duplicates",
+        print_four_column_summary_row_("", "Duplicates",
                                        format_count_cell_(cut_pool_.duplicate_cuts()),
                                        format_count_cell_(std::nullopt), "--");
-        print_four_column_summary_row_("MIP Cut Summary", "Pool size",
+        print_four_column_summary_row_("", "Pool size",
                                        format_count_cell_(cut_pool_.size()),
                                        format_count_cell_(std::nullopt), "--");
 
@@ -2224,10 +2284,11 @@ class Solver {
             std::ostringstream share;
             share << std::fixed << std::setprecision(1)
                   << (100.0 * static_cast<double>(generated_count) / total_generated) << "%";
-            print_four_column_summary_row_("MIP Cut Summary", name,
+            print_four_column_summary_row_("", name,
                                            format_count_cell_(generated_count),
                                            format_count_cell_(applied_count), share.str());
         }
+        std::cout << "\n" << std::string(79, '=') << "\n";
     }
 
     void maybe_log_progress_(const char* event, bool force = false,

@@ -88,15 +88,30 @@ std::string bold_(std::string_view text) { return colorize_(text, "1"); }
 std::string dim_(std::string_view text) { return colorize_(text, "2"); }
 std::string good_(std::string_view text) { return colorize_(text, "38;5;40"); }
 std::string warn_(std::string_view text) { return colorize_(text, "38;5;214"); }
+std::string cyan_(std::string_view text) { return colorize_(text, "38;5;51"); }
+std::string green_(std::string_view text) { return colorize_(text, "38;5;82"); }
+std::string yellow_(std::string_view text) { return colorize_(text, "38;5;226"); }
+std::string magenta_(std::string_view text) { return colorize_(text, "38;5;213"); }
 
-std::string rule_(char ch = '=') { return std::string(62, ch); }
+// Width = 79 chars (Gurobi-standard terminal width)
+constexpr int kLogWidth = 79;
+std::string rule_(char ch = '=') { return std::string(kLogWidth, ch); }
+std::string thin_rule_() { return dim_(std::string(kLogWidth, '-')); }
 
 void print_verbose_solver_banner() {
-    std::cout << dim_(rule_()) << std::endl;
-    std::cout << bold_("Simplinho") << " " << SIMPLEX_PROJECT_VERSION << "  " << dim_("git") << " "
-              << SIMPLEX_GIT_DESCRIBE << "  " << dim_("branch") << " " << SIMPLEX_GIT_BRANCH
-              << std::endl;
-    std::cout << dim_(rule_('-')) << std::endl << std::endl;
+    std::cout << dim_(rule_()) << "\n";
+    // Center "Simplinho" with version and git info
+    std::ostringstream title;
+    title << "Simplinho " << SIMPLEX_PROJECT_VERSION;
+    const std::string title_str = title.str();
+    const int pad = std::max(0, (kLogWidth - static_cast<int>(title_str.size())) / 2);
+    std::cout << std::string(pad, ' ') << bold_(title_str) << "\n";
+    std::ostringstream git_line;
+    git_line << "git:" << SIMPLEX_GIT_DESCRIBE << "  branch:" << SIMPLEX_GIT_BRANCH;
+    const std::string git_str = git_line.str();
+    const int git_pad = std::max(0, (kLogWidth - static_cast<int>(git_str.size())) / 2);
+    std::cout << dim_(std::string(git_pad, ' ') + git_str) << "\n";
+    std::cout << dim_(rule_()) << "\n\n";
 }
 
 enum class ConstraintSense { LessEqual, Equal, GreaterEqual };
@@ -134,12 +149,12 @@ template <typename Features> std::string join_feature_tokens_(const Features& fe
 }
 
 void print_verbose_solver_configuration(const BranchAndBoundOptions& options) {
-    std::cout << accent_("MIP Search") << "   | node "
-              << simplex_bnb::to_string(options.node_selection) << "  branch "
-              << simplex_bnb::to_string(options.branching_strategy) << "  dive "
-              << simplex_bnb::to_string(options.diving_strategy) << "  workers "
-              << options.parallel_workers << "  async "
-              << feature_token_("heuristics", options.use_async_heuristics) << std::endl;
+    std::cout << accent_("Search") << " " << dim_("|") << " node "
+              << cyan_(simplex_bnb::to_string(options.node_selection)) << "  branch "
+              << cyan_(simplex_bnb::to_string(options.branching_strategy)) << "  dive "
+              << cyan_(simplex_bnb::to_string(options.diving_strategy)) << "  workers "
+              << cyan_(std::to_string(options.parallel_workers)) << "  async "
+              << feature_token_("heuristics", options.use_async_heuristics) << "\n";
 
     const std::vector<std::pair<std::string_view, bool>> heuristics = {
         {"rounding", options.use_rounding},
@@ -151,7 +166,7 @@ void print_verbose_solver_configuration(const BranchAndBoundOptions& options) {
         {"local-search", options.use_local_search},
         {"local-branch", options.use_local_branching},
     };
-    std::cout << accent_("MIP Heur") << "     | " << join_feature_tokens_(heuristics) << std::endl;
+    std::cout << accent_("Heur")   << "   " << dim_("|") << " " << join_feature_tokens_(heuristics) << "\n";
 
     const std::vector<std::pair<std::string_view, bool>> cuts = {
         {"pool", options.use_cut_pool},
@@ -165,8 +180,8 @@ void print_verbose_solver_configuration(const BranchAndBoundOptions& options) {
         {"conflict", options.use_conflict_cuts},
         {"dual-proof", options.use_dual_proof_cuts},
     };
-    std::cout << accent_("MIP Cuts") << "     | " << join_feature_tokens_(cuts) << std::endl;
-    std::cout << dim_(rule_('-')) << std::endl << std::endl;
+    std::cout << accent_("Cuts")   << "   " << dim_("|") << " " << join_feature_tokens_(cuts) << "\n";
+    std::cout << "\n" << thin_rule_() << "\n";
 }
 
 const char* simplex_mode_name(SimplexMode mode) {
@@ -410,10 +425,13 @@ ProblemDimensionSummary summarize_problem_dimensions(const simplex_bnb::Problem&
 
 void print_verbose_problem_summary(const char* label, const simplex_bnb::Problem& problem) {
     const ProblemDimensionSummary summary = summarize_problem_dimensions(problem);
-    std::cout << accent_("MIP Model") << "    | " << std::left << std::setw(9) << label
-              << std::right << " vars " << summary.variables << " (cont " << summary.continuous
-              << ", int " << summary.integer << ", bin " << summary.binary << ") rows "
-              << summary.constraints << std::endl;
+    std::cout << accent_("Model") << "  " << dim_("|") << " " << std::left << std::setw(10) << label
+              << dim_("|") << " vars "    << bold_(std::to_string(summary.variables))
+              << " (cont "                << summary.continuous
+              << "  int "                 << summary.integer
+              << "  bin "                 << summary.binary
+              << ")  rows "              << bold_(std::to_string(summary.constraints))
+              << "\n";
 }
 
 std::string expr_repr(const LinearExprData& data, const std::shared_ptr<ModelState>& state) {
@@ -1768,23 +1786,23 @@ class Model {
             infeasible_result.root_presolve_removed_coeffs = root_presolve.removed_coeffs;
             infeasible_result.root_presolve_aggregations = root_presolve.aggregations;
             if (mip_options.verbose) {
-                std::cout << accent_("MIP Presolve")
-                          << " | Infeasible after presolve, tightened bounds "
-                          << root_presolve.tightened_bounds << ", removed rows "
-                          << root_presolve.removed_rows << ", removed coeffs "
-                          << root_presolve.removed_coeffs << ", aggregations "
-                          << root_presolve.aggregations << std::endl;
+                std::cout << warn_("Presolve") << " " << dim_("|") << " INFEASIBLE"
+                          << "  tightened " << root_presolve.tightened_bounds
+                          << "  removed rows " << root_presolve.removed_rows
+                          << "  removed coeffs " << root_presolve.removed_coeffs
+                          << "  aggregations " << root_presolve.aggregations << "\n";
             }
             return MIPSolution(state_, std::move(infeasible_result), original_vars);
         }
         problem = root_presolve.problem;
         if (mip_options.verbose) {
             print_verbose_problem_summary("Presolved", problem);
-            std::cout << accent_("MIP Presolve") << " | Tightened bounds "
-                      << root_presolve.tightened_bounds << ", removed rows "
-                      << root_presolve.removed_rows << ", removed coeffs "
-                      << root_presolve.removed_coeffs << ", aggregations "
-                      << root_presolve.aggregations << std::endl;
+            std::cout << accent_("Presolve") << " " << dim_("|") << " "
+                      << "tightened " << root_presolve.tightened_bounds
+                      << "  removed rows " << root_presolve.removed_rows
+                      << "  removed coeffs " << root_presolve.removed_coeffs
+                      << "  aggregations " << root_presolve.aggregations << "\n"
+                      << "\n" << thin_rule_() << "\n";
         }
         ModelLPData data = build_lp_data_from_problem_(problem);
         problem.lower_bounds = data.l;
