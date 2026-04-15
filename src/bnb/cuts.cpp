@@ -2123,9 +2123,14 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
     detail::LockTrace lock_trace("cuts_mutex_");
     std::unique_lock<std::shared_mutex> lock(cuts_mutex_);
     lock_trace.acquired_lock();
+    if (max_cuts <= 0 || cuts_.empty()) {
+        return {};
+    }
+
     struct Candidate {
         int index = -1;
         double violation = 0.0;
+        double full_norm = 0.0;
         double efficacy = 0.0;
         double active_efficacy = 0.0;
         double density_adjusted_efficacy = 0.0;
@@ -2140,34 +2145,48 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
     std::vector<char> violated(cuts_.size(), 0);
     for (int i = 0; i < static_cast<int>(cuts_.size()); ++i) {
         const double violation = cut_violation(cuts_[i], primal);
-        if (violation > min_violation_) {
-            violated[i] = 1;
-            const double full_norm =
-                i < static_cast<int>(row_norms_.size()) ? row_norms_[i] : cut_norm_(cuts_[i]);
-            const ActiveSupportStats active_stats =
-                active_support_stats_(cuts_[i], primal, lower_bounds, upper_bounds, min_violation_);
-            const double norm = active_stats.norm > 1e-16 ? active_stats.norm : full_norm;
-            const double efficacy = norm > 1e-16 ? violation / norm : 0.0;
-            const double active_efficacy =
-                active_stats.norm > 1e-16 ? violation / active_stats.norm : efficacy;
-            const double focus = fractional_focus_(cuts_[i], primal);
-            const double density_adj = density_adjusted_efficacy_(
-                violation, norm,
-                active_stats.nnz > 0 ? active_stats.nnz : static_cast<int>(cuts_[i].indices.size()),
-                focus, density_penalty_scale);
-            const double dynamism = cut_dynamism_(cuts_[i], primal, violation, norm);
-            candidates.push_back(Candidate{
-                index : i,
-                violation : violation,
-                efficacy : efficacy,
-                active_efficacy : active_efficacy,
-                density_adjusted_efficacy : density_adj,
-                dynamism : dynamism,
-                fractional_focus : focus,
-                strength : cuts_[i].strength,
-                marginal : violation <= 2.5 * min_violation_
+        if (violation <= min_violation_)
+            continue;
+        violated[i] = 1;
+        const double full_norm =
+            i < static_cast<int>(row_norms_.size()) ? row_norms_[i] : cut_norm_(cuts_[i]);
+        candidates.push_back(Candidate{
+            i, violation, full_norm, 0.0, 0.0, 0.0, 0.0, 0.0, cuts_[i].strength,
+            violation <= 2.5 * min_violation_});
+    }
+
+    if (candidates.empty()) {
+        return {};
+    }
+
+    const int max_candidates = std::max(32, max_cuts * 8);
+    if (static_cast<int>(candidates.size()) > max_candidates) {
+        std::nth_element(
+            candidates.begin(), candidates.begin() + max_candidates, candidates.end(),
+            [](const Candidate& lhs, const Candidate& rhs) {
+                const double lhs_ratio = lhs.full_norm > 1e-16 ? lhs.violation / lhs.full_norm
+                                                               : lhs.violation;
+                const double rhs_ratio = rhs.full_norm > 1e-16 ? rhs.violation / rhs.full_norm
+                                                               : rhs.violation;
+                return lhs_ratio > rhs_ratio;
             });
-        }
+        candidates.resize(max_candidates);
+    }
+
+    for (auto& candidate : candidates) {
+        const Cut& cut = cuts_[candidate.index];
+        const ActiveSupportStats active_stats =
+            active_support_stats_(cut, primal, lower_bounds, upper_bounds, min_violation_);
+        const double norm = active_stats.norm > 1e-16 ? active_stats.norm : candidate.full_norm;
+        candidate.efficacy = norm > 1e-16 ? candidate.violation / norm : 0.0;
+        candidate.active_efficacy = active_stats.norm > 1e-16 ? candidate.violation / active_stats.norm
+                                                               : candidate.efficacy;
+        candidate.fractional_focus = fractional_focus_(cut, primal);
+        candidate.density_adjusted_efficacy = density_adjusted_efficacy_(
+            candidate.violation, norm,
+            active_stats.nnz > 0 ? active_stats.nnz : static_cast<int>(cut.indices.size()),
+            candidate.fractional_focus, density_penalty_scale);
+        candidate.dynamism = cut_dynamism_(cut, primal, candidate.violation, norm);
     }
 
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {

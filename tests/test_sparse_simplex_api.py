@@ -83,6 +83,39 @@ class SparseSimplexApiTests(unittest.TestCase):
         self.assertEqual(simplinho.status_to_string(second.status), "optimal")
         self.assertEqual(second.info.get("sparse_pipeline"), "1")
 
+    def test_sparse_matrix_hyper_sparse_rhs_solve(self):
+        rows = 20
+        cols = 40
+        data = []
+        row_ind = []
+        col_ptr = [0]
+        for j in range(rows):
+            data.append(1.0)
+            row_ind.append(j)
+            col_ptr.append(col_ptr[-1] + 1)
+        for j in range(rows, cols):
+            col_ptr.append(col_ptr[-1])
+
+        A = sp.csc_matrix((data, row_ind, col_ptr), shape=(rows, cols))
+        b = np.zeros(rows, dtype=float)
+        b[0] = 1.0
+        c = np.arange(cols, dtype=float)
+        l = np.zeros(cols, dtype=float)
+        u = np.full(cols, np.inf, dtype=float)
+
+        options = simplinho.RevisedSimplexOptions()
+        options.mode = simplinho.SimplexMode.Primal
+        options.pricing_rule = "adaptive"
+        options.primal_edge_weight_strategy = "dense_diagonal"
+
+        solver = simplinho.RevisedSimplex(options)
+        sol = solver.solve(A, b, c, l, u)
+
+        self.assertEqual(simplinho.status_to_string(sol.status), "optimal")
+        self.assertTrue(np.allclose(sol.x[:rows], b, atol=1e-8))
+        self.assertTrue(np.allclose(sol.x[rows:], 0.0, atol=1e-8))
+        self.assertEqual(sol.info.get("sparse_pipeline"), "1")
+
     def test_sparse_matrix_warm_start_basis_after_feasible_bound_change(self):
         A = sp.csc_matrix([[1.0, 1.0]])
         b = np.array([4.0], dtype=float)

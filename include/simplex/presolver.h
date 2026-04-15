@@ -925,7 +925,7 @@ class Presolver {
         }
 
         std::vector<char> dirty_rows(m, 1), dirty_cols(n, 0);
-        const int max_rounds = 2;  // Reduced from max(2, 2*max_passes) for speed
+        const int max_rounds = std::max(2, opt_.max_passes);
         for (int round = 0; round < max_rounds; ++round) {
             bool any_dirty_row = false;
             std::fill(dirty_cols.begin(), dirty_cols.end(), 0);
@@ -947,10 +947,6 @@ class Presolver {
             if (!round_changed)
                 break;
             changed_any = true;
-
-            // Early termination: no significant improvements after 2 rounds
-            if (round >= 1)
-                break;
 
             std::fill(dirty_rows.begin(), dirty_rows.end(), 0);
             for (int j = 0; j < n; ++j) {
@@ -1088,7 +1084,8 @@ class Presolver {
     bool apply_implied_bounds_(LP& P, const ImpliedBoundsSummary& summary,
                                std::vector<char>* dirty_cols, bool require_big_delta) {
         bool changed = false;
-        for (int j = 0; j < (int)P.A.cols(); ++j) {
+        int j = 0;
+        while (j < (int)P.A.cols()) {
             double newL = P.l(j);
             double newU = P.u(j);
             if (j < (int)summary.has_lower.size() && summary.has_lower[j]) {
@@ -1106,6 +1103,12 @@ class Presolver {
                 const double xfix = 0.5 * (newL + newU);
                 newL = xfix;
                 newU = xfix;
+                if (opt_.allow_structural_changes && !opt_.non_destructive) {
+                    if (apply_structural_fix(P, j, xfix))
+                        return true;
+                    changed = true;
+                    continue; // current index now holds next column
+                }
             }
 
             const double oldL = P.l(j);
@@ -1116,8 +1119,10 @@ class Presolver {
             const bool tightenU =
                 is_finite(newU) && (!is_finite(oldU) || newU < oldU - opt_.zero_tol) &&
                 (!require_big_delta || !is_finite(oldU) || (oldU - newU) > domprop_min_delta_);
-            if (!tightenL && !tightenU)
+            if (!tightenL && !tightenU) {
+                ++j;
                 continue;
+            }
 
             res_.stack.emplace_back(ActTightenBound{j, oldL, oldU});
             P.l(j) = tightenL ? newL : oldL;
@@ -1127,6 +1132,7 @@ class Presolver {
                 (*dirty_cols)[j] = 1;
             }
             changed = true;
+            ++j;
         }
         return changed;
     }

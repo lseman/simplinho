@@ -51,8 +51,14 @@ inline double edge_weight_from_direction(const Eigen::VectorXd& direction,
     return dense_weight;
 }
 
-template <class MatrixLike> inline Eigen::VectorXd dense_column(const MatrixLike& A, int j) {
+template <class MatrixLike>
+inline Eigen::VectorXd dense_column(const MatrixLike& A, int j) {
     return A.col(j);
+}
+
+template <class MatrixLike>
+inline void dense_column(const MatrixLike& A, int j, Eigen::VectorXd& out) {
+    out = A.col(j);
 }
 
 inline Eigen::VectorXd dense_column(const Eigen::SparseMatrix<double, Eigen::ColMajor, int>& A,
@@ -62,6 +68,16 @@ inline Eigen::VectorXd dense_column(const Eigen::SparseMatrix<double, Eigen::Col
         out(it.row()) = it.value();
     }
     return out;
+}
+
+inline void dense_column(const Eigen::SparseMatrix<double, Eigen::ColMajor, int>& A,
+                         int j, Eigen::VectorXd& out) {
+    if (out.size() != A.rows())
+        out.resize(A.rows());
+    out.setZero();
+    for (Eigen::SparseMatrix<double, Eigen::ColMajor, int>::InnerIterator it(A, j); it; ++it) {
+        out(it.row()) = it.value();
+    }
 }
 
 template <class MatrixLike>
@@ -202,11 +218,12 @@ class SteepestEdgePricer {
         initialize_positions_(N);
         const int take = (pool_max_ > 0) ? std::min<int>(pool_max_, (int)N.size()) : (int)N.size();
         pool_.reserve(take);
+        Eigen::VectorXd Aj(A.rows());
         for (int k = 0; k < take; ++k) {
             const int j = N[k];
             Entry e;
             e.jN = j;
-            const Eigen::VectorXd Aj = pricing_detail::dense_column(A, j);
+            pricing_detail::dense_column(A, j, Aj);
             e.t = B.solve_B(Aj); // caller-provided
             e.weight = pricing_detail::edge_weight_from_direction(e.t, weight_strategy_);
             set_position_(j, (int)pool_.size());
@@ -674,11 +691,13 @@ class DualSteepestEdgePricer {
         row_pool_.clear();
         const int take = (pool_max_ > 0) ? std::min<int>(pool_max_, (int)N.size()) : (int)N.size();
         dual_pool_.reserve(take);
+        Eigen::VectorXd Aj(A.rows());
+        Eigen::VectorXd e_i(A.rows());
         for (int k = 0; k < take; ++k) {
             const int j = N[k];
             DualEntry e;
             e.jN = j;
-            const Eigen::VectorXd Aj = pricing_detail::dense_column(A, j);
+            pricing_detail::dense_column(A, j, Aj);
             e.w = B.solve_BT(Aj); // caller-provided
             e.dual_weight = pricing_detail::edge_weight_from_direction(e.w, weight_strategy_);
             dual_pos_[j] = (int)dual_pool_.size();
@@ -686,7 +705,7 @@ class DualSteepestEdgePricer {
         }
         row_pool_.resize(A.rows());
         for (int i = 0; i < A.rows(); ++i) {
-            Eigen::VectorXd e_i = Eigen::VectorXd::Zero(A.rows());
+            e_i.setZero();
             e_i(i) = 1.0;
             row_pool_[i].psi = B.solve_BT(e_i);
             row_pool_[i].weight = std::max(1.0, pricing_detail::edge_weight_from_direction(
@@ -701,6 +720,7 @@ class DualSteepestEdgePricer {
                                       double tol) const {
         LeavingChoice best;
         double best_score = -1.0;
+        Eigen::VectorXd e_i;
         for (int i = 0; i < yB.size(); ++i) {
             if (yB(i) >= -tol)
                 continue;
@@ -715,7 +735,8 @@ class DualSteepestEdgePricer {
                 if (i < (int)row_pool_.size() && row_pool_[i].psi.size() == yB.size()) {
                     best.dual_row = row_pool_[i].psi;
                 } else {
-                    Eigen::VectorXd e_i = Eigen::VectorXd::Zero(yB.size());
+                    e_i.resize(yB.size());
+                    e_i.setZero();
                     e_i(i) = 1.0;
                     best.dual_row = B.solve_BT(e_i);
                     weight = std::max(1.0, pricing_detail::edge_weight_from_direction(
@@ -900,8 +921,9 @@ class DualDevexPricer {
     template <class BasisLike, class MatrixLike>
     void build_dual_pool(const BasisLike& B, const MatrixLike& A, const std::vector<int>& /*N*/) {
         row_weights_.assign(A.rows(), 1.0);
+        Eigen::VectorXd e_i(A.rows());
         for (int i = 0; i < A.rows(); ++i) {
-            Eigen::VectorXd e_i = Eigen::VectorXd::Zero(A.rows());
+            e_i.setZero();
             e_i(i) = 1.0;
             const Eigen::VectorXd psi_i = B.solve_BT(e_i);
             row_weights_[i] = std::max(1.0, psi_i.squaredNorm());
@@ -916,6 +938,7 @@ class DualDevexPricer {
                                       double tol) const {
         LeavingChoice best;
         double best_score = -1.0;
+        Eigen::VectorXd e_i;
         for (int i = 0; i < yB.size(); ++i) {
             if (yB(i) >= -tol)
                 continue;
@@ -930,7 +953,8 @@ class DualDevexPricer {
         }
 
         if (best.row >= 0) {
-            Eigen::VectorXd e_i = Eigen::VectorXd::Zero(yB.size());
+            e_i.resize(yB.size());
+            e_i.setZero();
             e_i(best.row) = 1.0;
             best.dual_row = B.solve_BT(e_i);
             best.weight = std::max(1.0, best.dual_row.squaredNorm());
@@ -1011,6 +1035,7 @@ class DualRowPricer {
                                       double tol) const {
         LeavingChoice best;
         double best_score = -1.0;
+        Eigen::VectorXd e_i;
 
         for (int i = 0; i < yB.size(); ++i) {
             if (yB(i) >= -tol)
@@ -1029,7 +1054,8 @@ class DualRowPricer {
                 best.weight = std::max(1.0, weight);
                 if (use_row_pricing) {
                     // Get row vector for row pricing
-                    Eigen::VectorXd e_i = Eigen::VectorXd::Zero(yB.size());
+                    e_i.resize(yB.size());
+                    e_i.setZero();
                     e_i(i) = 1.0;
                     best.dual_row = B.solve_BT(e_i);
                 }
@@ -1038,7 +1064,8 @@ class DualRowPricer {
 
         if (best.row >= 0) {
             // Always compute the dual row for the leaving row
-            Eigen::VectorXd e_i = Eigen::VectorXd::Zero(yB.size());
+            e_i.resize(yB.size());
+            e_i.setZero();
             e_i(best.row) = 1.0;
             best.dual_row = B.solve_BT(e_i);
             best.weight = std::max(
@@ -1053,15 +1080,16 @@ class DualRowPricer {
                             const std::vector<int>& N) {
         row_weights_.resize(A.rows());
         prefer_row_pricing_.resize(A.rows(), false);
+        Eigen::VectorXd e_i(A.rows());
         for (int i = 0; i < A.rows(); ++i) {
             // Compute row weight as ||B^{-T} e_i||^2
-            Eigen::VectorXd e_i = Eigen::VectorXd::Zero(A.rows());
+            e_i.setZero();
             e_i(i) = 1.0;
             const Eigen::VectorXd psi_i = B_inv.solve_BT(e_i);
             row_weights_[i] =
                 std::max(1.0, pricing_detail::edge_weight_from_direction(psi_i, weight_strategy_));
             prefer_row_pricing_[i] =
-                computeRowDensity(psi_i, A, N) < static_cast<double>(density_threshold_);
+                computeRowDensity(i, A, N) < static_cast<double>(density_threshold_);
         }
         iter_count_ = 0;
     }
@@ -1083,16 +1111,30 @@ class DualRowPricer {
 
   private:
     template <class MatrixLike>
-    double computeRowDensity(const Eigen::VectorXd& dual_row, const MatrixLike& A,
-                             const std::vector<int>& N) const {
-        const int sample_size = std::min<int>(20, N.size());
+    int countRowNnz(int row, const MatrixLike& A, const std::vector<int>& N) const {
         int nz_count = 0;
-        for (int k = 0; k < sample_size; ++k) {
-            const double dot = pricing_detail::column_dot(A, N[k], dual_row);
-            if (std::abs(dot) > 1e-14)
-                ++nz_count;
+        if constexpr (std::is_same_v<MatrixLike,
+                                     Eigen::SparseMatrix<double, Eigen::ColMajor, int>>) {
+            for (int j : N) {
+                for (typename MatrixLike::InnerIterator it(A, j); it; ++it) {
+                    if (it.row() == row) {
+                        ++nz_count;
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (int j : N) {
+                if (std::abs(A(row, j)) > 0.0)
+                    ++nz_count;
+            }
         }
-        return static_cast<double>(nz_count);
+        return nz_count;
+    }
+
+    template <class MatrixLike>
+    double computeRowDensity(int row, const MatrixLike& A, const std::vector<int>& N) const {
+        return static_cast<double>(countRowNnz(row, A, N));
     }
 
     std::vector<double> row_weights_;

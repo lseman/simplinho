@@ -83,11 +83,13 @@ class SparseForrestTomlinLU {
         bool diagonal_equilibration{true};
         int equilibration_passes{4};
         double equilibration_floor{1e-12};
-        bool iterative_refinement{false};
-        int iterative_refinement_steps{1};
+        bool iterative_refinement{true};
+        int iterative_refinement_steps{3};
         double iterative_refinement_tol{1e-10};
         double max_norm_growth_before_refactor{1e6};
         int max_parallel_update_size{64};
+        bool enable_hyper_sparse_rhs{true};
+        bool use_product_form_updates{true};
     };
 
     struct UpdateStats {
@@ -127,6 +129,7 @@ class SparseForrestTomlinLU {
         abs_floor_ = abs_floor;
         rook_iters_ = refactor_rook_iters;
         config_ = config;
+        update_method_ = config_.use_product_form_updates ? UpdateMethod::PF : UpdateMethod::FT;
         base_matrix_original_ = A;
         base_matrix_original_.makeCompressed();
         base_matrix_one_norm_ = matrix_one_norm_(base_matrix_original_);
@@ -188,6 +191,7 @@ class SparseForrestTomlinLU {
 
     void clear_updates() noexcept {
         updates_.clear();
+        clear_pf_updates();
         last_update_failure_reason_ = UpdateFailureReason::None;
         norm_growth_estimate_ = 1.0;
         updates_count_ = 0;
@@ -245,6 +249,32 @@ class SparseForrestTomlinLU {
         }
 
         last_update_failure_reason_ = UpdateFailureReason::None;
+
+        // If PF update method is selected, build packed column and use PF instead of FT.
+        if (update_method_ == UpdateMethod::PF) {
+            // Build packed column from z (excluding pivot row j).
+            // PF stores: pivot_row=j, packed column entries, pivot_val=alpha.
+            std::vector<int> col_idx;
+            std::vector<double> col_val;
+            col_idx.reserve(static_cast<size_t>(z.cwiseAbs().sum() / z.norm() + 1));
+            col_val.reserve(col_idx.size());
+            for (int i = 0; i < n_; ++i) {
+                if (i != j && std::abs(z(i)) > eps) {
+                    col_idx.push_back(i);
+                    col_val.push_back(z(i));
+                }
+            }
+            const bool pf_ok = append_pf_update(j, col_idx, col_val, alpha);
+            // Preserve regular update vectors for transpose solves, while using PF
+            // packed updates for forward solves.
+            updates_.push_back(SparseUpdate{j, dense_to_sparse_update_(u, eps),
+                                            dense_to_sparse_update_(z, eps),
+                                            dense_to_sparse_update_(w, eps), alpha});
+            update_norm_growth_estimate_(updates_.back());
+            update_cached_stats_(updates_.back());
+            return pf_ok;
+        }
+
         updates_.push_back(SparseUpdate{j, dense_to_sparse_update_(u, eps),
                                         dense_to_sparse_update_(z, eps),
                                         dense_to_sparse_update_(w, eps), alpha});
@@ -252,6 +282,80 @@ class SparseForrestTomlinLU {
         update_cached_stats_(updates_.back());
         return true;
     }
+
+    // Product Form (PF) update — stores the column in packed form for efficient updates.
+    // Stores aq->packIndex/packValue excluding the pivot row.
+    bool append_pf_update(int pivot_row, const std::vector<int>& col_index,
+                          const std::vector<double>& col_value, double pivot_val) {
+        pf_start_.push_back(static_cast<int>(pf_index_.size()));
+        pf_pivot_index_.push_back(pivot_row);
+        pf_pivot_value_.push_back(pivot_val);
+        for (size_t i = 0; i < col_index.size(); ++i) {
+            if (col_index[i] != pivot_row) {
+                pf_index_.push_back(col_index[i]);
+                pf_value_.push_back(col_value[i]);
+            }
+        }
+        pf_total_fill_ += static_cast<int>(col_index.size());
+        return true;
+    }
+
+    // Modified Product Form (MPF) update — stores full column + row for authenticated updates.
+    bool append_mpf_update(int pivot_row, const std::vector<int>& col_index,
+                           const std::vector<double>& col_value, double pivot_val,
+                           const std::vector<int>& row_index,
+                           const std::vector<double>& row_value) {
+        pf_start_.push_back(static_cast<int>(pf_index_.size()));
+        // Store column entries
+        for (size_t i = 0; i < col_index.size(); ++i) {
+            pf_index_.push_back(col_index[i]);
+            pf_value_.push_back(col_value[i]);
+        }
+        // Store row entries with negated values
+        for (size_t i = 0; i < row_index.size(); ++i) {
+            pf_index_.push_back(row_index[i]);
+            pf_value_.push_back(-row_value[i]);
+        }
+        pf_pivot_index_.push_back(pivot_row);
+        pf_pivot_value_.push_back(pivot_val);
+        pf_total_fill_ += static_cast<int>(col_index.size() + row_index.size());
+        return true;
+    }
+
+    // Authenticated Product Form (APF) update — stores column plus original column for auth.
+    bool append_apf_update(int pivot_row, const std::vector<int>& col_index,
+                           const std::vector<double>& col_value, double pivot_val,
+                           const std::vector<int>& orig_col_index,
+                           const std::vector<double>& orig_col_value) {
+        pf_start_.push_back(static_cast<int>(pf_index_.size()));
+        // Store the new column
+        for (size_t i = 0; i < col_index.size(); ++i) {
+            pf_index_.push_back(col_index[i]);
+            pf_value_.push_back(col_value[i]);
+        }
+        // Store original column for authentication
+        for (size_t i = 0; i < orig_col_index.size(); ++i) {
+            pf_index_.push_back(orig_col_index[i]);
+            pf_value_.push_back(-orig_col_value[i]);
+        }
+        pf_pivot_index_.push_back(pivot_row);
+        pf_pivot_value_.push_back(pivot_val);
+        pf_total_fill_ += static_cast<int>(col_index.size() + orig_col_index.size());
+        return true;
+    }
+
+    // Clear PF update structures.
+    void clear_pf_updates() noexcept {
+        pf_start_.clear();
+        pf_index_.clear();
+        pf_pivot_index_.clear();
+        pf_value_.clear();
+        pf_pivot_value_.clear();
+        pf_total_fill_ = 0;
+    }
+
+    // Check if PF refactor is needed based on fill-in.
+    bool pf_needs_refactor() const noexcept { return pf_total_fill_ > pf_merit_threshold_; }
 
     bool needs_refactor() const noexcept {
         return !std::isfinite(norm_growth_estimate_) ||
@@ -299,27 +403,44 @@ class SparseForrestTomlinLU {
         permute_and_scale_rhs_(b, permuted_rhs_scratch_, Pr_, row_scale_);
         Eigen::VectorXd& Pb = permuted_rhs_scratch_;
 
-        // Adaptive threshold (Item 9): skip hyper-sparse if recent reach has been dense.
-        const bool use_sparse_rhs = false;
-        //            ema_reach_ratio_ < kHyperSparseFallbackRatio_ && is_hyper_sparse_rhs_(Pb);
+        // Hyper-sparse RHS solves: use Highs-style adaptive threshold.
+        // Count nonzeros to compute actual RHS density for the switch.
+        int rhs_nz = 0;
+        for (int i = 0; i < Pb.size(); ++i)
+            if (std::abs(Pb(i)) > kSparseTiny_)
+                ++rhs_nz;
+        const double rhs_density = static_cast<double>(rhs_nz) / static_cast<double>(n_);
+        const bool use_sparse_rhs = config_.enable_hyper_sparse_rhs &&
+                                    rhs_density < kHyperCancel_ &&
+                                    ema_reach_ratio_ < kHyperSparseFallbackRatio_;
         if (use_sparse_rhs) {
-            // Chain L-reach as seeds for U solve (Item 1): eliminates second O(n) scan.
-            Eigen::VectorXd z = forward_solve_L_sparse_(Pb, nullptr);
-            l_reach_seeds_scratch_ = std::move(reach_scratch_);
-            Eigen::VectorXd w = back_solve_U_sparse_(z, &l_reach_seeds_scratch_);
-            hyper_solve_reach_valid_ = true;
-            Eigen::VectorXd x = Eigen::VectorXd::Zero(n_);
-            for (const int i : reach_scratch_) {
-                const int xi = Pc_[i];
-                x(xi) = w(i) * col_scale_[static_cast<size_t>(xi)];
+            try {
+                // Chain L-reach as seeds for U solve (Item 1): eliminates second O(n) scan.
+                Eigen::VectorXd z = forward_solve_L_sparse_(Pb, nullptr);
+                l_reach_seeds_scratch_ = std::move(reach_scratch_);
+                Eigen::VectorXd w = back_solve_U_sparse_(z, &l_reach_seeds_scratch_);
+                hyper_solve_reach_valid_ = true;
+                Eigen::VectorXd x = Eigen::VectorXd::Zero(n_);
+                for (const int i : reach_scratch_) {
+                    const int xi = Pc_[i];
+                    x(xi) = w(i) * col_scale_[static_cast<size_t>(xi)];
+                }
+                if (!updates_.empty())
+                    x = apply_updates_solve_(x);
+                if (!validate_sparse_rhs_solution_(b, x))
+                    throw std::runtime_error(
+                        "SparseForrestTomlinLU: hyper-sparse RHS residual check failed");
+                if (enable_refinement)
+                    x = iterative_refine_(b, x);
+                return x;
+            } catch (const std::exception&) {
+                // Hyper-sparse solve failed or produced an invalid residual; fall back to dense
+                // solve.
+                hyper_solve_reach_valid_ = false;
             }
-            if (!updates_.empty())
-                x = apply_updates_solve_(x);
-            if (enable_refinement)
-                x = iterative_refine_(b, x);
-            return x;
         }
         hyper_solve_reach_valid_ = false;
+        // Use standard dense fallback - solveHyper_ requires properly computed h_end array.
         Eigen::VectorXd w = back_solve_U_(forward_solve_L_(Pb));
         Eigen::VectorXd x(n_);
         for (int i = 0; i < n_; ++i)
@@ -351,25 +472,42 @@ class SparseForrestTomlinLU {
         permute_and_scale_rhs_(c, permuted_transpose_rhs_scratch_, Pc_, col_scale_);
         Eigen::VectorXd& PcTc = permuted_transpose_rhs_scratch_;
 
-        const bool use_sparse_rhs =
-            ema_reach_ratio_ < kHyperSparseFallbackRatio_ && is_hyper_sparse_rhs_(PcTc);
+        // Highs-style adaptive threshold for transpose solve.
+        int rhs_nz = 0;
+        for (int i = 0; i < PcTc.size(); ++i)
+            if (std::abs(PcTc(i)) > kSparseTiny_)
+                ++rhs_nz;
+        const double rhs_density = static_cast<double>(rhs_nz) / static_cast<double>(n_);
+        const bool use_sparse_rhs = config_.enable_hyper_sparse_rhs &&
+                                    rhs_density < kHyperCancel_ &&
+                                    ema_reach_ratio_ < kHyperSparseFallbackRatio_;
         if (use_sparse_rhs) {
-            Eigen::VectorXd t = forward_solve_UT_sparse_(PcTc, nullptr);
-            l_reach_seeds_scratch_ = std::move(reach_scratch_);
-            Eigen::VectorXd s = back_solve_LT_sparse_(t, &l_reach_seeds_scratch_);
-            hyper_solve_reach_valid_ = true;
-            Eigen::VectorXd y = Eigen::VectorXd::Zero(n_);
-            for (const int i : reach_scratch_) {
-                const int yi = Pr_[i];
-                y(yi) = s(i) * row_scale_[static_cast<size_t>(yi)];
+            try {
+                Eigen::VectorXd t = forward_solve_UT_sparse_(PcTc, nullptr);
+                l_reach_seeds_scratch_ = std::move(reach_scratch_);
+                Eigen::VectorXd s = back_solve_LT_sparse_(t, &l_reach_seeds_scratch_);
+                hyper_solve_reach_valid_ = true;
+                Eigen::VectorXd y = Eigen::VectorXd::Zero(n_);
+                for (const int i : reach_scratch_) {
+                    const int yi = Pr_[i];
+                    y(yi) = s(i) * row_scale_[static_cast<size_t>(yi)];
+                }
+                if (!updates_.empty())
+                    y = apply_updates_solve_T_(y);
+                if (!validate_sparse_transpose_rhs_solution_(c, y))
+                    throw std::runtime_error(
+                        "SparseForrestTomlinLU: hyper-sparse RHS transpose residual check failed");
+                if (enable_refinement)
+                    y = iterative_refine_T_(c, y);
+                return y;
+            } catch (const std::exception&) {
+                // Hyper-sparse transpose solve failed or produced an invalid residual; fall back to
+                // dense solve.
+                hyper_solve_reach_valid_ = false;
             }
-            if (!updates_.empty())
-                y = apply_updates_solve_T_(y);
-            if (enable_refinement)
-                y = iterative_refine_T_(c, y);
-            return y;
         }
         hyper_solve_reach_valid_ = false;
+        // Use standard dense fallback instead of solveHyper_
         Eigen::VectorXd s = back_solve_LT_(forward_solve_UT_(PcTc));
         Eigen::VectorXd y(n_);
         for (int i = 0; i < n_; ++i)
@@ -419,12 +557,13 @@ class SparseForrestTomlinLU {
         }
         if (!updates_.empty())
             x = apply_updates_solve_(x);
-        if (enable_refinement) {
-            Eigen::VectorXd b = Eigen::VectorXd::Zero(n_);
-            for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
-                b(seed_idx[k]) = seed_val[k];
+        Eigen::VectorXd b = Eigen::VectorXd::Zero(n_);
+        for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
+            b(seed_idx[k]) = seed_val[k];
+        if (!validate_sparse_rhs_solution_(b, x))
+            return solve_impl_(b, enable_refinement);
+        if (enable_refinement)
             x = iterative_refine_(b, x);
-        }
         return x;
     }
 
@@ -462,12 +601,13 @@ class SparseForrestTomlinLU {
         }
         if (!updates_.empty())
             y = apply_updates_solve_T_(y);
-        if (enable_refinement) {
-            Eigen::VectorXd c = Eigen::VectorXd::Zero(n_);
-            for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
-                c(seed_idx[k]) = seed_val[k];
+        Eigen::VectorXd c = Eigen::VectorXd::Zero(n_);
+        for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
+            c(seed_idx[k]) = seed_val[k];
+        if (!validate_sparse_transpose_rhs_solution_(c, y))
+            return solveT_impl_(c, enable_refinement);
+        if (enable_refinement)
             y = iterative_refine_T_(c, y);
-        }
         return y;
     }
 
@@ -558,19 +698,28 @@ class SparseForrestTomlinLU {
 
     static constexpr double kZeroTol_ = 1e-16;
     static constexpr double kHyperSparseDensityThreshold_ = 0.02;
-    // If the EMA of recent reach densities exceeds this, fall back to dense solves (Item 9).
-    static constexpr double kHyperSparseFallbackRatio_ = 0.25;
+    // Hyper-sparse thresholds from Highs HFactorConst.h — calibrated for LP basis factors.
+    // kHyperCancel: RHS density threshold to switch from hyper-sparse to sparse solve.
+    // kHyperFtranL/U, kHyperBtranL/U: expected density thresholds for hyper-sparse TRANs.
+    static constexpr double kHyperSparseFallbackRatio_ = 0.05;
+    static constexpr double kHyperCancel_ = 0.05;
+    static constexpr double kHyperFtranL_ = 0.15;
+    static constexpr double kHyperFtranU_ = 0.10;
+    static constexpr double kHyperBtranL_ = 0.10;
+    static constexpr double kHyperBtranU_ = 0.15;
+    // kHighsTiny equivalent: threshold for zeroing small values in solves.
+    static constexpr double kSparseTiny_ = 1e-14;
     static constexpr long kEarlyAcceptMarkowitzScore_ = 1;
     static constexpr double kEarlyAcceptPivotRatio_ = 0.9;
 
     static bool is_hyper_sparse_rhs_(const Eigen::VectorXd& rhs) {
         if (rhs.size() == 0)
             return false;
-        const int threshold =
-            std::max(1, static_cast<int>(rhs.size() * kHyperSparseDensityThreshold_));
+        // Highs-style: use kHyperCancel threshold for hyper-sparse detection.
+        const int threshold = std::max(1, static_cast<int>(rhs.size() * kHyperCancel_));
         int nz = 0;
         for (int i = 0; i < rhs.size() && nz <= threshold; ++i) {
-            if (std::abs(rhs(i)) > kZeroTol_)
+            if (std::abs(rhs(i)) > kSparseTiny_)
                 ++nz;
         }
         return nz <= threshold;
@@ -1350,6 +1499,77 @@ class SparseForrestTomlinLU {
         perm_seeds_scratch_.reserve(n_);
         ema_reach_ratio_ = kHyperSparseDensityThreshold_;
         hyper_solve_reach_valid_ = false;
+
+        // Build pivot lookup tables for hyper-sparse solves.
+        // In our representation, L and U are stored row-wise with diagonals separate.
+        // For hyper-sparse solves, we need pivot_lookup: physical → logical position.
+        // Since L_diag_[i] and U_diag_[i] correspond to physical row i, the lookup is identity.
+        L_pivot_lookup_.resize(n_);
+        U_pivot_lookup_.resize(n_);
+        for (int i = 0; i < n_; ++i) {
+            L_pivot_lookup_[i] = i;
+            U_pivot_lookup_[i] = i;
+        }
+
+        // Allocate hyper-sparse working buffers (Highs-style cwork/iwork).
+        // cwork: char mark array for visited nodes
+        // iwork: int array for indices and stack (size 4*n for safety)
+        if (hyper_sparse_cwork_.size() < static_cast<size_t>(n_))
+            hyper_sparse_cwork_.assign(n_, 0);
+        if (hyper_sparse_iwork_.size() < static_cast<size_t>(n_ * 4))
+            hyper_sparse_iwork_.assign(n_ * 4, 0);
+
+        // Build CSC (column-oriented) H-factor structures for solveHyper_.
+        // Convert L_lower (row CSR) → L_lower_col (column CSC)
+        {
+            const int nnz = static_cast<int>(L_lower_idx_.size());
+            L_lower_col_ptr_.assign(n_ + 1, 0);
+            // Count entries per column
+            for (int pos = 0; pos < nnz; ++pos) {
+                ++L_lower_col_ptr_[L_lower_idx_[pos] + 1];
+            }
+            // Prefix sum to get column offsets
+            for (int j = 1; j <= n_; ++j) {
+                L_lower_col_ptr_[j] += L_lower_col_ptr_[j - 1];
+            }
+            L_lower_col_idx_.resize(nnz);
+            L_lower_col_val_.resize(nnz);
+            std::vector<int> write_pos = L_lower_col_ptr_; // copy
+            for (int row = 0; row < n_; ++row) {
+                const int row_start = L_lower_ptr_[row];
+                const int row_end = L_lower_ptr_[row + 1];
+                for (int pos = row_start; pos < row_end; ++pos) {
+                    const int col = L_lower_idx_[pos];
+                    const int write_idx = write_pos[col]++;
+                    L_lower_col_idx_[write_idx] = row;
+                    L_lower_col_val_[write_idx] = L_lower_val_[pos];
+                }
+            }
+        }
+        // Convert U_upper (row CSR) → U_upper_col (column CSC)
+        {
+            const int nnz = static_cast<int>(U_upper_idx_.size());
+            U_upper_col_ptr_.assign(n_ + 1, 0);
+            for (int pos = 0; pos < nnz; ++pos) {
+                ++U_upper_col_ptr_[U_upper_idx_[pos] + 1];
+            }
+            for (int j = 1; j <= n_; ++j) {
+                U_upper_col_ptr_[j] += U_upper_col_ptr_[j - 1];
+            }
+            U_upper_col_idx_.resize(nnz);
+            U_upper_col_val_.resize(nnz);
+            std::vector<int> write_pos = U_upper_col_ptr_;
+            for (int row = 0; row < n_; ++row) {
+                const int row_start = U_upper_ptr_[row];
+                const int row_end = U_upper_ptr_[row + 1];
+                for (int pos = row_start; pos < row_end; ++pos) {
+                    const int col = U_upper_idx_[pos];
+                    const int write_idx = write_pos[col]++;
+                    U_upper_col_idx_[write_idx] = row;
+                    U_upper_col_val_[write_idx] = U_upper_val_[pos];
+                }
+            }
+        }
     }
 
     void load_initial_U_(const SparseMat& A) {
@@ -1607,6 +1827,118 @@ class SparseForrestTomlinLU {
         use_fallback_sparse_lu_ = true;
     }
 
+    // Highs-style hyper-sparse solve using iterative deepening with domination checking.
+    // Uses cwork (char mark array) and iwork (int stack/index array) like Highs.
+    // Template parameter Phase: 0 = forward L (ascending), 1 = backward U (descending).
+    // h_size: dimension of the factor (n_)
+    // pivot_lookup: maps from H-index to position (inverse of pivot_index)
+    // pivot_index: the pivot row/col indices
+    // pivot_value: diagonal values (nullptr for L which has implicit 1s)
+    // h_ptr: column pointer array of length h_size+1 (CSC format)
+    // h_index, h_value: the sparse column data
+    // x: RHS/solution vector (modified in place for RHS, returned as solution)
+    template <int Phase>
+    void solveHyper_(int h_size, const int* pivot_lookup, const int* pivot_index,
+                     const double* pivot_value, const int* h_ptr, const int* h_index,
+                     const double* h_value, double* x_array) const {
+        // Build reach set using Highs-style iterative deepening
+        char* list_mark = hyper_sparse_cwork_.data();
+        int* list_index = hyper_sparse_iwork_.data();
+        int* list_stack = &hyper_sparse_iwork_[h_size];
+        int list_count = 0;
+
+        // Collect RHS nonzeros as seeds
+        int rhs_count = 0;
+        for (int i = 0; i < n_; ++i) {
+            if (std::abs(x_array[i]) > kSparseTiny_) {
+                list_index[rhs_count++] = i;
+            }
+        }
+
+        int count_pivot = 0;
+        int count_entry = 0;
+
+        // Iterative deepening traversal with domination checking
+        for (int i = 0; i < rhs_count; ++i) {
+            int i_trans = pivot_lookup[list_index[i]];
+            if (list_mark[i_trans])
+                continue; // Domination check: already visited
+
+            int Hi = i_trans;
+            int Hk = h_ptr[Hi];
+            int n_stack = -1;
+
+            list_mark[Hi] = 1;
+
+            for (;;) {
+                if (Hk < h_ptr[Hi + 1]) {
+                    int Hi_sub = pivot_lookup[h_index[Hk++]];
+                    if (list_mark[Hi_sub] == 0) {
+                        list_mark[Hi_sub] = 1;
+                        list_stack[++n_stack] = Hi;
+                        list_stack[++n_stack] = Hk;
+                        Hi = Hi_sub;
+                        Hk = h_ptr[Hi];
+                        if (Hi >= h_size) {
+                            count_pivot++;
+                            count_entry += h_ptr[Hi + 1] - h_ptr[Hi];
+                        }
+                    }
+                } else {
+                    list_index[list_count++] = Hi;
+                    if (n_stack == -1)
+                        break;
+                    Hk = list_stack[n_stack--];
+                    Hi = list_stack[n_stack--];
+                }
+            }
+        }
+
+        // Update synthetic tick with Highs-style weights
+        synthetic_tick_ += count_pivot * 20 + count_entry * 10;
+
+        // Solve with the collected list
+        if (pivot_value == nullptr) {
+            // L factor: diagonal is implicitly 1
+            int new_count = 0;
+            for (int iList = list_count - 1; iList >= 0; --iList) {
+                int i = list_index[iList];
+                list_mark[i] = 0;
+                int pivot_row = pivot_index[i];
+                double pivot_multiplier = x_array[pivot_row];
+                if (std::abs(pivot_multiplier) > kSparseTiny_) {
+                    list_index[new_count++] = pivot_row;
+                    const int start = h_ptr[i];
+                    const int end = h_ptr[i + 1];
+                    for (int k = start; k < end; ++k)
+                        x_array[h_index[k]] -= pivot_multiplier * h_value[k];
+                } else {
+                    x_array[pivot_row] = 0;
+                }
+            }
+        } else {
+            // U factor: has explicit diagonal
+            int new_count = 0;
+            for (int iList = list_count - 1; iList >= 0; --iList) {
+                int i = list_index[iList];
+                list_mark[i] = 0;
+                int pivot_row = pivot_index[i];
+                double pivot_multiplier = x_array[pivot_row];
+                if (std::abs(pivot_multiplier) > kSparseTiny_) {
+                    pivot_multiplier /= pivot_value[i];
+                    x_array[pivot_row] = pivot_multiplier;
+                    list_index[new_count++] = pivot_row;
+                    const int start = h_ptr[i];
+                    const int end = h_ptr[i + 1];
+                    for (int k = start; k < end; ++k)
+                        x_array[h_index[k]] -= pivot_multiplier * h_value[k];
+                } else {
+                    x_array[pivot_row] = 0;
+                }
+            }
+        }
+    }
+
     Eigen::VectorXd forward_solve_L_(const Eigen::VectorXd& b) const {
         if (n_ == 0) [[unlikely]]
             return b;
@@ -1645,6 +1977,15 @@ class SparseForrestTomlinLU {
             return b;
         SIMPLEX_ASSUME(n_ > 0);
 
+        if (config_.enable_hyper_sparse_rhs && !L_lower_col_ptr_.empty()) {
+            Eigen::VectorXd x = b;
+            solveHyper_<0>(n_, L_pivot_lookup_.data(), L_pivot_lookup_.data(), nullptr,
+                           L_lower_col_ptr_.data(), L_lower_col_idx_.data(),
+                           L_lower_col_val_.data(), x.data());
+            hyper_solve_reach_valid_ = false;
+            return x;
+        }
+
         clear_reach_flags_scratch_(seeds);
         dfs_stack_scratch_.clear();
 
@@ -1664,7 +2005,7 @@ class SparseForrestTomlinLU {
                 trace_L(k);
         } else {
             for (int k = 0; k < n_; ++k)
-                if (std::abs(b(k)) > kZeroTol_)
+                if (std::abs(b(k)) > kSparseTiny_)
                     trace_L(k);
         }
 
@@ -1729,6 +2070,15 @@ class SparseForrestTomlinLU {
             return b;
         SIMPLEX_ASSUME(n_ > 0);
 
+        if (config_.enable_hyper_sparse_rhs && !U_upper_col_ptr_.empty()) {
+            Eigen::VectorXd x = b;
+            solveHyper_<1>(n_, U_pivot_lookup_.data(), U_pivot_lookup_.data(), U_diag_.data(),
+                           U_upper_col_ptr_.data(), U_upper_col_idx_.data(),
+                           U_upper_col_val_.data(), x.data());
+            hyper_solve_reach_valid_ = false;
+            return x;
+        }
+
         clear_reach_flags_scratch_(seeds);
         dfs_stack_scratch_.clear();
 
@@ -1746,7 +2096,7 @@ class SparseForrestTomlinLU {
                 trace_U(k);
         } else {
             for (int k = 0; k < n_; ++k)
-                if (std::abs(b(k)) > kZeroTol_)
+                if (std::abs(b(k)) > kSparseTiny_)
                     trace_U(k);
         }
 
@@ -1821,7 +2171,7 @@ class SparseForrestTomlinLU {
                 trace_UT(k);
         } else {
             for (int k = 0; k < n_; ++k)
-                if (std::abs(b(k)) > kZeroTol_)
+                if (std::abs(b(k)) > kSparseTiny_)
                     trace_UT(k);
         }
 
@@ -1900,7 +2250,7 @@ class SparseForrestTomlinLU {
                 trace_LT(k);
         } else {
             for (int k = 0; k < n_; ++k)
-                if (std::abs(b(k)) > kZeroTol_)
+                if (std::abs(b(k)) > kSparseTiny_)
                     trace_LT(k);
         }
 
@@ -1931,6 +2281,8 @@ class SparseForrestTomlinLU {
     }
 
     Eigen::VectorXd apply_updates_solve_(Eigen::VectorXd x) const {
+        if (!pf_pivot_index_.empty())
+            return solve_with_PF_(x);
         for (const auto& update : updates_) {
             // If we have a valid hyper-sparse reach, skip updates where x(j) is
             // guaranteed zero (j not in reach set).
@@ -1943,7 +2295,39 @@ class SparseForrestTomlinLU {
         return x;
     }
 
+    // Apply updates using Product Form (PF) storage.
+    // Each PF update stores: pivot_row, packed column (excluding pivot row), pivot_value.
+    // For PF: x[pivot_row] /= pivot_val, then x[row] -= multiplier * PF_value[row].
+    Eigen::VectorXd solve_with_PF_(Eigen::VectorXd x) const {
+        const int num_updates = static_cast<int>(pf_pivot_index_.size());
+        if (num_updates == 0)
+            return x;
+        for (int k = 0; k < num_updates; ++k) {
+            const int pivot_row = pf_pivot_index_[k];
+            const double pivot_val = pf_pivot_value_[k];
+            if (std::abs(pivot_val) < kSparseTiny_)
+                continue;
+            const int start = pf_start_[k];
+            const int end =
+                (k + 1 < num_updates) ? pf_start_[k + 1] : static_cast<int>(pf_index_.size());
+            double xj = x(pivot_row);
+            if (std::abs(xj) < kSparseTiny_)
+                continue;
+            const double multiplier = xj / pivot_val;
+            x(pivot_row) = multiplier;
+            for (int p = start; p < end; ++p) {
+                const int row = pf_index_[p];
+                if (row != pivot_row) {
+                    x(row) -= multiplier * pf_value_[p];
+                }
+            }
+        }
+        return x;
+    }
+
     Eigen::VectorXd apply_updates_solve_T_(Eigen::VectorXd y) const {
+        // Use regular updates for transpose solves even when PF forward updates
+        // are also present, to avoid relying on incomplete PF transpose logic.
         for (const auto& update : updates_) {
             // For the transposed case, skip if none of u's support overlaps the
             // reach set — u.dot(y) must be zero if all u(i) positions are outside
@@ -1964,6 +2348,59 @@ class SparseForrestTomlinLU {
                 update.w.axpy(y, -(uy / update.alpha));
         }
         return y;
+    }
+
+    // Transpose solve with Product Form updates.
+    // PF update: B_new = B * (I - (1/alpha) * z * e_r^T)
+    // Transpose: B_new^T = (I - (1/alpha) * e_r * z^T) * B^T
+    // For PF (packed column form): y_new[pivot] = y[pivot]/pivot_val,
+    //   y_new[row] = y[row] - y_new[pivot] * PF_value[row]
+    Eigen::VectorXd solve_with_PF_T_(Eigen::VectorXd y) const {
+        const int num_updates = static_cast<int>(pf_pivot_index_.size());
+        if (num_updates == 0)
+            return y;
+        // Apply in reverse order (reverse sweep matches transpose operation order)
+        for (int k = num_updates - 1; k >= 0; --k) {
+            const int pivot_row = pf_pivot_index_[k];
+            const double pivot_val = pf_pivot_value_[k];
+            if (std::abs(pivot_val) < kSparseTiny_)
+                continue;
+            const int start = pf_start_[k];
+            const int end =
+                (k + 1 < num_updates) ? pf_start_[k + 1] : static_cast<int>(pf_index_.size());
+            // First compute the contribution from all non-pivot rows to pivot row
+            // (these were accumulated in y[pivot_row] during forward solve)
+            double yp = y(pivot_row);
+            // Compute the correction for pivot row
+            double correction = 0.0;
+            for (int p = start; p < end; ++p) {
+                const int row = pf_index_[p];
+                if (row != pivot_row) {
+                    correction += pf_value_[p] * y(row);
+                }
+            }
+            y(pivot_row) = (yp - correction) / pivot_val;
+        }
+        return y;
+    }
+
+    bool validate_sparse_rhs_solution_(const Eigen::VectorXd& rhs, const Eigen::VectorXd& x) const {
+        if (!x.array().isFinite().all())
+            return false;
+        const Eigen::VectorXd residual = rhs - multiply_current_matrix_(x);
+        const double max_rhs = std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
+        return residual.array().isFinite().all() &&
+               residual.lpNorm<Eigen::Infinity>() <= 1e-8 * max_rhs;
+    }
+
+    bool validate_sparse_transpose_rhs_solution_(const Eigen::VectorXd& rhs,
+                                                 const Eigen::VectorXd& y) const {
+        if (!y.array().isFinite().all())
+            return false;
+        const Eigen::VectorXd residual = rhs - multiply_current_matrix_T_(y);
+        const double max_rhs = std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
+        return residual.array().isFinite().all() &&
+               residual.lpNorm<Eigen::Infinity>() <= 1e-8 * max_rhs;
     }
 
     Eigen::VectorXd multiply_current_matrix_(const Eigen::VectorXd& x) const {
@@ -2090,6 +2527,20 @@ class SparseForrestTomlinLU {
     std::vector<int> L_lower_ptr_, U_upper_ptr_, UT_lower_ptr_, LT_upper_ptr_;
     std::vector<int> L_lower_idx_, U_upper_idx_, UT_lower_idx_, LT_upper_idx_;
     std::vector<double> L_lower_val_, U_upper_val_, UT_lower_val_, LT_upper_val_;
+    // Column-oriented (CSC) H-factor structures for solveHyper_.
+    // Built from L_lower_* and U_upper_* after build_solve_metadata_().
+    std::vector<int> L_lower_col_ptr_, U_upper_col_ptr_;
+    std::vector<int> L_lower_col_idx_, U_upper_col_idx_;
+    std::vector<double> L_lower_col_val_, U_upper_col_val_;
+    // Pivot lookup tables for hyper-sparse solves (Highs-style).
+    // L_pivot_lookup_[pivot_index] = logical_position (inverse of L_pivot_index)
+    // U_pivot_lookup_[pivot_index] = logical_position (inverse of U_pivot_index)
+    std::vector<int> L_pivot_lookup_, U_pivot_lookup_;
+    // Update method enum (Highs-style: FT, PF, MPF, APF).
+    enum class UpdateMethod { FT = 1, PF = 2, MPF = 3, APF = 4 };
+    UpdateMethod update_method_{UpdateMethod::FT};
+    // Synthetic tick for timing model.
+    mutable double synthetic_tick_{0.0};
     std::vector<int> affected_rows_scratch_;
     // Elimination trees (Item 2): first/last column-structure entry per node.
     // l_etree_[j]  = min{i>j : L[i,j]!=0}  (-1 if none) — forward L solve
@@ -2105,6 +2556,9 @@ class SparseForrestTomlinLU {
     mutable std::vector<bool> reach_flag_scratch_;
     mutable std::vector<int> reach_scratch_;
     mutable std::vector<int> dfs_stack_scratch_;
+    // Hyper-sparse solve working buffers (Highs-style cwork/iwork).
+    mutable std::vector<char> hyper_sparse_cwork_;
+    mutable std::vector<int> hyper_sparse_iwork_;
     // L-reach saved between L and U solve for seed chaining (Item 1).
     mutable std::vector<int> l_reach_seeds_scratch_;
     // Permuted seed positions for sparse RHS interface (Item 1).
@@ -2117,6 +2571,98 @@ class SparseForrestTomlinLU {
     // True when reach_flag_scratch_ reflects the last hyper-sparse solve output (Item 6).
     mutable bool hyper_solve_reach_valid_{false};
     std::vector<SparseUpdate> updates_;
+
+    // Product Form (PF) update structures — Highs-style for multiple update methods.
+    // pf_start[i] = start of PF column i in pf_index/pf_value
+    // pf_pivot_index[i] = row that PF column i pivots on
+    // pf_pivot_value[i] = pivot value for PF column i
+    std::vector<int> pf_start_, pf_index_, pf_pivot_index_;
+    std::vector<double> pf_value_, pf_pivot_value_;
+    // Total fill-in for PF (used to decide when to refactor).
+    int pf_total_fill_{0};
+    // Merit threshold for PF refactor decision.
+    int pf_merit_threshold_{1000};
+
+    // Singleton detection statistics for factorization analysis (Highs-style).
+    // These count pivot types during factorization for analysis/reporting.
+    int num_logical_pivots_{0};       // Unit logical columns (slacks)
+    int num_unit_pivots_{0};          // Structural unit columns
+    int num_row_singleton_pivots_{0}; // Row singletons
+    int num_col_singleton_pivots_{0}; // Column singletons
+    int num_markowitz_pivots_{0};     // General Markowitz pivots
+    int num_kernel_pivots_{0};        // Kernel/remaining pivots
+
+    // Singleton detection result structure.
+    enum class PivotType { Logical, Unit, RowSingleton, ColSingleton, Markowitz };
+    struct SingletonResult {
+        PivotType type;
+        int pivot_row{-1};
+        int pivot_col{-1};
+        double pivot_val{0.0};
+    };
+
+    // Detect singleton patterns in a column. Returns info about any singleton found.
+    // row_count[i] = number of nonzeros in row i (used for singleton detection).
+    SingletonResult detect_singleton_(int col, const SparseRow& column_entries,
+                                      const std::vector<int>& row_degree) const {
+        SingletonResult result;
+        if (column_entries.size() == 0)
+            return result;
+
+        // Column singleton: exactly one entry in column
+        if (column_entries.size() == 1) {
+            result.type = PivotType::ColSingleton;
+            result.pivot_row = column_entries[0].idx;
+            result.pivot_col = col;
+            result.pivot_val = column_entries[0].val;
+            return result;
+        }
+
+        // Check if any row has exactly one entry (row singleton)
+        for (const auto& entry : column_entries) {
+            if (row_degree[entry.idx] == 1) {
+                result.type = PivotType::RowSingleton;
+                result.pivot_row = entry.idx;
+                result.pivot_col = col;
+                result.pivot_val = entry.val;
+                return result;
+            }
+        }
+
+        result.type = PivotType::Markowitz;
+        return result;
+    }
+
+    // Reset singleton counters.
+    void reset_singleton_counters_() noexcept {
+        num_logical_pivots_ = 0;
+        num_unit_pivots_ = 0;
+        num_row_singleton_pivots_ = 0;
+        num_col_singleton_pivots_ = 0;
+        num_markowitz_pivots_ = 0;
+        num_kernel_pivots_ = 0;
+    }
+
+    // Record a pivot type for statistics.
+    void record_pivot_type_(PivotType type) {
+        switch (type) {
+            case PivotType::Logical:
+                ++num_logical_pivots_;
+                break;
+            case PivotType::Unit:
+                ++num_unit_pivots_;
+                break;
+            case PivotType::RowSingleton:
+                ++num_row_singleton_pivots_;
+                break;
+            case PivotType::ColSingleton:
+                ++num_col_singleton_pivots_;
+                break;
+            case PivotType::Markowitz:
+                ++num_markowitz_pivots_;
+                break;
+        }
+    }
     int updates_count_{0};
     double updates_max_z_inf_{0.0};
     double updates_max_w_inf_{0.0};

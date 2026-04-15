@@ -1843,19 +1843,40 @@ class Model {
                 }
                 std::vector<int> basis;
                 basis.reserve(static_cast<std::size_t>(node_data.rows));
-                for (int i = 0; i < node_data.rows; ++i) {
-                    int slack_index = -1;
-                    for (int j = node_data.original_vars; j < node_data.total_vars; ++j) {
-                        const double coeff = node_data.A(i, j);
-                        if (std::abs(coeff - 1.0) <= 1e-12 || std::abs(coeff + 1.0) <= 1e-12) {
-                            slack_index = j;
+                // For each slack column (original_vars to total_vars), find which row it's basic in.
+                // Iterate over slack columns and find the row where coefficient is ±1.
+                for (int j = node_data.original_vars; j < node_data.total_vars; ++j) {
+                    int found_row = -1;
+                    for (Eigen::SparseMatrix<double>::InnerIterator it(node_data.A_sparse, j); it; ++it) {
+                        if (std::abs(it.value() - 1.0) <= 1e-12) {
+                            found_row = it.row();
+                            break;
+                        }
+                        if (std::abs(it.value() + 1.0) <= 1e-12) {
+                            found_row = it.row();
                             break;
                         }
                     }
-                    if (slack_index < 0) {
+                    if (found_row < 0) {
                         return std::nullopt;
                     }
-                    basis.push_back(slack_index);
+                    // Ensure we don't have duplicate row assignments
+                    if (found_row < static_cast<int>(basis.size()) && basis[found_row] >= 0) {
+                        return std::nullopt;  // Row already assigned
+                    }
+                    if (found_row >= static_cast<int>(basis.size())) {
+                        basis.resize(found_row + 1, -1);
+                    }
+                    basis[found_row] = j;
+                }
+                // Check all rows 0..rows-1 have a basic slack
+                if (static_cast<int>(basis.size()) != node_data.rows) {
+                    return std::nullopt;
+                }
+                for (int i = 0; i < node_data.rows; ++i) {
+                    if (basis[i] < 0) {
+                        return std::nullopt;
+                    }
                 }
                 return basis;
             }
@@ -2628,16 +2649,18 @@ class Model {
         out.objective_sign = base_data.objective_sign;
         out.rows = base_data.rows + static_cast<int>(cuts.size());
         out.total_vars = base_data.total_vars + cut_slack_count;
-        out.A = Eigen::MatrixXd::Zero(out.rows, out.total_vars);
+        // Don't allocate dense out.A - only A_sparse is used for solving.
         out.b = Eigen::VectorXd::Zero(out.rows);
         out.c = Eigen::VectorXd::Zero(out.total_vars);
         out.l = Eigen::VectorXd::Zero(out.total_vars);
         out.u = Eigen::VectorXd::Constant(out.total_vars, std::numeric_limits<double>::infinity());
 
-        out.A.topLeftCorner(base_data.rows, base_data.total_vars) = base_data.A;
+        // Copy only what we need: into vectors (which are used) and for building A_sparse.
         out.b.head(base_data.rows) = base_data.b;
         out.c.head(base_data.total_vars) = base_data.c;
         out.l.head(base_data.total_vars) = base_data.l;
+        // out.u already set to infinity for all vars; only first base_data.total_vars are
+        // overwritten below.
         out.u.head(base_data.total_vars) = base_data.u;
         out.warm_start_basis = base_data.warm_start_basis;
         out.warm_start_basis_state = base_data.warm_start_basis_state;
@@ -2659,12 +2682,10 @@ class Model {
                 if (index < 0 || index >= base_data.total_vars) {
                     throw std::out_of_range("simplex: cut references invalid base variable");
                 }
-                out.A(row, index) = cut.values[k];
                 trips.emplace_back(row, index, cut.values[k]);
             }
             out.b(row) = cut.rhs;
             if (cut.sense == simplex_bnb::LinearConstraintSense::LessEqual) {
-                out.A(row, next_slack) = 1.0;
                 trips.emplace_back(row, next_slack, 1.0);
                 if (!out.warm_start_basis.empty()) {
                     out.warm_start_basis.push_back(next_slack);
@@ -2674,7 +2695,6 @@ class Model {
                 }
                 next_slack++;
             } else if (cut.sense == simplex_bnb::LinearConstraintSense::GreaterEqual) {
-                out.A(row, next_slack) = -1.0;
                 trips.emplace_back(row, next_slack, -1.0);
                 if (!out.warm_start_basis.empty()) {
                     out.warm_start_basis.push_back(next_slack);

@@ -1543,19 +1543,25 @@ RevisedSimplex::choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::Vec
                 consider(build_basis_attempt_(A, b, c, crash_attempt_config_(opt, k), opt.tol,
                                               opt.mode, seed_basis),
                          "repaired_warm_start", k);
-            }
-            if (can_accept_early(best.quality)) {
-                return best;
+                if (can_accept_early(best.quality)) {
+                    return best;
+                }
             }
         }
     }
 
     consider(find_logical_basis_(A), "logical_basis", -2);
+    if (can_accept_early(best.quality)) {
+        return best;
+    }
 
     const int attempts = std::max(1, opt.crash_attempts);
     for (int k = 0; k < attempts; ++k) {
         consider(build_basis_attempt_(A, b, c, crash_attempt_config_(opt, k), opt.tol, opt.mode),
                  "crash", k);
+        if (can_accept_early(best.quality)) {
+            return best;
+        }
     }
     return best;
 }
@@ -1616,19 +1622,25 @@ RevisedSimplex::choose_initial_basis_(const SparseMatrix& A, const Eigen::Vector
                 consider(build_basis_attempt_(A, b, c, crash_attempt_config_(opt, k), opt.tol,
                                               opt.mode, seed_basis),
                          "repaired_warm_start", k);
-            }
-            if (can_accept_early(best.quality)) {
-                return best;
+                if (can_accept_early(best.quality)) {
+                    return best;
+                }
             }
         }
     }
 
     consider(find_logical_basis_(A), "logical_basis", -2);
+    if (can_accept_early(best.quality)) {
+        return best;
+    }
 
     const int attempts = std::max(1, opt.crash_attempts);
     for (int k = 0; k < attempts; ++k) {
         consider(build_basis_attempt_(A, b, c, crash_attempt_config_(opt, k), opt.tol, opt.mode),
                  "crash", k);
+        if (can_accept_early(best.quality)) {
+            return best;
+        }
     }
     return best;
 }
