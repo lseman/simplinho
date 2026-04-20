@@ -482,6 +482,13 @@ print('status', module.mip_status_to_string(solution.status))
         self.assertEqual(solution.lp_profile, "bnb_reoptimization")
         self.assertEqual(solution.lp_mode, "dual")
         self.assertTrue(solution.warm_start_basis_state_used)
+        self.assertGreaterEqual(solution.lp_refactorizations, 0)
+        self.assertGreaterEqual(solution.lp_eta_stack_depth_entry_sum, 0)
+        self.assertGreaterEqual(solution.lp_warm_factorization_reuse_count, 0)
+        self.assertGreaterEqual(solution.lp_dual_pool_builds, 0)
+        self.assertGreaterEqual(solution.relaxation_lp_lu_build_ns, 0)
+        self.assertGreaterEqual(solution.relaxation_lp_pricing_build_ns, 0)
+        self.assertGreaterEqual(solution.relaxation_lp_pivot_ns, 0)
 
     def test_solve_mip_rebuilds_thread_local_lp_context_between_runs(self):
         model = simplinho.Model()
@@ -1090,6 +1097,36 @@ print('status', module.mip_status_to_string(solution.status))
         self.assertGreaterEqual(solution.cuts_applied, 1)
         self.assertTrue(math.isclose(solution.value(x), 4.0, rel_tol=0.0, abs_tol=1e-8))
         self.assertTrue(math.isclose(solution.value(y), 1.0, rel_tol=0.0, abs_tol=1e-8))
+
+    def test_solve_mip_implied_bound_cuts_negative_coefficient(self):
+        model = simplinho.Model()
+        x = model.add_integer_var("x", lb=0.0, ub=10.0)
+        y = model.add_binary_var("y")
+        z = model.add_binary_var("z")
+        model.add_constr(-1.0 * x + 2.0 * y + 3.0 * z <= 3.0, name="negcoef")
+        model.add_constr(y + z <= 1.0, name="pack")
+        model.maximize(y + z)
+
+        options = simplinho.BranchAndBoundOptions()
+        options.node_selection = simplinho.NodeSelectionStrategy.BestBound
+        options.use_cut_pool = True
+        options.use_gomory_cuts = False
+        options.use_cover_cuts = False
+        options.use_implied_bound_cuts = True
+        options.use_clique_cuts = False
+        options.use_probing_implications = False
+        options.use_conflict_cuts = False
+        options.max_cut_rounds_per_node = 2
+        options.max_cuts_added_per_round = 4
+
+        solution = model.solve_mip(options)
+
+        self.assertEqual(solution.status, simplinho.MIPStatus.Optimal)
+        self.assertTrue(solution.has_solution)
+        self.assertTrue(math.isclose(solution.obj, 1.0, rel_tol=0.0, abs_tol=1e-8))
+        self.assertTrue(
+            math.isclose(solution.value(y) + solution.value(z), 1.0, rel_tol=0.0, abs_tol=1e-8)
+        )
 
     def test_solve_mip_clique_cuts(self):
         model = simplinho.Model()

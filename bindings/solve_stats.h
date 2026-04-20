@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 
@@ -14,6 +15,19 @@ struct SolveStats {
     std::string status;
     int iterations = 0;
     int phase2_iterations = 0;
+    int refactorizations = 0;
+    int eta_stack_depth_entry = 0;
+    int ft_updates = 0;
+    int dual_pool_builds = 0;
+    int primal_pool_builds = 0;
+    int warm_start_attempted = 0;
+    int warm_start_accepted = 0;
+    int warm_start_cold_retry = 0;
+    int warm_factorization_reused = 0;
+    int warm_dual_weights_reused = 0;
+    std::uint64_t lu_build_ns = 0;
+    std::uint64_t pricing_build_ns = 0;
+    std::uint64_t pivot_ns = 0;
     std::optional<int> phase1_iterations;
     std::optional<int> presolve_actions;
     std::optional<int> presolve_implied_bound_updates;
@@ -51,6 +65,19 @@ struct SolveStats {
         out["status"] = status;
         out["iterations"] = iterations;
         out["phase2_iterations"] = phase2_iterations;
+        out["refactorizations"] = refactorizations;
+        out["eta_stack_depth_entry"] = eta_stack_depth_entry;
+        out["ft_updates"] = ft_updates;
+        out["dual_pool_builds"] = dual_pool_builds;
+        out["primal_pool_builds"] = primal_pool_builds;
+        out["warm_start_attempted"] = warm_start_attempted;
+        out["warm_start_accepted"] = warm_start_accepted;
+        out["warm_start_cold_retry"] = warm_start_cold_retry;
+        out["warm_factorization_reused"] = warm_factorization_reused;
+        out["warm_dual_weights_reused"] = warm_dual_weights_reused;
+        out["lu_build_ns"] = lu_build_ns;
+        out["pricing_build_ns"] = pricing_build_ns;
+        out["pivot_ns"] = pivot_ns;
         out["phase1_iterations"] = phase1_iterations ? py::cast(*phase1_iterations) : py::none();
         out["presolve_actions"] = presolve_actions ? py::cast(*presolve_actions) : py::none();
         out["presolve_implied_bound_updates"] =

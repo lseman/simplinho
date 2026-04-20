@@ -1115,6 +1115,44 @@ std::optional<int> binary_literal_from_reason_(const Problem& problem, const Rea
     return std::nullopt;
 }
 
+static std::vector<int> collect_implied_literals_(const Problem& problem,
+                                                     const ImplicationStore* learned_implications,
+                                                     const Options& options,
+                                                     int trigger_literal,
+                                                     int max_literal) {
+    std::vector<int> implied_literals;
+    if (learned_implications == nullptr || trigger_literal < 0 ||
+        trigger_literal >= max_literal) {
+        return implied_literals;
+    }
+
+    std::vector<char> visited(static_cast<std::size_t>(max_literal), 0);
+    std::vector<int> stack;
+    visited[trigger_literal] = 1;
+    stack.push_back(trigger_literal);
+
+    while (!stack.empty()) {
+        const int literal = stack.back();
+        stack.pop_back();
+        for (const ReasonLiteral& consequence :
+             learned_implications->consequences(literal)) {
+            const std::optional<int> consequence_literal =
+                binary_literal_from_reason_(problem, consequence, options.integrality_tol);
+            if (!consequence_literal.has_value())
+                continue;
+            const int implied_literal = *consequence_literal;
+            if (implied_literal < 0 || implied_literal >= max_literal)
+                continue;
+            if (visited[implied_literal])
+                continue;
+            visited[implied_literal] = 1;
+            stack.push_back(implied_literal);
+            implied_literals.push_back(implied_literal);
+        }
+    }
+    return implied_literals;
+}
+
 void add_implication_conflicts_(ConflictGraph* graph, const Problem& problem,
                                 const ImplicationStore* learned_implications,
                                 const Options& options) {
@@ -1124,13 +1162,11 @@ void add_implication_conflicts_(ConflictGraph* graph, const Problem& problem,
         std::min(graph->literal_count(), learned_implications->literal_count());
     bool added = false;
     for (int trigger_literal = 0; trigger_literal < literal_count; ++trigger_literal) {
-        for (const ReasonLiteral& consequence :
-             learned_implications->consequences(trigger_literal)) {
-            const std::optional<int> consequence_literal =
-                binary_literal_from_reason_(problem, consequence, options.integrality_tol);
-            if (!consequence_literal.has_value())
-                continue;
-            graph->add_implication(trigger_literal, *consequence_literal);
+        const std::vector<int> implied_literals =
+            collect_implied_literals_(problem, learned_implications, options, trigger_literal,
+                                      literal_count);
+        for (int consequence_literal : implied_literals) {
+            graph->add_implication(trigger_literal, consequence_literal);
             added = true;
         }
     }
@@ -1162,13 +1198,11 @@ build_implication_seed_cliques_(const Problem& problem, const ConflictGraph& gra
         std::vector<int> clique_literals = {trigger_literal};
         std::unordered_set<int> used_variables = {ConflictGraph::variable_of(trigger_literal)};
         std::vector<int> implication_candidates;
-        for (const ReasonLiteral& consequence :
-             learned_implications->consequences(trigger_literal)) {
-            const std::optional<int> consequence_literal =
-                binary_literal_from_reason_(problem, consequence, options.integrality_tol);
-            if (!consequence_literal.has_value())
-                continue;
-            const int candidate_literal = ConflictGraph::complement_of(*consequence_literal);
+        const std::vector<int> implied_literals = collect_implied_literals_(
+            problem, learned_implications, options, trigger_literal,
+            std::min(graph.literal_count(), learned_implications->literal_count()));
+        for (int implied_literal : implied_literals) {
+            const int candidate_literal = ConflictGraph::complement_of(implied_literal);
             const int candidate_variable = ConflictGraph::variable_of(candidate_literal);
             if (!graph.has_literal(candidate_literal) ||
                 used_variables.contains(candidate_variable))
@@ -1506,11 +1540,12 @@ void append_implied_bound_cuts_from_leq_(const Problem& problem, const std::vect
             const int x = indices[x_pos];
             const double x_coeff = values[x_pos];
             if (x < 0 || x >= problem.lower_bounds.size() || x >= problem.upper_bounds.size() ||
-                x_coeff <= 1e-9)
+                std::abs(x_coeff) <= 1e-9)
                 continue;
 
-            const double upper = problem.upper_bounds(x);
-            if (!std::isfinite(upper))
+            const bool tighten_upper = x_coeff > 0.0;
+            const double x_bound = tighten_upper ? problem.upper_bounds(x) : problem.lower_bounds(x);
+            if (!std::isfinite(x_bound))
                 continue;
 
             double min_other_activity = 0.0;
@@ -1536,20 +1571,36 @@ void append_implied_bound_cuts_from_leq_(const Problem& problem, const std::vect
             if (!finite)
                 continue;
 
-            const double tightened_upper =
+            const double tightened_bound =
                 (rhs - y_coeff * tight_y_value - min_other_activity) / x_coeff;
-            if (!std::isfinite(tightened_upper) ||
-                tightened_upper >= upper - options.min_cut_violation) {
+            if (!std::isfinite(tightened_bound))
                 continue;
-            }
 
             Cut cut;
-            cut.sense = LinearConstraintSense::LessEqual;
-            cut.rhs = tight_y_value > 0.5 ? upper : tightened_upper;
             cut.cut_type = "ImpliedBound";
             cut.indices = {x, y};
-            cut.values = {1.0, tight_y_value > 0.5 ? (upper - tightened_upper)
-                                                   : -(upper - tightened_upper)};
+
+            if (tighten_upper) {
+                if (tightened_bound >= x_bound - options.min_cut_violation)
+                    continue;
+                cut.sense = LinearConstraintSense::LessEqual;
+                cut.rhs = tight_y_value > 0.5 ? x_bound : tightened_bound;
+                cut.values = {1.0, tight_y_value > 0.5 ? (x_bound - tightened_bound)
+                                                       : -(x_bound - tightened_bound)};
+            } else {
+                if (tightened_bound <= x_bound + options.min_cut_violation)
+                    continue;
+                cut.sense = LinearConstraintSense::GreaterEqual;
+                const double lower = problem.lower_bounds(x);
+                if (tight_y_value > 0.5) {
+                    cut.rhs = lower;
+                    cut.values = {1.0, -(tightened_bound - lower)};
+                } else {
+                    cut.rhs = tightened_bound;
+                    cut.values = {1.0, tightened_bound - lower};
+                }
+            }
+
             const double violation = cut_violation(cut, relaxation.primal);
             if (violation <= options.min_cut_violation)
                 continue;
@@ -3821,6 +3872,71 @@ std::vector<Cut> generate_dual_proof_cuts(const Problem& problem,
                                     problem.upper_bounds, options);
 }
 
+static std::vector<Cut> filter_generated_cuts_(std::vector<Cut> cuts, const Problem& problem,
+                                               const RelaxationSolution& relaxation,
+                                               const Options& options) {
+    if (cuts.empty())
+        return cuts;
+
+    const Eigen::VectorXd& primal = relaxation.primal;
+    std::vector<std::pair<double, int>> scored;
+    scored.reserve(cuts.size());
+    for (int i = 0; i < static_cast<int>(cuts.size()); ++i) {
+        const Cut& cut = cuts[i];
+        if (cut.indices.empty())
+            continue;
+        const double violation = cut_violation(cut, primal);
+        if (violation <= options.min_cut_violation)
+            continue;
+        const double norm = cut_norm_(cut);
+        if (norm <= 1e-16)
+            continue;
+        const ActiveSupportStats active_stats = active_support_stats_(
+            cut, primal, problem.lower_bounds, problem.upper_bounds, options.min_cut_violation);
+        const double efficacy = violation / norm;
+        const double active_efficacy =
+            active_stats.norm > 1e-16 ? violation / active_stats.norm : efficacy;
+        const double fractional_focus = fractional_focus_(cut, primal);
+        const double density_adjusted_efficacy = density_adjusted_efficacy_(
+            violation, norm,
+            active_stats.nnz > 0 ? active_stats.nnz : static_cast<int>(cut.indices.size()),
+            fractional_focus, 1.0);
+        const double dynamism = cut_dynamism_(cut, primal, violation, norm);
+        const double score = 0.40 * active_efficacy + 0.25 * efficacy +
+                             0.20 * density_adjusted_efficacy + 0.10 * dynamism +
+                             0.05 * fractional_focus;
+        if (cut.indices.size() > 128 && score < std::max(0.02, options.min_cut_violation * 2.0))
+            continue;
+        scored.emplace_back(score, i);
+    }
+
+    if (scored.empty())
+        return {};
+
+    std::sort(scored.begin(), scored.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+
+    const int cap = std::max(16, options.max_cuts_added_per_round * 6);
+    std::unordered_map<std::string, int> per_type_count;
+    std::vector<Cut> filtered;
+    filtered.reserve(std::min<int>(static_cast<int>(scored.size()), cap));
+
+    for (const auto& [score, index] : scored) {
+        if (index < 0 || index >= static_cast<int>(cuts.size()))
+            continue;
+        Cut& cut = cuts[index];
+        if (options.max_cuts_per_type > 0 &&
+            per_type_count[cut.cut_type] >= options.max_cuts_per_type) {
+            continue;
+        }
+        filtered.push_back(std::move(cut));
+        ++per_type_count[filtered.back().cut_type];
+        if (static_cast<int>(filtered.size()) >= cap)
+            break;
+    }
+    return filtered;
+}
+
 std::vector<Cut> generate_cuts(const Problem& problem, const RelaxationSolution& relaxation,
                                const Options& options, const ImplicationStore* learned_implications,
                                const std::vector<Cut>* structural_cuts) {
@@ -3853,15 +3969,14 @@ std::vector<Cut> generate_cuts(const Problem& problem, const RelaxationSolution&
             cuts.insert(cuts.end(), std::make_move_iterator(separator_cuts.begin()),
                         std::make_move_iterator(separator_cuts.end()));
         }
-        return cuts;
+    } else {
+        for (const CutSeparator* separator : enabled_separators) {
+            std::vector<Cut> family_cuts = separator->separate(context);
+            cuts.insert(cuts.end(), std::make_move_iterator(family_cuts.begin()),
+                        std::make_move_iterator(family_cuts.end()));
+        }
     }
-
-    for (const CutSeparator* separator : enabled_separators) {
-        std::vector<Cut> family_cuts = separator->separate(context);
-        cuts.insert(cuts.end(), std::make_move_iterator(family_cuts.begin()),
-                    std::make_move_iterator(family_cuts.end()));
-    }
-    return cuts;
+    return filter_generated_cuts_(std::move(cuts), problem, relaxation, options);
 }
 
 } // namespace simplex::bnb::detail

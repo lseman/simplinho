@@ -1053,12 +1053,12 @@ class Presolver {
                 res_.proven_infeasible = true;
                 return true;
             }
-            const bool lower_unchanged = (is_finite(newL) && is_finite(oldL)
-                                              ? std::abs(newL - oldL) <= opt_.zero_tol
-                                              : (!is_finite(newL) && !is_finite(oldL)));
-            const bool upper_unchanged = (is_finite(newU) && is_finite(oldU)
-                                              ? std::abs(newU - oldU) <= opt_.zero_tol
-                                              : (!is_finite(newU) && !is_finite(oldU)));
+            const bool lower_unchanged =
+                (is_finite(newL) && is_finite(oldL) ? std::abs(newL - oldL) <= opt_.zero_tol
+                                                    : (!is_finite(newL) && !is_finite(oldL)));
+            const bool upper_unchanged =
+                (is_finite(newU) && is_finite(oldU) ? std::abs(newU - oldU) <= opt_.zero_tol
+                                                    : (!is_finite(newU) && !is_finite(oldU)));
             if (lower_unchanged && upper_unchanged)
                 continue;
 

@@ -11,7 +11,6 @@ void AsyncHeuristicManager::dispatch(Solver& solver, std::uint64_t launch_order,
     }
     auto* dispatcher = solver.async_heuristic_dispatcher_.get();
     if (dispatcher == nullptr || dispatcher->stop_requested()) {
-        work();
         return;
     }
 

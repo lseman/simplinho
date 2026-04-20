@@ -660,6 +660,10 @@ class DevexPricer {
 // ============================================================================
 class DualSteepestEdgePricer {
   public:
+    struct WarmStartState {
+        std::vector<double> row_weights;
+    };
+
     struct DualEntry {
         int jN;
         Eigen::VectorXd w;  // approx B^{-T} a_j
@@ -879,6 +883,31 @@ class DualSteepestEdgePricer {
         average_log_low_weight_error_ = 0.0;
         average_log_high_weight_error_ = 0.0;
     }
+    WarmStartState export_state() const {
+        WarmStartState out;
+        out.row_weights.reserve(row_pool_.size());
+        for (const auto& row : row_pool_) {
+            out.row_weights.push_back(row.weight);
+        }
+        return out;
+    }
+    bool import_state(const WarmStartState& state, int rows) {
+        if (rows < 0 || static_cast<int>(state.row_weights.size()) != rows) {
+            return false;
+        }
+        dual_pool_.clear();
+        dual_pos_.clear();
+        row_pool_.assign(static_cast<std::size_t>(rows), RowEntry{});
+        for (int i = 0; i < rows; ++i) {
+            row_pool_[static_cast<std::size_t>(i)].weight =
+                std::max(1.0, state.row_weights[static_cast<std::size_t>(i)]);
+        }
+        iter_count_ = 0;
+        no_improvement_count_ = 0;
+        need_rebuild_ = false;
+        clear_weight_error_stats();
+        return true;
+    }
     double average_log_weight_error_sum() const {
         return average_log_low_weight_error_ + average_log_high_weight_error_;
     }
@@ -905,6 +934,10 @@ class DualSteepestEdgePricer {
 // ============================================================================
 class DualDevexPricer {
   public:
+    struct WarmStartState {
+        std::vector<double> row_weights;
+    };
+
     struct LeavingChoice {
         int row = -1;
         Eigen::VectorXd dual_row;
@@ -995,6 +1028,20 @@ class DualDevexPricer {
 
     bool needs_rebuild() const { return need_rebuild_; }
     void clear_rebuild_flag() { need_rebuild_ = false; }
+    WarmStartState export_state() const { return WarmStartState{row_weights_}; }
+    bool import_state(const WarmStartState& state, int rows) {
+        if (rows < 0 || static_cast<int>(state.row_weights.size()) != rows) {
+            return false;
+        }
+        row_weights_ = state.row_weights;
+        for (double& weight : row_weights_) {
+            weight = std::max(1.0, weight);
+        }
+        iter_count_ = 0;
+        no_improvement_count_ = 0;
+        need_rebuild_ = false;
+        return true;
+    }
 
   private:
     std::vector<double> row_weights_;
@@ -1011,6 +1058,11 @@ class DualDevexPricer {
 // ============================================================================
 class DualRowPricer {
   public:
+    struct WarmStartState {
+        std::vector<double> row_weights;
+        std::vector<char> prefer_row_pricing;
+    };
+
     struct LeavingChoice {
         int row = -1;
         Eigen::VectorXd dual_row;
@@ -1107,6 +1159,21 @@ class DualRowPricer {
 
     bool needs_rebuild() const { return need_rebuild_; }
     void clear_rebuild_flag() { need_rebuild_ = false; }
+    WarmStartState export_state() const { return WarmStartState{row_weights_, prefer_row_pricing_}; }
+    bool import_state(const WarmStartState& state, int rows) {
+        if (rows < 0 || static_cast<int>(state.row_weights.size()) != rows ||
+            static_cast<int>(state.prefer_row_pricing.size()) != rows) {
+            return false;
+        }
+        row_weights_ = state.row_weights;
+        for (double& weight : row_weights_) {
+            weight = std::max(1.0, weight);
+        }
+        prefer_row_pricing_ = state.prefer_row_pricing;
+        iter_count_ = 0;
+        need_rebuild_ = false;
+        return true;
+    }
 
   private:
     template <class MatrixLike>
@@ -1150,6 +1217,15 @@ class DualRowPricer {
 // ============================================================================
 class DualAdaptivePricer {
   public:
+    enum class Rule { SteepestEdge, Devex, RowPricing, MostInfeasible };
+
+    struct WarmStartState {
+        Rule active_rule = Rule::MostInfeasible;
+        DualSteepestEdgePricer::WarmStartState steepest;
+        DualDevexPricer::WarmStartState devex;
+        DualRowPricer::WarmStartState row;
+    };
+
     struct LeavingChoice {
         int row = -1;
         Eigen::VectorXd dual_row;
@@ -1340,9 +1416,46 @@ class DualAdaptivePricer {
         return "dual_unknown";
     }
 
-  private:
-    enum class Rule { SteepestEdge, Devex, RowPricing, MostInfeasible };
+    WarmStartState export_state() const {
+        WarmStartState out;
+        out.active_rule = active_rule_;
+        out.steepest = steepest_pricer_.export_state();
+        out.devex = devex_pricer_.export_state();
+        out.row = row_pricer_.export_state();
+        return out;
+    }
 
+    bool import_state(const WarmStartState& state, int rows) {
+        active_rule_ = state.active_rule;
+        bool ok = false;
+        switch (active_rule_) {
+            case Rule::SteepestEdge:
+                ok = steepest_pricer_.import_state(state.steepest, rows);
+                devex_pricer_.clear_rebuild_flag();
+                row_pricer_.clear_rebuild_flag();
+                break;
+            case Rule::Devex:
+                ok = devex_pricer_.import_state(state.devex, rows);
+                steepest_pricer_.clear_rebuild_flag();
+                row_pricer_.clear_rebuild_flag();
+                break;
+            case Rule::RowPricing:
+                ok = row_pricer_.import_state(state.row, rows);
+                steepest_pricer_.clear_rebuild_flag();
+                devex_pricer_.clear_rebuild_flag();
+                break;
+            case Rule::MostInfeasible:
+                ok = true;
+                steepest_pricer_.clear_rebuild_flag();
+                devex_pricer_.clear_rebuild_flag();
+                row_pricer_.clear_rebuild_flag();
+                break;
+        }
+        need_rebuild_ = !ok;
+        return ok;
+    }
+
+  private:
     template <class MatrixLike>
     Rule select_rule_(const MatrixLike& A, const std::vector<int>& N, int basis_rows) const {
         if (dual_pricing_preference_ == "row")

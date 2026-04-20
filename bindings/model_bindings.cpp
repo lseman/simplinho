@@ -565,6 +565,8 @@ LPBasis parse_basis_state_from_info(const std::unordered_map<std::string, std::s
                 break;
         }
     }
+    out.basis_columns = fallback.basis_columns;
+    out.warm_state = fallback.warm_state;
     return out;
 }
 
@@ -675,6 +677,8 @@ LPBasis rebuild_basis_from_solution(const LPSolution& sol) {
 
     LPBasis out;
     out.column_status.reserve(status.size());
+    out.basis_columns = sol.basis;
+    out.warm_state = sol.basis_state.warm_state;
     for (const int value : status) {
         switch (value) {
             case 0:
@@ -713,6 +717,9 @@ std::optional<LPBasis> try_extend_basis(const LPBasis& basis, int total_vars, in
     }
     LPBasis extended = basis;
     extended.column_status.resize(total_vars, LPBasisStatus::AtLower);
+    if (static_cast<int>(basis.column_status.size()) != total_vars) {
+        extended.warm_state.reset();
+    }
     if (basis_matches_dimensions(extended, total_vars, rows)) {
         return extended;
     }
@@ -739,6 +746,19 @@ SolveStats build_solve_stats(const LPSolution& sol) {
     stats.iterations = sol.iters;
     stats.phase1_iterations = find_info_int(sol.info, "phase1_iters");
     stats.phase2_iterations = sol.iters - stats.phase1_iterations.value_or(0);
+    stats.refactorizations = sol.solve_stats.refactorizations;
+    stats.eta_stack_depth_entry = sol.solve_stats.eta_stack_depth_entry;
+    stats.ft_updates = sol.solve_stats.ft_updates;
+    stats.dual_pool_builds = sol.solve_stats.dual_pool_builds;
+    stats.primal_pool_builds = sol.solve_stats.primal_pool_builds;
+    stats.warm_start_attempted = sol.solve_stats.warm_start_attempted;
+    stats.warm_start_accepted = sol.solve_stats.warm_start_accepted;
+    stats.warm_start_cold_retry = sol.solve_stats.warm_start_cold_retry;
+    stats.warm_factorization_reused = sol.solve_stats.warm_factorization_reused;
+    stats.warm_dual_weights_reused = sol.solve_stats.warm_dual_weights_reused;
+    stats.lu_build_ns = sol.solve_stats.lu_build_ns;
+    stats.pricing_build_ns = sol.solve_stats.pricing_build_ns;
+    stats.pivot_ns = sol.solve_stats.pivot_ns;
     stats.presolve_actions = find_info_int(sol.info, "presolve_actions");
     stats.presolve_implied_bound_updates =
         find_info_int(sol.info, "presolve_implied_bound_updates");
@@ -1246,6 +1266,12 @@ class MIPSolution {
           warm_start_relaxation_accept_count_(result.warm_start_relaxation_accept_count),
           warm_start_cold_retry_count_(result.warm_start_cold_retry_count),
           warm_start_relaxation_solve_count_(result.warm_start_relaxation_solve_count),
+          lp_refactorizations_(result.lp_refactorizations),
+          lp_eta_stack_depth_entry_sum_(result.lp_eta_stack_depth_entry_sum),
+          lp_dual_pool_builds_(result.lp_dual_pool_builds),
+          lp_primal_pool_builds_(result.lp_primal_pool_builds),
+          lp_warm_factorization_reuse_count_(result.lp_warm_factorization_reuse_count),
+          lp_warm_dual_weights_reuse_count_(result.lp_warm_dual_weights_reuse_count),
           strong_branching_probe_count_(result.strong_branching_probe_count),
           strong_branching_probe_iterations_(result.strong_branching_probe_iterations),
           relaxation_core_solve_time_ns_(result.relaxation_core_solve_time_ns),
@@ -1254,6 +1280,9 @@ class MIPSolution {
           relaxation_lp_internal_crash_ns_(result.relaxation_lp_internal_crash_ns),
           relaxation_lp_internal_iters_ns_(result.relaxation_lp_internal_iters_ns),
           relaxation_lp_internal_serialize_ns_(result.relaxation_lp_internal_serialize_ns),
+          relaxation_lp_lu_build_ns_(result.relaxation_lp_lu_build_ns),
+          relaxation_lp_pricing_build_ns_(result.relaxation_lp_pricing_build_ns),
+          relaxation_lp_pivot_ns_(result.relaxation_lp_pivot_ns),
           strong_branching_probe_core_solve_time_ns_(
               result.strong_branching_probe_core_solve_time_ns),
           strong_branching_probe_lp_assembly_time_ns_(
@@ -1335,6 +1364,14 @@ class MIPSolution {
     int warm_start_relaxation_accept_count() const { return warm_start_relaxation_accept_count_; }
     int warm_start_cold_retry_count() const { return warm_start_cold_retry_count_; }
     int warm_start_relaxation_solve_count() const { return warm_start_relaxation_solve_count_; }
+    int lp_refactorizations() const { return lp_refactorizations_; }
+    int lp_eta_stack_depth_entry_sum() const { return lp_eta_stack_depth_entry_sum_; }
+    int lp_dual_pool_builds() const { return lp_dual_pool_builds_; }
+    int lp_primal_pool_builds() const { return lp_primal_pool_builds_; }
+    int lp_warm_factorization_reuse_count() const { return lp_warm_factorization_reuse_count_; }
+    int lp_warm_dual_weights_reuse_count() const {
+        return lp_warm_dual_weights_reuse_count_;
+    }
     int strong_branching_probe_count() const { return strong_branching_probe_count_; }
     int strong_branching_probe_iterations() const { return strong_branching_probe_iterations_; }
     std::uint64_t relaxation_core_solve_time_ns() const { return relaxation_core_solve_time_ns_; }
@@ -1351,6 +1388,11 @@ class MIPSolution {
     std::uint64_t relaxation_lp_internal_serialize_ns() const {
         return relaxation_lp_internal_serialize_ns_;
     }
+    std::uint64_t relaxation_lp_lu_build_ns() const { return relaxation_lp_lu_build_ns_; }
+    std::uint64_t relaxation_lp_pricing_build_ns() const {
+        return relaxation_lp_pricing_build_ns_;
+    }
+    std::uint64_t relaxation_lp_pivot_ns() const { return relaxation_lp_pivot_ns_; }
     std::uint64_t strong_branching_probe_core_solve_time_ns() const {
         return strong_branching_probe_core_solve_time_ns_;
     }
@@ -1475,6 +1517,12 @@ class MIPSolution {
     int warm_start_relaxation_accept_count_ = 0;
     int warm_start_cold_retry_count_ = 0;
     int warm_start_relaxation_solve_count_ = 0;
+    int lp_refactorizations_ = 0;
+    int lp_eta_stack_depth_entry_sum_ = 0;
+    int lp_dual_pool_builds_ = 0;
+    int lp_primal_pool_builds_ = 0;
+    int lp_warm_factorization_reuse_count_ = 0;
+    int lp_warm_dual_weights_reuse_count_ = 0;
     int strong_branching_probe_count_ = 0;
     int strong_branching_probe_iterations_ = 0;
     std::uint64_t relaxation_core_solve_time_ns_ = 0;
@@ -1483,6 +1531,9 @@ class MIPSolution {
     std::uint64_t relaxation_lp_internal_crash_ns_ = 0;
     std::uint64_t relaxation_lp_internal_iters_ns_ = 0;
     std::uint64_t relaxation_lp_internal_serialize_ns_ = 0;
+    std::uint64_t relaxation_lp_lu_build_ns_ = 0;
+    std::uint64_t relaxation_lp_pricing_build_ns_ = 0;
+    std::uint64_t relaxation_lp_pivot_ns_ = 0;
     std::uint64_t strong_branching_probe_core_solve_time_ns_ = 0;
     std::uint64_t strong_branching_probe_lp_assembly_time_ns_ = 0;
     std::uint64_t strong_branching_probe_lp_internal_presolve_ns_ = 0;
@@ -1954,6 +2005,12 @@ class Model {
                 const std::size_t prior_size = extended.column_status.size();
                 extended.column_status.resize(static_cast<std::size_t>(total_vars),
                                               LPBasisStatus::Basic);
+                if (extended.column_status.size() > prior_size) {
+                    extended.warm_state.reset();
+                    for (int col = static_cast<int>(prior_size); col < total_vars; ++col) {
+                        extended.basis_columns.push_back(col);
+                    }
+                }
                 if (extended.column_status.size() > prior_size &&
                     basis_matches_dimensions(extended, total_vars, rows)) {
                     return extended;
@@ -2087,8 +2144,9 @@ class Model {
                     attach_basis(*parent_basis)) {
                     warm_start_source = WarmStartSource::ParentBasis;
                 } else if (parent_basis && entry.root_warm_start_fallback->allow_parent_basis) {
-                    effective_basis_state =
-                        try_extend_basis(*parent_basis, node_data.total_vars, node_data.rows);
+                    effective_basis_state = adapt_warm_start_basis_state(
+                        std::optional<LPBasis>(*parent_basis), node_data.total_vars,
+                        node_data.rows);
                     if (effective_basis_state.has_value()) {
                         effective_basis = &*effective_basis_state;
                         warm_start_source = WarmStartSource::ParentBasis;
@@ -2098,9 +2156,9 @@ class Model {
                     if (attach_basis(*node_data.warm_start_basis_state)) {
                         warm_start_source = WarmStartSource::RootBasisState;
                     } else {
-                        effective_basis_state =
-                            try_extend_basis(*node_data.warm_start_basis_state,
-                                             node_data.total_vars, node_data.rows);
+                        effective_basis_state = adapt_warm_start_basis_state(
+                            node_data.warm_start_basis_state, node_data.total_vars,
+                            node_data.rows);
                         if (effective_basis_state.has_value()) {
                             effective_basis = &*effective_basis_state;
                             warm_start_source = WarmStartSource::RootBasisState;
@@ -2711,6 +2769,8 @@ class Model {
                 }
                 if (out.warm_start_basis_state.has_value()) {
                     out.warm_start_basis_state->column_status.push_back(LPBasisStatus::Basic);
+                    out.warm_start_basis_state->basis_columns.push_back(next_slack);
+                    out.warm_start_basis_state->warm_state.reset();
                 }
                 next_slack++;
             } else if (cut.sense == simplex_bnb::LinearConstraintSense::GreaterEqual) {
@@ -2720,6 +2780,8 @@ class Model {
                 }
                 if (out.warm_start_basis_state.has_value()) {
                     out.warm_start_basis_state->column_status.push_back(LPBasisStatus::Basic);
+                    out.warm_start_basis_state->basis_columns.push_back(next_slack);
+                    out.warm_start_basis_state->warm_state.reset();
                 }
                 next_slack++;
             }
@@ -3109,6 +3171,15 @@ void bind_model_bindings(py::module_& m) {
                                &MIPSolution::warm_start_cold_retry_count)
         .def_property_readonly("warm_start_relaxation_solve_count",
                                &MIPSolution::warm_start_relaxation_solve_count)
+        .def_property_readonly("lp_refactorizations", &MIPSolution::lp_refactorizations)
+        .def_property_readonly("lp_eta_stack_depth_entry_sum",
+                               &MIPSolution::lp_eta_stack_depth_entry_sum)
+        .def_property_readonly("lp_dual_pool_builds", &MIPSolution::lp_dual_pool_builds)
+        .def_property_readonly("lp_primal_pool_builds", &MIPSolution::lp_primal_pool_builds)
+        .def_property_readonly("lp_warm_factorization_reuse_count",
+                               &MIPSolution::lp_warm_factorization_reuse_count)
+        .def_property_readonly("lp_warm_dual_weights_reuse_count",
+                               &MIPSolution::lp_warm_dual_weights_reuse_count)
         .def_property_readonly("strong_branching_probe_count",
                                &MIPSolution::strong_branching_probe_count)
         .def_property_readonly("strong_branching_probe_iterations",
@@ -3125,6 +3196,12 @@ void bind_model_bindings(py::module_& m) {
                                &MIPSolution::relaxation_lp_internal_iters_ns)
         .def_property_readonly("relaxation_lp_internal_serialize_ns",
                                &MIPSolution::relaxation_lp_internal_serialize_ns)
+        .def_property_readonly("relaxation_lp_lu_build_ns",
+                               &MIPSolution::relaxation_lp_lu_build_ns)
+        .def_property_readonly("relaxation_lp_pricing_build_ns",
+                               &MIPSolution::relaxation_lp_pricing_build_ns)
+        .def_property_readonly("relaxation_lp_pivot_ns",
+                               &MIPSolution::relaxation_lp_pivot_ns)
         .def_property_readonly("strong_branching_probe_core_solve_time_ns",
                                &MIPSolution::strong_branching_probe_core_solve_time_ns)
         .def_property_readonly("strong_branching_probe_lp_assembly_time_ns",

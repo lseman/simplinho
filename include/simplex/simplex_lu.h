@@ -11,7 +11,9 @@
 #include "sparse_lu.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -82,6 +84,14 @@ class FTBasis {
 
         // if update chain already under stress, skip expensive update attempt and refactor
         double early_refactor_stability_score = 1.0;
+
+        // Optional external counters — when non-null, FTBasis bumps these on
+        // every full refactor and accumulates time spent. Threaded through
+        // Options to avoid changing the public solve_B/solve_BT/replace_column
+        // signatures. Ownership stays with the caller.
+        int* ext_refactor_counter = nullptr;
+        std::uint64_t* ext_refactor_ns = nullptr;
+        std::uint64_t* ext_pivot_ns = nullptr;
     };
 
     struct Eta {
@@ -192,8 +202,36 @@ class FTBasis {
     Eigen::VectorXd solve_B(const Eigen::SparseMatrixBase<Derived>& b_sparse) const {
         if (b_sparse.rows() != m_ || b_sparse.cols() != 1)
             throw std::invalid_argument("FTBasis::solve_B sparse size mismatch");
+        auto* self = const_cast<FTBasis*>(this);
+        auto [seed_idx, seed_val] = sparse_vector_to_seed_data_(b_sparse.derived());
+        const double rhs_density =
+            m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;
+        const bool use_sparse_rhs = A_is_sparse_ && rhs_density < kSparseSolveDensityThreshold_;
         Eigen::VectorXd b = sparse_vector_to_dense_(b_sparse.derived(), m_);
-        return solve_B(b);
+        auto do_solve = [&]() {
+            if (use_sparse_rhs)
+                return self->lu_sparse_.solve_sparse(seed_idx, seed_val);
+            Eigen::VectorXd x = self->solve_B_fast_(b);
+            if (self->opt_.enable_iterative_refinement && !self->A_is_sparse_)
+                x = self->refine_solve_B_(b, x);
+            return x;
+        };
+
+        try {
+            Eigen::VectorXd x = do_solve();
+            self->verify_solve_quality_B_(b, x, "FTBasis::solve_B sparse");
+            return x;
+        } catch (const std::exception& err) {
+            if (!opt_.refactor_on_solve_failure)
+                throw;
+
+            self->last_update_diagnostic_ = err.what();
+            self->refactor();
+
+            Eigen::VectorXd x = do_solve();
+            self->verify_solve_quality_B_(b, x, "FTBasis::solve_B sparse after refactor");
+            return x;
+        }
     }
 
     Eigen::VectorXd solve_BT(const Eigen::VectorXd& c) const {
@@ -221,6 +259,42 @@ class FTBasis {
 
             Eigen::VectorXd y = do_solve();
             self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT after refactor");
+            return y;
+        }
+    }
+
+    template <typename Derived>
+    Eigen::VectorXd solve_BT(const Eigen::SparseMatrixBase<Derived>& c_sparse) const {
+        if (c_sparse.rows() != m_ || c_sparse.cols() != 1)
+            throw std::invalid_argument("FTBasis::solve_BT sparse size mismatch");
+        auto* self = const_cast<FTBasis*>(this);
+        auto [seed_idx, seed_val] = sparse_vector_to_seed_data_(c_sparse.derived());
+        const double rhs_density =
+            m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;
+        const bool use_sparse_rhs = A_is_sparse_ && rhs_density < kSparseSolveDensityThreshold_;
+        Eigen::VectorXd c = sparse_vector_to_dense_(c_sparse.derived(), m_);
+        auto do_solve = [&]() {
+            if (use_sparse_rhs)
+                return self->lu_sparse_.solveT_sparse(seed_idx, seed_val);
+            Eigen::VectorXd y = self->solve_BT_fast_(c);
+            if (self->opt_.enable_iterative_refinement && !self->A_is_sparse_)
+                y = self->refine_solve_BT_(c, y);
+            return y;
+        };
+
+        try {
+            Eigen::VectorXd y = do_solve();
+            self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT sparse");
+            return y;
+        } catch (const std::exception& err) {
+            if (!opt_.refactor_on_solve_failure)
+                throw;
+
+            self->last_update_diagnostic_ = err.what();
+            self->refactor();
+
+            Eigen::VectorXd y = do_solve();
+            self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT sparse after refactor");
             return y;
         }
     }
@@ -262,6 +336,8 @@ class FTBasis {
     }
 
   private:
+    static constexpr double kSparseSolveDensityThreshold_ = 0.05;
+
     static std::vector<int> permutation_to_vector_(const Permutation& perm) {
         std::vector<int> out(static_cast<size_t>(perm.indices().size()));
         for (int i = 0; i < perm.indices().size(); ++i)
@@ -279,6 +355,24 @@ class FTBasis {
                 out(it.row()) = it.value();
         }
         return out;
+    }
+
+    template <typename Derived>
+    static std::pair<std::vector<int>, std::vector<double>>
+    sparse_vector_to_seed_data_(const Eigen::SparseMatrixBase<Derived>& mat) {
+        std::vector<int> seed_idx;
+        std::vector<double> seed_val;
+        const auto& derived = mat.derived();
+        const int reserve_hint = std::max(0, static_cast<int>(derived.nonZeros()));
+        seed_idx.reserve(static_cast<size_t>(reserve_hint));
+        seed_val.reserve(static_cast<size_t>(reserve_hint));
+        for (int k = 0; k < derived.outerSize(); ++k) {
+            for (typename Derived::InnerIterator it(derived, k); it; ++it) {
+                seed_idx.push_back(it.row());
+                seed_val.push_back(it.value());
+            }
+        }
+        return {std::move(seed_idx), std::move(seed_val)};
     }
 
     static CSR sparse_to_amd_csr_(const SparseMat& B) {
@@ -596,6 +690,7 @@ class FTBasis {
     void mark_sparse_basis_cache_dirty_() noexcept { current_B_sparse_dirty_ = true; }
 
     void dense_refactor_() {
+        const auto t0 = std::chrono::steady_clock::now();
         lu_dense_.factor(current_B_dense_, opt_.pivot_rel, opt_.abs_floor, opt_.rook_iters);
         max_element_ = lu_dense_.U().cwiseAbs().maxCoeff();
         refactor_baseline_max_element_ = std::max(1.0, max_element_);
@@ -603,6 +698,7 @@ class FTBasis {
             initial_refactor_max_element_ = refactor_baseline_max_element_;
         reset_update_state_();
         refresh_refactor_diagnostics_();
+        report_refactor_telemetry_(t0);
     }
 
     void sparse_build_B_(SparseMat& B) const {
@@ -611,6 +707,7 @@ class FTBasis {
     }
 
     void sparse_refactor_() {
+        const auto t0 = std::chrono::steady_clock::now();
         SparseMat B;
         sparse_build_B_(B);
         compute_sparse_ordering_(B);
@@ -634,6 +731,18 @@ class FTBasis {
         }
         reset_update_state_();
         refresh_refactor_diagnostics_();
+        report_refactor_telemetry_(t0);
+    }
+
+    void report_refactor_telemetry_(
+        const std::chrono::steady_clock::time_point& t0) noexcept {
+        if (opt_.ext_refactor_counter)
+            ++(*opt_.ext_refactor_counter);
+        if (opt_.ext_refactor_ns) {
+            const auto dt = std::chrono::steady_clock::now() - t0;
+            *opt_.ext_refactor_ns += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count());
+        }
     }
 
     // ----------------------------
@@ -1092,6 +1201,15 @@ class FTBasis {
     // ----------------------------
     void replace_column_impl_(int j, std::optional<int> entering_col,
                               const Eigen::VectorXd& new_col_dense) {
+        const auto t0 = std::chrono::steady_clock::now();
+        auto report_pivot_telemetry = [&]() noexcept {
+            if (opt_.ext_pivot_ns) {
+                *opt_.ext_pivot_ns += static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count());
+            }
+        };
         if (j < 0 || j >= m_)
             throw std::out_of_range("FTBasis::replace_column bad j");
         if (new_col_dense.size() != m_)
@@ -1162,6 +1280,7 @@ class FTBasis {
 
             if (bad_factorization_column_residual_(j) || need_compress_())
                 sparse_refactor_();
+            report_pivot_telemetry();
             return;
         }
 
@@ -1237,6 +1356,7 @@ class FTBasis {
                 need_compress_()) {
                 dense_refactor_();
             }
+            report_pivot_telemetry();
             return;
         }
 
@@ -1264,6 +1384,7 @@ class FTBasis {
             need_compress_()) {
             dense_refactor_();
         }
+        report_pivot_telemetry();
     }
 
   private:

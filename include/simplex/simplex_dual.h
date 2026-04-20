@@ -406,17 +406,32 @@ class RevisedSimplexDualEngine {
             }
         }
 
-        std::optional<FTBasis> Bopt;
-        try {
-            Bopt.emplace(Ahat, basis, self.make_basis_options_());
-        } catch (const std::exception& e) {
-            return {LPSolution::Status::Singular,
-                    Eigen::VectorXd::Zero(n),
-                    basis,
-                    0,
-                    {{"where", "dual initial basis factorization failed"}, {"what", e.what()}}};
+        std::shared_ptr<FTBasis> basis_factorization;
+        std::shared_ptr<LPWarmStateData> reused_warm_state = self.try_reuse_factorization_(basis);
+        if (reused_warm_state) {
+            basis_factorization = reused_warm_state->basis_factorization;
+        } else {
+            try {
+                basis_factorization =
+                    std::make_shared<FTBasis>(Ahat, basis, self.make_basis_options_());
+            } catch (const std::exception& e) {
+                return {LPSolution::Status::Singular,
+                        Eigen::VectorXd::Zero(n),
+                        basis,
+                        0,
+                        {{"where", "dual initial basis factorization failed"}, {"what", e.what()}}};
+            }
         }
-        FTBasis& B = *Bopt;
+        auto rebuild_basis_factorization = [&]() -> std::shared_ptr<FTBasis> {
+            return std::make_shared<FTBasis>(Ahat, basis, self.make_basis_options_());
+        };
+        auto read_basis = [&]() -> FTBasis& { return *basis_factorization; };
+        auto write_basis = [&]() -> FTBasis& {
+            if (!basis_factorization.unique()) {
+                basis_factorization = rebuild_basis_factorization();
+            }
+            return *basis_factorization;
+        };
         self.degen_.start_basis_history(basis);
 
         auto apply_views_to_nonbasics = [&](const Eigen::VectorXd& ydual) {
@@ -464,22 +479,26 @@ class RevisedSimplexDualEngine {
             Eigen::VectorXd cB(m);
             for (int i = 0; i < m; ++i)
                 cB(i) = chat(basis[i]);
-            Eigen::VectorXd ydual = B.solve_BT(cB);
+            Eigen::VectorXd ydual = read_basis().solve_BT(cB);
             apply_views_to_nonbasics(ydual);
         }
-        try {
-            B.refactor();
-        } catch (const std::exception& e) {
-            return {LPSolution::Status::Singular,
-                    Eigen::VectorXd::Zero(n),
-                    basis,
-                    0,
-                    {{"where", "dual initial refactor failed"}, {"what", e.what()}}};
+        if (!reused_warm_state) {
+            try {
+                read_basis().refactor();
+            } catch (const std::exception& e) {
+                return {LPSolution::Status::Singular,
+                        Eigen::VectorXd::Zero(n),
+                        basis,
+                        0,
+                        {{"where", "dual initial refactor failed"}, {"what", e.what()}}};
+            }
         }
         auto rebuild_dual_pool = [&](const char* where,
                                      int iter) -> std::optional<RevisedSimplex::PhaseResult> {
             try {
-                dual_pricer.build_dual_pool(B, Ahat, N);
+                self.measure_pricing_build_(true, [&]() {
+                    dual_pricer.build_dual_pool(read_basis(), Ahat, N);
+                });
                 return std::nullopt;
             } catch (const std::exception& e) {
                 std::unordered_map<std::string, std::string> info{
@@ -494,8 +513,42 @@ class RevisedSimplexDualEngine {
                                                    std::move(info)};
             }
         };
-        if (auto failed = rebuild_dual_pool("dual initial pricing setup failed", 0)) {
-            return *failed;
+        bool restored_dual_weights = false;
+        if (reused_warm_state && reused_warm_state->dual_pricing_state.has_value()) {
+            DualAdaptivePricer::WarmStartState imported;
+            switch (reused_warm_state->dual_pricing_state->active_rule) {
+                case LPDualPricingWarmState::Rule::SteepestEdge:
+                    imported.active_rule = DualAdaptivePricer::Rule::SteepestEdge;
+                    imported.steepest.row_weights =
+                        reused_warm_state->dual_pricing_state->row_weights;
+                    break;
+                case LPDualPricingWarmState::Rule::Devex:
+                    imported.active_rule = DualAdaptivePricer::Rule::Devex;
+                    imported.devex.row_weights =
+                        reused_warm_state->dual_pricing_state->row_weights;
+                    break;
+                case LPDualPricingWarmState::Rule::RowPricing:
+                    imported.active_rule = DualAdaptivePricer::Rule::RowPricing;
+                    imported.row.row_weights = reused_warm_state->dual_pricing_state->row_weights;
+                    imported.row.prefer_row_pricing =
+                        reused_warm_state->dual_pricing_state->prefer_row_pricing;
+                    break;
+                case LPDualPricingWarmState::Rule::MostInfeasible:
+                    imported.active_rule = DualAdaptivePricer::Rule::MostInfeasible;
+                    break;
+                case LPDualPricingWarmState::Rule::None:
+                    imported.active_rule = DualAdaptivePricer::Rule::MostInfeasible;
+                    break;
+            }
+            restored_dual_weights = dual_pricer.import_state(imported, m);
+            if (restored_dual_weights) {
+                self.solve_stats_.warm_dual_weights_reused = 1;
+            }
+        }
+        if (!restored_dual_weights) {
+            if (auto failed = rebuild_dual_pool("dual initial pricing setup failed", 0)) {
+                return *failed;
+            }
         }
         self.trace_line_("[dual] start basis=" + self.format_basis_(basis));
 
@@ -532,13 +585,13 @@ class RevisedSimplexDualEngine {
 
             while (true) {
                 try {
-                    yB = B.solve_B(rhs_eff);
+                    yB = read_basis().solve_B(rhs_eff);
                 } catch (...) {
                     if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
                         ++rebuild_attempts;
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after solve_B failure");
-                        B.refactor();
+                        write_basis().refactor();
                         if (auto failed = rebuild_dual_pool(
                                 "dual pricing rebuild failed after solve_B", iters)) {
                             return *failed;
@@ -555,16 +608,16 @@ class RevisedSimplexDualEngine {
                 for (int i = 0; i < m; ++i)
                     cB(i) = chat(basis[i]);
                 try {
-                    ydual = B.solve_BT(cB);
+                    ydual = read_basis().solve_BT(cB);
                 } catch (...) {
                     self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                      " refactor after solve_BT failure");
-                    B.refactor();
+                    write_basis().refactor();
                     if (auto failed = rebuild_dual_pool(
                             "dual pricing rebuild failed after solve_BT", iters)) {
                         return *failed;
                     }
-                    ydual = B.solve_BT(cB);
+                    ydual = read_basis().solve_BT(cB);
                 }
 
                 if (!(warm_views_provided && iters == 1) && apply_views_to_nonbasics(ydual)) {
@@ -576,7 +629,7 @@ class RevisedSimplexDualEngine {
                     continue;
                 }
 
-                const auto leaving = dual_pricer.choose_dual_leaving(B, yB, self.opt_.tol);
+                const auto leaving = dual_pricer.choose_dual_leaving(read_basis(), yB, self.opt_.tol);
                 r_leave = leaving.row;
                 if (r_leave < 0) {
                     rN.resize(N.size());
@@ -595,6 +648,28 @@ class RevisedSimplexDualEngine {
                         info_map["dual_bfrt_flips"] = std::to_string(total_flips);
                         self.trace_line_("[dual] optimal iter=" + std::to_string(iters) +
                                          " basis=" + self.format_basis_(basis));
+                        const auto dual_state = dual_pricer.export_state();
+                        LPDualPricingWarmState pricing_state;
+                        switch (dual_state.active_rule) {
+                            case DualAdaptivePricer::Rule::SteepestEdge:
+                                pricing_state.active_rule = LPDualPricingWarmState::Rule::SteepestEdge;
+                                pricing_state.row_weights = dual_state.steepest.row_weights;
+                                break;
+                            case DualAdaptivePricer::Rule::Devex:
+                                pricing_state.active_rule = LPDualPricingWarmState::Rule::Devex;
+                                pricing_state.row_weights = dual_state.devex.row_weights;
+                                break;
+                            case DualAdaptivePricer::Rule::RowPricing:
+                                pricing_state.active_rule = LPDualPricingWarmState::Rule::RowPricing;
+                                pricing_state.row_weights = dual_state.row.row_weights;
+                                pricing_state.prefer_row_pricing = dual_state.row.prefer_row_pricing;
+                                break;
+                            case DualAdaptivePricer::Rule::MostInfeasible:
+                                pricing_state.active_rule =
+                                    LPDualPricingWarmState::Rule::MostInfeasible;
+                                break;
+                        }
+                        self.remember_warm_state_(basis, basis_factorization, pricing_state);
                         return {LPSolution::Status::Optimal, std::move(x), basis, iters,
                                 std::move(info_map)};
                     }
@@ -625,7 +700,7 @@ class RevisedSimplexDualEngine {
                                 chat(basis[i]) = c_work(basis[i]);
                             self.trace_line_("[dual] cost-shift Phase 1 applied, refactoring");
                             try {
-                                B.refactor();
+                                write_basis().refactor();
                             } catch (const std::exception&) {
                                 return {LPSolution::Status::NeedPhase1,
                                         Eigen::VectorXd::Zero(n),
@@ -664,7 +739,7 @@ class RevisedSimplexDualEngine {
                         ++rebuild_attempts;
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after no eligible entering");
-                        B.refactor();
+                        write_basis().refactor();
                         if (auto failed = rebuild_dual_pool(
                                 "dual pricing rebuild failed after no eligible entering", iters)) {
                             return *failed;
@@ -760,13 +835,13 @@ class RevisedSimplexDualEngine {
                     }
                 }
                 try {
-                    s_enter = B.solve_B(Ahat.col(eAbs));
+                    s_enter = read_basis().solve_B(Ahat.col(eAbs));
                 } catch (...) {
                     if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
                         ++rebuild_attempts;
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after solve(B,a_e) failure");
-                        B.refactor();
+                        write_basis().refactor();
                         if (auto failed = rebuild_dual_pool(
                                 "dual pricing rebuild failed after solve(B,a_e)", iters)) {
                             return *failed;
@@ -797,7 +872,7 @@ class RevisedSimplexDualEngine {
                 info_map["farkas_y"] = serialize_vec(yF);
                 self.trace_line_("[dual] infeasible iter=" + std::to_string(iters) +
                                  " produced Farkas certificate");
-
+                self.remember_warm_state_(basis, basis_factorization);
                 return {LPSolution::Status::Infeasible, Eigen::VectorXd::Zero(n), basis, iters,
                         std::move(info_map)};
             }
@@ -854,11 +929,11 @@ class RevisedSimplexDualEngine {
             N[e_rel] = oldAbs;
 
             try {
-                B.replace_column(r_leave, Ahat.col(eAbs));
+                write_basis().replace_column(r_leave, Ahat.col(eAbs));
             } catch (...) {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
-                B.refactor();
+                write_basis().refactor();
                 if (auto failed = rebuild_dual_pool(
                         "dual pricing rebuild failed after replace_column", iters)) {
                     return *failed;
@@ -884,6 +959,7 @@ class RevisedSimplexDualEngine {
         info_map["dual_pricing"] = dual_pricer.current_strategy_name();
         info_map["dual_bfrt_flips"] = std::to_string(total_flips);
         self.trace_line_("[dual] iterlimit basis=" + self.format_basis_(basis));
+        self.remember_warm_state_(basis, basis_factorization);
         return {LPSolution::Status::IterLimit, Eigen::VectorXd::Zero(n), basis, iters,
                 std::move(info_map)};
     }

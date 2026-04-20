@@ -569,12 +569,21 @@ class Solver {
             warm_start_relaxation_solve_count_ = 0;
             strong_branching_probe_count_ = 0;
             strong_branching_probe_iterations_ = 0;
+            lp_refactorizations_ = 0;
+            lp_eta_stack_depth_entry_sum_ = 0;
+            lp_dual_pool_builds_ = 0;
+            lp_primal_pool_builds_ = 0;
+            lp_warm_factorization_reuse_count_ = 0;
+            lp_warm_dual_weights_reuse_count_ = 0;
             relaxation_core_solve_time_ns_ = 0;
             relaxation_lp_assembly_time_ns_ = 0;
             relaxation_lp_internal_presolve_ns_ = 0;
             relaxation_lp_internal_crash_ns_ = 0;
             relaxation_lp_internal_iters_ns_ = 0;
             relaxation_lp_internal_serialize_ns_ = 0;
+            relaxation_lp_lu_build_ns_ = 0;
+            relaxation_lp_pricing_build_ns_ = 0;
+            relaxation_lp_pivot_ns_ = 0;
             strong_branching_probe_core_solve_time_ns_ = 0;
             strong_branching_probe_lp_assembly_time_ns_ = 0;
             strong_branching_probe_lp_internal_presolve_ns_ = 0;
@@ -1657,6 +1666,9 @@ class Solver {
         }
 
         const double gap = relative_gap_from_bound_(relaxation.objective);
+        if (!shallow && gap <= 0.05) {
+            return false;
+        }
         return !std::isfinite(gap) || gap > 0.01 || shallow;
     }
 
@@ -1771,6 +1783,18 @@ class Solver {
         relaxation_lp_internal_crash_ns_ += relaxation.lp_internal_crash_ns;
         relaxation_lp_internal_iters_ns_ += relaxation.lp_internal_iters_ns;
         relaxation_lp_internal_serialize_ns_ += relaxation.lp_internal_serialize_ns;
+        if (relaxation.lp_solution.has_value()) {
+            const LPSolveStats& lp_stats = relaxation.lp_solution->solve_stats;
+            lp_refactorizations_ += lp_stats.refactorizations;
+            lp_eta_stack_depth_entry_sum_ += lp_stats.eta_stack_depth_entry;
+            lp_dual_pool_builds_ += lp_stats.dual_pool_builds;
+            lp_primal_pool_builds_ += lp_stats.primal_pool_builds;
+            lp_warm_factorization_reuse_count_ += lp_stats.warm_factorization_reused;
+            lp_warm_dual_weights_reuse_count_ += lp_stats.warm_dual_weights_reused;
+            relaxation_lp_lu_build_ns_ += lp_stats.lu_build_ns;
+            relaxation_lp_pricing_build_ns_ += lp_stats.pricing_build_ns;
+            relaxation_lp_pivot_ns_ += lp_stats.pivot_ns;
+        }
         if (node_count_ >= options_.max_nodes) {
             search_coordinator_.mark_node_limit_reached();
         }
@@ -2023,22 +2047,25 @@ class Solver {
             << "  " << "Event"
             << "\n";
         // clang-format on
-        std::cout << "   "
-                  << std::string(7, '-') << std::string(7, '-')
-                  << std::string(14, '-') << std::string(14, '-')
-                  << std::string(8, '-')
-                  << "\n";
+        std::cout << "   " << std::string(7, '-') << std::string(7, '-') << std::string(14, '-')
+                  << std::string(14, '-') << std::string(8, '-') << "\n";
     }
 
     // Map event name → single-char marker (Gurobi style)
     static char event_marker_(const char* event) {
         std::string_view ev(event);
-        if (ev == "incumbent") return 'H';  // heuristic incumbent
-        if (ev == "root")      return 'R';  // root relaxation
-        if (ev == "cut")       return 'C';  // cutting plane tightened bound
-        if (ev == "node-cut")  return 'c';
-        if (ev == "bound")     return 'B';
-        if (ev == "done")      return ' ';
+        if (ev == "incumbent")
+            return 'H'; // heuristic incumbent
+        if (ev == "root")
+            return 'R'; // root relaxation
+        if (ev == "cut")
+            return 'C'; // cutting plane tightened bound
+        if (ev == "node-cut")
+            return 'c';
+        if (ev == "bound")
+            return 'B';
+        if (ev == "done")
+            return ' ';
         return ' ';
     }
 
@@ -2126,7 +2153,8 @@ class Solver {
         const int inner = static_cast<int>(t.size()) + 2; // " title "
         const int left_dashes = std::max(3, (total - inner) / 2);
         const int right_dashes = std::max(3, total - inner - left_dashes);
-        std::cout << "\n" << std::string(left_dashes, '-') << " " << t << " "
+        std::cout << "\n"
+                  << std::string(left_dashes, '-') << " " << t << " "
                   << std::string(right_dashes, '-') << "\n";
     }
 
@@ -2134,20 +2162,19 @@ class Solver {
     static void print_three_column_summary_row_(const char* /*section*/, Left&& left, Mid&& mid,
                                                 Right&& right, int left_width = 22,
                                                 int value_width = 14) {
-        std::cout << "  " << std::left << std::setw(left_width)
-                  << std::forward<Left>(left) << std::right << std::setw(value_width)
-                  << std::forward<Mid>(mid) << std::setw(value_width) << std::forward<Right>(right)
-                  << "\n";
+        std::cout << "  " << std::left << std::setw(left_width) << std::forward<Left>(left)
+                  << std::right << std::setw(value_width) << std::forward<Mid>(mid)
+                  << std::setw(value_width) << std::forward<Right>(right) << "\n";
     }
 
     template <typename Left, typename Col1, typename Col2, typename Col3>
     static void print_four_column_summary_row_(const char* /*section*/, Left&& left, Col1&& col1,
                                                Col2&& col2, Col3&& col3, int left_width = 18,
                                                int value_width = 12) {
-        std::cout << "  " << std::left << std::setw(left_width)
-                  << std::forward<Left>(left) << std::right << std::setw(value_width)
-                  << std::forward<Col1>(col1) << std::setw(value_width) << std::forward<Col2>(col2)
-                  << std::setw(value_width) << std::forward<Col3>(col3) << "\n";
+        std::cout << "  " << std::left << std::setw(left_width) << std::forward<Left>(left)
+                  << std::right << std::setw(value_width) << std::forward<Col1>(col1)
+                  << std::setw(value_width) << std::forward<Col2>(col2) << std::setw(value_width)
+                  << std::forward<Col3>(col3) << "\n";
     }
 
     static std::vector<std::tuple<std::string, int, int>>
@@ -2219,17 +2246,13 @@ class Solver {
         print_three_column_summary_row_("", "Cut resolve",
                                         format_time_cell_(root_cut_resolve_wall_ns_),
                                         format_time_cell_(node_cut_resolve_wall_ns_));
-        print_three_column_summary_row_("", "Rounding",
-                                        format_time_cell_(std::nullopt),
+        print_three_column_summary_row_("", "Rounding", format_time_cell_(std::nullopt),
                                         format_time_cell_(rounding_heuristic_wall_ns_));
-        print_three_column_summary_row_("", "Async heuristics",
-                                        format_time_cell_(std::nullopt),
+        print_three_column_summary_row_("", "Async heuristics", format_time_cell_(std::nullopt),
                                         format_time_cell_(heuristics_wall_ns_));
-        print_three_column_summary_row_("", "Branching",
-                                        format_time_cell_(std::nullopt),
+        print_three_column_summary_row_("", "Branching", format_time_cell_(std::nullopt),
                                         format_time_cell_(branching_wall_ns_));
-        print_three_column_summary_row_("", "Child processing",
-                                        format_time_cell_(std::nullopt),
+        print_three_column_summary_row_("", "Child processing", format_time_cell_(std::nullopt),
                                         format_time_cell_(child_processing_wall_ns_));
 
         const int round_and_diving_successes =
@@ -2238,20 +2261,18 @@ class Solver {
                             local_search_successes_ - local_branching_successes_);
         print_summary_section_("Heuristics");
         print_three_column_summary_row_("", "Method", "Successes", "Time");
-        print_three_column_summary_row_("", "Round + diving",
-                                        format_count_cell_(round_and_diving_successes),
-                                        format_time_cell_(rounding_heuristic_wall_ns_ + diving_wall_ns_));
+        print_three_column_summary_row_(
+            "", "Round + diving", format_count_cell_(round_and_diving_successes),
+            format_time_cell_(rounding_heuristic_wall_ns_ + diving_wall_ns_));
         print_three_column_summary_row_("", "Feasibility jump",
                                         format_count_cell_(feasibility_jump_successes_),
                                         format_time_cell_(feasibility_jump_wall_ns_));
         print_three_column_summary_row_("", "Feasibility pump",
                                         format_count_cell_(feasibility_pump_successes_),
                                         format_time_cell_(feasibility_pump_wall_ns_));
-        print_three_column_summary_row_("", "RENS",
-                                        format_count_cell_(rens_successes_),
+        print_three_column_summary_row_("", "RENS", format_count_cell_(rens_successes_),
                                         format_time_cell_(rens_wall_ns_));
-        print_three_column_summary_row_("", "RINS",
-                                        format_count_cell_(rins_successes_),
+        print_three_column_summary_row_("", "RINS", format_count_cell_(rins_successes_),
                                         format_time_cell_(rins_wall_ns_));
         print_three_column_summary_row_("", "Local search",
                                         format_count_cell_(local_search_successes_),
@@ -2259,22 +2280,20 @@ class Solver {
         print_three_column_summary_row_("", "Local branching",
                                         format_count_cell_(local_branching_successes_),
                                         format_time_cell_(local_branching_wall_ns_));
-        print_three_column_summary_row_("", "Total",
-                                        format_count_cell_(heuristic_successes_),
-                                        format_time_cell_(rounding_heuristic_wall_ns_ + heuristics_wall_ns_));
+        print_three_column_summary_row_(
+            "", "Total", format_count_cell_(heuristic_successes_),
+            format_time_cell_(rounding_heuristic_wall_ns_ + heuristics_wall_ns_));
 
         print_summary_section_("Cuts");
         print_four_column_summary_row_("", "Family", "Generated", "Applied", "Share");
         const int total_generated_cuts = cut_pool_.cuts_generated();
         const std::string all_share = total_generated_cuts > 0 ? "100.0%" : "--";
-        print_four_column_summary_row_("", "All",
-                                       format_count_cell_(total_generated_cuts),
+        print_four_column_summary_row_("", "All", format_count_cell_(total_generated_cuts),
                                        format_count_cell_(cut_pool_.cuts_applied()), all_share);
         print_four_column_summary_row_("", "Duplicates",
                                        format_count_cell_(cut_pool_.duplicate_cuts()),
                                        format_count_cell_(std::nullopt), "--");
-        print_four_column_summary_row_("", "Pool size",
-                                       format_count_cell_(cut_pool_.size()),
+        print_four_column_summary_row_("", "Pool size", format_count_cell_(cut_pool_.size()),
                                        format_count_cell_(std::nullopt), "--");
 
         const auto cut_rows =
@@ -2284,8 +2303,7 @@ class Solver {
             std::ostringstream share;
             share << std::fixed << std::setprecision(1)
                   << (100.0 * static_cast<double>(generated_count) / total_generated) << "%";
-            print_four_column_summary_row_("", name,
-                                           format_count_cell_(generated_count),
+            print_four_column_summary_row_("", name, format_count_cell_(generated_count),
                                            format_count_cell_(applied_count), share.str());
         }
         std::cout << "\n" << std::string(79, '=') << "\n";
@@ -2530,10 +2548,10 @@ class Solver {
                         active_cuts_.push_back(cut);
                         ++added_count;
                     }
-                    if (added_count > 0) {
-                        search_coordinator_.for_each_mutable_node(
-                            [](detail::ActiveNode& active_node) { active_node.basis.reset(); });
-                    }
+                    // Keep queued node bases alive across global cut activation.
+                    // The LP assembly path can extend those bases with newly added
+                    // cut slacks on demand, which is much cheaper than forcing all
+                    // workers back to a cold start at once.
                 }
                 timing.root_cut_activation_wall_ns +=
                     elapsed_ns_(activation_start, SteadyClock::now());
@@ -2704,6 +2722,7 @@ class Solver {
             return;
         }
         timing.fractional_count = static_cast<int>(fractional.size());
+        const HeuristicSchedule schedule = build_heuristic_schedule_(node, relaxation);
 
         const auto rounding_start = SteadyClock::now();
         if (options_.use_rounding) {
@@ -2779,15 +2798,18 @@ class Solver {
                                      relaxation_cuts);
         };
 
-        const HeuristicSchedule schedule = build_heuristic_schedule_(node, relaxation);
         const auto incumbent = incumbent_snapshot_();
         auto heuristic_budget_available = [this]() { return this->more_heuristics_allowed_(); };
         auto maybe_run_async_submip_heuristic = [this, &node, &timing](auto&& task) {
             ++timing.async_heuristic_launch_attempts;
-            dispatch_async_heuristic_(node.order,
-                                      [this, task = std::forward<decltype(task)>(task)]() mutable {
-                                          enqueue_async_heuristic_completion_(task());
-                                      });
+            if (async_heuristics_enabled_()) {
+                dispatch_async_heuristic_(
+                    node.order, [this, task = std::forward<decltype(task)>(task)]() mutable {
+                        enqueue_async_heuristic_completion_(task());
+                    });
+            } else {
+                apply_async_heuristic_completion_(task());
+            }
         };
 
         const auto heuristics_start = SteadyClock::now();
@@ -2810,11 +2832,7 @@ class Solver {
                 }
                 return completion;
             };
-            if (async_heuristics_enabled_()) {
-                maybe_run_async_submip_heuristic(std::move(feasibility_jump_task));
-            } else {
-                apply_async_heuristic_completion_(feasibility_jump_task());
-            }
+            maybe_run_async_submip_heuristic(std::move(feasibility_jump_task));
             timing.feasibility_jump_wall_ns += elapsed_ns_(step_start, SteadyClock::now());
         }
 
@@ -2837,11 +2855,7 @@ class Solver {
                 }
                 return completion;
             };
-            if (async_heuristics_enabled_()) {
-                maybe_run_async_submip_heuristic(std::move(feasibility_pump_task));
-            } else {
-                apply_async_heuristic_completion_(feasibility_pump_task());
-            }
+            maybe_run_async_submip_heuristic(std::move(feasibility_pump_task));
             timing.feasibility_pump_wall_ns += elapsed_ns_(step_start, SteadyClock::now());
         }
 
@@ -2878,11 +2892,7 @@ class Solver {
                 }
                 return completion;
             };
-            if (async_heuristics_enabled_()) {
-                maybe_run_async_submip_heuristic(std::move(diving_task));
-            } else {
-                apply_async_heuristic_completion_(diving_task());
-            }
+            maybe_run_async_submip_heuristic(std::move(diving_task));
             timing.diving_wall_ns += elapsed_ns_(step_start, SteadyClock::now());
         }
 
@@ -2904,11 +2914,7 @@ class Solver {
                 }
                 return completion;
             };
-            if (async_heuristics_enabled_() && incumbent.has_incumbent) {
-                maybe_run_async_submip_heuristic(std::move(rens_task));
-            } else {
-                apply_async_heuristic_completion_(rens_task());
-            }
+            maybe_run_async_submip_heuristic(std::move(rens_task));
             timing.rens_wall_ns += elapsed_ns_(step_start, SteadyClock::now());
         }
 
@@ -2934,11 +2940,7 @@ class Solver {
                 }
                 return completion;
             };
-            if (async_heuristics_enabled_()) {
-                maybe_run_async_submip_heuristic(std::move(rins_task));
-            } else {
-                apply_async_heuristic_completion_(rins_task());
-            }
+            maybe_run_async_submip_heuristic(std::move(rins_task));
             timing.rins_wall_ns += elapsed_ns_(step_start, SteadyClock::now());
         }
 
@@ -2963,11 +2965,7 @@ class Solver {
                 }
                 return completion;
             };
-            if (async_heuristics_enabled_()) {
-                maybe_run_async_submip_heuristic(std::move(local_search_task));
-            } else {
-                apply_async_heuristic_completion_(local_search_task());
-            }
+            maybe_run_async_submip_heuristic(std::move(local_search_task));
             timing.local_search_wall_ns += elapsed_ns_(step_start, SteadyClock::now());
         }
 
@@ -2993,11 +2991,7 @@ class Solver {
                 }
                 return completion;
             };
-            if (async_heuristics_enabled_()) {
-                maybe_run_async_submip_heuristic(std::move(local_branching_task));
-            } else {
-                apply_async_heuristic_completion_(local_branching_task());
-            }
+            maybe_run_async_submip_heuristic(std::move(local_branching_task));
             timing.local_branching_wall_ns += elapsed_ns_(step_start, SteadyClock::now());
         }
         timing.heuristics_wall_ns += elapsed_ns_(heuristics_start, SteadyClock::now());
@@ -3285,12 +3279,21 @@ class Solver {
         result.warm_start_relaxation_solve_count = warm_start_relaxation_solve_count_;
         result.strong_branching_probe_count = strong_branching_probe_count_;
         result.strong_branching_probe_iterations = strong_branching_probe_iterations_;
+        result.lp_refactorizations = lp_refactorizations_;
+        result.lp_eta_stack_depth_entry_sum = lp_eta_stack_depth_entry_sum_;
+        result.lp_dual_pool_builds = lp_dual_pool_builds_;
+        result.lp_primal_pool_builds = lp_primal_pool_builds_;
+        result.lp_warm_factorization_reuse_count = lp_warm_factorization_reuse_count_;
+        result.lp_warm_dual_weights_reuse_count = lp_warm_dual_weights_reuse_count_;
         result.relaxation_core_solve_time_ns = relaxation_core_solve_time_ns_;
         result.relaxation_lp_assembly_time_ns = relaxation_lp_assembly_time_ns_;
         result.relaxation_lp_internal_presolve_ns = relaxation_lp_internal_presolve_ns_;
         result.relaxation_lp_internal_crash_ns = relaxation_lp_internal_crash_ns_;
         result.relaxation_lp_internal_iters_ns = relaxation_lp_internal_iters_ns_;
         result.relaxation_lp_internal_serialize_ns = relaxation_lp_internal_serialize_ns_;
+        result.relaxation_lp_lu_build_ns = relaxation_lp_lu_build_ns_;
+        result.relaxation_lp_pricing_build_ns = relaxation_lp_pricing_build_ns_;
+        result.relaxation_lp_pivot_ns = relaxation_lp_pivot_ns_;
         result.strong_branching_probe_core_solve_time_ns =
             strong_branching_probe_core_solve_time_ns_;
         result.strong_branching_probe_lp_assembly_time_ns =
@@ -3353,12 +3356,21 @@ class Solver {
     int warm_start_relaxation_solve_count_ = 0;
     int strong_branching_probe_count_ = 0;
     int strong_branching_probe_iterations_ = 0;
+    int lp_refactorizations_ = 0;
+    int lp_eta_stack_depth_entry_sum_ = 0;
+    int lp_dual_pool_builds_ = 0;
+    int lp_primal_pool_builds_ = 0;
+    int lp_warm_factorization_reuse_count_ = 0;
+    int lp_warm_dual_weights_reuse_count_ = 0;
     std::uint64_t relaxation_core_solve_time_ns_ = 0;
     std::uint64_t relaxation_lp_assembly_time_ns_ = 0;
     std::uint64_t relaxation_lp_internal_presolve_ns_ = 0;
     std::uint64_t relaxation_lp_internal_crash_ns_ = 0;
     std::uint64_t relaxation_lp_internal_iters_ns_ = 0;
     std::uint64_t relaxation_lp_internal_serialize_ns_ = 0;
+    std::uint64_t relaxation_lp_lu_build_ns_ = 0;
+    std::uint64_t relaxation_lp_pricing_build_ns_ = 0;
+    std::uint64_t relaxation_lp_pivot_ns_ = 0;
     std::uint64_t strong_branching_probe_core_solve_time_ns_ = 0;
     std::uint64_t strong_branching_probe_lp_assembly_time_ns_ = 0;
     std::uint64_t strong_branching_probe_lp_internal_presolve_ns_ = 0;

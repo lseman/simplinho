@@ -113,6 +113,8 @@ LPBasis parse_basis_state_from_info(const std::unordered_map<std::string, std::s
                 break;
         }
     }
+    out.basis_columns = fallback.basis_columns;
+    out.warm_state = fallback.warm_state;
     return out;
 }
 
@@ -223,6 +225,8 @@ LPBasis rebuild_basis_from_solution(const LPSolution& sol) {
 
     LPBasis out;
     out.column_status.reserve(status.size());
+    out.basis_columns = sol.basis;
+    out.warm_state = sol.basis_state.warm_state;
     for (const int value : status) {
         switch (value) {
             case 0:
@@ -249,6 +253,19 @@ SolveStats build_solve_stats(const LPSolution& sol) {
     stats.iterations = sol.iters;
     stats.phase1_iterations = find_info_int(sol.info, "phase1_iters");
     stats.phase2_iterations = sol.iters - stats.phase1_iterations.value_or(0);
+    stats.refactorizations = sol.solve_stats.refactorizations;
+    stats.eta_stack_depth_entry = sol.solve_stats.eta_stack_depth_entry;
+    stats.ft_updates = sol.solve_stats.ft_updates;
+    stats.dual_pool_builds = sol.solve_stats.dual_pool_builds;
+    stats.primal_pool_builds = sol.solve_stats.primal_pool_builds;
+    stats.warm_start_attempted = sol.solve_stats.warm_start_attempted;
+    stats.warm_start_accepted = sol.solve_stats.warm_start_accepted;
+    stats.warm_start_cold_retry = sol.solve_stats.warm_start_cold_retry;
+    stats.warm_factorization_reused = sol.solve_stats.warm_factorization_reused;
+    stats.warm_dual_weights_reused = sol.solve_stats.warm_dual_weights_reused;
+    stats.lu_build_ns = sol.solve_stats.lu_build_ns;
+    stats.pricing_build_ns = sol.solve_stats.pricing_build_ns;
+    stats.pivot_ns = sol.solve_stats.pivot_ns;
     stats.presolve_actions = find_info_int(sol.info, "presolve_actions");
     stats.presolve_implied_bound_updates =
         find_info_int(sol.info, "presolve_implied_bound_updates");
@@ -291,6 +308,37 @@ void bind_solve_stats_type(py::module_& m) {
                                [](const SolveStats& self) { return self.phase1_iterations; })
         .def_property_readonly("phase2_iterations",
                                [](const SolveStats& self) { return self.phase2_iterations; })
+        .def_property_readonly("refactorizations",
+                               [](const SolveStats& self) { return self.refactorizations; })
+        .def_property_readonly("eta_stack_depth_entry",
+                               [](const SolveStats& self) { return self.eta_stack_depth_entry; })
+        .def_property_readonly("ft_updates",
+                               [](const SolveStats& self) { return self.ft_updates; })
+        .def_property_readonly("dual_pool_builds",
+                               [](const SolveStats& self) { return self.dual_pool_builds; })
+        .def_property_readonly("primal_pool_builds",
+                               [](const SolveStats& self) { return self.primal_pool_builds; })
+        .def_property_readonly(
+            "warm_start_attempted",
+            [](const SolveStats& self) { return self.warm_start_attempted; })
+        .def_property_readonly(
+            "warm_start_accepted",
+            [](const SolveStats& self) { return self.warm_start_accepted; })
+        .def_property_readonly(
+            "warm_start_cold_retry",
+            [](const SolveStats& self) { return self.warm_start_cold_retry; })
+        .def_property_readonly(
+            "warm_factorization_reused",
+            [](const SolveStats& self) { return self.warm_factorization_reused; })
+        .def_property_readonly(
+            "warm_dual_weights_reused",
+            [](const SolveStats& self) { return self.warm_dual_weights_reused; })
+        .def_property_readonly("lu_build_ns",
+                               [](const SolveStats& self) { return self.lu_build_ns; })
+        .def_property_readonly("pricing_build_ns",
+                               [](const SolveStats& self) { return self.pricing_build_ns; })
+        .def_property_readonly("pivot_ns",
+                               [](const SolveStats& self) { return self.pivot_ns; })
         .def_property_readonly("presolve_actions",
                                [](const SolveStats& self) { return self.presolve_actions; })
         .def_property_readonly(

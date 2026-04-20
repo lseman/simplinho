@@ -18,6 +18,8 @@
 #include <Eigen/SparseQR>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <cstring>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -56,6 +58,24 @@ dm_stats_to_map(const DegeneracyManager::Stats& s) {
     info["deg_epoch"] = std::to_string(s.epoch);
     return info;
 }
+
+struct LPDualPricingWarmState {
+    enum class Rule { None, SteepestEdge, Devex, RowPricing, MostInfeasible };
+
+    Rule active_rule = Rule::None;
+    std::vector<double> row_weights;
+    std::vector<char> prefer_row_pricing;
+};
+
+struct LPWarmStateData {
+    std::uint64_t matrix_signature = 0;
+    int rows = -1;
+    int cols = -1;
+    bool matrix_is_sparse = false;
+    std::vector<int> basis_columns;
+    std::shared_ptr<FTBasis> basis_factorization;
+    std::optional<LPDualPricingWarmState> dual_pricing_state;
+};
 
 // ============================================================================
 // RevisedSimplex
@@ -199,7 +219,6 @@ class RevisedSimplex {
                            const Eigen::VectorXd& c_in, const Eigen::VectorXd& l_in,
                            const Eigen::VectorXd& u_in, std::optional<std::vector<int>> basis_opt,
                            const LPBasis* basis_state_opt) {
-        current_timing_ = RevisedSimplexTiming{};
         auto t0_presolve = std::chrono::steady_clock::now();
         SolveTraceScope trace_scope(*this);
         degen_.reset();
@@ -210,6 +229,8 @@ class RevisedSimplex {
         if (c_in.size() != n || l_in.size() != n || u_in.size() != n) {
             throw std::invalid_argument("simplex: c/l/u sizes must equal cols(A)");
         }
+        begin_solve_(matrix_signature_(A_in), static_cast<int>(A_in.rows()), n, false,
+                     basis_state_opt);
 
         trace_line_("[solve] start m=" + std::to_string(A_in.rows()) + " n=" + std::to_string(n));
 
@@ -1376,6 +1397,21 @@ class RevisedSimplex {
 
     static std::optional<std::vector<int>>
     basis_columns_from_basis_state_(const LPBasis& basis_state, int expected_rows) {
+        if (!basis_state.basis_columns.empty()) {
+            bool ordered_matches_status = true;
+            for (int j : basis_state.basis_columns) {
+                if (j < 0 || j >= static_cast<int>(basis_state.column_status.size()) ||
+                    basis_state.column_status[j] != LPBasisStatus::Basic) {
+                    ordered_matches_status = false;
+                    break;
+                }
+            }
+            if (ordered_matches_status &&
+                (expected_rows < 0 ||
+                 static_cast<int>(basis_state.basis_columns.size()) == expected_rows)) {
+                return basis_state.basis_columns;
+            }
+        }
         std::vector<int> basis;
         basis.reserve(basis_state.column_status.size());
         for (int j = 0; j < (int)basis_state.column_status.size(); ++j) {
@@ -1397,6 +1433,7 @@ class RevisedSimplex {
             return basis_state;
 
         basis_state.column_status.resize(x.size(), LPBasisStatus::AtLower);
+        basis_state.basis_columns = basis;
         std::vector<char> in_basis(x.size(), 0);
         for (int j : basis) {
             if (j >= 0 && j < x.size()) {
@@ -1488,6 +1525,10 @@ class RevisedSimplex {
             if (status == LPBasisStatus::Basic)
                 ++basic_count;
         }
+        if (!basis_state.basis_columns.empty() &&
+            static_cast<int>(basis_state.basis_columns.size()) != rows) {
+            return false;
+        }
         return basic_count == rows;
     }
 
@@ -1551,6 +1592,27 @@ class RevisedSimplex {
                 mapped.column_status[split_neg[j]] = LPBasisStatus::AtLower;
             }
         }
+        if (!original_basis_state.basis_columns.empty()) {
+            for (int j : original_basis_state.basis_columns) {
+                if (j < 0 || j >= static_cast<int>(single_y.size())) {
+                    continue;
+                }
+                if (single_y[j] >= 0 && mapped.column_status[single_y[j]] == LPBasisStatus::Basic) {
+                    mapped.basis_columns.push_back(single_y[j]);
+                } else if (split_pos[j] >= 0 &&
+                           mapped.column_status[split_pos[j]] == LPBasisStatus::Basic) {
+                    mapped.basis_columns.push_back(split_pos[j]);
+                }
+            }
+            for (int slack : upper_slack) {
+                if (slack >= 0 && slack < n_total &&
+                    mapped.column_status[slack] == LPBasisStatus::Basic &&
+                    std::find(mapped.basis_columns.begin(), mapped.basis_columns.end(), slack) ==
+                        mapped.basis_columns.end()) {
+                    mapped.basis_columns.push_back(slack);
+                }
+            }
+        }
         return mapped;
     }
 
@@ -1579,6 +1641,19 @@ class RevisedSimplex {
                 mapped.column_status[split_neg[j]] = LPBasisStatus::AtLower;
             }
         }
+        if (!original_basis_state.basis_columns.empty()) {
+            for (int j : original_basis_state.basis_columns) {
+                if (j < 0 || j >= static_cast<int>(single_y.size())) {
+                    continue;
+                }
+                if (single_y[j] >= 0 && mapped.column_status[single_y[j]] == LPBasisStatus::Basic) {
+                    mapped.basis_columns.push_back(single_y[j]);
+                } else if (split_pos[j] >= 0 &&
+                           mapped.column_status[split_pos[j]] == LPBasisStatus::Basic) {
+                    mapped.basis_columns.push_back(split_pos[j]);
+                }
+            }
+        }
         return mapped;
     }
 
@@ -1594,6 +1669,17 @@ class RevisedSimplex {
                 mapped.column_status[jr] = original_basis_state.column_status[jorig];
             } else {
                 mapped.column_status[jr] = default_basis_status_for_bounds_(jr, l, u, tol);
+            }
+        }
+        if (!original_basis_state.basis_columns.empty()) {
+            for (int jorig : original_basis_state.basis_columns) {
+                for (int jr = 0; jr < static_cast<int>(col_orig_map.size()); ++jr) {
+                    if (col_orig_map[jr] == jorig &&
+                        mapped.column_status[jr] == LPBasisStatus::Basic) {
+                        mapped.basis_columns.push_back(jr);
+                        break;
+                    }
+                }
             }
         }
         return mapped;
@@ -1806,9 +1892,134 @@ class RevisedSimplex {
         sol.timing.presolve_ns += current_timing_.presolve_ns;
         sol.timing.crash_ns += current_timing_.crash_ns;
         sol.timing.simplex_iters_ns += current_timing_.simplex_iters_ns;
+        if (solve_output_warm_state_ && !sol.basis_state.column_status.empty()) {
+            sol.basis_state.warm_state = solve_output_warm_state_;
+        }
+        sol.solve_stats = solve_stats_;
         if (opt_.verbose)
             sol.trace = trace_;
         return sol;
+    }
+
+    static std::uint64_t mix_signature_(std::uint64_t seed, std::uint64_t value) noexcept {
+        seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+        return seed;
+    }
+
+    static std::uint64_t hash_double_(double value) noexcept {
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        if (bits == 0x8000000000000000ULL) {
+            bits = 0;
+        }
+        return bits;
+    }
+
+    static std::uint64_t matrix_signature_(const Eigen::MatrixXd& A) noexcept {
+        std::uint64_t sig = 0xcbf29ce484222325ULL;
+        sig = mix_signature_(sig, static_cast<std::uint64_t>(A.rows()));
+        sig = mix_signature_(sig, static_cast<std::uint64_t>(A.cols()));
+        for (Eigen::Index j = 0; j < A.cols(); ++j) {
+            for (Eigen::Index i = 0; i < A.rows(); ++i) {
+                sig = mix_signature_(sig, static_cast<std::uint64_t>(i));
+                sig = mix_signature_(sig, static_cast<std::uint64_t>(j));
+                sig = mix_signature_(sig, hash_double_(A(i, j)));
+            }
+        }
+        return sig;
+    }
+
+    static std::uint64_t matrix_signature_(const SparseMatrix& A) noexcept {
+        if (!A.isCompressed()) {
+            SparseMatrix compressed = A;
+            compressed.makeCompressed();
+            return matrix_signature_(compressed);
+        }
+        std::uint64_t sig = 0xcbf29ce484222325ULL;
+        sig = mix_signature_(sig, static_cast<std::uint64_t>(A.rows()));
+        sig = mix_signature_(sig, static_cast<std::uint64_t>(A.cols()));
+        sig = mix_signature_(sig, static_cast<std::uint64_t>(A.nonZeros()));
+        const int* outer = A.outerIndexPtr();
+        const int* inner = A.innerIndexPtr();
+        const double* value = A.valuePtr();
+        for (int j = 0; j <= A.cols(); ++j) {
+            sig = mix_signature_(sig, static_cast<std::uint64_t>(outer[j]));
+        }
+        for (int k = 0; k < A.nonZeros(); ++k) {
+            sig = mix_signature_(sig, static_cast<std::uint64_t>(inner[k]));
+            sig = mix_signature_(sig, hash_double_(value[k]));
+        }
+        return sig;
+    }
+
+    void begin_solve_(std::uint64_t matrix_signature, int rows, int cols, bool matrix_is_sparse,
+                      const LPBasis* basis_state_opt) {
+        current_timing_ = RevisedSimplexTiming{};
+        solve_stats_ = LPSolveStats{};
+        current_matrix_signature_ = matrix_signature;
+        current_matrix_rows_ = rows;
+        current_matrix_cols_ = cols;
+        current_matrix_is_sparse_ = matrix_is_sparse;
+        solve_input_warm_state_ =
+            basis_state_opt ? basis_state_opt->warm_state : std::shared_ptr<LPWarmStateData>{};
+        solve_output_warm_state_.reset();
+        if (basis_state_opt && !basis_state_opt->column_status.empty()) {
+            solve_stats_.warm_start_attempted = 1;
+        }
+    }
+
+    std::shared_ptr<LPWarmStateData>
+    try_reuse_factorization_(const std::vector<int>& basis_columns) const {
+        if (!solve_input_warm_state_ || !solve_input_warm_state_->basis_factorization) {
+            return nullptr;
+        }
+        if (solve_input_warm_state_->matrix_signature != current_matrix_signature_ ||
+            solve_input_warm_state_->rows != current_matrix_rows_ ||
+            solve_input_warm_state_->cols != current_matrix_cols_ ||
+            solve_input_warm_state_->matrix_is_sparse != current_matrix_is_sparse_ ||
+            solve_input_warm_state_->basis_columns != basis_columns ||
+            solve_input_warm_state_->basis_factorization->basis() != basis_columns) {
+            return nullptr;
+        }
+        solve_stats_.warm_start_accepted = 1;
+        solve_stats_.warm_factorization_reused = 1;
+        solve_stats_.eta_stack_depth_entry =
+            solve_input_warm_state_->basis_factorization->stats().eta_count;
+        return solve_input_warm_state_;
+    }
+
+    void remember_warm_state_(const std::vector<int>& basis_columns,
+                              const std::shared_ptr<FTBasis>& basis_factorization,
+                              std::optional<LPDualPricingWarmState> dual_pricing_state =
+                                  std::nullopt) {
+        if (!basis_factorization || basis_columns.empty()) {
+            solve_output_warm_state_.reset();
+            return;
+        }
+        auto warm_state = std::make_shared<LPWarmStateData>();
+        warm_state->matrix_signature = current_matrix_signature_;
+        warm_state->rows = current_matrix_rows_;
+        warm_state->cols = current_matrix_cols_;
+        warm_state->matrix_is_sparse = current_matrix_is_sparse_;
+        warm_state->basis_columns = basis_columns;
+        warm_state->basis_factorization = basis_factorization;
+        warm_state->dual_pricing_state = std::move(dual_pricing_state);
+        solve_output_warm_state_ = std::move(warm_state);
+        solve_stats_.ft_updates = basis_factorization->stats().eta_count;
+    }
+
+    template <typename Fn> void measure_pricing_build_(bool dual_pool, Fn&& builder) {
+        const auto t0 = std::chrono::steady_clock::now();
+        builder();
+        solve_stats_.pricing_build_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 t0)
+                .count());
+        if (dual_pool) {
+            ++solve_stats_.dual_pool_builds;
+        } else {
+            ++solve_stats_.primal_pool_builds;
+        }
     }
 
     static LPSolution attach_postsolved_row_duals_(LPSolution sol, const presolve::Presolver& P,
@@ -1958,6 +2169,9 @@ class RevisedSimplex {
             bopt.update_mode = FTBasis::Options::UpdateMode::ForrestTomlin;
         }
 
+        bopt.ext_refactor_counter = &solve_stats_.refactorizations;
+        bopt.ext_refactor_ns = &solve_stats_.lu_build_ns;
+        bopt.ext_pivot_ns = &solve_stats_.pivot_ns;
         return bopt;
     }
 
@@ -2287,7 +2501,8 @@ class RevisedSimplex {
                               const Eigen::VectorXd& u) {
         const int cols = static_cast<int>(l.size());
         if (sol.x.size() == cols && sol.x.array().isFinite().all()) {
-            const LPBasis rebuilt = compute_basis_state_(sol.basis, sol.x, l, u, opt_.tol, rows);
+            LPBasis rebuilt = compute_basis_state_(sol.basis, sol.x, l, u, opt_.tol, rows);
+            rebuilt.warm_state = sol.basis_state.warm_state;
             if (basis_state_matches_problem_(rebuilt, rows, cols)) {
                 cached_basis_state_ = rebuilt;
                 cached_basis_rows_ = rows;
@@ -2372,6 +2587,14 @@ class RevisedSimplex {
                     has_upper[j] != static_cast<char>(has_u)) {
                     return false;
                 }
+            }
+            return true;
+        }
+
+        bool same_problem(const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
+                          const Eigen::VectorXd& l_use, const Eigen::VectorXd& u_use) const {
+            if (!valid || !same_problem(A, b, c) || !orientation_matches(l_use, u_use)) {
+                return false;
             }
             return true;
         }
@@ -2618,9 +2841,16 @@ class RevisedSimplex {
     std::optional<LPBasis> cached_basis_state_;
     int cached_basis_rows_ = -1;
     int cached_basis_cols_ = -1;
+    std::uint64_t current_matrix_signature_ = 0;
+    int current_matrix_rows_ = -1;
+    int current_matrix_cols_ = -1;
+    bool current_matrix_is_sparse_ = false;
+    std::shared_ptr<LPWarmStateData> solve_input_warm_state_;
+    std::shared_ptr<LPWarmStateData> solve_output_warm_state_;
     mutable std::vector<std::string> trace_;
     mutable int solve_depth_ = 0;
     RevisedSimplexTiming current_timing_;
+    mutable LPSolveStats solve_stats_;
 };
 
 #include "crash.h"
@@ -2641,7 +2871,6 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     const SparseMatrix& A_in, const Eigen::VectorXd& b_in, const Eigen::VectorXd& c_in,
     const Eigen::VectorXd& l_in, const Eigen::VectorXd& u_in,
     std::optional<std::vector<int>> basis_opt, const LPBasis* basis_state_opt) {
-    current_timing_ = RevisedSimplexTiming{};
     auto t0_presolve = std::chrono::steady_clock::now();
     SolveTraceScope trace_scope(*this);
     degen_.reset();
@@ -2653,6 +2882,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     if (c_in.size() != n || l_in.size() != n || u_in.size() != n) {
         throw std::invalid_argument("simplex: c/l/u sizes must equal cols(A)");
     }
+    begin_solve_(matrix_signature_(A_in), m_in, n, true, basis_state_opt);
 
     trace_line_("[solve] sparse start m=" + std::to_string(m_in) + " n=" + std::to_string(n));
 
@@ -2708,9 +2938,8 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             bool has_upper_row = false;
         };
 
-        // Temporarily disable sparse bound-only cached reuse because it can
-        // interfere with solver termination in complex bound-change sequences.
-        const bool cache_reuse = false;
+        const bool cache_reuse =
+            sparse_bound_only_cache_.same_problem(A_in, b_in, c_in, l_use, u_use);
         std::vector<ReformVar> map(n);
         std::vector<int> single_y(n, -1);
         std::vector<int> upper_slack(n, -1);

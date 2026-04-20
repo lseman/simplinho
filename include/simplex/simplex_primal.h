@@ -132,17 +132,58 @@ class RevisedSimplexPrimalEngine {
                     N.push_back(j);
         }
 
-        std::optional<FTBasis> Bopt;
-        try {
-            Bopt.emplace(A, basis, self.make_basis_options_());
-        } catch (const std::exception& e) {
-            return {LPSolution::Status::Singular,
-                    Eigen::VectorXd::Zero(n),
-                    basis,
-                    0,
-                    {{"where", "initial basis factorization failed"}, {"what", e.what()}}};
+        std::shared_ptr<FTBasis> basis_factorization;
+        if (const auto warm_state = self.try_reuse_factorization_(basis)) {
+            basis_factorization = warm_state->basis_factorization;
+        } else {
+            try {
+                if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
+                    if (m <= 16) {
+                        Eigen::MatrixXd B_dense(m, m);
+                        for (int i = 0; i < m; ++i)
+                            B_dense.col(i) = A.col(basis[i]);
+                        std::vector<int> dense_basis(m);
+                        std::iota(dense_basis.begin(), dense_basis.end(), 0);
+                        basis_factorization = std::make_shared<FTBasis>(
+                            B_dense, dense_basis, self.make_basis_options_());
+                    } else {
+                        basis_factorization =
+                            std::make_shared<FTBasis>(A, basis, self.make_basis_options_());
+                    }
+                } else {
+                    basis_factorization =
+                        std::make_shared<FTBasis>(A, basis, self.make_basis_options_());
+                }
+            } catch (const std::exception& e) {
+                return {LPSolution::Status::Singular,
+                        Eigen::VectorXd::Zero(n),
+                        basis,
+                        0,
+                        {{"where", "initial basis factorization failed"}, {"what", e.what()}}};
+            }
         }
-        FTBasis& B = *Bopt;
+        auto rebuild_basis_factorization = [&]() -> std::shared_ptr<FTBasis> {
+            if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
+                if (m <= 16) {
+                    Eigen::MatrixXd B_dense(m, m);
+                    for (int i = 0; i < m; ++i)
+                        B_dense.col(i) = A.col(basis[i]);
+                    std::vector<int> dense_basis(m);
+                    std::iota(dense_basis.begin(), dense_basis.end(), 0);
+                    return std::make_shared<FTBasis>(B_dense, dense_basis,
+                                                     self.make_basis_options_());
+                }
+                return std::make_shared<FTBasis>(A, basis, self.make_basis_options_());
+            }
+            return std::make_shared<FTBasis>(A, basis, self.make_basis_options_());
+        };
+        auto read_basis = [&]() -> FTBasis& { return *basis_factorization; };
+        auto write_basis = [&]() -> FTBasis& {
+            if (!basis_factorization.unique()) {
+                basis_factorization = rebuild_basis_factorization();
+            }
+            return *basis_factorization;
+        };
         self.degen_.start_basis_history(basis);
         self.trace_line_("[primal] start basis=" + self.format_basis_(basis));
 
@@ -155,7 +196,9 @@ class RevisedSimplexPrimalEngine {
             popts.primal_weight_log_error_threshold =
                 self.opt_.primal_steepest_edge_weight_log_error_threshold;
             self.adaptive_pricer_ = AdaptivePricer(n, popts);
-            self.adaptive_pricer_.build_primal_pools(B, A, N);
+            self.measure_pricing_build_(false, [&]() {
+                self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
+            });
             self.bridge_ = std::make_unique<PrimalPricingBridge<AdaptivePricer>>(
                 self.degen_, self.adaptive_pricer_);
         }
@@ -191,15 +234,17 @@ class RevisedSimplexPrimalEngine {
 
             Eigen::VectorXd xB;
             try {
-                xB = B.solve_B(b);
+                xB = read_basis().solve_B(b);
             } catch (...) {
                 if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
                     ++rebuild_attempts;
                     self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                      " refactor after solve_B failure");
-                    B.refactor();
+                    write_basis().refactor();
                     if (self.opt_.pricing_rule == "adaptive") {
-                        self.adaptive_pricer_.build_primal_pools(B, A, N);
+                        self.measure_pricing_build_(false, [&]() {
+                            self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
+                        });
                         self.adaptive_pricer_.clear_rebuild_flag();
                     }
                     continue;
@@ -228,23 +273,26 @@ class RevisedSimplexPrimalEngine {
 
             Eigen::VectorXd y;
             try {
-                y = B.solve_BT(cB);
+                y = read_basis().solve_BT(cB);
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after solve_BT failure");
-                B.refactor();
-                y = B.solve_BT(cB);
+                write_basis().refactor();
+                y = read_basis().solve_BT(cB);
                 if (self.opt_.pricing_rule == "adaptive") {
-                    self.adaptive_pricer_.build_primal_pools(B, A, N);
+                    self.measure_pricing_build_(false, [&]() {
+                        self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
+                    });
                     self.adaptive_pricer_.clear_rebuild_flag();
                 }
             }
 
+            Eigen::VectorXd aTy = A.transpose() * y;
             Eigen::VectorXd rN(N.size());
             Eigen::VectorXd rN_select(N.size());
             for (int k = 0; k < (int)N.size(); ++k) {
                 const int j = N[k];
-                rN(k) = c_work(j) - pricing_detail::column_dot(A, j, y);
+                rN(k) = c_work(j) - aTy(j);
                 rN_select(k) = self.can_increase_from_lower_(j, l, u, self.opt_.tol) ? rN(k) : 0.0;
             }
 
@@ -261,6 +309,7 @@ class RevisedSimplexPrimalEngine {
                     Eigen::VectorXd x = self.assemble_primal_(n, basis, xB, l, u);
                     self.trace_line_("[primal] optimal iter=" + std::to_string(iters) +
                                      " basis=" + self.format_basis_(basis));
+                    self.remember_warm_state_(basis, basis_factorization);
                     return {LPSolution::Status::Optimal, self.clip_small_(x), basis, iters,
                             dm_stats_to_map(self.degen_.get_stats())};
                 }
@@ -286,7 +335,7 @@ class RevisedSimplexPrimalEngine {
                         }
                     }
                     e_rel = self.bridge_->choose_primal_entering(rN_select, N, self.opt_.tol, iters,
-                                                                 current_obj, B, A,
+                                                                 current_obj, read_basis(), A,
                                                                  self.opt_.partial_pricing);
                 } else {
                     int idx = -1;
@@ -306,6 +355,7 @@ class RevisedSimplexPrimalEngine {
                     Eigen::VectorXd x = self.assemble_primal_(n, basis, xB, l, u);
                     self.trace_line_("[primal] optimal iter=" + std::to_string(iters) +
                                      " basis=" + self.format_basis_(basis));
+                    self.remember_warm_state_(basis, basis_factorization);
                     return {LPSolution::Status::Optimal, self.clip_small_(x), basis, iters,
                             dm_stats_to_map(self.degen_.get_stats())};
                 }
@@ -315,12 +365,14 @@ class RevisedSimplexPrimalEngine {
 
             Eigen::VectorXd dB;
             try {
-                dB = B.solve_B(A.col(e));
+                dB = read_basis().solve_B(A.col(e));
             } catch (...) {
-                B.refactor();
-                dB = B.solve_B(A.col(e));
+                write_basis().refactor();
+                dB = read_basis().solve_B(A.col(e));
                 if (self.opt_.pricing_rule == "adaptive") {
-                    self.adaptive_pricer_.build_primal_pools(B, A, N);
+                    self.measure_pricing_build_(false, [&]() {
+                        self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
+                    });
                     self.adaptive_pricer_.clear_rebuild_flag();
                 }
             }
@@ -347,6 +399,7 @@ class RevisedSimplexPrimalEngine {
                 info["primal_ray_has_cert"] = "1";
                 info["primal_ray_dim"] = std::to_string(n);
                 info["primal_ray"] = serialize_vec(ray);
+                self.remember_warm_state_(basis, basis_factorization);
                 return {LPSolution::Status::Unbounded, x, basis, iters, std::move(info)};
             }
 
@@ -367,6 +420,7 @@ class RevisedSimplexPrimalEngine {
                 info["primal_ray_has_cert"] = "1";
                 info["primal_ray_dim"] = std::to_string(n);
                 info["primal_ray"] = serialize_vec(ray);
+                self.remember_warm_state_(basis, basis_factorization);
                 return {LPSolution::Status::Unbounded, x, basis, iters, std::move(info)};
             }
 
@@ -426,13 +480,15 @@ class RevisedSimplexPrimalEngine {
             N[idxN] = oldAbs;
 
             try {
-                B.replace_column(r, A.col(e));
+                write_basis().replace_column(r, A.col(e));
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
-                B.refactor();
+                write_basis().refactor();
                 if (self.opt_.pricing_rule == "adaptive") {
-                    self.adaptive_pricer_.build_primal_pools(B, A, N);
+                    self.measure_pricing_build_(false, [&]() {
+                        self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
+                    });
                     self.adaptive_pricer_.clear_rebuild_flag();
                 }
             }
@@ -443,12 +499,15 @@ class RevisedSimplexPrimalEngine {
             }
 
             if (self.opt_.pricing_rule == "adaptive" && self.adaptive_pricer_.needs_rebuild()) {
-                self.adaptive_pricer_.build_primal_pools(B, A, N);
+                self.measure_pricing_build_(false, [&]() {
+                    self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
+                });
                 self.adaptive_pricer_.clear_rebuild_flag();
             }
         }
 
         self.trace_line_("[primal] iterlimit basis=" + self.format_basis_(basis));
+        self.remember_warm_state_(basis, basis_factorization);
         return {LPSolution::Status::IterLimit, Eigen::VectorXd::Zero(n), basis, iters,
                 dm_stats_to_map(self.degen_.get_stats())};
     }
