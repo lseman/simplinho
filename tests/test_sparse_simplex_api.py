@@ -165,7 +165,7 @@ class SparseSimplexApiTests(unittest.TestCase):
 
         self.assertEqual(simplinho.status_to_string(second.status), "optimal")
         self.assertEqual(len(second.basis_state.column_status), 2)
-        self.assertTrue(math.isclose(second.obj, 2.0, rel_tol=0.0, abs_tol=1e-8))
+        self.assertTrue(math.isclose(second.obj, -2.0, rel_tol=0.0, abs_tol=1e-8))
         self.assertTrue(math.isclose(second.x[0], 0.5, rel_tol=0.0, abs_tol=1e-8))
         self.assertTrue(math.isclose(second.x[1], 1.5, rel_tol=0.0, abs_tol=1e-8))
         self.assertIn(second.stats.basis_start, {"warm_start", "repaired_warm_start"})

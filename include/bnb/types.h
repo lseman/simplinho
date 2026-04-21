@@ -214,6 +214,9 @@ struct Options {
     int probing_max_candidates = 4;
     bool use_conflict_cuts = true;
     int max_conflict_cuts_per_round = 4;
+    // HiGHS-style conflict pool sizing.
+    int max_conflict_pool_size = 256;
+    int max_conflict_age = 10;
     int max_cuts_per_type = 4;
     double cut_max_parallelism = 0.98;
     bool use_dual_proof_cuts = true;
@@ -221,9 +224,14 @@ struct Options {
     bool use_quadratic_warm_start_repair = false;
     bool use_node_presolve = true;
     // HiGHS-inspired separate tolerances
-    double feasibility_tol = 1e-7; // Feasibility checks in relaxation
-    double optimality_tol = 1e-7;  // Optimality gap checks
-    // integrality_tol is already defined above (line 138) with default 1e-6
+    double feasibility_tol = 1e-7; // Feasibility checks in relaxation (LP)
+    double optimality_tol = 1e-7;  // LP optimality checks (reduced-cost dual feasibility)
+    // integrality_tol is already defined above with default 1e-6
+    // Absolute MIP gap: stop once |best_bound - incumbent| <= mip_abs_gap.
+    double mip_abs_gap = 1e-6;
+    // Relative MIP gap: stop once |best_bound - incumbent| / max(1, |incumbent|) <= mip_rel_gap.
+    // HiGHS default is 1e-4.
+    double mip_rel_gap = 1e-4;
     // Cache control for parallel mode
     bool enable_parallel_cache = true; // Enable thread-local cache for reduced lock contention
 };
@@ -284,6 +292,10 @@ struct TreeNode {
     TreeNodeStatus status = TreeNodeStatus::Created;
     double bound = std::numeric_limits<double>::quiet_NaN();
     double estimate = std::numeric_limits<double>::quiet_NaN();
+    // HiGHS NodeData-style: the LB of the sibling branch evaluated during
+    // strong branching / probing. Used to tighten the parent's global bound
+    // when both children have been evaluated.
+    double sibling_bound = std::numeric_limits<double>::quiet_NaN();
     int branch_var = -1;
     double branch_value = std::numeric_limits<double>::quiet_NaN();
 };

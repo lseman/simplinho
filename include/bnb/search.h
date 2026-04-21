@@ -283,8 +283,18 @@ inline bool best_bound_worse(const ActiveNode& lhs, const ActiveNode& rhs, bool 
     if (!tied) {
         return rhs_better;
     }
+    const double lhs_estimate = std::isfinite(lhs.estimate) ? lhs.estimate : lhs.bound;
+    const double rhs_estimate = std::isfinite(rhs.estimate) ? rhs.estimate : rhs.bound;
+    const bool estimate_tied = std::abs(lhs_estimate - rhs_estimate) <= 1e-12;
     if (lhs.domain_change_count != rhs.domain_change_count) {
         return rhs.domain_change_count > lhs.domain_change_count;
+    }
+    if (!estimate_tied) {
+        return maximize ? (rhs_estimate > lhs_estimate + 1e-12)
+                        : (rhs_estimate < lhs_estimate - 1e-12);
+    }
+    if (lhs.depth != rhs.depth) {
+        return rhs.depth > lhs.depth;
     }
     return rhs.order < lhs.order;
 }
@@ -298,15 +308,23 @@ inline bool best_estimate_worse(const ActiveNode& lhs, const ActiveNode& rhs, bo
     if (!tied) {
         return rhs_better;
     }
+    const double lhs_bound = std::isfinite(lhs.bound) ? lhs.bound : lhs_value;
+    const double rhs_bound = std::isfinite(rhs.bound) ? rhs.bound : rhs_value;
     if (lhs.domain_change_count != rhs.domain_change_count) {
         return rhs.domain_change_count > lhs.domain_change_count;
+    }
+    if (std::abs(lhs_bound - rhs_bound) > 1e-12) {
+        return maximize ? (rhs_bound > lhs_bound + 1e-12) : (rhs_bound < lhs_bound - 1e-12);
+    }
+    if (lhs.depth != rhs.depth) {
+        return rhs.depth > lhs.depth;
     }
     return rhs.order < lhs.order;
 }
 
 inline double hybrid_node_score(const ActiveNode& node) {
-    constexpr double estimate_weight = 0.1;
-    constexpr double bound_weight = 1.0 - estimate_weight;
+    constexpr double estimate_weight = 0.5;
+    constexpr double bound_weight = 0.5;
     const double estimate = std::isfinite(node.estimate) ? node.estimate : node.bound;
     const double bound = std::isfinite(node.bound) ? node.bound : estimate;
     return estimate_weight * estimate + bound_weight * bound;
@@ -321,10 +339,28 @@ inline bool hybrid_worse(const ActiveNode& lhs, const ActiveNode& rhs, bool maxi
     if (!tied) {
         return rhs_better;
     }
+    const double lhs_bound = std::isfinite(lhs.bound) ? lhs.bound : lhs.estimate;
+    const double rhs_bound = std::isfinite(rhs.bound) ? rhs.bound : rhs.estimate;
     if (lhs.domain_change_count != rhs.domain_change_count) {
         return rhs.domain_change_count > lhs.domain_change_count;
     }
+    if (std::abs(lhs_bound - rhs_bound) > 1e-12) {
+        return maximize ? (rhs_bound > lhs_bound + 1e-12) : (rhs_bound < lhs_bound - 1e-12);
+    }
+    if (lhs.depth != rhs.depth) {
+        return rhs.depth > lhs.depth;
+    }
     return rhs.order < lhs.order;
+}
+
+inline double strategy_secondary_score(const ActiveNode& node, NodeSelectionStrategy strategy) {
+    const double estimate = std::isfinite(node.estimate) ? node.estimate : node.bound;
+    const double bound = std::isfinite(node.bound) ? node.bound : estimate;
+    if (strategy == NodeSelectionStrategy::BestBound ||
+        strategy == NodeSelectionStrategy::BestFirstPlunging) {
+        return estimate;
+    }
+    return bound;
 }
 
 inline bool uses_best_bound_heap(NodeSelectionStrategy strategy) {
@@ -444,6 +480,7 @@ class WorkerLocalQueue {
         int handle = -1;
         std::uint64_t stamp = 0;
         double normalized_score = -std::numeric_limits<double>::infinity();
+        double secondary_normalized_score = -std::numeric_limits<double>::infinity();
         int depth = 0;
         int domain_change_count = 0;
         std::uint64_t order = 0;
@@ -454,11 +491,14 @@ class WorkerLocalQueue {
             if (std::abs(lhs.normalized_score - rhs.normalized_score) > 1e-12) {
                 return lhs.normalized_score < rhs.normalized_score;
             }
-            if (lhs.depth != rhs.depth) {
-                return lhs.depth < rhs.depth;
-            }
             if (lhs.domain_change_count != rhs.domain_change_count) {
                 return lhs.domain_change_count < rhs.domain_change_count;
+            }
+            if (std::abs(lhs.secondary_normalized_score - rhs.secondary_normalized_score) > 1e-12) {
+                return lhs.secondary_normalized_score < rhs.secondary_normalized_score;
+            }
+            if (lhs.depth != rhs.depth) {
+                return lhs.depth < rhs.depth;
             }
             if (lhs.order != rhs.order) {
                 return lhs.order > rhs.order;
@@ -471,6 +511,7 @@ class WorkerLocalQueue {
         int handle = -1;
         std::uint64_t stamp = 0;
         double normalized_score = -std::numeric_limits<double>::infinity();
+        double secondary_normalized_score = -std::numeric_limits<double>::infinity();
         int depth = 0;
         int domain_change_count = 0;
         std::uint64_t order = 0;
@@ -481,11 +522,14 @@ class WorkerLocalQueue {
             if (std::abs(lhs.normalized_score - rhs.normalized_score) > 1e-12) {
                 return lhs.normalized_score < rhs.normalized_score;
             }
-            if (lhs.depth != rhs.depth) {
-                return lhs.depth < rhs.depth;
-            }
             if (lhs.domain_change_count != rhs.domain_change_count) {
                 return lhs.domain_change_count < rhs.domain_change_count;
+            }
+            if (std::abs(lhs.secondary_normalized_score - rhs.secondary_normalized_score) > 1e-12) {
+                return lhs.secondary_normalized_score < rhs.secondary_normalized_score;
+            }
+            if (lhs.depth != rhs.depth) {
+                return lhs.depth < rhs.depth;
             }
             if (lhs.order != rhs.order) {
                 return lhs.order < rhs.order;
@@ -997,7 +1041,9 @@ class WorkerLocalQueue {
         key.handle = handle;
         key.stamp = stamp;
         const double score = score_for_strategy_(node, strategy);
+        const double secondary_score = strategy_secondary_score(node, strategy);
         key.normalized_score = maximize ? score : -score;
+        key.secondary_normalized_score = maximize ? secondary_score : -secondary_score;
         key.depth = node.depth;
         key.domain_change_count = node.domain_change_count;
         key.order = node.order;
@@ -1010,7 +1056,9 @@ class WorkerLocalQueue {
         key.handle = handle;
         key.stamp = stamp;
         const double score = score_for_strategy_(node, strategy);
+        const double secondary_score = strategy_secondary_score(node, strategy);
         key.normalized_score = maximize ? score : -score;
+        key.secondary_normalized_score = maximize ? secondary_score : -secondary_score;
         key.depth = node.depth;
         key.domain_change_count = node.domain_change_count;
         key.order = node.order;

@@ -156,6 +156,18 @@ class Solver {
                 if (!next_node.has_value())
                     break;
                 process_node(std::move(*next_node), next_node->depth == 0, -1);
+                // HiGHS-style MIP gap termination: stop once the best_bound across
+                // open nodes is within the configured absolute or relative gap of
+                // the incumbent.
+                const IncumbentSnapshot inc = incumbent_snapshot_();
+                if (inc.has_incumbent) {
+                    const double best_bound = search_coordinator_.compute_best_bound(
+                        inc.has_incumbent, inc.objective, problem_.maximize,
+                        root_relaxation_objective);
+                    if (mip_gap_closed_(best_bound)) {
+                        break;
+                    }
+                }
             }
         }
 
@@ -650,13 +662,28 @@ class Solver {
     }
 
     bool objective_improves_(double candidate, double incumbent) const {
-        return problem_.maximize ? (candidate > incumbent + options_.integrality_tol)
-                                 : (candidate < incumbent - options_.integrality_tol);
+        return problem_.maximize ? (candidate > incumbent + options_.feasibility_tol)
+                                 : (candidate < incumbent - options_.feasibility_tol);
     }
 
     bool bound_prunes_(double candidate, double incumbent) const {
-        return problem_.maximize ? (candidate <= incumbent + options_.integrality_tol)
-                                 : (candidate >= incumbent - options_.integrality_tol);
+        return problem_.maximize ? (candidate <= incumbent + options_.feasibility_tol)
+                                 : (candidate >= incumbent - options_.feasibility_tol);
+    }
+
+    bool mip_gap_closed_(double bound) const {
+        const IncumbentSnapshot incumbent = incumbent_snapshot_();
+        if (!incumbent.has_incumbent || !std::isfinite(incumbent.objective) ||
+            !std::isfinite(bound)) {
+            return false;
+        }
+        const double raw_gap =
+            problem_.maximize ? (bound - incumbent.objective) : (incumbent.objective - bound);
+        if (raw_gap <= options_.mip_abs_gap) {
+            return true;
+        }
+        const double scale = std::max(1.0, std::abs(incumbent.objective));
+        return (raw_gap / scale) <= options_.mip_rel_gap;
     }
 
     std::vector<Cut> current_relaxation_cuts_snapshot_() const {
@@ -1473,7 +1500,7 @@ class Solver {
         return cuts;
     }
 
-    std::vector<Cut> generate_conflict_cuts_(const RelaxationSolution& relaxation) const {
+    std::vector<Cut> generate_conflict_cuts_(const RelaxationSolution& relaxation) {
         std::vector<Cut> cuts;
         if (!options_.use_conflict_cuts || options_.max_conflict_cuts_per_round == 0 ||
             relaxation.status != RelaxationStatus::Optimal) {
@@ -1483,7 +1510,16 @@ class Solver {
         const detail::ConflictGraph* graph = conflict_graph_();
         const std::vector<LearnedConflict> conflicts = learned_conflicts_snapshot_();
         std::unordered_set<detail::CutSignature, detail::CutSignatureHash> signatures;
+        // Track which pool entries produced a cut, so their age can be reset
+        // (and hits incremented) after this round. Index matches `conflicts`.
+        std::vector<char> produced_cut(conflicts.size(), 0);
+        auto mark_cut_produced = [&](std::size_t idx) {
+            if (idx < produced_cut.size())
+                produced_cut[idx] = 1;
+        };
+        std::size_t conflict_index = static_cast<std::size_t>(-1);
         for (const LearnedConflict& conflict : conflicts) {
+            ++conflict_index;
             if (static_cast<int>(cuts.size()) >= options_.max_conflict_cuts_per_round)
                 break;
             if (conflict.literals.size() < 2 || conflict.literals.size() > 12)
@@ -1597,6 +1633,7 @@ class Solver {
                             if (!signatures.contains(signature)) {
                                 signatures.insert(signature);
                                 cuts.push_back(std::move(lifted_cut));
+                                mark_cut_produced(conflict_index);
                                 continue;
                             }
                         }
@@ -1616,6 +1653,32 @@ class Solver {
                 continue;
             signatures.insert(signature);
             cuts.push_back(std::move(cut));
+            mark_cut_produced(conflict_index);
+        }
+
+        // Age-based conflict-pool grooming (HiGHS-style). Entries that produced
+        // a violated cut have their age reset and hits incremented; everything
+        // else ages by one. Conflicts older than `max_conflict_age` without
+        // ever producing a useful cut are evicted.
+        {
+            std::lock_guard<std::mutex> lock(learning_mutex_);
+            const std::size_t n =
+                std::min(produced_cut.size(), learned_conflicts_.size());
+            for (std::size_t i = 0; i < n; ++i) {
+                if (produced_cut[i]) {
+                    learned_conflicts_[i].age = 0;
+                    ++learned_conflicts_[i].hits;
+                } else {
+                    ++learned_conflicts_[i].age;
+                }
+            }
+            const int age_limit = std::max(1, options_.max_conflict_age);
+            learned_conflicts_.erase(
+                std::remove_if(learned_conflicts_.begin(), learned_conflicts_.end(),
+                               [age_limit](const LearnedConflict& c) {
+                                   return c.hits == 0 && c.age > age_limit;
+                               }),
+                learned_conflicts_.end());
         }
 
         return cuts;
@@ -3051,17 +3114,28 @@ class Solver {
                 std::swap(first_child, second_child);
             }
         }
+        // HiGHS NodeData-style: record the sibling's LB when both were evaluated
+        // in strong branching. Children inherit it so the parent's global bound
+        // can later be tightened to min(child_lb, sibling_lb) in the cutoff logic.
+        const auto sibling_bound_or_nan = [](const detail::ChildEvaluation& eval) {
+            return eval.relaxation.has_value() &&
+                           eval.relaxation->status == RelaxationStatus::Optimal
+                       ? eval.relaxation->objective
+                       : std::numeric_limits<double>::quiet_NaN();
+        };
+        const double first_sibling_bound = sibling_bound_or_nan(second_child);
+        const double second_sibling_bound = sibling_bound_or_nan(first_child);
         process_child_(node.id, node.depth + 1, decision.variable, decision.value, parent_basis,
-                       relaxation.objective, std::move(first_child), node_relaxation_solver,
-                       &timing, worker_id);
+                       relaxation.objective, first_sibling_bound, std::move(first_child),
+                       node_relaxation_solver, &timing, worker_id);
         if (should_terminate_()) {
             search_coordinator_.notify_all();
             finalize_node_timing("first_child", "branched");
             return;
         }
         process_child_(node.id, node.depth + 1, decision.variable, decision.value, parent_basis,
-                       relaxation.objective, std::move(second_child), node_relaxation_solver,
-                       &timing, worker_id);
+                       relaxation.objective, second_sibling_bound, std::move(second_child),
+                       node_relaxation_solver, &timing, worker_id);
         search_coordinator_.notify_all();
         finalize_node_timing("children", "branched");
     }
@@ -3069,7 +3143,8 @@ class Solver {
     template <typename RelaxationSolver>
     void process_child_(int parent_id, int depth, int branch_variable, double branch_value,
                         const LPBasis* parent_basis, double inherited_bound,
-                        detail::ChildEvaluation child, RelaxationSolver&& relaxation_solver,
+                        double sibling_bound, detail::ChildEvaluation child,
+                        RelaxationSolver&& relaxation_solver,
                         NodeTimingRecord* parent_timing, int worker_id) {
         const auto child_start = SteadyClock::now();
         auto finalize_child_timing = [&]() {
@@ -3090,6 +3165,7 @@ class Solver {
             TreeNode& tree_node = tree_nodes_[child_id];
             tree_node.branch_var = branch_variable;
             tree_node.branch_value = branch_value;
+            tree_node.sibling_bound = sibling_bound;
         }
 
         if (child.state.upper_bounds(branch_variable) + options_.integrality_tol <

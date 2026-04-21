@@ -88,8 +88,13 @@ struct EvaluatedBranchCandidate {
 };
 
 struct PseudoCostAverages {
-    double down = 0.0;
-    double up = 0.0;
+    // HiGHS-style averages over all candidates: each channel is averaged
+    // separately so the weighted score in get_combined_pseudocost_score can
+    // normalize per channel (cost, inference, conflict, cutoff).
+    double cost = 1.0;
+    double inference = 1.0;
+    double conflict = 1.0;
+    double cutoff = 1.0;
 };
 
 [[nodiscard]] double node_estimate(const RelaxationSolution& relaxation,

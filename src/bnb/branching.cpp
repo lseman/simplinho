@@ -63,10 +63,9 @@ namespace {
     return combine_branch_scores(down_score, up_score);
 }
 
-[[nodiscard]] double compute_cost_score(const PseudoCost& pseudocost, double cost_avg,
+[[nodiscard]] double compute_cost_score(double up_cost, double down_cost, double cost_avg,
                                         double eps = 1e-12) {
-    return safe_max(pseudocost.cost.up_value(), eps) * safe_max(pseudocost.cost.down_value(), eps) /
-           safe_max(cost_avg * cost_avg, eps);
+    return safe_max(up_cost, eps) * safe_max(down_cost, eps) / safe_max(cost_avg * cost_avg, eps);
 }
 
 [[nodiscard]] double compute_conflict_score(const PseudoCost& pseudocost, double conflict_avg,
@@ -89,27 +88,50 @@ namespace {
            safe_max(pseudocost.signal.cutoff_down, eps) / safe_max(cutoff_avg * cutoff_avg, eps);
 }
 
-[[nodiscard]] double get_combined_pseudocost_score(const PseudoCost& pseudocost, double cost_avg,
+[[nodiscard]] double get_combined_pseudocost_score(const PseudoCost& pseudocost, double up_cost,
+                                                   double down_cost, double cost_avg,
                                                    double inference_avg, double conflict_avg,
                                                    double cutoff_avg, double eps = 1e-12) {
-    const double cost_score = map_score(compute_cost_score(pseudocost, cost_avg, eps), eps);
+    const double cost_score = map_score(compute_cost_score(up_cost, down_cost, cost_avg, eps), eps);
     const double conflict_score =
         map_score(compute_conflict_score(pseudocost, conflict_avg, eps), eps);
     const double inference_score =
         map_score(compute_inference_score(pseudocost, inference_avg, eps), eps);
     const double cutoff_score = map_score(compute_cutoff_score(pseudocost, cutoff_avg, eps), eps);
 
-    return 0.85 * cost_score + 0.02 * conflict_score + 0.01 * inference_score + 0.01 * cutoff_score;
+    // HiGHS HighsPseudocost::getScore weighting: the cost term dominates, with
+    // conflict ~1% and cutoff+inference ~0.01% as tie-breakers. See
+    // highs-source/highs/mip/HighsPseudocost.h:285-289.
+    return cost_score + 1e-2 * conflict_score + 1e-4 * (cutoff_score + inference_score);
+}
+
+[[nodiscard]] double blended_unit_pseudocost(const PseudoCost& pseudocost, bool branch_up,
+                                             int reliability, double average_cost,
+                                             double eps = 1e-12) {
+    const int samples = branch_up ? pseudocost.cost.up_count : pseudocost.cost.down_count;
+    const double observed =
+        branch_up ? pseudocost.cost.up_value() : pseudocost.cost.down_value();
+    const double fallback = safe_max(average_cost, 1.0);
+
+    if (samples <= 0) {
+        return fallback;
+    }
+    if (reliability > 0 && samples < reliability) {
+        const double weight =
+            0.9 + 0.1 * static_cast<double>(samples) / static_cast<double>(reliability);
+        return weight * safe_max(observed, eps) + (1.0 - weight) * fallback;
+    }
+    return safe_max(observed, eps);
 }
 
 [[nodiscard]] double pseudocost_candidate_score_simple(const PseudoCost& pseudocost,
-                                                       const FractionalCandidate& candidate) {
-    constexpr double default_cost = 1.0;
+                                                       const FractionalCandidate& candidate,
+                                                       int reliability, double average_cost) {
     const double down_score =
-        (pseudocost.cost.down_count > 0 ? pseudocost.cost.down_value() : default_cost) *
+        blended_unit_pseudocost(pseudocost, false, reliability, average_cost) *
         candidate.down_distance;
     const double up_score =
-        (pseudocost.cost.up_count > 0 ? pseudocost.cost.up_value() : default_cost) *
+        blended_unit_pseudocost(pseudocost, true, reliability, average_cost) *
         candidate.up_distance;
     return combine_branch_scores(down_score, up_score);
 }
@@ -127,36 +149,47 @@ compute_pseudocost_averages(const std::vector<FractionalCandidate>& candidates,
     double conflict_sum = 0.0;
     double cutoff_sum = 0.0;
     int count = 0;
+    int cost_observations = 0;
     for (const auto& candidate : candidates) {
         if (candidate.variable < 0 || candidate.variable >= static_cast<int>(pseudocosts.size())) {
             continue;
         }
         const auto& pseudocost = pseudocosts[candidate.variable];
-        cost_sum += pseudocost.cost.up_value() + pseudocost.cost.down_value();
+        cost_sum += pseudocost.cost.up_sum + pseudocost.cost.down_sum;
         inference_sum += pseudocost.signal.inference_up + pseudocost.signal.inference_down;
         conflict_sum += pseudocost.signal.conflict_score_up + pseudocost.signal.conflict_score_down;
         cutoff_sum += pseudocost.signal.cutoff_up + pseudocost.signal.cutoff_down;
+        cost_observations += pseudocost.cost.up_count + pseudocost.cost.down_count;
         ++count;
     }
     if (count <= 0) {
-        averages.down = 1.0;
-        averages.up = 1.0;
         return averages;
     }
 
     const double denom = static_cast<double>(count);
-    averages.down = cost_sum / denom;
-    averages.up = (inference_sum + conflict_sum + cutoff_sum) / denom;
+    averages.cost =
+        cost_observations > 0 ? std::max(cost_sum / static_cast<double>(cost_observations), 1e-12)
+                              : 1.0;
+    averages.inference = std::max(inference_sum / denom, 1e-12);
+    averages.conflict = std::max(conflict_sum / denom, 1e-12);
+    averages.cutoff = std::max(cutoff_sum / denom, 1e-12);
     return averages;
 }
 
 [[nodiscard]] double pseudocost_candidate_score(const PseudoCost& pseudocost,
                                                 const FractionalCandidate& candidate,
-                                                const PseudoCostAverages& averages) {
-    const double rich_score = get_combined_pseudocost_score(pseudocost, averages.down, averages.up,
-                                                            averages.up, averages.up);
-    const double simple_score = pseudocost_candidate_score_simple(pseudocost, candidate);
-    return rich_score + 0.1 * simple_score;
+                                                const PseudoCostAverages& averages,
+                                                int reliability) {
+    const double down_cost = blended_unit_pseudocost(pseudocost, false, reliability, averages.cost) *
+                             candidate.down_distance;
+    const double up_cost = blended_unit_pseudocost(pseudocost, true, reliability, averages.cost) *
+                           candidate.up_distance;
+    const double rich_score = get_combined_pseudocost_score(
+        pseudocost, up_cost, down_cost, averages.cost, averages.inference, averages.conflict,
+        averages.cutoff);
+    const double simple_score =
+        pseudocost_candidate_score_simple(pseudocost, candidate, reliability, averages.cost);
+    return rich_score + 1e-6 * simple_score;
 }
 
 void record_cutoff(std::vector<PseudoCost>& pseudocosts, int variable, bool branch_up) {
@@ -219,11 +252,12 @@ void update_pseudocosts(std::vector<PseudoCost>& pseudocosts, const FractionalCa
 [[nodiscard]] BranchDecision
 choose_pseudocost_without_probing(const ActiveNode& node,
                                   const std::vector<FractionalCandidate>& candidates,
-                                  const std::vector<PseudoCost>& pseudocosts) {
+                                  const std::vector<PseudoCost>& pseudocosts, int reliability) {
     if (candidates.empty()) {
         return {};
     }
 
+    const PseudoCostAverages averages = compute_pseudocost_averages(candidates, pseudocosts);
     const FractionalCandidate* best = &candidates.front();
     double best_score = -std::numeric_limits<double>::infinity();
     bool saw_reliable = false;
@@ -239,7 +273,8 @@ choose_pseudocost_without_probing(const ActiveNode& node,
             continue;
         }
 
-        const double score = pseudocost_candidate_score_simple(pseudocost, candidate);
+        const double score =
+            pseudocost_candidate_score(pseudocost, candidate, averages, reliability);
         if (!saw_reliable || reliable) {
             if (!saw_reliable && reliable) {
                 best = &candidate;
@@ -443,7 +478,8 @@ choose_pseudocost_branching(const ActiveNode& node, const RelaxationSolution& re
         item.candidate = candidate;
         if (candidate.variable >= 0 && candidate.variable < static_cast<int>(pseudocosts.size())) {
             item.score =
-                pseudocost_candidate_score(pseudocosts[candidate.variable], candidate, averages);
+                pseudocost_candidate_score(pseudocosts[candidate.variable], candidate, averages,
+                                           reliability);
         } else {
             item.score = candidate.fractionality;
         }
@@ -482,7 +518,7 @@ choose_pseudocost_branching(const ActiveNode& node, const RelaxationSolution& re
     }
 
     if (evaluate_candidates.empty()) {
-        return choose_pseudocost_without_probing(node, candidates, pseudocosts);
+        return choose_pseudocost_without_probing(node, candidates, pseudocosts, reliability);
     }
 
     return choose_strong_branching(node, relaxation, evaluate_candidates,

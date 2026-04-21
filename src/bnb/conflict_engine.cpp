@@ -442,9 +442,29 @@ void ConflictEngine::learn_conflict_literals(Solver& solver,
         if (identical)
             return;
     }
-    solver.learned_conflicts_.push_back(LearnedConflict{literals});
-    if (solver.learned_conflicts_.size() > 256) {
-        solver.learned_conflicts_.erase(solver.learned_conflicts_.begin());
+    LearnedConflict entry;
+    entry.literals = literals;
+    entry.age = 0;
+    entry.hits = 0;
+    solver.learned_conflicts_.push_back(std::move(entry));
+    const int pool_limit = std::max(1, solver.options_.max_conflict_pool_size);
+    if (static_cast<int>(solver.learned_conflicts_.size()) > pool_limit) {
+        // Evict the oldest-by-age entries first, breaking ties by insertion
+        // order. This matches HiGHS' aging-based conflict pool: stale
+        // conflicts that haven't produced violated cuts are dropped in favor
+        // of newer, still-useful ones.
+        auto victim = std::max_element(solver.learned_conflicts_.begin(),
+                                       solver.learned_conflicts_.end(),
+                                       [](const LearnedConflict& a, const LearnedConflict& b) {
+                                           if (a.age != b.age)
+                                               return a.age < b.age;
+                                           return a.hits > b.hits;
+                                       });
+        if (victim != solver.learned_conflicts_.end()) {
+            solver.learned_conflicts_.erase(victim);
+        } else {
+            solver.learned_conflicts_.erase(solver.learned_conflicts_.begin());
+        }
     }
 
     if (literals.size() == 2) {

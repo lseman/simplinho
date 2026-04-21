@@ -24,6 +24,13 @@ using NodeReasonStore = detail::NodeReasonStore;
 
 struct LearnedConflict {
     std::vector<ConflictLiteral> literals;
+    // HiGHS-inspired conflict-pool aging metadata. `age` is the number of
+    // cut-generation rounds this conflict has sat unused; `hits` tracks how
+    // often it has been converted into a useful cut. Both are reset when the
+    // conflict produces a violated cut, and `age` is incremented each round
+    // so stale conflicts can be evicted.
+    int age = 0;
+    int hits = 0;
 };
 
 struct NodePresolveOutcome {

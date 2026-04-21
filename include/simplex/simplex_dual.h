@@ -7,6 +7,46 @@ class RevisedSimplexDualEngine {
     using SparseRowMatrix = Eigen::SparseMatrix<double, Eigen::RowMajor, int>;
     enum class BoundView { Lower, Upper, Fixed };
 
+    struct SparsePricingWorkspace {
+        std::vector<int> rel_of_col;
+        std::vector<unsigned int> mark_of_col;
+        unsigned int stamp = 1;
+
+        void prepare(int num_cols, const std::vector<int>& nonbasic_columns) {
+            if (num_cols < 0) {
+                num_cols = 0;
+            }
+            if (static_cast<int>(rel_of_col.size()) < num_cols) {
+                rel_of_col.resize(static_cast<std::size_t>(num_cols), -1);
+                mark_of_col.resize(static_cast<std::size_t>(num_cols), 0);
+            }
+
+            ++stamp;
+            if (stamp == 0) {
+                std::fill(mark_of_col.begin(), mark_of_col.end(), 0);
+                stamp = 1;
+            }
+
+            for (int k = 0; k < static_cast<int>(nonbasic_columns.size()); ++k) {
+                const int col = nonbasic_columns[k];
+                if (col < 0 || col >= num_cols) {
+                    continue;
+                }
+                rel_of_col[static_cast<std::size_t>(col)] = k;
+                mark_of_col[static_cast<std::size_t>(col)] = stamp;
+            }
+        }
+
+        [[nodiscard]] int lookup(int col) const {
+            if (col < 0 || col >= static_cast<int>(mark_of_col.size())) {
+                return -1;
+            }
+            return mark_of_col[static_cast<std::size_t>(col)] == stamp
+                       ? rel_of_col[static_cast<std::size_t>(col)]
+                       : -1;
+        }
+    };
+
     struct DualChoose {
         std::optional<int> e_rel;
         double tau = std::numeric_limits<double>::infinity();
@@ -140,9 +180,8 @@ class RevisedSimplexDualEngine {
             rN(k) = chat(N[k]);
         }
 
-        std::vector<int> rel_of_col(Ahat.cols(), -1);
-        for (int k = 0; k < (int)N.size(); ++k)
-            rel_of_col[N[k]] = k;
+        thread_local SparsePricingWorkspace workspace;
+        workspace.prepare(Ahat.cols(), N);
 
         for (int i = 0; i < Ahat_row.rows(); ++i) {
             const double wi = (i < w.size()) ? w(i) : 0.0;
@@ -150,7 +189,7 @@ class RevisedSimplexDualEngine {
             if (wi == 0.0 && yi == 0.0)
                 continue;
             for (SparseRowMatrix::InnerIterator it(Ahat_row, i); it; ++it) {
-                const int rel = rel_of_col[it.col()];
+                const int rel = workspace.lookup(it.col());
                 if (rel < 0)
                     continue;
                 if (wi != 0.0)
