@@ -135,6 +135,80 @@ inline HVector pivot_column_delta(const HVector& s, int leave_rel) {
     return out;
 }
 
+inline void normalize_pattern(HVector& v) {
+    if (!v.has_pattern())
+        return;
+
+    std::vector<char> present(static_cast<std::size_t>(v.size()), 0);
+    std::vector<int> unique;
+    unique.reserve(static_cast<std::size_t>(v.count));
+    for (int k = 0; k < v.count; ++k) {
+        const int i = v.index[k];
+        if (i < 0 || i >= v.size() || present[static_cast<std::size_t>(i)])
+            continue;
+        present[static_cast<std::size_t>(i)] = 1;
+        unique.push_back(i);
+    }
+    v.index = std::move(unique);
+    v.count = static_cast<int>(v.index.size());
+}
+
+inline HVector scaled_hvector(const HVector& v, double scale) {
+    HVector out;
+    out.value = v.value * scale;
+    if (v.has_pattern()) {
+        out.index = v.index;
+        out.count = v.count;
+        normalize_pattern(out);
+    }
+    return out;
+}
+
+inline void subtract_scaled(Eigen::VectorXd& target, const HVector& delta, double coeff) {
+    if (!delta.has_pattern()) {
+        target.noalias() -= delta.value * coeff;
+        return;
+    }
+    for (int k = 0; k < delta.count; ++k) {
+        const int i = delta.index[k];
+        if (i >= 0 && i < target.size())
+            target(i) -= delta.value(i) * coeff;
+    }
+}
+
+inline void subtract_scaled(HVector& target, const HVector& delta, double coeff) {
+    if (!delta.has_pattern()) {
+        target.value.noalias() -= delta.value * coeff;
+        target.drop_pattern();
+        return;
+    }
+
+    for (int k = 0; k < delta.count; ++k) {
+        const int i = delta.index[k];
+        if (i >= 0 && i < target.value.size())
+            target.value(i) -= delta.value(i) * coeff;
+    }
+
+    if (!target.has_pattern())
+        return;
+
+    std::vector<char> present(static_cast<std::size_t>(target.size()), 0);
+    std::vector<int> merged;
+    merged.reserve(static_cast<std::size_t>(target.count + delta.count));
+    auto add = [&](int i) {
+        if (i < 0 || i >= target.size() || present[static_cast<std::size_t>(i)])
+            return;
+        present[static_cast<std::size_t>(i)] = 1;
+        merged.push_back(i);
+    };
+    for (int k = 0; k < target.count; ++k)
+        add(target.index[k]);
+    for (int k = 0; k < delta.count; ++k)
+        add(delta.index[k]);
+    target.index = std::move(merged);
+    target.count = static_cast<int>(target.index.size());
+}
+
 } // namespace pricing_detail
 
 // ============================================================================
@@ -711,7 +785,7 @@ class DualSteepestEdgePricer {
     };
 
     struct RowEntry {
-        Eigen::VectorXd psi; // exact B^{-T} e_i for current basis row i
+        HVector psi; // exact B^{-T} e_i for current basis row i
         double weight = 1.0;
     };
 
@@ -746,6 +820,7 @@ class DualSteepestEdgePricer {
         row_pool_.resize(A.rows());
         for (int i = 0; i < A.rows(); ++i) {
             row_pool_[i].psi = B.solve_BT_unit(i);
+            pricing_detail::normalize_pattern(row_pool_[i].psi);
             row_pool_[i].weight = std::max(1.0, pricing_detail::edge_weight_from_direction(
                                                     row_pool_[i].psi, weight_strategy_));
         }
@@ -773,6 +848,7 @@ class DualSteepestEdgePricer {
                     best.dual_row = row_pool_[i].psi;
                 } else {
                     best.dual_row = B.solve_BT_unit(i);
+                    pricing_detail::normalize_pattern(best.dual_row);
                     weight = std::max(1.0, pricing_detail::edge_weight_from_direction(
                                                best.dual_row, weight_strategy_));
                 }
@@ -799,7 +875,8 @@ class DualSteepestEdgePricer {
             return;
         }
 
-        const Eigen::VectorXd& psi_r = dual_row.value;
+        HVector psi_before = dual_row;
+        pricing_detail::normalize_pattern(psi_before);
         if (leave_rel < 0 || leave_rel >= s.size()) {
             need_rebuild_ = true;
             return;
@@ -811,25 +888,12 @@ class DualSteepestEdgePricer {
                 return;
             }
 
-            // When psi_r has a sparse pattern (typical: it came from a
-            // BTRAN-unit solve), update only the rows where psi_r is nonzero.
-            // Otherwise fall back to the dense update path.
-            const bool have_pattern = dual_row.has_pattern();
-            const Eigen::VectorXd psi_before = psi_r;
             auto update_row = [&](int i) {
                 if (i == leave_rel)
                     return;
                 const double coeff = s(i) / alpha;
                 if (coeff != 0.0) {
-                    if (have_pattern) {
-                        auto& psi_target = row_pool_[i].psi;
-                        for (int k = 0; k < dual_row.count; ++k) {
-                            const int r = dual_row.index[k];
-                            psi_target(r) -= psi_before(r) * coeff;
-                        }
-                    } else {
-                        row_pool_[i].psi.noalias() -= psi_before * coeff;
-                    }
+                    pricing_detail::subtract_scaled(row_pool_[i].psi, psi_before, coeff);
                 }
                 row_pool_[i].weight = std::max(1.0, pricing_detail::edge_weight_from_direction(
                                                         row_pool_[i].psi, weight_strategy_));
@@ -848,7 +912,7 @@ class DualSteepestEdgePricer {
                 for (int i = 0; i < (int)row_pool_.size(); ++i)
                     update_row(i);
             }
-            row_pool_[leave_rel].psi = psi_before / alpha;
+            row_pool_[leave_rel].psi = pricing_detail::scaled_hvector(psi_before, 1.0 / alpha);
             row_pool_[leave_rel].weight =
                 std::max(1.0, pricing_detail::edge_weight_from_direction(row_pool_[leave_rel].psi,
                                                                          weight_strategy_));
@@ -869,7 +933,7 @@ class DualSteepestEdgePricer {
             const double beta = pricing_detail::column_dot(A, E.jN, s_minus_er) * inv_alpha;
             if (beta != 0.0) {
                 const double old_weight = E.dual_weight;
-                E.w.noalias() -= psi_r * beta;
+                pricing_detail::subtract_scaled(E.w, psi_before, beta);
                 const double new_weight = std::max(
                     1.0, pricing_detail::edge_weight_from_direction(E.w, weight_strategy_));
                 const double log_error = pricing_detail::log_weight_error(new_weight, old_weight);
@@ -907,7 +971,7 @@ class DualSteepestEdgePricer {
             E.w = e_r;
             const double beta_old = pricing_detail::column_dot(A, old_abs, s_minus_er) * inv_alpha;
             if (beta_old != 0.0)
-                E.w.noalias() -= psi_r * beta_old;
+                pricing_detail::subtract_scaled(E.w, psi_before, beta_old);
             E.dual_weight =
                 std::max(1.0, pricing_detail::edge_weight_from_direction(E.w, weight_strategy_));
 
