@@ -383,6 +383,22 @@ class SparseForrestTomlinLU {
         return solveT_sparse_impl_(seed_idx, seed_val, config_.iterative_refinement);
     }
 
+    // Returns the list of original-space row indices that may be nonzero in
+    // the result of the most recent solve_sparse / solveT_sparse call. Only
+    // meaningful when last_solve_pattern_valid() is true — otherwise the
+    // caller must treat the solve result as dense.
+    //
+    // The pattern is invalidated (valid() returns false) when:
+    //   - the solve fell back to the dense path (reach not tracked);
+    //   - Forrest-Tomlin updates extended the pattern beyond the reach;
+    //   - iterative refinement ran (may introduce new nonzeros);
+    //   - the solve was a dense-RHS solve.
+    const std::vector<int>& last_solve_reach_original() const noexcept {
+        return last_solve_reach_original_;
+    }
+
+    bool last_solve_pattern_valid() const noexcept { return last_solve_pattern_valid_; }
+
   private:
     Eigen::VectorXd solve_impl_(const Eigen::VectorXd& b, bool enable_refinement) const {
         if (b.size() != n_) [[unlikely]]
@@ -390,6 +406,9 @@ class SparseForrestTomlinLU {
         if (n_ == 0) [[unlikely]]
             return b;
         SIMPLEX_ASSUME(n_ > 0);
+        // Dense-entry path never advertises a valid pattern; sparse_impl_ is
+        // the only path that populates last_solve_reach_original_.
+        last_solve_pattern_valid_ = false;
 
         if (use_fallback_sparse_lu_) {
             Eigen::VectorXd x = fallback_sparse_lu_.solve(b);
@@ -456,6 +475,7 @@ class SparseForrestTomlinLU {
     Eigen::VectorXd solveT_impl_(const Eigen::VectorXd& c, bool enable_refinement) const {
         if (c.size() != n_) [[unlikely]]
             throw std::invalid_argument("SparseForrestTomlinLU::solveT size mismatch");
+        last_solve_pattern_valid_ = false;
         if (n_ == 0) [[unlikely]]
             return c;
         SIMPLEX_ASSUME(n_ > 0);
@@ -551,19 +571,30 @@ class SparseForrestTomlinLU {
         Eigen::VectorXd w = back_solve_U_sparse_(z, &l_reach_seeds_scratch_);
         hyper_solve_reach_valid_ = true;
         Eigen::VectorXd x = Eigen::VectorXd::Zero(n_);
+        // Capture original-space pattern while we map reach->result.
+        last_solve_reach_original_.clear();
+        last_solve_reach_original_.reserve(reach_scratch_.size());
         for (const int i : reach_scratch_) {
             const int xi = Pc_[i];
             x(xi) = w(i) * col_scale_[static_cast<size_t>(xi)];
+            last_solve_reach_original_.push_back(xi);
         }
+        const bool pattern_preserved = updates_.empty();
         if (!updates_.empty())
             x = apply_updates_solve_(x);
         Eigen::VectorXd b = Eigen::VectorXd::Zero(n_);
         for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
             b(seed_idx[k]) = seed_val[k];
-        if (!validate_sparse_rhs_solution_(b, x))
+        if (!validate_sparse_rhs_solution_(b, x)) {
+            last_solve_pattern_valid_ = false;
             return solve_impl_(b, enable_refinement);
-        if (enable_refinement)
+        }
+        if (enable_refinement) {
             x = iterative_refine_(b, x);
+            last_solve_pattern_valid_ = false;
+        } else {
+            last_solve_pattern_valid_ = pattern_preserved;
+        }
         return x;
     }
 
@@ -595,19 +626,29 @@ class SparseForrestTomlinLU {
         Eigen::VectorXd s = back_solve_LT_sparse_(t, &l_reach_seeds_scratch_);
         hyper_solve_reach_valid_ = true;
         Eigen::VectorXd y = Eigen::VectorXd::Zero(n_);
+        last_solve_reach_original_.clear();
+        last_solve_reach_original_.reserve(reach_scratch_.size());
         for (const int i : reach_scratch_) {
             const int yi = Pr_[i];
             y(yi) = s(i) * row_scale_[static_cast<size_t>(yi)];
+            last_solve_reach_original_.push_back(yi);
         }
+        const bool pattern_preserved = updates_.empty();
         if (!updates_.empty())
             y = apply_updates_solve_T_(y);
         Eigen::VectorXd c = Eigen::VectorXd::Zero(n_);
         for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
             c(seed_idx[k]) = seed_val[k];
-        if (!validate_sparse_transpose_rhs_solution_(c, y))
+        if (!validate_sparse_transpose_rhs_solution_(c, y)) {
+            last_solve_pattern_valid_ = false;
             return solveT_impl_(c, enable_refinement);
-        if (enable_refinement)
+        }
+        if (enable_refinement) {
             y = iterative_refine_T_(c, y);
+            last_solve_pattern_valid_ = false;
+        } else {
+            last_solve_pattern_valid_ = pattern_preserved;
+        }
         return y;
     }
 
@@ -2570,6 +2611,9 @@ class SparseForrestTomlinLU {
     mutable double ema_reach_ratio_{kHyperSparseDensityThreshold_};
     // True when reach_flag_scratch_ reflects the last hyper-sparse solve output (Item 6).
     mutable bool hyper_solve_reach_valid_{false};
+    // Original-space row pattern of the last sparse-path solve (HVector source).
+    mutable std::vector<int> last_solve_reach_original_;
+    mutable bool last_solve_pattern_valid_{false};
     std::vector<SparseUpdate> updates_;
 
     // Product Form (PF) update structures — Highs-style for multiple update methods.

@@ -18,9 +18,9 @@
 #include <Eigen/SparseQR>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -1565,12 +1565,14 @@ class RevisedSimplex {
                         mapped.column_status[y] = LPBasisStatus::Basic;
                         mapped.column_status[slack] = LPBasisStatus::AtLower;
                     } else if (status == LPBasisStatus::AtUpper) {
-                        // A bound-tightened child node introduces an upper slack row.
-                        // For a variable that was previously nonbasic at its upper bound,
-                        // the slack should become basic while the variable remains at
-                        // its upper bound, preserving the same pivot matrix.
-                        mapped.column_status[y] = LPBasisStatus::AtUpper;
-                        mapped.column_status[slack] = LPBasisStatus::Basic;
+                        // In the reformulated model the single variable y is
+                        // nonnegative with no finite upper bound, and the
+                        // finite upper bound is represented by y + s = u - l.
+                        // Mapping an original AtUpper status therefore means
+                        // keeping the upper slack at zero and making y basic
+                        // at the transformed RHS value.
+                        mapped.column_status[y] = LPBasisStatus::Basic;
+                        mapped.column_status[slack] = LPBasisStatus::AtLower;
                     } else {
                         mapped.column_status[y] = LPBasisStatus::AtLower;
                         mapped.column_status[slack] = LPBasisStatus::Basic;
@@ -1988,10 +1990,10 @@ class RevisedSimplex {
         return solve_input_warm_state_;
     }
 
-    void remember_warm_state_(const std::vector<int>& basis_columns,
-                              const std::shared_ptr<FTBasis>& basis_factorization,
-                              std::optional<LPDualPricingWarmState> dual_pricing_state =
-                                  std::nullopt) {
+    void
+    remember_warm_state_(const std::vector<int>& basis_columns,
+                         const std::shared_ptr<FTBasis>& basis_factorization,
+                         std::optional<LPDualPricingWarmState> dual_pricing_state = std::nullopt) {
         if (!basis_factorization || basis_columns.empty()) {
             solve_output_warm_state_.reset();
             return;
@@ -2011,10 +2013,10 @@ class RevisedSimplex {
     template <typename Fn> void measure_pricing_build_(bool dual_pool, Fn&& builder) {
         const auto t0 = std::chrono::steady_clock::now();
         builder();
-        solve_stats_.pricing_build_ns += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
-                                                                 t0)
-                .count());
+        solve_stats_.pricing_build_ns +=
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - t0)
+                                           .count());
         if (dual_pool) {
             ++solve_stats_.dual_pool_builds;
         } else {
@@ -2916,16 +2918,9 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         }
     }
 
-    // For Dual mode with a warm-start basis, bypass the reformulation path.
-    // The reformulation adds extra rows/variables for upper bounds and maps
-    // warm-start bases through map_reformulated_basis_state_, which breaks
-    // down when branching changes which variables are fixed vs free.
-    // The direct sparse path (below) handles bounded variables correctly via
-    // variable shifting (y = x - lb) and the dual simplex's BoundView
-    // mechanism, which preserves dual feasibility across bound changes.
-    // For cold Dual starts, the reformulation path is used as before.
     const bool has_warm_basis_for_dual = opt_.mode == SimplexMode::Dual && basis_state_opt &&
                                          !basis_state_opt->column_status.empty();
+
     if (!is_nonnegative_standard && !has_warm_basis_for_dual) {
         struct ReformVar {
             int y = -1;

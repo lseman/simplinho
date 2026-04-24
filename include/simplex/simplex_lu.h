@@ -7,6 +7,7 @@
 #include <ankerl/unordered_dense.h>
 
 #include "amd.h"
+#include "hvector.h"
 #include "markowitz.h"
 #include "sparse_lu.h"
 
@@ -169,7 +170,17 @@ class FTBasis {
     Stats stats() const noexcept { return stats_; }
     const std::string& last_update_diagnostic() const noexcept { return last_update_diagnostic_; }
 
-    Eigen::VectorXd solve_B(const Eigen::VectorXd& b) const {
+    // Attach the sparse pattern captured by the last sparse-path solve in
+    // lu_sparse_, when that path was used and the pattern wasn't invalidated
+    // by Forrest-Tomlin updates or iterative refinement.
+    HVector wrap_with_pattern_(Eigen::VectorXd v, bool sparse_path_used) const {
+        if (sparse_path_used && A_is_sparse_ && lu_sparse_.last_solve_pattern_valid()) {
+            return HVector(std::move(v), lu_sparse_.last_solve_reach_original());
+        }
+        return HVector(std::move(v));
+    }
+
+    HVector solve_B(const Eigen::VectorXd& b) const {
         if (b.size() != m_)
             throw std::invalid_argument("FTBasis::solve_B size mismatch");
 
@@ -184,7 +195,7 @@ class FTBasis {
         try {
             Eigen::VectorXd x = do_solve();
             self->verify_solve_quality_B_(b, x, "FTBasis::solve_B");
-            return x;
+            return HVector(std::move(x));
         } catch (const std::exception& err) {
             if (!opt_.refactor_on_solve_failure)
                 throw;
@@ -194,12 +205,12 @@ class FTBasis {
 
             Eigen::VectorXd x = do_solve();
             self->verify_solve_quality_B_(b, x, "FTBasis::solve_B after refactor");
-            return x;
+            return HVector(std::move(x));
         }
     }
 
     template <typename Derived>
-    Eigen::VectorXd solve_B(const Eigen::SparseMatrixBase<Derived>& b_sparse) const {
+    HVector solve_B(const Eigen::SparseMatrixBase<Derived>& b_sparse) const {
         if (b_sparse.rows() != m_ || b_sparse.cols() != 1)
             throw std::invalid_argument("FTBasis::solve_B sparse size mismatch");
         auto* self = const_cast<FTBasis*>(this);
@@ -220,7 +231,7 @@ class FTBasis {
         try {
             Eigen::VectorXd x = do_solve();
             self->verify_solve_quality_B_(b, x, "FTBasis::solve_B sparse");
-            return x;
+            return wrap_with_pattern_(std::move(x), use_sparse_rhs);
         } catch (const std::exception& err) {
             if (!opt_.refactor_on_solve_failure)
                 throw;
@@ -230,11 +241,11 @@ class FTBasis {
 
             Eigen::VectorXd x = do_solve();
             self->verify_solve_quality_B_(b, x, "FTBasis::solve_B sparse after refactor");
-            return x;
+            return wrap_with_pattern_(std::move(x), use_sparse_rhs);
         }
     }
 
-    Eigen::VectorXd solve_BT(const Eigen::VectorXd& c) const {
+    HVector solve_BT(const Eigen::VectorXd& c) const {
         if (c.size() != m_)
             throw std::invalid_argument("FTBasis::solve_BT size mismatch");
 
@@ -249,7 +260,7 @@ class FTBasis {
         try {
             Eigen::VectorXd y = do_solve();
             self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT");
-            return y;
+            return HVector(std::move(y));
         } catch (const std::exception& err) {
             if (!opt_.refactor_on_solve_failure)
                 throw;
@@ -259,12 +270,61 @@ class FTBasis {
 
             Eigen::VectorXd y = do_solve();
             self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT after refactor");
-            return y;
+            return HVector(std::move(y));
+        }
+    }
+
+    // Fast path for canonical unit-vector RHS (most common case: row picks in pricing).
+    // Routes directly to the sparse triangular solve using a single-seed index, avoiding
+    // the O(m) zero-scan in the dense solve path.
+    HVector solve_B_unit(int i) const {
+        if (i < 0 || i >= m_)
+            throw std::invalid_argument("FTBasis::solve_B_unit index out of range");
+        if (!A_is_sparse_) {
+            Eigen::VectorXd e = Eigen::VectorXd::Zero(m_);
+            e(i) = 1.0;
+            return solve_B(e);
+        }
+        auto* self = const_cast<FTBasis*>(this);
+        static const std::vector<double> one_val{1.0};
+        std::vector<int> seed{i};
+        auto do_solve = [&]() { return self->lu_sparse_.solve_sparse(seed, one_val); };
+        try {
+            return wrap_with_pattern_(do_solve(), true);
+        } catch (const std::exception& err) {
+            if (!opt_.refactor_on_solve_failure)
+                throw;
+            self->last_update_diagnostic_ = err.what();
+            self->refactor();
+            return wrap_with_pattern_(do_solve(), true);
+        }
+    }
+
+    HVector solve_BT_unit(int i) const {
+        if (i < 0 || i >= m_)
+            throw std::invalid_argument("FTBasis::solve_BT_unit index out of range");
+        if (!A_is_sparse_) {
+            Eigen::VectorXd e = Eigen::VectorXd::Zero(m_);
+            e(i) = 1.0;
+            return solve_BT(e);
+        }
+        auto* self = const_cast<FTBasis*>(this);
+        static const std::vector<double> one_val{1.0};
+        std::vector<int> seed{i};
+        auto do_solve = [&]() { return self->lu_sparse_.solveT_sparse(seed, one_val); };
+        try {
+            return wrap_with_pattern_(do_solve(), true);
+        } catch (const std::exception& err) {
+            if (!opt_.refactor_on_solve_failure)
+                throw;
+            self->last_update_diagnostic_ = err.what();
+            self->refactor();
+            return wrap_with_pattern_(do_solve(), true);
         }
     }
 
     template <typename Derived>
-    Eigen::VectorXd solve_BT(const Eigen::SparseMatrixBase<Derived>& c_sparse) const {
+    HVector solve_BT(const Eigen::SparseMatrixBase<Derived>& c_sparse) const {
         if (c_sparse.rows() != m_ || c_sparse.cols() != 1)
             throw std::invalid_argument("FTBasis::solve_BT sparse size mismatch");
         auto* self = const_cast<FTBasis*>(this);
@@ -285,7 +345,7 @@ class FTBasis {
         try {
             Eigen::VectorXd y = do_solve();
             self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT sparse");
-            return y;
+            return wrap_with_pattern_(std::move(y), use_sparse_rhs);
         } catch (const std::exception& err) {
             if (!opt_.refactor_on_solve_failure)
                 throw;
@@ -295,7 +355,7 @@ class FTBasis {
 
             Eigen::VectorXd y = do_solve();
             self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT sparse after refactor");
-            return y;
+            return wrap_with_pattern_(std::move(y), use_sparse_rhs);
         }
     }
 

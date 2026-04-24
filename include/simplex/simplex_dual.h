@@ -200,6 +200,59 @@ class RevisedSimplexDualEngine {
         }
     }
 
+    // HVector-aware variant: when w carries a sparse pattern, iterate only
+    // the rows where w may be nonzero. `ydual` is assumed dense (typically
+    // is in practice, so we still walk Ahat_row for it — but skip rows that
+    // are zero in both w and ydual the same way the dense path does).
+    static void compute_pricing_products(const RevisedSimplex::SparseMatrix& Ahat,
+                                         const SparseRowMatrix& Ahat_row, const std::vector<int>& N,
+                                         const HVector& w, const Eigen::VectorXd& ydual,
+                                         const Eigen::VectorXd& chat, Eigen::VectorXd& pN,
+                                         Eigen::VectorXd& rN) {
+        if (!w.has_pattern()) {
+            compute_pricing_products(Ahat, Ahat_row, N, w.value, ydual, chat, pN, rN);
+            return;
+        }
+
+        pN = Eigen::VectorXd::Zero(N.size());
+        rN.resize(N.size());
+        for (int k = 0; k < (int)N.size(); ++k) {
+            rN(k) = chat(N[k]);
+        }
+
+        thread_local SparsePricingWorkspace workspace;
+        workspace.prepare(Ahat.cols(), N);
+
+        // Accumulate w-contribution: iterate only w's nonzero rows.
+        for (int k = 0; k < w.count; ++k) {
+            const int i = w.index[k];
+            const double wi = w.value(i);
+            if (wi == 0.0)
+                continue;
+            if (i >= Ahat_row.rows())
+                continue;
+            for (SparseRowMatrix::InnerIterator it(Ahat_row, i); it; ++it) {
+                const int rel = workspace.lookup(it.col());
+                if (rel < 0)
+                    continue;
+                pN(rel) += wi * it.value();
+            }
+        }
+
+        // Accumulate ydual-contribution: full row scan (ydual is dense).
+        for (int i = 0; i < Ahat_row.rows(); ++i) {
+            const double yi = (i < ydual.size()) ? ydual(i) : 0.0;
+            if (yi == 0.0)
+                continue;
+            for (SparseRowMatrix::InnerIterator it(Ahat_row, i); it; ++it) {
+                const int rel = workspace.lookup(it.col());
+                if (rel < 0)
+                    continue;
+                rN(rel) -= yi * it.value();
+            }
+        }
+    }
+
     template <class MatrixType>
     static MatrixType signed_matrix_copy(const MatrixType& A, const std::vector<BoundView>& view) {
         MatrixType out = A;
@@ -616,7 +669,7 @@ class RevisedSimplexDualEngine {
             Eigen::VectorXd pN;
             Eigen::VectorXd rN;
             int r_leave = -1;
-            Eigen::VectorXd w;
+            HVector w;
             int e_rel = -1;
             int eAbs = -1;
             Eigen::VectorXd s_enter;

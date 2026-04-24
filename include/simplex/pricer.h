@@ -1,6 +1,7 @@
 #pragma once
 
 #include "degeneracy.h"
+#include "hvector.h"
 
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
@@ -51,32 +52,26 @@ inline double edge_weight_from_direction(const Eigen::VectorXd& direction,
     return dense_weight;
 }
 
-template <class MatrixLike> inline Eigen::VectorXd dense_column(const MatrixLike& A, int j) {
-    return A.col(j);
+// Column FTRAN/BTRAN that preserves sparsity when A is a CSC sparse matrix.
+// Dense A paths fall through to the generic solve_B/solve_BT with a dense column.
+template <class BasisLike, class MatrixLike>
+inline Eigen::VectorXd solve_B_column(const BasisLike& B, const MatrixLike& A, int j) {
+    return B.solve_B(A.col(j).eval());
 }
 
-template <class MatrixLike>
-inline void dense_column(const MatrixLike& A, int j, Eigen::VectorXd& out) {
-    out = A.col(j);
+inline Eigen::VectorXd
+solve_B_column(const auto& B, const Eigen::SparseMatrix<double, Eigen::ColMajor, int>& A, int j) {
+    return B.solve_B(A.col(j));
 }
 
-inline Eigen::VectorXd dense_column(const Eigen::SparseMatrix<double, Eigen::ColMajor, int>& A,
-                                    int j) {
-    Eigen::VectorXd out = Eigen::VectorXd::Zero(A.rows());
-    for (Eigen::SparseMatrix<double, Eigen::ColMajor, int>::InnerIterator it(A, j); it; ++it) {
-        out(it.row()) = it.value();
-    }
-    return out;
+template <class BasisLike, class MatrixLike>
+inline Eigen::VectorXd solve_BT_column(const BasisLike& B, const MatrixLike& A, int j) {
+    return B.solve_BT(A.col(j).eval());
 }
 
-inline void dense_column(const Eigen::SparseMatrix<double, Eigen::ColMajor, int>& A, int j,
-                         Eigen::VectorXd& out) {
-    if (out.size() != A.rows())
-        out.resize(A.rows());
-    out.setZero();
-    for (Eigen::SparseMatrix<double, Eigen::ColMajor, int>::InnerIterator it(A, j); it; ++it) {
-        out(it.row()) = it.value();
-    }
+inline Eigen::VectorXd
+solve_BT_column(const auto& B, const Eigen::SparseMatrix<double, Eigen::ColMajor, int>& A, int j) {
+    return B.solve_BT(A.col(j));
 }
 
 template <class MatrixLike>
@@ -217,13 +212,11 @@ class SteepestEdgePricer {
         initialize_positions_(N);
         const int take = (pool_max_ > 0) ? std::min<int>(pool_max_, (int)N.size()) : (int)N.size();
         pool_.reserve(take);
-        Eigen::VectorXd Aj(A.rows());
         for (int k = 0; k < take; ++k) {
             const int j = N[k];
             Entry e;
             e.jN = j;
-            pricing_detail::dense_column(A, j, Aj);
-            e.t = B.solve_B(Aj); // caller-provided
+            e.t = pricing_detail::solve_B_column(B, A, j); // sparse-aware FTRAN of column
             e.weight = pricing_detail::edge_weight_from_direction(e.t, weight_strategy_);
             set_position_(j, (int)pool_.size());
             pool_.push_back(std::move(e));
@@ -677,7 +670,7 @@ class DualSteepestEdgePricer {
 
     struct LeavingChoice {
         int row = -1;
-        Eigen::VectorXd dual_row;
+        HVector dual_row;
         double weight = 1.0;
     };
 
@@ -694,23 +687,18 @@ class DualSteepestEdgePricer {
         row_pool_.clear();
         const int take = (pool_max_ > 0) ? std::min<int>(pool_max_, (int)N.size()) : (int)N.size();
         dual_pool_.reserve(take);
-        Eigen::VectorXd Aj(A.rows());
-        Eigen::VectorXd e_i(A.rows());
         for (int k = 0; k < take; ++k) {
             const int j = N[k];
             DualEntry e;
             e.jN = j;
-            pricing_detail::dense_column(A, j, Aj);
-            e.w = B.solve_BT(Aj); // caller-provided
+            e.w = pricing_detail::solve_BT_column(B, A, j); // sparse-aware BTRAN of column
             e.dual_weight = pricing_detail::edge_weight_from_direction(e.w, weight_strategy_);
             dual_pos_[j] = (int)dual_pool_.size();
             dual_pool_.push_back(std::move(e));
         }
         row_pool_.resize(A.rows());
         for (int i = 0; i < A.rows(); ++i) {
-            e_i.setZero();
-            e_i(i) = 1.0;
-            row_pool_[i].psi = B.solve_BT(e_i);
+            row_pool_[i].psi = B.solve_BT_unit(i);
             row_pool_[i].weight = std::max(1.0, pricing_detail::edge_weight_from_direction(
                                                     row_pool_[i].psi, weight_strategy_));
         }
@@ -723,7 +711,6 @@ class DualSteepestEdgePricer {
                                       double tol) const {
         LeavingChoice best;
         double best_score = -1.0;
-        Eigen::VectorXd e_i;
         for (int i = 0; i < yB.size(); ++i) {
             if (yB(i) >= -tol)
                 continue;
@@ -738,10 +725,7 @@ class DualSteepestEdgePricer {
                 if (i < (int)row_pool_.size() && row_pool_[i].psi.size() == yB.size()) {
                     best.dual_row = row_pool_[i].psi;
                 } else {
-                    e_i.resize(yB.size());
-                    e_i.setZero();
-                    e_i(i) = 1.0;
-                    best.dual_row = B.solve_BT(e_i);
+                    best.dual_row = B.solve_BT_unit(i);
                     weight = std::max(1.0, pricing_detail::edge_weight_from_direction(
                                                best.dual_row, weight_strategy_));
                 }
@@ -754,7 +738,7 @@ class DualSteepestEdgePricer {
     template <class MatrixLike>
     void update_after_dual_pivot(int leave_rel, int e_abs, int old_abs, const Eigen::VectorXd& s,
                                  double alpha, const MatrixLike& A, const std::vector<int>& /*N*/,
-                                 const Eigen::VectorXd& dual_row,
+                                 const HVector& dual_row,
                                  bool insert_leaver_into_pool = true) {
         if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol) {
             need_rebuild_ = true;
@@ -768,7 +752,7 @@ class DualSteepestEdgePricer {
             return;
         }
 
-        const Eigen::VectorXd& psi_r = dual_row;
+        const Eigen::VectorXd& psi_r = dual_row.value;
         if (leave_rel < 0 || leave_rel >= s.size()) {
             need_rebuild_ = true;
             return;
@@ -780,13 +764,25 @@ class DualSteepestEdgePricer {
                 return;
             }
 
+            // When psi_r has a sparse pattern (typical: it came from a
+            // BTRAN-unit solve), update only the rows where psi_r is nonzero.
+            // Otherwise fall back to the dense update path.
+            const bool have_pattern = dual_row.has_pattern();
             const Eigen::VectorXd psi_before = psi_r;
             for (int i = 0; i < (int)row_pool_.size(); ++i) {
                 if (i == leave_rel)
                     continue;
                 const double coeff = s(i) / alpha;
                 if (coeff != 0.0) {
-                    row_pool_[i].psi.noalias() -= psi_before * coeff;
+                    if (have_pattern) {
+                        auto& psi_target = row_pool_[i].psi;
+                        for (int k = 0; k < dual_row.count; ++k) {
+                            const int r = dual_row.index[k];
+                            psi_target(r) -= psi_before(r) * coeff;
+                        }
+                    } else {
+                        row_pool_[i].psi.noalias() -= psi_before * coeff;
+                    }
                 }
                 row_pool_[i].weight = std::max(1.0, pricing_detail::edge_weight_from_direction(
                                                         row_pool_[i].psi, weight_strategy_));
@@ -940,7 +936,7 @@ class DualDevexPricer {
 
     struct LeavingChoice {
         int row = -1;
-        Eigen::VectorXd dual_row;
+        HVector dual_row;
         double weight = 1.0;
     };
 
@@ -953,11 +949,8 @@ class DualDevexPricer {
     template <class BasisLike, class MatrixLike>
     void build_dual_pool(const BasisLike& B, const MatrixLike& A, const std::vector<int>& /*N*/) {
         row_weights_.assign(A.rows(), 1.0);
-        Eigen::VectorXd e_i(A.rows());
         for (int i = 0; i < A.rows(); ++i) {
-            e_i.setZero();
-            e_i(i) = 1.0;
-            const Eigen::VectorXd psi_i = B.solve_BT(e_i);
+            const Eigen::VectorXd psi_i = B.solve_BT_unit(i);
             row_weights_[i] = std::max(1.0, psi_i.squaredNorm());
         }
         iter_count_ = 0;
@@ -970,7 +963,6 @@ class DualDevexPricer {
                                       double tol) const {
         LeavingChoice best;
         double best_score = -1.0;
-        Eigen::VectorXd e_i;
         for (int i = 0; i < yB.size(); ++i) {
             if (yB(i) >= -tol)
                 continue;
@@ -985,11 +977,8 @@ class DualDevexPricer {
         }
 
         if (best.row >= 0) {
-            e_i.resize(yB.size());
-            e_i.setZero();
-            e_i(best.row) = 1.0;
-            best.dual_row = B.solve_BT(e_i);
-            best.weight = std::max(1.0, best.dual_row.squaredNorm());
+            best.dual_row = B.solve_BT_unit(best.row);
+            best.weight = std::max(1.0, best.dual_row.value.squaredNorm());
         }
         return best;
     }
@@ -997,7 +986,7 @@ class DualDevexPricer {
     template <class MatrixLike>
     void update_after_dual_pivot(int leave_rel, int /*e_abs*/, int /*old_abs*/,
                                  const Eigen::VectorXd& s, double alpha, const MatrixLike& /*A*/,
-                                 const std::vector<int>& /*N*/, const Eigen::VectorXd& /*dual_row*/,
+                                 const std::vector<int>& /*N*/, const HVector& /*dual_row*/,
                                  bool /*insert_leaver_into_pool*/ = true) {
         if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol) {
             need_rebuild_ = true;
@@ -1065,7 +1054,7 @@ class DualRowPricer {
 
     struct LeavingChoice {
         int row = -1;
-        Eigen::VectorXd dual_row;
+        HVector dual_row;
         double weight = 1.0;
     };
 
@@ -1086,7 +1075,6 @@ class DualRowPricer {
                                       double tol) const {
         LeavingChoice best;
         double best_score = -1.0;
-        Eigen::VectorXd e_i;
 
         for (int i = 0; i < yB.size(); ++i) {
             if (yB(i) >= -tol)
@@ -1104,21 +1092,14 @@ class DualRowPricer {
                 best.row = i;
                 best.weight = std::max(1.0, weight);
                 if (use_row_pricing) {
-                    // Get row vector for row pricing
-                    e_i.resize(yB.size());
-                    e_i.setZero();
-                    e_i(i) = 1.0;
-                    best.dual_row = B.solve_BT(e_i);
+                    best.dual_row = B.solve_BT_unit(i);
                 }
             }
         }
 
         if (best.row >= 0) {
             // Always compute the dual row for the leaving row
-            e_i.resize(yB.size());
-            e_i.setZero();
-            e_i(best.row) = 1.0;
-            best.dual_row = B.solve_BT(e_i);
+            best.dual_row = B.solve_BT_unit(best.row);
             best.weight = std::max(
                 1.0, pricing_detail::edge_weight_from_direction(best.dual_row, weight_strategy_));
         }
@@ -1131,12 +1112,9 @@ class DualRowPricer {
                             const std::vector<int>& N) {
         row_weights_.resize(A.rows());
         prefer_row_pricing_.resize(A.rows(), false);
-        Eigen::VectorXd e_i(A.rows());
         for (int i = 0; i < A.rows(); ++i) {
             // Compute row weight as ||B^{-T} e_i||^2
-            e_i.setZero();
-            e_i(i) = 1.0;
-            const Eigen::VectorXd psi_i = B_inv.solve_BT(e_i);
+            const Eigen::VectorXd psi_i = B_inv.solve_BT_unit(i);
             row_weights_[i] =
                 std::max(1.0, pricing_detail::edge_weight_from_direction(psi_i, weight_strategy_));
             prefer_row_pricing_[i] =
@@ -1149,7 +1127,7 @@ class DualRowPricer {
     void update_after_dual_pivot(int /*leave_rel*/, int /*e_abs*/, int /*old_abs*/,
                                  const Eigen::VectorXd& /*s*/, double alpha,
                                  const MatrixLike& /*A*/, const std::vector<int>& /*N*/,
-                                 const Eigen::VectorXd& /*dual_row*/,
+                                 const HVector& /*dual_row*/,
                                  bool /*insert_leaver_into_pool*/ = true) {
         ++iter_count_;
         if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol || iter_count_ >= reset_freq_) {
@@ -1228,7 +1206,7 @@ class DualAdaptivePricer {
 
     struct LeavingChoice {
         int row = -1;
-        Eigen::VectorXd dual_row;
+        HVector dual_row;
         double weight = 1.0;
     };
 
@@ -1345,10 +1323,8 @@ class DualAdaptivePricer {
                 LeavingChoice choice;
                 choice.row = best_row;
                 if (best_row >= 0) {
-                    Eigen::VectorXd e_i = Eigen::VectorXd::Zero(yB.size());
-                    e_i(best_row) = 1.0;
-                    choice.dual_row = B.solve_BT(e_i);
-                    choice.weight = std::max(1.0, choice.dual_row.squaredNorm());
+                    choice.dual_row = B.solve_BT_unit(best_row);
+                    choice.weight = std::max(1.0, choice.dual_row.value.squaredNorm());
                 }
                 return choice;
             }
@@ -1359,7 +1335,7 @@ class DualAdaptivePricer {
     template <class MatrixLike>
     void update_after_dual_pivot(int leave_rel, int e_abs, int old_abs, const Eigen::VectorXd& s,
                                  double alpha, const MatrixLike& A, const std::vector<int>& N,
-                                 const Eigen::VectorXd& dual_row,
+                                 const HVector& dual_row,
                                  bool insert_leaver_into_pool = true) {
         switch (active_rule_) {
             case Rule::SteepestEdge:

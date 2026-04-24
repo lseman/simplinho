@@ -1,5 +1,7 @@
 #pragma once
 
+#include "hvector.h"
+
 class RevisedSimplexPrimalEngine {
   public:
     struct BFRTStep {
@@ -7,13 +9,14 @@ class RevisedSimplexPrimalEngine {
         bool to_upper = false;
     };
 
+    // Core Harris ratio test. `candidate_rows` lists the row indices worth
+    // examining (positive entries of dB above `delta`). When dB has a known
+    // sparse pattern, the caller iterates only the pattern rows; otherwise
+    // it scans all m rows. The arithmetic from the initial filter onward is
+    // identical in both paths.
     static std::pair<std::optional<int>, double>
-    harris_ratio(const Eigen::VectorXd& xB, const Eigen::VectorXd& dB, double delta, double eta) {
-        std::vector<int> pos;
-        pos.reserve(dB.size());
-        for (int i = 0; i < dB.size(); ++i)
-            if (dB(i) > delta)
-                pos.push_back(i);
+    harris_ratio_core_(const Eigen::VectorXd& xB, const Eigen::VectorXd& dB,
+                       const std::vector<int>& pos, double eta) {
         if (pos.empty())
             return {std::nullopt, std::numeric_limits<double>::infinity()};
 
@@ -64,6 +67,35 @@ class RevisedSimplexPrimalEngine {
             }
         }
         return {best, best_ratio};
+    }
+
+    static std::pair<std::optional<int>, double>
+    harris_ratio(const Eigen::VectorXd& xB, const Eigen::VectorXd& dB, double delta, double eta) {
+        std::vector<int> pos;
+        pos.reserve(dB.size());
+        for (int i = 0; i < dB.size(); ++i)
+            if (dB(i) > delta)
+                pos.push_back(i);
+        return harris_ratio_core_(xB, dB, pos, eta);
+    }
+
+    // Sparse-pattern-aware variant: iterates only the rows where dB *may* be
+    // nonzero (from the HVector index list), collapsing the O(m) initial scan
+    // to O(nnz). Correctness is preserved because dB.value is still the
+    // authoritative dense store and we always check `dB(i) > delta`.
+    static std::pair<std::optional<int>, double>
+    harris_ratio(const Eigen::VectorXd& xB, const HVector& dB, double delta, double eta) {
+        std::vector<int> pos;
+        if (dB.has_pattern()) {
+            pos.reserve(static_cast<std::size_t>(dB.count));
+            for (int k = 0; k < dB.count; ++k) {
+                const int i = dB.index[k];
+                if (dB.value(i) > delta)
+                    pos.push_back(i);
+            }
+            return harris_ratio_core_(xB, dB.value, pos, eta);
+        }
+        return harris_ratio(xB, dB.value, delta, eta);
     }
 
     static BFRTStep entering_bound_step(double x_e, double l_e, double u_e, double rc_e,
@@ -363,7 +395,7 @@ class RevisedSimplexPrimalEngine {
 
             const int e = N[*e_rel];
 
-            Eigen::VectorXd dB;
+            HVector dB;
             try {
                 dB = read_basis().solve_B(A.col(e));
             } catch (...) {
@@ -405,7 +437,7 @@ class RevisedSimplexPrimalEngine {
 
             const bool flip_entering = (bfrt.theta_e + 1e-14 < theta_B);
             if (flip_entering) {
-                dB = -dB;
+                dB.value = -dB.value; // pattern unchanged, just sign-flip
                 const_cast<Eigen::VectorXd&>(rN)(idxN) = -rc_e;
             }
 
