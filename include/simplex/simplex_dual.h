@@ -672,7 +672,7 @@ class RevisedSimplexDualEngine {
             HVector w;
             int e_rel = -1;
             int eAbs = -1;
-            Eigen::VectorXd s_enter;
+            HVector s_enter;
             double tau = std::numeric_limits<double>::infinity();
 
             while (true) {
