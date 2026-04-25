@@ -223,6 +223,7 @@ struct Options {
     bool use_lp_reoptimization_profile = true;
     bool use_quadratic_warm_start_repair = false;
     bool use_node_presolve = true;
+    bool use_node_presolve_on_warm_basis = false;
     // HiGHS-inspired separate tolerances
     double feasibility_tol = 1e-7; // Feasibility checks in relaxation (LP)
     double optimality_tol = 1e-7;  // LP optimality checks (reduced-cost dual feasibility)

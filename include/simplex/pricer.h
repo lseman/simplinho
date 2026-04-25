@@ -1355,7 +1355,9 @@ class DualAdaptivePricer {
                        int steepest_reset_frequency, bool partial_pricing = false,
                        std::string dual_pricing = "row", int row_pricing_threshold = 10,
                        std::string dual_edge_weight_strategy = "dense",
-                       double dual_weight_log_error_threshold = 1.3862943611198906)
+                       double dual_weight_log_error_threshold = 1.3862943611198906,
+                       bool warm_start_near_optimal = false,
+                       bool warm_start_near_optimal_nonlogical_basis = false)
         : requested_rule_(std::move(pricing_rule)), partial_pricing_enabled_(partial_pricing),
           dual_pricing_preference_(std::move(dual_pricing)),
           row_pricing_threshold_(row_pricing_threshold),
@@ -1363,7 +1365,9 @@ class DualAdaptivePricer {
                            dual_weight_log_error_threshold),
           devex_pricer_(0.99, devex_reset_frequency),
           row_pricer_(devex_reset_frequency, row_pricing_threshold, dual_edge_weight_strategy),
-          dual_weight_log_error_threshold_(dual_weight_log_error_threshold) {}
+          dual_weight_log_error_threshold_(dual_weight_log_error_threshold),
+          warm_start_near_optimal_(warm_start_near_optimal),
+          warm_start_near_optimal_nonlogical_basis_(warm_start_near_optimal_nonlogical_basis) {}
 
     template <class BasisLike, class MatrixLike>
     void build_dual_pool(const BasisLike& B, const MatrixLike& A, const std::vector<int>& N) {
@@ -1591,6 +1595,9 @@ class DualAdaptivePricer {
             if (row_pricing_is_beneficial(A, N)) {
                 return Rule::RowPricing;
             }
+            if (warm_start_near_optimal_ && warm_start_near_optimal_nonlogical_basis_) {
+                return Rule::Devex;
+            }
             return (basis_rows > 256) ? Rule::Devex : Rule::SteepestEdge;
         }
         return Rule::SteepestEdge;
@@ -1602,6 +1609,8 @@ class DualAdaptivePricer {
     int row_pricing_threshold_{10};
     Rule active_rule_{Rule::SteepestEdge};
     bool need_rebuild_{false};
+    bool warm_start_near_optimal_{false};
+    bool warm_start_near_optimal_nonlogical_basis_{false};
     DualSteepestEdgePricer steepest_pricer_;
     DualDevexPricer devex_pricer_;
     DualRowPricer row_pricer_;

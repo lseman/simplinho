@@ -78,6 +78,10 @@ class MIPModelingApiTests(unittest.TestCase):
         self.assertEqual(simplinho.status_to_string(sol3.status), "optimal")
         self.assertIn(sol3.stats.basis_start, {"warm_start", "repaired_warm_start"})
 
+    def test_branch_and_bound_options_default_warm_presolve_override(self):
+        options = simplinho.BranchAndBoundOptions()
+        self.assertFalse(options.use_node_presolve_on_warm_basis)
+
     def _build_binary_branching_model(self):
         model = simplinho.Model()
         x = model.add_binary_var("x")
@@ -189,6 +193,19 @@ class MIPModelingApiTests(unittest.TestCase):
         self.assertTrue(math.isclose(solution.obj, 1.0, rel_tol=0.0, abs_tol=1e-8))
         self.assertGreaterEqual(solution.node_count, 1)
         self.assertTrue(math.isfinite(solution.tree_nodes[0].estimate))
+
+    def test_solve_mip_degenerate_reduced_cost_fixing(self):
+        model = simplinho.Model()
+        x = model.add_integer_var("x", lb=0.0, ub=3.0, obj=5.0)
+        y = model.add_integer_var("y", lb=0.0, ub=4.0, obj=2.0)
+        model.add_constr(x + 2.0 * y <= 5.0, name="cap")
+        model.maximize(5.0 * x + 2.0 * y)
+
+        solution = model.solve_mip()
+
+        self.assertEqual(solution.status, simplinho.MIPStatus.Optimal)
+        self.assertTrue(solution.has_solution)
+        self.assertTrue(math.isclose(solution.obj, 17.0, rel_tol=0.0, abs_tol=1e-8))
 
     def test_solve_mip_hybrid_queue_domain_rebasing_preserves_multiknapsack_optimum(
         self,
@@ -489,6 +506,31 @@ print('status', module.mip_status_to_string(solution.status))
         self.assertGreaterEqual(solution.relaxation_lp_lu_build_ns, 0)
         self.assertGreaterEqual(solution.relaxation_lp_pricing_build_ns, 0)
         self.assertGreaterEqual(solution.relaxation_lp_pivot_ns, 0)
+
+    def test_solve_mip_reduced_cost_bound_tightening_path(self):
+        model = simplinho.Model()
+        x = model.add_binary_var("x")
+        y = model.add_binary_var("y")
+        model.add_constr(x + 2 * y <= 2, name="cap")
+        model.maximize(x + y)
+
+        options = simplinho.BranchAndBoundOptions()
+        options.node_selection = simplinho.NodeSelectionStrategy.BestBound
+        options.use_rounding = False
+        options.use_cut_pool = False
+        options.use_rins = False
+        options.use_rens = False
+        options.use_local_search = False
+        options.use_feasibility_pump = False
+        options.use_feasibility_jump = False
+        options.use_async_heuristics = False
+
+        solution = model.solve_mip(options)
+
+        self.assertEqual(solution.status, simplinho.MIPStatus.Optimal)
+        self.assertGreater(solution.node_count, 1)
+        self.assertEqual(solution.lp_profile, "bnb_reoptimization")
+        self.assertEqual(solution.lp_mode, "dual")
 
     def test_solve_mip_rebuilds_thread_local_lp_context_between_runs(self):
         model = simplinho.Model()
@@ -1125,7 +1167,9 @@ print('status', module.mip_status_to_string(solution.status))
         self.assertTrue(solution.has_solution)
         self.assertTrue(math.isclose(solution.obj, 1.0, rel_tol=0.0, abs_tol=1e-8))
         self.assertTrue(
-            math.isclose(solution.value(y) + solution.value(z), 1.0, rel_tol=0.0, abs_tol=1e-8)
+            math.isclose(
+                solution.value(y) + solution.value(z), 1.0, rel_tol=0.0, abs_tol=1e-8
+            )
         )
 
     def test_solve_mip_clique_cuts(self):

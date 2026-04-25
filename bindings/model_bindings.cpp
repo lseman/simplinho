@@ -2182,6 +2182,14 @@ class Model {
                     }
                 }
 
+                const LPBasis* solver_warm_basis = nullptr;
+                if (effective_basis != nullptr) {
+                    if (!entry.warm_solver->has_cached_basis_state(node_data.total_vars,
+                                                                  node_data.rows)) {
+                        solver_warm_basis = effective_basis;
+                    }
+                }
+
                 simplex_bnb::RelaxationSolution out;
                 out.lp_assembly_time_ns =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(t1_assembly - t0_assembly)
@@ -2270,7 +2278,7 @@ class Model {
                 };
                 if (effective_basis != nullptr) {
                     std::optional<LPSolution> warm_opt =
-                        try_solver("warm", *entry.warm_solver, effective_basis);
+                        try_solver("warm", *entry.warm_solver, solver_warm_basis);
                     const bool warm_failed = !warm_opt.has_value() ||
                                              status_requires_warm_start_retry(warm_opt->status) ||
                                              warm_opt->status == LPSolution::Status::Infeasible ||

@@ -465,7 +465,9 @@ class RevisedSimplexDualEngine {
                                        self.opt_.adaptive_reset_freq, self.opt_.partial_pricing,
                                        self.opt_.dual_pricing, self.opt_.row_pricing_threshold,
                                        self.opt_.dual_edge_weight_strategy,
-                                       self.opt_.dual_steepest_edge_weight_log_error_threshold);
+                                       self.opt_.dual_steepest_edge_weight_log_error_threshold,
+                                       self.opt_.dual_warm_start_near_optimal,
+                                       RevisedSimplex::find_logical_basis_(A).empty());
 
         MatrixType Ahat = signed_matrix_copy(A, view);
         std::optional<SparseRowMatrix> Ahat_row;

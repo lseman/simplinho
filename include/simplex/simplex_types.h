@@ -201,6 +201,7 @@ struct RevisedSimplexOptions {
     // BNB layer flips this on for the warm solver only. Default false to
     // preserve cold-solve behavior.
     bool dual_suppress_perturbation_when_warm = false;
+    bool dual_warm_start_near_optimal = false;
 
     // Verbose diagnostics
     bool verbose = false;

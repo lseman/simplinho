@@ -214,6 +214,11 @@ class RevisedSimplex {
         cached_basis_cols_ = -1;
     }
 
+    bool has_cached_basis_state(int rows, int cols) const noexcept {
+        return cached_basis_state_ && cached_basis_rows_ == rows && cached_basis_cols_ == cols &&
+               basis_state_matches_problem_(*cached_basis_state_, rows, cols);
+    }
+
     // HiGHS-style per-call cutoff. The bound is interpreted in this solver's
     // internal c-space (i.e. the c the caller passes to solve()), so the BNB
     // layer is responsible for mapping incumbent_obj <-> internal cutoff.
@@ -2947,7 +2952,8 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         };
 
         const bool cache_reuse =
-            sparse_bound_only_cache_.same_problem(A_in, b_in, c_in, l_use, u_use);
+            sparse_bound_only_cache_.same_problem(A_in, b_in, c_in) &&
+            sparse_bound_only_cache_.orientation_matches(l_use, u_use);
         std::vector<ReformVar> map(n);
         std::vector<int> single_y(n, -1);
         std::vector<int> upper_slack(n, -1);

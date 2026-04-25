@@ -577,6 +577,8 @@ void bind_simplex_bindings(py::module_& m) {
                        &RevisedSimplexOptions::primal_simplex_cost_perturbation_multiplier)
         .def_readwrite("dual_simplex_cost_perturbation_multiplier",
                        &RevisedSimplexOptions::dual_simplex_cost_perturbation_multiplier)
+        .def_readwrite("dual_warm_start_near_optimal",
+                       &RevisedSimplexOptions::dual_warm_start_near_optimal)
         .def_readwrite("max_basis_rebuilds", &RevisedSimplexOptions::max_basis_rebuilds)
         .def_readwrite("crash_attempts", &RevisedSimplexOptions::crash_attempts)
         .def_readwrite("crash_markowitz_tol", &RevisedSimplexOptions::crash_markowitz_tol)

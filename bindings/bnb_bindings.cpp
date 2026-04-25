@@ -179,6 +179,8 @@ void bind_bnb_bindings(py::module_& m) {
         .def_readwrite("use_quadratic_warm_start_repair",
                        &BranchAndBoundOptions::use_quadratic_warm_start_repair)
         .def_readwrite("use_node_presolve", &BranchAndBoundOptions::use_node_presolve)
+        .def_readwrite("use_node_presolve_on_warm_basis",
+                       &BranchAndBoundOptions::use_node_presolve_on_warm_basis)
         .def("__repr__", [](const BranchAndBoundOptions& self) {
             std::ostringstream oss;
             oss << "BranchAndBoundOptions(max_nodes=" << self.max_nodes

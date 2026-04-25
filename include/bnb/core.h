@@ -1680,8 +1680,7 @@ class Solver {
         // ever producing a useful cut are evicted.
         {
             std::lock_guard<std::mutex> lock(learning_mutex_);
-            const std::size_t n =
-                std::min(produced_cut.size(), learned_conflicts_.size());
+            const std::size_t n = std::min(produced_cut.size(), learned_conflicts_.size());
             for (std::size_t i = 0; i < n; ++i) {
                 if (produced_cut[i]) {
                     learned_conflicts_[i].age = 0;
@@ -1691,12 +1690,12 @@ class Solver {
                 }
             }
             const int age_limit = std::max(1, options_.max_conflict_age);
-            learned_conflicts_.erase(
-                std::remove_if(learned_conflicts_.begin(), learned_conflicts_.end(),
-                               [age_limit](const LearnedConflict& c) {
-                                   return c.hits == 0 && c.age > age_limit;
-                               }),
-                learned_conflicts_.end());
+            learned_conflicts_.erase(std::remove_if(learned_conflicts_.begin(),
+                                                    learned_conflicts_.end(),
+                                                    [age_limit](const LearnedConflict& c) {
+                                                        return c.hits == 0 && c.age > age_limit;
+                                                    }),
+                                     learned_conflicts_.end());
         }
 
         return cuts;
@@ -2487,7 +2486,163 @@ class Solver {
             flush_node_timing_record_(timing);
         };
 
+        auto should_run_node_presolve = [&](const LPBasis* basis) {
+            return options_.use_node_presolve &&
+                   (!basis || options_.use_node_presolve_on_warm_basis);
+        };
+
         bool current_relaxation_allows_global_conflicts = true;
+        auto tighten_bounds_from_reduced_costs = [&](detail::ActiveNode& current_node,
+                                                     const RelaxationSolution& out) {
+            if (out.status != RelaxationStatus::Optimal || !out.lp_solution.has_value() ||
+                out.lp_solution->reduced_costs_internal.size() == 0 ||
+                out.lp_solution->basis_state.column_status.empty()) {
+                return;
+            }
+
+            const auto incumbent = incumbent_snapshot_();
+            if (!incumbent.has_incumbent) {
+                return;
+            }
+
+            const double objective_sign = problem_.maximize ? -1.0 : 1.0;
+            const double gap = objective_sign * (incumbent.objective - out.objective);
+            if (!(gap > 0.0)) {
+                return;
+            }
+
+            const Eigen::VectorXd& reduced_costs = out.lp_solution->reduced_costs_internal;
+            const auto& status = out.lp_solution->basis_state.column_status;
+            const int var_count =
+                std::min<int>(static_cast<int>(current_node.lower_bounds.size()),
+                              std::min<int>(static_cast<int>(reduced_costs.size()),
+                                            static_cast<int>(status.size())));
+            const double tol = 1e-12;
+
+            Eigen::VectorXd adjusted_reduced_costs = reduced_costs;
+            if (out.lp_solution->has_internal_tableau &&
+                out.lp_solution->tableau.rows() ==
+                    static_cast<int>(out.lp_solution->basis_state.basis_columns.size()) &&
+                out.lp_solution->tableau.cols() >= var_count &&
+                static_cast<int>(out.lp_solution->x.size()) >= var_count) {
+                std::vector<int> basis_row_index(var_count, -1);
+                for (int row = 0;
+                     row < static_cast<int>(out.lp_solution->basis_state.basis_columns.size());
+                     ++row) {
+                    int col = out.lp_solution->basis_state.basis_columns[row];
+                    if (col >= 0 && col < var_count) {
+                        basis_row_index[col] = row;
+                    }
+                }
+
+                for (int j = 0; j < var_count; ++j) {
+                    if (j >= static_cast<int>(problem_.variable_types.size()) ||
+                        problem_.variable_types[j] == VariableType::Continuous ||
+                        status[j] != LPBasisStatus::Basic) {
+                        continue;
+                    }
+                    const double xj = out.lp_solution->x[j];
+                    const double lb = current_node.lower_bounds[j];
+                    const double ub = current_node.upper_bounds[j];
+                    const bool at_lower = xj <= lb + tol;
+                    const bool at_upper = xj >= ub - tol;
+                    if (!at_lower && !at_upper) {
+                        continue;
+                    }
+
+                    const int row = basis_row_index[j];
+                    if (row < 0 || row >= out.lp_solution->tableau.rows()) {
+                        continue;
+                    }
+
+                    const Eigen::VectorXd row_coeffs = out.lp_solution->tableau.row(row);
+                    const double sign = at_lower ? 1.0 : -1.0;
+                    double degenerate_dual = std::numeric_limits<double>::infinity();
+
+                    for (int k = 0; k < var_count; ++k) {
+                        if (k == j) {
+                            continue;
+                        }
+                        const double val = sign * row_coeffs[k];
+                        if (!std::isfinite(val) || std::abs(val) <= tol) {
+                            continue;
+                        }
+                        const double xk = out.lp_solution->x[k];
+                        const double lbk = current_node.lower_bounds[k];
+                        const double ubk = current_node.upper_bounds[k];
+                        if (!std::isfinite(xk) || !std::isfinite(lbk) || !std::isfinite(ubk)) {
+                            continue;
+                        }
+                        const double rc_k = adjusted_reduced_costs[k];
+                        if (!std::isfinite(rc_k)) {
+                            continue;
+                        }
+                        double candidate = std::numeric_limits<double>::infinity();
+                        if (val > 0.0) {
+                            if (xk - lbk > tol) {
+                                candidate = -rc_k / val;
+                            }
+                        } else {
+                            if (ubk - xk > tol) {
+                                candidate = -rc_k / val;
+                            }
+                        }
+                        if (candidate < degenerate_dual) {
+                            degenerate_dual = candidate;
+                        }
+                    }
+
+                    if (!std::isfinite(degenerate_dual) || degenerate_dual <= tol) {
+                        continue;
+                    }
+                    const double candidate_rc = sign * degenerate_dual;
+                    if (std::abs(candidate_rc) > std::abs(adjusted_reduced_costs[j]) + tol) {
+                        adjusted_reduced_costs[j] = candidate_rc;
+                    }
+                }
+            }
+
+            for (int j = 0; j < var_count; ++j) {
+                if (j >= static_cast<int>(problem_.variable_types.size()) ||
+                    problem_.variable_types[j] == VariableType::Continuous) {
+                    continue;
+                }
+                const double rc = adjusted_reduced_costs[j];
+                if (!std::isfinite(rc) || std::abs(rc) <= tol) {
+                    continue;
+                }
+                if (status[j] == LPBasisStatus::AtLower) {
+                    if (rc <= 0.0) {
+                        continue;
+                    }
+                    const double bound = current_node.lower_bounds[j] + gap / rc;
+                    if (!std::isfinite(bound)) {
+                        continue;
+                    }
+                    const double tightened_upper = std::floor(bound + 1e-12);
+                    if (tightened_upper + tol < current_node.upper_bounds[j] &&
+                        tightened_upper >= current_node.lower_bounds[j]) {
+                        current_node.upper_bounds[j] =
+                            std::min(current_node.upper_bounds[j], tightened_upper);
+                    }
+                } else if (status[j] == LPBasisStatus::AtUpper) {
+                    if (rc >= 0.0) {
+                        continue;
+                    }
+                    const double bound = current_node.upper_bounds[j] + gap / rc;
+                    if (!std::isfinite(bound)) {
+                        continue;
+                    }
+                    const double tightened_lower = std::ceil(bound - 1e-12);
+                    if (tightened_lower > current_node.lower_bounds[j] + tol &&
+                        tightened_lower <= current_node.upper_bounds[j]) {
+                        current_node.lower_bounds[j] =
+                            std::max(current_node.lower_bounds[j], tightened_lower);
+                    }
+                }
+            }
+        };
+
         auto solve_relaxation_with_cuts = [&](detail::ActiveNode& current_node,
                                               const std::vector<Cut>& extra_cuts) {
             const auto solve_start = SteadyClock::now();
@@ -2496,10 +2651,18 @@ class Solver {
             const bool allow_global_conflict_learning =
                 !contains_incumbent_cutoff_(relaxation_cuts);
             current_relaxation_allows_global_conflicts = allow_global_conflict_learning;
+            const LPBasis* warm_basis = current_node.basis ? &*current_node.basis : nullptr;
             const auto presolve_start = SteadyClock::now();
-            const NodePresolveOutcome presolved =
-                presolve_node_bounds_(current_node.lower_bounds, current_node.upper_bounds,
-                                      relaxation_cuts, current_node.reasons);
+            NodePresolveOutcome presolved;
+            if (should_run_node_presolve(warm_basis)) {
+                presolved =
+                    presolve_node_bounds_(current_node.lower_bounds, current_node.upper_bounds,
+                                          relaxation_cuts, current_node.reasons);
+            } else {
+                presolved.lower_bounds = current_node.lower_bounds;
+                presolved.upper_bounds = current_node.upper_bounds;
+                presolved.reasons = current_node.reasons;
+            }
             const std::uint64_t presolve_wall_ns = elapsed_ns_(presolve_start, SteadyClock::now());
             current_node.lower_bounds = presolved.lower_bounds;
             current_node.upper_bounds = presolved.upper_bounds;
@@ -2520,13 +2683,14 @@ class Solver {
                                               presolve_wall_ns);
                 return out;
             }
-            const LPBasis* warm_basis = current_node.basis ? &*current_node.basis : nullptr;
             RelaxationSolution out = relaxation_solver(
                 current_node.lower_bounds, current_node.upper_bounds, warm_basis, relaxation_cuts);
             if (out.status == RelaxationStatus::Infeasible) {
                 maybe_learn_conflict_from_bounds_(current_node.lower_bounds,
                                                   current_node.upper_bounds,
                                                   allow_global_conflict_learning);
+            } else {
+                tighten_bounds_from_reduced_costs(current_node, out);
             }
             std::lock_guard<std::mutex> timing_lock(timing_mutex);
             accumulate_relaxation_timing_(&timing.node_relaxation, out,
@@ -2826,8 +2990,15 @@ class Solver {
             const bool allow_global_conflict_learning =
                 !contains_incumbent_cutoff_(relaxation_cuts);
             const auto presolve_start = SteadyClock::now();
-            const NodePresolveOutcome presolved = presolve_node_bounds_(
-                prepared.lower_bounds, prepared.upper_bounds, relaxation_cuts, prepared.reasons);
+            NodePresolveOutcome presolved;
+            if (should_run_node_presolve(basis)) {
+                presolved = presolve_node_bounds_(prepared.lower_bounds, prepared.upper_bounds,
+                                                  relaxation_cuts, prepared.reasons);
+            } else {
+                presolved.lower_bounds = prepared.lower_bounds;
+                presolved.upper_bounds = prepared.upper_bounds;
+                presolved.reasons = prepared.reasons;
+            }
             const std::uint64_t presolve_wall_ns = elapsed_ns_(presolve_start, SteadyClock::now());
             if (presolved.infeasible) {
                 maybe_learn_conflict_from_bounds_(presolved.lower_bounds, presolved.upper_bounds,
@@ -2857,15 +3028,22 @@ class Solver {
             return out;
         };
 
-        auto async_node_relaxation_solver = [this, &relaxation_solver](
+        auto async_node_relaxation_solver = [this, &relaxation_solver, &should_run_node_presolve](
                                                 const detail::ChildState& child_state,
                                                 const LPBasis* basis) {
             detail::ChildState prepared = child_state;
             detail::materialize_child_state(&prepared);
             detail::prepare_child_state_for_relaxation(&prepared);
             const std::vector<Cut> relaxation_cuts = current_relaxation_cuts_snapshot_();
-            const NodePresolveOutcome presolved = presolve_node_bounds_(
-                prepared.lower_bounds, prepared.upper_bounds, relaxation_cuts, prepared.reasons);
+            NodePresolveOutcome presolved;
+            if (should_run_node_presolve(basis)) {
+                presolved = presolve_node_bounds_(prepared.lower_bounds, prepared.upper_bounds,
+                                                  relaxation_cuts, prepared.reasons);
+            } else {
+                presolved.lower_bounds = prepared.lower_bounds;
+                presolved.upper_bounds = prepared.upper_bounds;
+                presolved.reasons = prepared.reasons;
+            }
             if (presolved.infeasible) {
                 RelaxationSolution out;
                 out.status = RelaxationStatus::Infeasible;
@@ -3160,9 +3338,8 @@ class Solver {
 
     template <typename RelaxationSolver>
     void process_child_(int parent_id, int depth, int branch_variable, double branch_value,
-                        const LPBasis* parent_basis, double inherited_bound,
-                        double sibling_bound, detail::ChildEvaluation child,
-                        RelaxationSolver&& relaxation_solver,
+                        const LPBasis* parent_basis, double inherited_bound, double sibling_bound,
+                        detail::ChildEvaluation child, RelaxationSolver&& relaxation_solver,
                         NodeTimingRecord* parent_timing, int worker_id) {
         const auto child_start = SteadyClock::now();
         auto finalize_child_timing = [&]() {

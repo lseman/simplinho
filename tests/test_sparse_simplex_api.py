@@ -145,6 +145,74 @@ class SparseSimplexApiTests(unittest.TestCase):
         )
         self.assertNotIn("bound_reformulation_retry_mode", second.info)
 
+    def test_sparse_matrix_reuses_bound_only_cache_after_same_orientation_bound_change(self):
+        A = sp.csc_matrix([[1.0, 1.0]])
+        b = np.array([4.0], dtype=float)
+        c = np.array([1.0, 2.0], dtype=float)
+        l = np.array([1.0, 0.0], dtype=float)
+        u = np.array([np.inf, np.inf], dtype=float)
+
+        options = simplinho.RevisedSimplexOptions()
+        options.mode = simplinho.SimplexMode.Dual
+
+        solver = simplinho.RevisedSimplex(options)
+        first = solver.solve(A, b, c, l, u)
+
+        self.assertEqual(simplinho.status_to_string(first.status), "optimal")
+        self.assertEqual(first.info.get("sparse_pipeline"), "1")
+        self.assertIsNone(first.info.get("sparse_bound_only_fast_path"))
+
+        l2 = np.array([2.0, 0.0], dtype=float)
+        second = solver.solve(A, b, c, l2, u)
+
+        self.assertEqual(simplinho.status_to_string(second.status), "optimal")
+        self.assertEqual(second.info.get("sparse_pipeline"), "1")
+        self.assertEqual(second.info.get("sparse_bound_only_fast_path"), "1")
+
+    def test_sparse_matrix_warm_start_reuses_internal_solver_basis_on_bound_change(self):
+        A = sp.csc_matrix([[1.0, 1.0]])
+        b = np.array([4.0], dtype=float)
+        c = np.array([1.0, 2.0], dtype=float)
+        l = np.zeros(2, dtype=float)
+        u = np.array([np.inf, np.inf], dtype=float)
+
+        options = simplinho.RevisedSimplexOptions()
+        options.mode = simplinho.SimplexMode.Dual
+
+        solver = simplinho.RevisedSimplex(options)
+        first = solver.solve(A, b, c, l, u)
+        self.assertEqual(simplinho.status_to_string(first.status), "optimal")
+
+        u2 = np.array([1.5, np.inf], dtype=float)
+        second = solver.solve(A, b, c, l, u2)
+
+        self.assertEqual(simplinho.status_to_string(second.status), "optimal")
+        self.assertIn(second.stats.basis_start, {"warm_start", "repaired_warm_start"})
+        self.assertEqual(second.info.get("bound_reformulation_initial_mode"), "dual")
+        self.assertEqual(
+            second.info.get("bound_reformulation_warm_start_dual_feasible"), "1"
+        )
+        self.assertNotIn("bound_reformulation_retry_mode", second.info)
+
+    def test_dual_adaptive_warm_start_near_optimal_switches_to_devex(self):
+        A = sp.csc_matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        b = np.array([7.0, 8.0], dtype=float)
+        c = np.array([1.0, 1.0, 1.0], dtype=float)
+        l = np.zeros(3, dtype=float)
+        u = np.array([np.inf, np.inf, np.inf], dtype=float)
+
+        options = simplinho.RevisedSimplexOptions()
+        options.mode = simplinho.SimplexMode.Dual
+        options.pricing_rule = "adaptive"
+        options.row_pricing_threshold = 0
+        options.dual_warm_start_near_optimal = True
+
+        solver = simplinho.RevisedSimplex(options)
+        sol = solver.solve(A, b, c, l, u)
+
+        self.assertEqual(simplinho.status_to_string(sol.status), "optimal")
+        self.assertEqual(sol.info.get("dual_pricing"), "dual_devex")
+
     def test_sparse_matrix_warm_start_basis_after_upper_bound_branch(self):
         A = sp.csc_matrix([[1.0, 1.0]])
         b = np.array([2.0], dtype=float)
