@@ -52,6 +52,24 @@ class Solver {
         return root_warm_start_basis_state_;
     }
 
+    // Public snapshot of the current incumbent so per-node LP solvers can
+    // install an objective-bound cutoff and bail out early in dual phase 2.
+    struct IncumbentObjectiveSnapshot {
+        bool has_incumbent = false;
+        double objective = std::numeric_limits<double>::quiet_NaN();
+    };
+
+    IncumbentObjectiveSnapshot incumbent_objective_snapshot() const {
+        std::lock_guard<std::mutex> lock(incumbent_mutex_);
+        IncumbentObjectiveSnapshot snap;
+        snap.has_incumbent = has_incumbent_;
+        snap.objective = incumbent_objective_;
+        return snap;
+    }
+
+    bool maximize() const noexcept { return problem_.maximize; }
+    double objective_constant() const noexcept { return problem_.objective_constant; }
+
     template <typename RelaxationSolver> SolveResult solve(RelaxationSolver&& relaxation_solver) {
         reset_state_();
         initialize_node_timing_log_();

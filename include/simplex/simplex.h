@@ -214,6 +214,18 @@ class RevisedSimplex {
         cached_basis_cols_ = -1;
     }
 
+    // HiGHS-style per-call cutoff. The bound is interpreted in this solver's
+    // internal c-space (i.e. the c the caller passes to solve()), so the BNB
+    // layer is responsible for mapping incumbent_obj <-> internal cutoff.
+    // Pass +inf to disable.
+    void set_objective_bound_internal(double bound) noexcept {
+        opt_.objective_bound_internal = bound;
+    }
+
+    double objective_bound_internal() const noexcept {
+        return opt_.objective_bound_internal;
+    }
+
   private:
     LPSolution solve_impl_(const Eigen::MatrixXd& A_in, const Eigen::VectorXd& b_in,
                            const Eigen::VectorXd& c_in, const Eigen::VectorXd& l_in,
@@ -937,6 +949,7 @@ class RevisedSimplex {
 
             if (st == LPSolution::Status::Optimal || st == LPSolution::Status::Unbounded ||
                 st == LPSolution::Status::IterLimit ||
+                st == LPSolution::Status::ObjectiveBound ||
                 (st == LPSolution::Status::Infeasible && !basis_guess_from_warm_start)) {
                 auto [z_full, obj_corr] = postsolve_primal(v2);
                 Eigen::VectorXd x_full = anchor + sign.cwiseProduct(z_full);
@@ -3464,6 +3477,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             }
             info2["reason"] = "invalid_returned_primal";
         } else if (st == LPSolution::Status::Unbounded || st == LPSolution::Status::IterLimit ||
+                   st == LPSolution::Status::ObjectiveBound ||
                    (st == LPSolution::Status::Infeasible && !basis_guess_from_warm_start)) {
             return finalize_sparse_solution(st, v2, red_basis2, it2, std::move(info2));
         }

@@ -2111,12 +2111,21 @@ class Model {
                        sol->status == LPSolution::Status::NeedPhase1;
             }
 
-            simplex_bnb::RelaxationSolution solve_node(const Eigen::VectorXd& node_l,
-                                                       const Eigen::VectorXd& node_u,
-                                                       const std::vector<simplex_bnb::Cut>& cuts,
-                                                       const LPBasis* parent_basis) {
+            simplex_bnb::RelaxationSolution solve_node(
+                const Eigen::VectorXd& node_l, const Eigen::VectorXd& node_u,
+                const std::vector<simplex_bnb::Cut>& cuts, const LPBasis* parent_basis,
+                double objective_bound_internal = std::numeric_limits<double>::infinity()) {
                 const auto t0_assembly = std::chrono::steady_clock::now();
                 const NodeLPSolverView entry = get_node_lp_entry(cuts);
+                // HiGHS-style objective-bound bailout: tell every solver in the
+                // entry to stop early if the current node's LP obj provably
+                // exceeds the cutoff. +inf disables.
+                entry.cold_solver->set_objective_bound_internal(objective_bound_internal);
+                entry.warm_solver->set_objective_bound_internal(objective_bound_internal);
+                if (entry.fallback_solver->has_value()) {
+                    (*entry.fallback_solver)->set_objective_bound_internal(
+                        objective_bound_internal);
+                }
                 const auto t1_assembly = std::chrono::steady_clock::now();
                 const ModelLPData& node_data = *entry.lp_data;
                 Eigen::VectorXd solve_l = node_data.l;
@@ -2315,6 +2324,8 @@ class Model {
                     const bool terminal_optimal = raw_opt->status == LPSolution::Status::Optimal;
                     const bool terminal_unbounded =
                         raw_opt->status == LPSolution::Status::Unbounded;
+                    const bool terminal_objective_bound =
+                        raw_opt->status == LPSolution::Status::ObjectiveBound;
                     out.status = raw_opt->status == LPSolution::Status::Optimal
                                      ? simplex_bnb::RelaxationStatus::Optimal
                                  : raw_opt->status == LPSolution::Status::Unbounded
@@ -2326,6 +2337,13 @@ class Model {
                             : Eigen::VectorXd::Constant(node_data.total_vars,
                                                         std::numeric_limits<double>::quiet_NaN());
                     if (terminal_optimal || terminal_unbounded) {
+                        out.objective =
+                            node_data.objective_sign * raw_opt->obj + objective_constant_;
+                    } else if (terminal_objective_bound && std::isfinite(raw_opt->obj)) {
+                        // Bailout: report a lower bound on the node's true LP
+                        // optimum so that downstream prune-by-bound logic still
+                        // sees a meaningful estimate (it would otherwise be
+                        // ±inf and the node would be marked infeasible-cutoff).
                         out.objective =
                             node_data.objective_sign * raw_opt->obj + objective_constant_;
                     } else {
@@ -2489,9 +2507,22 @@ class Model {
                 //               << " node_presolve_tightened_bounds="
                 //               << node_presolve.tightened_bounds << std::endl;
                 // }
-                simplex_bnb::RelaxationSolution relaxation =
-                    thread_context.solve_node(node_presolve.lower, node_presolve.upper,
-                                              simplified_structural_cuts.cuts, basis);
+                // HiGHS-style cutoff: map external incumbent into the LP's
+                // internal c-space. The internal LP is always a min problem
+                // (objective_sign negates for maximize), so for both senses
+                // the bound is objective_sign * (incumbent - constant).
+                double objective_bound_internal = std::numeric_limits<double>::infinity();
+                {
+                    const auto inc = bnb_solver.incumbent_objective_snapshot();
+                    if (inc.has_incumbent && std::isfinite(inc.objective)) {
+                        const double sign_external = state_->maximize ? -1.0 : 1.0;
+                        objective_bound_internal =
+                            sign_external * (inc.objective - state_->objective.constant);
+                    }
+                }
+                simplex_bnb::RelaxationSolution relaxation = thread_context.solve_node(
+                    node_presolve.lower, node_presolve.upper, simplified_structural_cuts.cuts,
+                    basis, objective_bound_internal);
                 if (mip_options.verbose && cuts.empty()) {
                     const int lp_iters = relaxation.lp_solution ? relaxation.lp_solution->iters : 0;
                     const bool primal_valid = (relaxation.primal.size() == data.total_vars &&

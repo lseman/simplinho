@@ -49,7 +49,15 @@ struct LPSolveStats {
 };
 
 struct LPSolution {
-    enum class Status { Optimal, Unbounded, Infeasible, IterLimit, Singular, NeedPhase1 };
+    enum class Status {
+        Optimal,
+        Unbounded,
+        Infeasible,
+        IterLimit,
+        Singular,
+        NeedPhase1,
+        ObjectiveBound,
+    };
 
     Status status{};
     Eigen::VectorXd x; // primal solution (original space)
@@ -95,6 +103,8 @@ inline const char* to_string(LPSolution::Status s) {
             return "singular";
         case LPSolution::Status::NeedPhase1:
             return "need_phase1";
+        case LPSolution::Status::ObjectiveBound:
+            return "objective_bound";
     }
     return "unknown";
 }
@@ -176,6 +186,14 @@ struct RevisedSimplexOptions {
 
     // Algorithm selection
     SimplexMode mode = SimplexMode::Auto; // Auto | Primal | Dual
+
+    // Objective-bound early termination (HiGHS-style).
+    // When set, the dual engine bails out if the internal primal objective
+    // (in the engine's c_work space) provably exceeds objective_bound_internal.
+    // The check runs every objective_bound_check_freq iterations.
+    // Disabled when objective_bound_internal is +inf.
+    double objective_bound_internal = std::numeric_limits<double>::infinity();
+    int objective_bound_check_freq = 16;
 
     // Verbose diagnostics
     bool verbose = false;

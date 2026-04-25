@@ -1082,6 +1082,32 @@ class RevisedSimplexDualEngine {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                  " basis_after=" + self.format_basis_(basis));
             }
+
+            // HiGHS-style objective-bound bailout: dual phase 2 obj is monotone
+            // non-decreasing for a min problem. Check periodically; if we have
+            // already crossed the bound the node can be pruned without solving
+            // to optimality.
+            if (std::isfinite(self.opt_.objective_bound_internal) &&
+                self.opt_.objective_bound_check_freq > 0 &&
+                (iters % self.opt_.objective_bound_check_freq) == 0) {
+                Eigen::VectorXd x_check =
+                    assemble_transformed_primal(n, basis, yB.cwiseMax(0.0), l, u, view);
+                const double obj_check = c.dot(x_check);
+                if (obj_check > self.opt_.objective_bound_internal) {
+                    auto info_map = dm_stats_to_map(self.degen_.get_stats());
+                    info_map["dual_pricing"] = dual_pricer.current_strategy_name();
+                    info_map["dual_bfrt_flips"] = std::to_string(total_flips);
+                    info_map["objective_bound_bailout"] = "1";
+                    info_map["objective_bound_bailout_obj"] = std::to_string(obj_check);
+                    self.trace_line_("[dual] objective-bound bailout iter=" +
+                                     std::to_string(iters) + " obj=" + std::to_string(obj_check) +
+                                     " bound=" +
+                                     std::to_string(self.opt_.objective_bound_internal));
+                    self.remember_warm_state_(basis, basis_factorization);
+                    return {LPSolution::Status::ObjectiveBound, std::move(x_check), basis, iters,
+                            std::move(info_map)};
+                }
+            }
         }
 
         auto info_map = dm_stats_to_map(self.degen_.get_stats());
