@@ -195,6 +195,13 @@ struct RevisedSimplexOptions {
     double objective_bound_internal = std::numeric_limits<double>::infinity();
     int objective_bound_check_freq = 16;
 
+    // BNB warm-start hint: when true, the dual engine will not apply its
+    // reactive cost perturbation. HiGHS skips perturbation entirely when the
+    // basis is "near-optimal" (the typical warm-start state in MIP); the
+    // BNB layer flips this on for the warm solver only. Default false to
+    // preserve cold-solve behavior.
+    bool dual_suppress_perturbation_when_warm = false;
+
     // Verbose diagnostics
     bool verbose = false;
     int verbose_every = 1;

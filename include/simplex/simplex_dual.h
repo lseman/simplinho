@@ -1001,8 +1001,18 @@ class RevisedSimplexDualEngine {
                     " enter=" + std::to_string(eAbs) +
                     (basis_cycle.cycling_detected ? " cycle_detected=1" : " cycle_detected=0"));
             }
-            if (basis_cycle.cycling_detected ||
-                (is_degenerate && self.degen_.should_apply_perturbation())) {
+            // HiGHS-style: when warm-starting in a BNB context (signalled by
+            // dual_suppress_perturbation_when_warm + a finite objective bound),
+            // skip the reactive cost perturbation. Node LPs typically pivot a
+            // handful of times before they're optimal or pruned; perturbing
+            // their costs only adds a cleanup pass that the bailout check
+            // makes irrelevant.
+            const bool suppress_perturbation =
+                self.opt_.dual_suppress_perturbation_when_warm &&
+                std::isfinite(self.opt_.objective_bound_internal);
+            if (!suppress_perturbation && (basis_cycle.cycling_detected ||
+                                           (is_degenerate &&
+                                            self.degen_.should_apply_perturbation()))) {
                 if (!costs_perturbed) {
                     const double rel_multiplier =
                         1e-8 * std::max(1e-6, self.opt_.dual_simplex_cost_perturbation_multiplier);

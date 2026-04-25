@@ -245,6 +245,13 @@ RevisedSimplexOptions tune_mip_lp_options(const RevisedSimplexOptions& base_opti
     tuned.devex_reset = std::max(50, std::min(tuned.devex_reset, 100));
     tuned.adaptive_reset_freq = std::min(tuned.adaptive_reset_freq, 350);
 
+    // HiGHS-style: in BNB warm context, suppress reactive cost perturbation.
+    // The bailout check makes the cleanup pass that perturbation forces
+    // largely wasted for nodes that will be pruned.
+    if (warm_start_expected) {
+        tuned.dual_suppress_perturbation_when_warm = true;
+    }
+
     return tuned;
 }
 
