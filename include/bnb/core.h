@@ -48,7 +48,8 @@ class Solver {
         pseudocosts_.resize(problem_.variable_types.size());
     }
 
-    const std::optional<LPBasis>& root_warm_start_basis_state() const noexcept {
+    std::optional<LPBasis> root_warm_start_basis_state() const {
+        std::lock_guard<std::mutex> lock(incumbent_mutex_);
         return root_warm_start_basis_state_;
     }
 
