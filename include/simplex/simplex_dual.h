@@ -603,9 +603,8 @@ class RevisedSimplexDualEngine {
         auto rebuild_dual_pool = [&](const char* where,
                                      int iter) -> std::optional<RevisedSimplex::PhaseResult> {
             try {
-                self.measure_pricing_build_(true, [&]() {
-                    dual_pricer.build_dual_pool(read_basis(), Ahat, N);
-                });
+                self.measure_pricing_build_(
+                    true, [&]() { dual_pricer.build_dual_pool(read_basis(), Ahat, N); });
                 return std::nullopt;
             } catch (const std::exception& e) {
                 std::unordered_map<std::string, std::string> info{
@@ -631,8 +630,7 @@ class RevisedSimplexDualEngine {
                     break;
                 case LPDualPricingWarmState::Rule::Devex:
                     imported.active_rule = DualAdaptivePricer::Rule::Devex;
-                    imported.devex.row_weights =
-                        reused_warm_state->dual_pricing_state->row_weights;
+                    imported.devex.row_weights = reused_warm_state->dual_pricing_state->row_weights;
                     break;
                 case LPDualPricingWarmState::Rule::RowPricing:
                     imported.active_rule = DualAdaptivePricer::Rule::RowPricing;
@@ -662,6 +660,8 @@ class RevisedSimplexDualEngine {
         int rebuild_attempts = 0;
         int total_flips = 0;
         Eigen::VectorXd rhs_eff = b - transformed_rhs(A, view, l, u);
+        bool ydual_cached = false;
+        Eigen::VectorXd ydual;
 
         auto serialize_vec = [](const Eigen::VectorXd& v) {
             std::ostringstream oss;
@@ -680,7 +680,6 @@ class RevisedSimplexDualEngine {
             int flips_this_iter = 0;
             Eigen::VectorXd yB;
             Eigen::VectorXd cB(m);
-            Eigen::VectorXd ydual;
             Eigen::VectorXd pN;
             Eigen::VectorXd rN;
             int r_leave = -1;
@@ -714,17 +713,21 @@ class RevisedSimplexDualEngine {
 
                 for (int i = 0; i < m; ++i)
                     cB(i) = chat(basis[i]);
-                try {
-                    ydual = read_basis().solve_BT(cB);
-                } catch (...) {
-                    self.trace_line_("[dual] iter=" + std::to_string(iters) +
-                                     " refactor after solve_BT failure");
-                    write_basis().refactor();
-                    if (auto failed = rebuild_dual_pool(
-                            "dual pricing rebuild failed after solve_BT", iters)) {
-                        return *failed;
+                if (!ydual_cached) {
+                    try {
+                        ydual = read_basis().solve_BT(cB);
+                        ydual_cached = true;
+                    } catch (...) {
+                        self.trace_line_("[dual] iter=" + std::to_string(iters) +
+                                         " refactor after solve_BT failure");
+                        write_basis().refactor();
+                        if (auto failed = rebuild_dual_pool(
+                                "dual pricing rebuild failed after solve_BT", iters)) {
+                            return *failed;
+                        }
+                        ydual = read_basis().solve_BT(cB);
+                        ydual_cached = true;
                     }
-                    ydual = read_basis().solve_BT(cB);
                 }
 
                 if (!(warm_views_provided && iters == 1) && apply_views_to_nonbasics(ydual)) {
@@ -736,7 +739,8 @@ class RevisedSimplexDualEngine {
                     continue;
                 }
 
-                const auto leaving = dual_pricer.choose_dual_leaving(read_basis(), yB, self.opt_.tol);
+                const auto leaving =
+                    dual_pricer.choose_dual_leaving(read_basis(), yB, self.opt_.tol);
                 r_leave = leaving.row;
                 if (r_leave < 0) {
                     rN.resize(N.size());
@@ -759,7 +763,8 @@ class RevisedSimplexDualEngine {
                         LPDualPricingWarmState pricing_state;
                         switch (dual_state.active_rule) {
                             case DualAdaptivePricer::Rule::SteepestEdge:
-                                pricing_state.active_rule = LPDualPricingWarmState::Rule::SteepestEdge;
+                                pricing_state.active_rule =
+                                    LPDualPricingWarmState::Rule::SteepestEdge;
                                 pricing_state.row_weights = dual_state.steepest.row_weights;
                                 break;
                             case DualAdaptivePricer::Rule::Devex:
@@ -767,9 +772,11 @@ class RevisedSimplexDualEngine {
                                 pricing_state.row_weights = dual_state.devex.row_weights;
                                 break;
                             case DualAdaptivePricer::Rule::RowPricing:
-                                pricing_state.active_rule = LPDualPricingWarmState::Rule::RowPricing;
+                                pricing_state.active_rule =
+                                    LPDualPricingWarmState::Rule::RowPricing;
                                 pricing_state.row_weights = dual_state.row.row_weights;
-                                pricing_state.prefer_row_pricing = dual_state.row.prefer_row_pricing;
+                                pricing_state.prefer_row_pricing =
+                                    dual_state.row.prefer_row_pricing;
                                 break;
                             case DualAdaptivePricer::Rule::MostInfeasible:
                                 pricing_state.active_rule =
@@ -1007,6 +1014,7 @@ class RevisedSimplexDualEngine {
                         chat(j) = (view_sign(view[j]) > 0) ? c_work(j) : -c_work(j);
                     }
                     costs_perturbed = true;
+                    ydual_cached = false;
                 }
             } else {
                 if (costs_perturbed) {
@@ -1015,6 +1023,7 @@ class RevisedSimplexDualEngine {
                         chat(j) = (view_sign(view[j]) > 0) ? c_work(j) : -c_work(j);
                     }
                     costs_perturbed = false;
+                    ydual_cached = false;
                 }
                 (void)self.degen_.reset_perturbation();
             }
@@ -1032,8 +1041,21 @@ class RevisedSimplexDualEngine {
                 }
                 self.trace_line_(oss.str());
             }
+
+            Eigen::VectorXd unit = Eigen::VectorXd::Zero(m);
+            unit(r_leave) = 1.0;
+            Eigen::VectorXd z = read_basis().solve_BT(unit);
+            const double pivot = s_enter(r_leave);
+            const double alpha = rN(e_rel) / pivot;
+            ydual.noalias() += alpha * z;
+            for (int k = 0; k < static_cast<int>(N.size()); ++k) {
+                if (k == e_rel)
+                    continue;
+                rN(k) -= alpha * column_dot(Ahat, N[k], z);
+            }
             basis[r_leave] = eAbs;
             N[e_rel] = oldAbs;
+            rN(e_rel) = chat(oldAbs) - column_dot(Ahat, oldAbs, ydual);
 
             try {
                 write_basis().replace_column(r_leave, Ahat.col(eAbs));

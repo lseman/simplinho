@@ -819,10 +819,8 @@ class DualSteepestEdgePricer {
         }
         row_pool_.resize(A.rows());
         for (int i = 0; i < A.rows(); ++i) {
-            row_pool_[i].psi = B.solve_BT_unit(i);
-            pricing_detail::normalize_pattern(row_pool_[i].psi);
-            row_pool_[i].weight = std::max(1.0, pricing_detail::edge_weight_from_direction(
-                                                    row_pool_[i].psi, weight_strategy_));
+            row_pool_[i].psi = HVector();
+            row_pool_[i].weight = 1.0;
         }
         iter_count_ = 0;
         need_rebuild_ = false;
@@ -844,7 +842,7 @@ class DualSteepestEdgePricer {
             if (score > best_score) {
                 best_score = score;
                 best.row = i;
-                if (i < (int)row_pool_.size() && row_pool_[i].psi.size() == yB.size()) {
+                if (i < (int)row_pool_.size() && row_pool_[i].psi.has_pattern()) {
                     best.dual_row = row_pool_[i].psi;
                 } else {
                     best.dual_row = B.solve_BT_unit(i);
@@ -891,12 +889,14 @@ class DualSteepestEdgePricer {
             auto update_row = [&](int i) {
                 if (i == leave_rel)
                     return;
-                const double coeff = s(i) / alpha;
-                if (coeff != 0.0) {
-                    pricing_detail::subtract_scaled(row_pool_[i].psi, psi_before, coeff);
+                if (row_pool_[i].psi.has_pattern()) {
+                    const double coeff = s(i) / alpha;
+                    if (coeff != 0.0) {
+                        pricing_detail::subtract_scaled(row_pool_[i].psi, psi_before, coeff);
+                    }
+                    row_pool_[i].weight = std::max(1.0, pricing_detail::edge_weight_from_direction(
+                                                            row_pool_[i].psi, weight_strategy_));
                 }
-                row_pool_[i].weight = std::max(1.0, pricing_detail::edge_weight_from_direction(
-                                                        row_pool_[i].psi, weight_strategy_));
             };
             if (s.has_pattern()) {
                 std::vector<char> seen(row_pool_.size(), 0);
@@ -1072,12 +1072,8 @@ class DualDevexPricer {
         : threshold_(threshold), reset_freq_(reset_frequency) {}
 
     template <class BasisLike, class MatrixLike>
-    void build_dual_pool(const BasisLike& B, const MatrixLike& A, const std::vector<int>& /*N*/) {
+    void build_dual_pool(const BasisLike& /*B*/, const MatrixLike& A, const std::vector<int>& /*N*/) {
         row_weights_.assign(A.rows(), 1.0);
-        for (int i = 0; i < A.rows(); ++i) {
-            const Eigen::VectorXd psi_i = B.solve_BT_unit(i);
-            row_weights_[i] = std::max(1.0, psi_i.squaredNorm());
-        }
         iter_count_ = 0;
         no_improvement_count_ = 0;
         need_rebuild_ = false;

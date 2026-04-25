@@ -369,15 +369,19 @@ class FTBasis {
 
     template <typename Derived>
     void replace_column(int j, const Eigen::SparseMatrixBase<Derived>& new_col_sparse) {
+        const auto& sparse = new_col_sparse.derived();
+        const SparseMat sparse_copy = sparse;
         replace_column_impl_(j, std::nullopt,
-                             sparse_vector_to_dense_(new_col_sparse.derived(), m_));
+                             sparse_vector_to_dense_(sparse, m_), &sparse_copy);
     }
 
     template <typename Derived>
     void replace_column(int j, int entering_col,
                         const Eigen::SparseMatrixBase<Derived>& new_col_sparse) {
+        const auto& sparse = new_col_sparse.derived();
+        const SparseMat sparse_copy = sparse;
         replace_column_impl_(j, entering_col,
-                             sparse_vector_to_dense_(new_col_sparse.derived(), m_));
+                             sparse_vector_to_dense_(sparse, m_), &sparse_copy);
     }
 
     void refactor() {
@@ -1045,6 +1049,11 @@ class FTBasis {
         mark_sparse_basis_cache_dirty_();
     }
 
+    void set_sparse_column_(int col_j, const SparseMat& sparse) {
+        Bcols_sparse_[col_j] = sparse;
+        mark_sparse_basis_cache_dirty_();
+    }
+
     // ----------------------------
     // Eta application
     // ----------------------------
@@ -1260,7 +1269,8 @@ class FTBasis {
     // Replace column
     // ----------------------------
     void replace_column_impl_(int j, std::optional<int> entering_col,
-                              const Eigen::VectorXd& new_col_dense) {
+                              const Eigen::VectorXd& new_col_dense,
+                              const SparseMat* new_col_sparse = nullptr) {
         const auto t0 = std::chrono::steady_clock::now();
         auto report_pivot_telemetry = [&]() noexcept {
             if (opt_.ext_pivot_ns) {
@@ -1292,7 +1302,10 @@ class FTBasis {
             const Eigen::VectorXd old_dense = Eigen::VectorXd(current_B_sparse_.col(j));
 
             if (sparse_update_looks_doomed_(old_dense, new_col_dense)) {
-                set_sparse_column_(j, new_col_dense);
+                if (new_col_sparse)
+                    set_sparse_column_(j, *new_col_sparse);
+                else
+                    set_sparse_column_(j, new_col_dense);
                 sparse_refactor_();
                 return;
             }
@@ -1308,7 +1321,10 @@ class FTBasis {
                 w = fast_solve_BT_(unit_basis_vector_(j));
                 alpha = 1.0 + z(j);
             } catch (...) {
-                set_sparse_column_(j, new_col_dense);
+                if (new_col_sparse)
+                    set_sparse_column_(j, *new_col_sparse);
+                else
+                    set_sparse_column_(j, new_col_dense);
                 sparse_refactor_();
                 return;
             }
@@ -1320,21 +1336,30 @@ class FTBasis {
             if (unstable) {
                 last_update_diagnostic_ = make_update_diagnostic_(
                     "Sparse FT update rejected by adaptive alpha or finite guards", alpha, &z, &w);
-                set_sparse_column_(j, new_col_dense);
+                if (new_col_sparse)
+                    set_sparse_column_(j, *new_col_sparse);
+                else
+                    set_sparse_column_(j, new_col_dense);
                 sparse_refactor_();
                 return;
             }
 
             if (!lu_sparse_.append_forrest_tomlin_update(j, u, z, w, alpha,
-                                                         std::max(opt_.abs_floor, 1e-14))) {
+                                                           std::max(opt_.abs_floor, 1e-14))) {
                 last_update_diagnostic_ = make_update_diagnostic_(
                     lu_sparse_.last_update_failure_reason_message(), alpha, &z, &w);
-                set_sparse_column_(j, new_col_dense);
+                if (new_col_sparse)
+                    set_sparse_column_(j, *new_col_sparse);
+                else
+                    set_sparse_column_(j, new_col_dense);
                 sparse_refactor_();
                 return;
             }
 
-            set_sparse_column_(j, new_col_dense);
+            if (new_col_sparse)
+                set_sparse_column_(j, *new_col_sparse);
+            else
+                set_sparse_column_(j, new_col_dense);
             ++update_count_;
             refresh_stats_();
 
