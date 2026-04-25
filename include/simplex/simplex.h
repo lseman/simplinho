@@ -113,7 +113,7 @@ class RevisedSimplex {
                      std::optional<std::vector<int>> basis_opt = std::nullopt) {
         const int n = static_cast<int>(A_in.cols());
         const LPBasis* implicit_basis = nullptr;
-        if (!basis_opt && should_reuse_cached_basis_(A_in.rows(), n)) {
+        if (!basis_opt && has_cached_basis_state(A_in)) {
             implicit_basis = &*cached_basis_state_;
         }
         LPSolution sol =
@@ -141,7 +141,7 @@ class RevisedSimplex {
                      std::optional<std::vector<int>> basis_opt = std::nullopt) {
         const int n = static_cast<int>(A_in.cols());
         const LPBasis* implicit_basis = nullptr;
-        if (!basis_opt && should_reuse_cached_basis_(A_in.rows(), n)) {
+        if (!basis_opt && has_cached_basis_state(A_in)) {
             implicit_basis = &*cached_basis_state_;
         }
         LPSolution sol = solve_impl_(A_in, b_in, c_in, l_in, u_in, basis_opt, implicit_basis);
@@ -162,7 +162,7 @@ class RevisedSimplex {
                      std::optional<std::vector<int>> basis_opt = std::nullopt) {
         const int n = static_cast<int>(A_in.cols());
         const LPBasis* implicit_basis = nullptr;
-        if (!basis_opt && should_reuse_cached_basis_(A_in.rows(), n)) {
+        if (!basis_opt && has_cached_basis_state(A_in)) {
             implicit_basis = &*cached_basis_state_;
         }
         LPSolution sol = solve_impl_sparse_(A_in, b_in, c_in, Eigen::VectorXd::Zero(n),
@@ -190,7 +190,7 @@ class RevisedSimplex {
                      std::optional<std::vector<int>> basis_opt = std::nullopt) {
         const int n = static_cast<int>(A_in.cols());
         const LPBasis* implicit_basis = nullptr;
-        if (!basis_opt && should_reuse_cached_basis_(A_in.rows(), n)) {
+        if (!basis_opt && has_cached_basis_state(A_in)) {
             implicit_basis = &*cached_basis_state_;
         }
         LPSolution sol =
@@ -2517,6 +2517,27 @@ class RevisedSimplex {
                basis_state_matches_problem_(*cached_basis_state_, rows, cols);
     }
 
+  public:
+    bool has_cached_basis_state(const Eigen::MatrixXd& A) const noexcept {
+        return has_cached_basis_state(static_cast<int>(A.rows()), static_cast<int>(A.cols()),
+                                      matrix_signature_(A), false);
+    }
+
+    bool has_cached_basis_state(const SparseMatrix& A) const noexcept {
+        return has_cached_basis_state(static_cast<int>(A.rows()), static_cast<int>(A.cols()),
+                                      matrix_signature_(A), true);
+    }
+
+  private:
+    bool has_cached_basis_state(int rows, int cols, std::uint64_t signature,
+                                bool matrix_is_sparse) const noexcept {
+        return opt_.mode == SimplexMode::Dual && cached_basis_state_ &&
+               cached_basis_rows_ == rows && cached_basis_cols_ == cols &&
+               cached_matrix_signature_ == signature &&
+               cached_matrix_is_sparse_ == matrix_is_sparse &&
+               basis_state_matches_problem_(*cached_basis_state_, rows, cols);
+    }
+
     void update_cached_basis_(const LPSolution& sol, int rows, const Eigen::VectorXd& l,
                               const Eigen::VectorXd& u) {
         const int cols = static_cast<int>(l.size());
@@ -2527,6 +2548,8 @@ class RevisedSimplex {
                 cached_basis_state_ = rebuilt;
                 cached_basis_rows_ = rows;
                 cached_basis_cols_ = cols;
+                cached_matrix_signature_ = current_matrix_signature_;
+                cached_matrix_is_sparse_ = current_matrix_is_sparse_;
                 return;
             }
         }
@@ -2534,6 +2557,8 @@ class RevisedSimplex {
             cached_basis_state_ = sol.basis_state;
             cached_basis_rows_ = rows;
             cached_basis_cols_ = cols;
+            cached_matrix_signature_ = current_matrix_signature_;
+            cached_matrix_is_sparse_ = current_matrix_is_sparse_;
         } else {
             clear_basis_cache();
         }
@@ -2861,6 +2886,8 @@ class RevisedSimplex {
     std::optional<LPBasis> cached_basis_state_;
     int cached_basis_rows_ = -1;
     int cached_basis_cols_ = -1;
+    std::uint64_t cached_matrix_signature_ = 0;
+    bool cached_matrix_is_sparse_ = false;
     std::uint64_t current_matrix_signature_ = 0;
     int current_matrix_rows_ = -1;
     int current_matrix_cols_ = -1;

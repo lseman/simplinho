@@ -2184,8 +2184,7 @@ class Model {
 
                 const LPBasis* solver_warm_basis = nullptr;
                 if (effective_basis != nullptr) {
-                    if (!entry.warm_solver->has_cached_basis_state(node_data.total_vars,
-                                                                  node_data.rows)) {
+                    if (!entry.warm_solver->has_cached_basis_state(node_data.A_sparse)) {
                         solver_warm_basis = effective_basis;
                     }
                 }
