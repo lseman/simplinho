@@ -90,15 +90,30 @@ class RevisedSimplexDualEngine {
         return std::max(0.0, u(j) - l(j));
     }
 
-    template <class MatrixType>
-    static Eigen::VectorXd transformed_rhs(const MatrixType& A, const std::vector<BoundView>& view,
+    static Eigen::VectorXd transformed_rhs(const Eigen::MatrixXd& A,
+                                           const std::vector<BoundView>& view,
                                            const Eigen::VectorXd& l, const Eigen::VectorXd& u) {
         Eigen::VectorXd rhs = A.rows() ? Eigen::VectorXd::Zero(A.rows()) : Eigen::VectorXd{};
         for (int j = 0; j < A.cols(); ++j) {
             const double anchor = bound_anchor(view[j], j, l, u);
             if (anchor != 0.0) {
-                const Eigen::VectorXd col = A.col(j);
-                rhs.noalias() += col * anchor;
+                rhs.noalias() += A.col(j) * anchor;
+            }
+        }
+        return rhs;
+    }
+
+    static Eigen::VectorXd transformed_rhs(const RevisedSimplex::SparseMatrix& A,
+                                           const std::vector<BoundView>& view,
+                                           const Eigen::VectorXd& l, const Eigen::VectorXd& u) {
+        Eigen::VectorXd rhs = A.rows() ? Eigen::VectorXd::Zero(A.rows()) : Eigen::VectorXd{};
+        for (int j = 0; j < A.cols(); ++j) {
+            const double anchor = bound_anchor(view[j], j, l, u);
+            if (anchor == 0.0) {
+                continue;
+            }
+            for (RevisedSimplex::SparseMatrix::InnerIterator it(A, j); it; ++it) {
+                rhs(it.row()) += it.value() * anchor;
             }
         }
         return rhs;
@@ -646,6 +661,7 @@ class RevisedSimplexDualEngine {
 
         int rebuild_attempts = 0;
         int total_flips = 0;
+        Eigen::VectorXd rhs_eff = b - transformed_rhs(A, view, l, u);
 
         auto serialize_vec = [](const Eigen::VectorXd& v) {
             std::ostringstream oss;
@@ -662,7 +678,6 @@ class RevisedSimplexDualEngine {
         while (iters < self.opt_.max_iters) {
             ++iters;
             int flips_this_iter = 0;
-            Eigen::VectorXd rhs_eff = b - transformed_rhs(A, view, l, u);
             Eigen::VectorXd yB;
             Eigen::VectorXd cB(m);
             Eigen::VectorXd ydual;

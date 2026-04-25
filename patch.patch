@@ -1,0 +1,43 @@
+diff --git a//data/dev/simplinho/include/simplex/simplex_dual.h b//data/dev/simplinho/include/simplex/simplex_dual.h
+--- a//data/dev/simplinho/include/simplex/simplex_dual.h
++++ b//data/dev/simplinho/include/simplex/simplex_dual.h
+@@ -92,4 +92,4 @@
+
+-    template <class MatrixType>
+-    static Eigen::VectorXd transformed_rhs(const MatrixType& A, const std::vector<BoundView>& view,
++    static Eigen::VectorXd transformed_rhs(const Eigen::MatrixXd& A,
++                                           const std::vector<BoundView>& view,
+                                            const Eigen::VectorXd& l, const Eigen::VectorXd& u) {
+@@ -99,4 +99,3 @@
+             if (anchor != 0.0) {
+-                const Eigen::VectorXd col = A.col(j);
+-                rhs.noalias() += col * anchor;
++                rhs.noalias() += A.col(j) * anchor;
+             }
+@@ -106,2 +105,18 @@
+
++    static Eigen::VectorXd transformed_rhs(const RevisedSimplex::SparseMatrix& A,
++                                           const std::vector<BoundView>& view,
++                                           const Eigen::VectorXd& l, const Eigen::VectorXd& u) {
++        Eigen::VectorXd rhs = A.rows() ? Eigen::VectorXd::Zero(A.rows()) : Eigen::VectorXd{};
++        for (int j = 0; j < A.cols(); ++j) {
++            const double anchor = bound_anchor(view[j], j, l, u);
++            if (anchor == 0.0) {
++                continue;
++            }
++            for (RevisedSimplex::SparseMatrix::InnerIterator it(A, j); it; ++it) {
++                rhs(it.row()) += it.value() * anchor;
++            }
++        }
++        return rhs;
++    }
++
+     static void scale_column(Eigen::MatrixXd& A, int j, double scale) {
+@@ -648,2 +663,3 @@
+         int total_flips = 0;
++        Eigen::VectorXd rhs_eff = b - transformed_rhs(A, view, l, u);
+
+@@ -664,3 +680,2 @@
+             int flips_this_iter = 0;
+-            Eigen::VectorXd rhs_eff = b - transformed_rhs(A, view, l, u);
+             Eigen::VectorXd yB;

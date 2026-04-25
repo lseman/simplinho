@@ -107,7 +107,7 @@ void print_verbose_solver_banner() {
     const int pad = std::max(0, (kLogWidth - static_cast<int>(title_str.size())) / 2);
     std::cout << std::string(pad, ' ') << bold_(title_str) << "\n";
     std::ostringstream git_line;
-    git_line << "git:" << SIMPLEX_GIT_DESCRIBE << "  branch:" << SIMPLEX_GIT_BRANCH;
+    git_line << "git " << SIMPLEX_GIT_DESCRIBE << "  branch:" << SIMPLEX_GIT_BRANCH;
     const std::string git_str = git_line.str();
     const int git_pad = std::max(0, (kLogWidth - static_cast<int>(git_str.size())) / 2);
     std::cout << dim_(std::string(git_pad, ' ') + git_str) << "\n";

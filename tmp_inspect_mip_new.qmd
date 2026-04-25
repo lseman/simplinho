@@ -1,0 +1,160 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .qmd
+      format_name: quarto
+      format_version: '1.0'
+      jupytext_version: 1.19.1
+  kernelspec:
+    display_name: .venv
+    language: python
+    name: python3
+---
+
+```{python}
+# Simplinho MIP Infeasibility Debugger
+This notebook defines a large binary multiknapsack test instance, solves it with Simplinho, and compares the result to PuLP.
+</VSCode.Cell>
+<VSCode.Cell id="2" language="python">
+import sys
+from pathlib import Path
+import importlib.util
+import numpy as np
+import pandas as pd
+
+# Load the built simplinho extension from build directory
+build_dir = Path("build")
+module_path = next(build_dir.glob("simplinho*.so"), None)
+if module_path is None:
+    raise FileNotFoundError("Could not find simplinho extension module in build directory")
+spec = importlib.util.spec_from_file_location("simplinho", module_path)
+simplinho = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(simplinho)
+print("Loaded simplinho module from", module_path)
+print("Python executable:", sys.executable)
+print("simplinho objects:", hasattr(simplinho, "Model"), hasattr(simplinho, "BranchAndBoundOptions"))
+</VSCode.Cell>
+<VSCode.Cell id="3" language="markdown">
+## Define the MIP Model
+Build the large binary multiknapsack instance used for the failing case.
+</VSCode.Cell>
+<VSCode.Cell id="4" language="python">
+n = 100
+profits = []
+weights1 = []
+weights2 = []
+weights3 = []
+groups = []
+for i in range(n):
+    profit = float(((17 * i + 13) % 97) + 10)
+    w1 = float(((11 * i + 7) % 29) + 1)
+    w2 = float(((19 * i + 5) % 31) + 1)
+    w3 = float(((23 * i + 3) % 37) + 1)
+    group = 1.0 if i % 10 in (0, 1, 2, 3) else 0.0
+    profits.append(profit)
+    weights1.append(w1)
+    weights2.append(w2)
+    weights3.append(w3)
+    groups.append(group)
+constraints = [
+    (weights1, "<=", 0.35 * sum(weights1), "cap_1"),
+    (weights2, "<=", 0.33 * sum(weights2), "cap_2"),
+    (weights3, "<=", 0.31 * sum(weights3), "cap_3"),
+    (groups, "<=", max(8.0, 0.18 * n), "group_cap"),
+]
+model = simplinho.Model()
+x_vars = []
+for i in range(n):
+    x = model.add_binary_var(f"x_{i}", obj=profits[i])
+    x_vars.append(x)
+for coeffs, sense, rhs, name in constraints:
+    expr = 0.0
+    for i, coeff in enumerate(coeffs):
+        expr = expr + coeff * x_vars[i]
+    if sense == "<=":
+        model.add_constr(expr <= rhs, name=name)
+    elif sense == ">=":
+        model.add_constr(expr >= rhs, name=name)
+    else:
+        model.add_constr(expr == rhs, name=name)
+model.maximize(sum(profits[i] * x_vars[i] for i in range(n)))
+print("Model built: vars=", n, "constraints=", len(constraints))
+</VSCode.Cell>
+<VSCode.Cell id="5" language="markdown">
+## Solve with Simplinho
+Run the model with explicit MIP options matching the failing case.
+</VSCode.Cell>
+<VSCode.Cell id="6" language="python">
+options = simplinho.BranchAndBoundOptions()
+options.max_nodes = 10000
+options.node_selection = simplinho.NodeSelectionStrategy.BestBound
+options.parallel_workers = 1
+options.use_async_heuristics = False
+options.use_cut_pool = False
+options.use_gomory_cuts = False
+options.use_cover_cuts = False
+options.use_feasibility_pump = False
+options.use_rens = False
+options.use_rins = False
+options.use_local_search = False
+options.use_local_branching = False
+
+result = model.solve_mip(options)
+print("Simplinho status:", result.status)
+print("Objective:", result.obj)
+print("Best bound:", result.best_bound)
+print("Node count:", result.node_count)
+print("Root relaxation objective:", result.root_relaxation_objective)
+print("Has solution:", result.has_solution)
+print("Warm start used:", result.warm_start_basis_state_used)
+if result.has_solution:
+    x_vals = [result.value(v) for v in x_vars]
+    print("First 10 x:", x_vals[:10])
+else:
+    print("No incumbent found")
+print("Tree nodes:", len(result.tree_nodes))
+for node in result.tree_nodes[:10]:
+    print(node.id, node.parent_id, node.depth, node.status, node.branch_var, node.branch_value, node.bound)
+</VSCode.Cell>
+<VSCode.Cell id="7" language="markdown">
+## Reference Solve with PuLP
+Solve the same model using PuLP to confirm feasibility and objective.
+</VSCode.Cell>
+<VSCode.Cell id="8" language="python">
+try:
+    import pulp
+except ImportError:
+    import sys
+    print("PuLP is not installed; install with pip install pulp", file=sys.stderr)
+    raise
+
+pulp_model = pulp.LpProblem("binary_multiknapsack", pulp.LpMaximize)
+pulp_x = [pulp.LpVariable(f"x_{i}", cat="Binary") for i in range(n)]
+pulp_model += pulp.lpSum(profits[i] * pulp_x[i] for i in range(n))
+pulp_model += pulp.lpSum(weights1[i] * pulp_x[i] for i in range(n)) <= 0.35 * sum(weights1)
+pulp_model += pulp.lpSum(weights2[i] * pulp_x[i] for i in range(n)) <= 0.33 * sum(weights2)
+pulp_model += pulp.lpSum(weights3[i] * pulp_x[i] for i in range(n)) <= 0.31 * sum(weights3)
+pulp_model += pulp.lpSum(groups[i] * pulp_x[i] for i in range(n)) <= max(8.0, 0.18 * n)
+pulp_status = pulp_model.solve(pulp.PULP_CBC_CMD(msg=False))
+print("PuLP status:", pulp.LpStatus[pulp_status])
+print("PuLP objective:", pulp.value(pulp_model.objective))
+pulp_vals = [v.value() for v in pulp_x]
+print("PuLP first 10 x:", pulp_vals[:10])
+</VSCode.Cell>
+<VSCode.Cell id="9" language="markdown">
+## Summary Diagnostics
+Compare results from Simplinho and PuLP.
+</VSCode.Cell>
+<VSCode.Cell id="10" language="python">
+diag = {
+    "simplinho_status": result.status,
+    "simplinho_obj": result.obj,
+    "simplinho_best_bound": result.best_bound,
+    "simplinho_has_solution": result.has_solution,
+    "simplinho_node_count": result.node_count,
+    "pulp_status": pulp.LpStatus[pulp_status],
+    "pulp_obj": pulp.value(pulp_model.objective),
+}
+print(pd.Series(diag))
+```
