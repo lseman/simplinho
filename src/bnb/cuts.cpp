@@ -315,13 +315,14 @@ double cut_dynamism_(const Cut& cut, const Eigen::VectorXd& primal, double viola
     return normalized_violation * (0.5 + 0.5 * focus) / (1.0 + 0.1 * activity);
 }
 
-double cut_retention_score_(const Cut& cut, double norm, int type_usage) {
-    const double age_decay = std::exp(-0.08 * static_cast<double>(cut.age));
-    const double usage_reward = std::log1p(static_cast<double>(cut.times_used));
+double cut_retention_score_(const Cut& cut, double norm, int type_usage,
+                               double age_decay_rate) {
+    const double age_decay = std::exp(-age_decay_rate * static_cast<double>(cut.age));
+    const double usage_reward = std::log1p(1.0 + static_cast<double>(cut.times_used));
     const double density_reward =
         1.0 / std::sqrt(static_cast<double>(std::max<std::size_t>(1, cut.indices.size())));
-    return age_decay * (0.55 * cut.strength + 0.2 * usage_reward + 0.15 * density_reward +
-                        0.10 * static_cast<double>(type_usage)) +
+    return age_decay * (0.70 * cut.strength + 0.15 * usage_reward + 0.10 * density_reward +
+                        0.05 * static_cast<double>(type_usage)) +
            0.05 * norm;
 }
 
@@ -882,6 +883,8 @@ std::vector<int> extend_cover_literals_(const std::vector<CoverLiteralTerm>& all
     return lifted;
 }
 
+bool postprocess_cover_cut_(const Problem& problem, const Options& options, Cut* cut);
+
 void maybe_add_cover_cut_(const Problem& problem, const RelaxationSolution& relaxation,
                           const Options& options, const std::vector<int>& literals,
                           const std::string& cut_type,
@@ -906,8 +909,8 @@ void maybe_add_cover_cut_(const Problem& problem, const RelaxationSolution& rela
             cut.rhs -= 1.0;
         }
     }
-    if (!canonicalize_cut(&cut, options.min_cut_violation * 1e-3))
-        cut.indices.clear();
+    if (!postprocess_cover_cut_(problem, options, &cut))
+        return;
     if (cut.indices.empty())
         return;
 
@@ -2078,7 +2081,9 @@ double cut_parallelism(const Cut& lhs, const Cut& rhs) {
 
 CutPool::CutPool(const Options& options)
     : max_pool_size_(options.max_cut_pool_size), min_violation_(options.min_cut_violation),
-      max_age_(options.max_cut_age), max_cuts_per_type_(options.max_cuts_per_type),
+      max_age_(options.max_cut_age), cut_age_decay_(options.cut_age_decay),
+      cut_selection_age_bonus_(options.cut_selection_age_bonus),
+      max_cuts_per_type_(options.max_cuts_per_type),
       max_parallelism_(options.cut_max_parallelism) {}
 
 void CutPool::reset(const Options& options) {
@@ -2086,6 +2091,8 @@ void CutPool::reset(const Options& options) {
     max_pool_size_ = options.max_cut_pool_size;
     min_violation_ = options.min_cut_violation;
     max_age_ = options.max_cut_age;
+    cut_age_decay_ = options.cut_age_decay;
+    cut_selection_age_bonus_ = options.cut_selection_age_bonus;
     max_cuts_per_type_ = options.max_cuts_per_type;
     max_parallelism_ = options.cut_max_parallelism;
     cuts_.clear();
@@ -2208,6 +2215,7 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         double dynamism = 0.0;
         double fractional_focus = 0.0;
         double strength = 0.0;
+        double age_bonus = 0.0;
         bool marginal = false;
     };
 
@@ -2221,8 +2229,10 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         violated[i] = 1;
         const double full_norm =
             i < static_cast<int>(row_norms_.size()) ? row_norms_[i] : cut_norm_(cuts_[i]);
+        const double age_bonus = std::exp(-cut_selection_age_bonus_ * static_cast<double>(cuts_[i].age));
         candidates.push_back(Candidate{i, violation, full_norm, 0.0, 0.0, 0.0, 0.0, 0.0,
-                                       cuts_[i].strength, violation <= 2.5 * min_violation_});
+                                       cuts_[i].strength, age_bonus,
+                                       violation <= 2.5 * min_violation_});
     }
 
     if (candidates.empty()) {
@@ -2303,12 +2313,13 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
             if (max_parallelism > max_parallelism_)
                 continue;
 
-            double score = 0.42 * candidate.active_efficacy + 0.18 * candidate.efficacy +
-                           0.23 * (1.0 - max_parallelism) + dynamism_weight_ * candidate.dynamism +
-                           0.05 * candidate.strength;
+            double score = 0.40 * candidate.active_efficacy + 0.15 * candidate.efficacy +
+                           0.20 * (1.0 - max_parallelism) + 0.12 * candidate.age_bonus +
+                           0.10 * candidate.density_adjusted_efficacy + 0.08 * candidate.strength +
+                           dynamism_weight_ * candidate.dynamism + 0.05 * candidate.fractional_focus;
             if (candidate.marginal) {
-                score +=
-                    0.08 * candidate.density_adjusted_efficacy + 0.05 * candidate.fractional_focus;
+                score += 0.06 * candidate.density_adjusted_efficacy +
+                         0.04 * candidate.fractional_focus;
             }
             score += 0.02 * std::log1p(static_cast<double>(type_usage_stats_[cut.cut_type]));
             if (score > best_score) {
@@ -2329,14 +2340,14 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         ++type_usage_stats_[cuts_[index].cut_type];
         ++cuts_[index].times_used;
         cuts_[index].age = 0;
-        cuts_[index].strength = 0.92 * cuts_[index].strength + 0.08 * best_score;
+        cuts_[index].strength = std::max(cuts_[index].strength, 0.90 * best_score);
     }
 
     for (int i = 0; i < static_cast<int>(cuts_.size()); ++i) {
         if (chosen[i])
             continue;
         ++cuts_[i].age;
-        cuts_[i].strength *= violated[i] ? 0.997 : 0.99;
+        cuts_[i].strength *= violated[i] ? 0.998 : 0.97;
     }
 
     cuts_applied_ += static_cast<int>(selected.size());
@@ -2356,7 +2367,7 @@ void CutPool::manage_pool_size_() {
     std::vector<int> keep_indices;
     keep_indices.reserve(cuts_.size());
     for (int i = 0; i < static_cast<int>(cuts_.size()); ++i) {
-        if (cuts_[i].age <= max_age_ || cuts_[i].strength > 0.25)
+        if (cuts_[i].age <= max_age_ || cuts_[i].strength > 0.35 || cuts_[i].times_used > 0)
             keep_indices.push_back(i);
     }
 
@@ -2367,9 +2378,11 @@ void CutPool::manage_pool_size_() {
     if (keep_indices.size() > static_cast<std::size_t>(max_pool_size_)) {
         std::sort(keep_indices.begin(), keep_indices.end(), [&](int lhs, int rhs) {
             return cut_retention_score_(cuts_[lhs], row_norms_[lhs],
-                                        type_usage_stats_[cuts_[lhs].cut_type]) >
+                                        type_usage_stats_[cuts_[lhs].cut_type],
+                                        cut_age_decay_) >
                    cut_retention_score_(cuts_[rhs], row_norms_[rhs],
-                                        type_usage_stats_[cuts_[rhs].cut_type]);
+                                        type_usage_stats_[cuts_[rhs].cut_type],
+                                        cut_age_decay_);
         });
         keep_indices.resize(max_pool_size_);
     }
@@ -2610,6 +2623,41 @@ bool postprocess_gmi_cut_(const Problem& problem, const Options& options, Cut* c
     if (cut->indices.size() > 128)
         return false;
 
+    return true;
+}
+
+bool strengthen_integral_cut_(const Problem& problem, const Options& options, Cut* cut) {
+    if (cut == nullptr || cut->indices.empty())
+        return false;
+
+    for (int index : cut->indices) {
+        if (index < 0 || index >= static_cast<int>(problem.variable_types.size()))
+            return false;
+        if (problem.variable_types[index] == VariableType::Continuous)
+            return true;
+    }
+
+    scale_integral_support_gmi_cut_(problem, options, cut);
+    return true;
+}
+
+bool postprocess_mir_cut_(const Problem& problem, const Options& options, Cut* cut) {
+    if (cut == nullptr || cut->indices.empty())
+        return false;
+    if (!strengthen_integral_cut_(problem, options, cut))
+        return false;
+    if (!canonicalize_cut(cut, options.min_cut_violation * 1e-3) || cut->indices.empty())
+        return false;
+    return true;
+}
+
+bool postprocess_cover_cut_(const Problem& problem, const Options& options, Cut* cut) {
+    if (cut == nullptr || cut->indices.empty())
+        return false;
+    if (!strengthen_integral_cut_(problem, options, cut))
+        return false;
+    if (!canonicalize_cut(cut, options.min_cut_violation * 1e-3) || cut->indices.empty())
+        return false;
     return true;
 }
 
@@ -3060,7 +3108,7 @@ std::optional<Cut> build_mir_cut_from_canonical_row_(const Problem& problem,
                                           term.substitution, term.shift);
             }
 
-            if (!canonicalize_cut(&cut, options.min_cut_violation * 1e-3) || cut.indices.empty()) {
+            if (!postprocess_mir_cut_(problem, options, &cut) || cut.indices.empty()) {
                 continue;
             }
             const double violation = cut_violation(cut, relaxation.primal);

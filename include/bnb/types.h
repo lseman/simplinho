@@ -204,6 +204,8 @@ struct Options {
     int max_cut_pool_size = 128;      // Reduced from 256 for faster cut management
     double min_cut_violation = 1e-4;
     int max_cut_age = 5;
+    double cut_age_decay = 0.08;             // decay factor used when scoring and retaining cuts
+    double cut_selection_age_bonus = 0.10;    // age bonus factor used when scoring cut candidates
     bool use_gomory_cuts = true;
     bool use_mir_cuts = true; // Enable MIR cuts (more powerful than Gomory cover)
     bool use_cover_cuts = true;

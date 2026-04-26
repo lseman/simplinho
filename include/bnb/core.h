@@ -2704,6 +2704,19 @@ class Solver {
             return solve_relaxation_with_cuts(current_node, {});
         };
 
+        auto tighten_bounds_from_implied_cuts = [&](const std::vector<Cut>& cuts,
+                                                   detail::ActiveNode& current_node) {
+            int tightened_bounds = 0;
+            for (const Cut& cut : cuts) {
+                if (!propagate_row_bounds_(cut.indices, cut.values, cut.rhs, cut.sense,
+                                           &current_node.lower_bounds, &current_node.upper_bounds,
+                                           &tightened_bounds, nullptr, nullptr)) {
+                    return -1;
+                }
+            }
+            return tightened_bounds;
+        };
+
         RelaxationSolution relaxation = current_relaxation(node);
         timing.final_relaxation_objective = relaxation.objective;
         node.basis = relaxation.basis;
@@ -2781,6 +2794,59 @@ class Solver {
                     timing.root_cut_generation_wall_ns +=
                         elapsed_ns_(phase_generation_start, SteadyClock::now());
                     timing.root_cuts_generated += static_cast<int>(phase_generated.size());
+                    if (phase == detail::CutSeparatorPhase::ImpliedBound) {
+                        const int tightened = tighten_bounds_from_implied_cuts(phase_generated, node);
+                        if (tightened < 0) {
+                            update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                tree_node.status = TreeNodeStatus::Infeasible;
+                            });
+                            finalize_node_timing("root_bound_tighten", "infeasible");
+                            return;
+                        }
+                        if (tightened > 0) {
+                            any_cuts_applied = true;
+                            re_solved_with_cuts = true;
+                            const auto resolve_start = SteadyClock::now();
+                            relaxation = current_relaxation(node);
+                            timing.root_cut_resolve_wall_ns +=
+                                elapsed_ns_(resolve_start, SteadyClock::now());
+                            timing.final_relaxation_objective = relaxation.objective;
+                            node.basis = relaxation.basis;
+                            note_lp_work_(relaxation);
+                            const auto cut_estimate = detail::node_estimate(
+                                relaxation, problem_.variable_types, pseudocosts_snapshot_(),
+                                options_.integrality_tol, problem_.maximize);
+                            update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                tree_node.bound = relaxation.objective;
+                                tree_node.estimate = cut_estimate;
+                            });
+                            if (relaxation.status == RelaxationStatus::Unbounded) {
+                                update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                    tree_node.status = TreeNodeStatus::Unbounded;
+                                });
+                                mark_unbounded_();
+                                search_coordinator_.notify_all();
+                                finalize_node_timing("root_bound_tighten", "unbounded");
+                                return;
+                            }
+                            if (relaxation.status == RelaxationStatus::Infeasible) {
+                                update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                    tree_node.status = TreeNodeStatus::Infeasible;
+                                });
+                                finalize_node_timing("root_bound_tighten", "infeasible");
+                                return;
+                            }
+                            const auto incumbent = incumbent_snapshot_();
+                            if (incumbent.has_incumbent &&
+                                bound_prunes_(relaxation.objective, incumbent.objective)) {
+                                update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                    tree_node.status = TreeNodeStatus::PrunedByBound;
+                                });
+                                finalize_node_timing("root_bound_tighten", "pruned_by_bound");
+                                return;
+                            }
+                        }
+                    }
                     for (const Cut& cut : phase_generated) {
                         cut_pool_.add_cut(problem_, cut);
                     }
@@ -2903,6 +2969,70 @@ class Solver {
                     timing.node_cut_generation_wall_ns +=
                         elapsed_ns_(phase_generation_start, SteadyClock::now());
                     timing.node_cuts_generated += static_cast<int>(phase_generated.size());
+                    if (phase == detail::CutSeparatorPhase::ImpliedBound) {
+                        const int tightened = tighten_bounds_from_implied_cuts(phase_generated, node);
+                        if (tightened < 0) {
+                            update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                tree_node.status = TreeNodeStatus::Infeasible;
+                            });
+                            finalize_node_timing("node_bound_tighten", "infeasible");
+                            return;
+                        }
+                        if (tightened > 0) {
+                            any_cuts_applied = true;
+                            const auto resolve_start = SteadyClock::now();
+                            relaxation = solve_relaxation_with_cuts(node, local_cuts);
+                            timing.node_cut_resolve_wall_ns +=
+                                elapsed_ns_(resolve_start, SteadyClock::now());
+                            timing.final_relaxation_objective = relaxation.objective;
+                            node.basis = relaxation.basis;
+                            note_lp_work_(relaxation);
+                            const auto cut_estimate = detail::node_estimate(
+                                relaxation, problem_.variable_types, pseudocosts_snapshot_(),
+                                options_.integrality_tol, problem_.maximize);
+                            update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                tree_node.bound = relaxation.objective;
+                                tree_node.estimate = cut_estimate;
+                            });
+                            if (relaxation.status == RelaxationStatus::Unbounded) {
+                                update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                    tree_node.status = TreeNodeStatus::Unbounded;
+                                });
+                                mark_unbounded_();
+                                search_coordinator_.notify_all();
+                                finalize_node_timing("node_bound_tighten", "unbounded");
+                                return;
+                            }
+                            if (relaxation.status == RelaxationStatus::Infeasible) {
+                                update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                    tree_node.status = TreeNodeStatus::Infeasible;
+                                });
+                                finalize_node_timing("node_bound_tighten", "infeasible");
+                                return;
+                            }
+                            const auto incumbent = incumbent_snapshot_();
+                            if (incumbent.has_incumbent &&
+                                bound_prunes_(relaxation.objective, incumbent.objective)) {
+                                update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                    tree_node.status = TreeNodeStatus::PrunedByBound;
+                                });
+                                finalize_node_timing("node_bound_tighten", "pruned_by_bound");
+                                return;
+                            }
+                            fractional = detail::collect_fractional_candidates(
+                                relaxation.primal, problem_.variable_types, options_.integrality_tol);
+                            if (fractional.empty()) {
+                                timing.fractional_count = 0;
+                                update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                    tree_node.status = TreeNodeStatus::Integral;
+                                });
+                                maybe_update_incumbent_(relaxation.primal, relaxation.objective);
+                                search_coordinator_.notify_all();
+                                finalize_node_timing("node_bound_tighten", "integral");
+                                return;
+                            }
+                        }
+                    }
                     for (const Cut& cut : phase_generated) {
                         cut_pool_.add_cut(problem_, cut);
                     }

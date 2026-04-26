@@ -132,6 +132,8 @@ class CutPool {
     int max_pool_size_ = 256;
     double min_violation_ = 1e-4;
     int max_age_ = 5;
+    double cut_age_decay_ = 0.08;
+    double cut_selection_age_bonus_ = 0.10;
     int max_cuts_per_type_ = 4;
     double max_parallelism_ = 0.98;
     double dynamism_weight_ = 0.15;
