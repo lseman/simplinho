@@ -29,10 +29,13 @@ class FunctionCutSeparator final : public CutSeparator {
     using EnabledFn = std::function<bool(const SeparatorContext&)>;
     using SeparateFn = std::function<std::vector<Cut>(const SeparatorContext&)>;
 
-    FunctionCutSeparator(std::string_view name, EnabledFn enabled, SeparateFn separate)
-        : name_(name), enabled_(std::move(enabled)), separate_(std::move(separate)) {}
+    FunctionCutSeparator(std::string_view name, CutSeparatorPhase phase,
+                         EnabledFn enabled, SeparateFn separate)
+        : name_(name), phase_(phase), enabled_(std::move(enabled)),
+          separate_(std::move(separate)) {}
 
     std::string_view name() const override { return name_; }
+    CutSeparatorPhase phase() const override { return phase_; }
     bool enabled(const SeparatorContext& context) const override { return enabled_(context); }
     std::vector<Cut> separate(const SeparatorContext& context) const override {
         return separate_(context);
@@ -40,6 +43,7 @@ class FunctionCutSeparator final : public CutSeparator {
 
   private:
     std::string name_;
+    CutSeparatorPhase phase_;
     EnabledFn enabled_;
     SeparateFn separate_;
 };
@@ -47,28 +51,10 @@ class FunctionCutSeparator final : public CutSeparator {
 const std::vector<std::unique_ptr<CutSeparator>>& default_cut_separators_() {
     static const std::vector<std::unique_ptr<CutSeparator>> separators = [] {
         std::vector<std::unique_ptr<CutSeparator>> built;
-        built.reserve(6);
+        built.reserve(7);
 
         built.push_back(std::make_unique<FunctionCutSeparator>(
-            "GMI", [](const SeparatorContext& context) { return context.options.use_gomory_cuts; },
-            [](const SeparatorContext& context) {
-                return generate_gomory_cuts(context.problem, context.relaxation, context.options);
-            }));
-
-        built.push_back(std::make_unique<FunctionCutSeparator>(
-            "MIR", [](const SeparatorContext& context) { return context.options.use_mir_cuts; },
-            [](const SeparatorContext& context) {
-                return generate_mir_cuts(context.problem, context.relaxation, context.options);
-            }));
-
-        built.push_back(std::make_unique<FunctionCutSeparator>(
-            "Cover", [](const SeparatorContext& context) { return context.options.use_cover_cuts; },
-            [](const SeparatorContext& context) {
-                return generate_cover_cuts(context.problem, context.relaxation, context.options);
-            }));
-
-        built.push_back(std::make_unique<FunctionCutSeparator>(
-            "ImpliedBound",
+            "ImpliedBound", CutSeparatorPhase::ImpliedBound,
             [](const SeparatorContext& context) { return context.options.use_implied_bound_cuts; },
             [](const SeparatorContext& context) {
                 return generate_implied_bound_cuts(context.problem, context.relaxation,
@@ -76,7 +62,7 @@ const std::vector<std::unique_ptr<CutSeparator>>& default_cut_separators_() {
             }));
 
         built.push_back(std::make_unique<FunctionCutSeparator>(
-            "Clique",
+            "Clique", CutSeparatorPhase::Clique,
             [](const SeparatorContext& context) { return context.options.use_clique_cuts; },
             [](const SeparatorContext& context) {
                 return generate_clique_cuts(context.problem, context.relaxation, context.options,
@@ -84,12 +70,41 @@ const std::vector<std::unique_ptr<CutSeparator>>& default_cut_separators_() {
             }));
 
         built.push_back(std::make_unique<FunctionCutSeparator>(
-            "OddCycle",
+            "OddCycle", CutSeparatorPhase::OddCycle,
             [](const SeparatorContext& context) { return context.options.use_odd_cycle_cuts; },
             [](const SeparatorContext& context) {
                 return generate_odd_cycle_cuts(context.problem, context.relaxation, context.options,
                                                context.learned_implications,
                                                context.structural_cuts);
+            }));
+
+        built.push_back(std::make_unique<FunctionCutSeparator>(
+            "GMI", CutSeparatorPhase::LP,
+            [](const SeparatorContext& context) { return context.options.use_gomory_cuts; },
+            [](const SeparatorContext& context) {
+                return generate_gomory_cuts(context.problem, context.relaxation, context.options);
+            }));
+
+        built.push_back(std::make_unique<FunctionCutSeparator>(
+            "MIR", CutSeparatorPhase::LP,
+            [](const SeparatorContext& context) { return context.options.use_mir_cuts; },
+            [](const SeparatorContext& context) {
+                return generate_mir_cuts(context.problem, context.relaxation, context.options);
+            }));
+
+        built.push_back(std::make_unique<FunctionCutSeparator>(
+            "Cover", CutSeparatorPhase::LP,
+            [](const SeparatorContext& context) { return context.options.use_cover_cuts; },
+            [](const SeparatorContext& context) {
+                return generate_cover_cuts(context.problem, context.relaxation, context.options);
+            }));
+
+        built.push_back(std::make_unique<FunctionCutSeparator>(
+            "DualProof", CutSeparatorPhase::Proof,
+            [](const SeparatorContext& context) { return context.options.use_dual_proof_cuts; },
+            [](const SeparatorContext& context) {
+                return generate_dual_proof_cuts(context.problem, context.relaxation,
+                                                context.options);
             }));
 
         return built;
@@ -1116,13 +1131,11 @@ std::optional<int> binary_literal_from_reason_(const Problem& problem, const Rea
 }
 
 static std::vector<int> collect_implied_literals_(const Problem& problem,
-                                                     const ImplicationStore* learned_implications,
-                                                     const Options& options,
-                                                     int trigger_literal,
-                                                     int max_literal) {
+                                                  const ImplicationStore* learned_implications,
+                                                  const Options& options, int trigger_literal,
+                                                  int max_literal) {
     std::vector<int> implied_literals;
-    if (learned_implications == nullptr || trigger_literal < 0 ||
-        trigger_literal >= max_literal) {
+    if (learned_implications == nullptr || trigger_literal < 0 || trigger_literal >= max_literal) {
         return implied_literals;
     }
 
@@ -1134,8 +1147,7 @@ static std::vector<int> collect_implied_literals_(const Problem& problem,
     while (!stack.empty()) {
         const int literal = stack.back();
         stack.pop_back();
-        for (const ReasonLiteral& consequence :
-             learned_implications->consequences(literal)) {
+        for (const ReasonLiteral& consequence : learned_implications->consequences(literal)) {
             const std::optional<int> consequence_literal =
                 binary_literal_from_reason_(problem, consequence, options.integrality_tol);
             if (!consequence_literal.has_value())
@@ -1162,9 +1174,8 @@ void add_implication_conflicts_(ConflictGraph* graph, const Problem& problem,
         std::min(graph->literal_count(), learned_implications->literal_count());
     bool added = false;
     for (int trigger_literal = 0; trigger_literal < literal_count; ++trigger_literal) {
-        const std::vector<int> implied_literals =
-            collect_implied_literals_(problem, learned_implications, options, trigger_literal,
-                                      literal_count);
+        const std::vector<int> implied_literals = collect_implied_literals_(
+            problem, learned_implications, options, trigger_literal, literal_count);
         for (int consequence_literal : implied_literals) {
             graph->add_implication(trigger_literal, consequence_literal);
             added = true;
@@ -1544,7 +1555,8 @@ void append_implied_bound_cuts_from_leq_(const Problem& problem, const std::vect
                 continue;
 
             const bool tighten_upper = x_coeff > 0.0;
-            const double x_bound = tighten_upper ? problem.upper_bounds(x) : problem.lower_bounds(x);
+            const double x_bound =
+                tighten_upper ? problem.upper_bounds(x) : problem.lower_bounds(x);
             if (!std::isfinite(x_bound))
                 continue;
 
@@ -2338,7 +2350,7 @@ void CutPool::manage_pool_size_() {
     detail::LockTrace lock_trace("cuts_mutex_");
     std::unique_lock<std::shared_mutex> lock(cuts_mutex_);
     lock_trace.acquired_lock();
-    if (cuts_.size() <= static_cast<std::size_t>(max_pool_size_))
+    if (cuts_.empty())
         return;
 
     std::vector<int> keep_indices;
@@ -2348,6 +2360,10 @@ void CutPool::manage_pool_size_() {
             keep_indices.push_back(i);
     }
 
+    if (keep_indices.size() == cuts_.size() &&
+        cuts_.size() <= static_cast<std::size_t>(max_pool_size_)) {
+        return;
+    }
     if (keep_indices.size() > static_cast<std::size_t>(max_pool_size_)) {
         std::sort(keep_indices.begin(), keep_indices.end(), [&](int lhs, int rhs) {
             return cut_retention_score_(cuts_[lhs], row_norms_[lhs],
@@ -2376,6 +2392,8 @@ void CutPool::manage_pool_size_() {
     for (int i = 0; i < static_cast<int>(cuts_.size()); ++i)
         support_buckets_[support_signature_(cuts_[i])].push_back(i);
 }
+
+void CutPool::perform_aging() { manage_pool_size_(); }
 
 namespace {
 
@@ -3945,32 +3963,85 @@ std::vector<Cut> generate_cuts(const Problem& problem, const RelaxationSolution&
     };
 
     const auto& separators = default_cut_separators_();
-    std::vector<const CutSeparator*> enabled_separators;
-    enabled_separators.reserve(separators.size());
-    for (const auto& separator : separators) {
-        if (separator == nullptr || !separator->enabled(context))
-            continue;
-        enabled_separators.push_back(separator.get());
-    }
-
     std::vector<Cut> cuts;
-    if (enabled_separators.empty()) {
-        return cuts;
+    const std::array<CutSeparatorPhase, 5> phase_order = {
+        CutSeparatorPhase::ImpliedBound,
+        CutSeparatorPhase::Clique,
+        CutSeparatorPhase::OddCycle,
+        CutSeparatorPhase::LP,
+        CutSeparatorPhase::Proof,
+    };
+
+    for (CutSeparatorPhase phase : phase_order) {
+        std::vector<const CutSeparator*> phase_separators;
+        for (const auto& separator : separators) {
+            if (separator == nullptr || separator->phase() != phase ||
+                !separator->enabled(context)) {
+                continue;
+            }
+            phase_separators.push_back(separator.get());
+        }
+
+        if (phase_separators.empty())
+            continue;
+
+        if (options.parallel_workers > 1 && phase_separators.size() > 1) {
+            const int worker_count = std::min<int>(options.parallel_workers,
+                                                   phase_separators.size());
+            detail::ParallelDispatcher dispatcher(worker_count);
+            std::vector<std::vector<Cut>> family_cuts(phase_separators.size());
+            dispatcher.run(static_cast<int>(phase_separators.size()), [&](int index) {
+                family_cuts[index] = phase_separators[index]->separate(context);
+            });
+            for (auto& separator_cuts : family_cuts) {
+                cuts.insert(cuts.end(), std::make_move_iterator(separator_cuts.begin()),
+                            std::make_move_iterator(separator_cuts.end()));
+            }
+        } else {
+            for (const CutSeparator* separator : phase_separators) {
+                std::vector<Cut> family_cuts = separator->separate(context);
+                cuts.insert(cuts.end(), std::make_move_iterator(family_cuts.begin()),
+                            std::make_move_iterator(family_cuts.end()));
+            }
+        }
+    }
+    return filter_generated_cuts_(std::move(cuts), problem, relaxation, options);
+}
+
+std::vector<Cut> generate_cuts(const Problem& problem, const RelaxationSolution& relaxation,
+                               const Options& options, CutSeparatorPhase phase,
+                               const ImplicationStore* learned_implications,
+                               const std::vector<Cut>* structural_cuts) {
+    const SeparatorContext context{problem, relaxation, options, learned_implications,
+                                   structural_cuts};
+    const auto& separators = default_cut_separators_();
+    std::vector<Cut> cuts;
+    std::vector<const CutSeparator*> phase_separators;
+    for (const auto& separator : separators) {
+        if (separator == nullptr || separator->phase() != phase ||
+            !separator->enabled(context)) {
+            continue;
+        }
+        phase_separators.push_back(separator.get());
     }
 
-    if (options.parallel_workers > 1 && enabled_separators.size() > 1) {
-        const int worker_count = std::min<int>(options.parallel_workers, enabled_separators.size());
-        detail::ParallelDispatcher dispatcher(worker_count);
-        std::vector<std::vector<Cut>> family_cuts(enabled_separators.size());
-        dispatcher.run(static_cast<int>(enabled_separators.size()), [&](int index) {
-            family_cuts[index] = enabled_separators[index]->separate(context);
+    if (phase_separators.empty())
+        return {};
+
+    if (options.parallel_workers > 1 && phase_separators.size() > 1) {
+        const int worker_count = std::min<int>(options.parallel_workers,
+                                               phase_separators.size());
+        ParallelDispatcher dispatcher(worker_count);
+        std::vector<std::vector<Cut>> family_cuts(phase_separators.size());
+        dispatcher.run(static_cast<int>(phase_separators.size()), [&](int index) {
+            family_cuts[index] = phase_separators[index]->separate(context);
         });
         for (auto& separator_cuts : family_cuts) {
             cuts.insert(cuts.end(), std::make_move_iterator(separator_cuts.begin()),
                         std::make_move_iterator(separator_cuts.end()));
         }
     } else {
-        for (const CutSeparator* separator : enabled_separators) {
+        for (const CutSeparator* separator : phase_separators) {
             std::vector<Cut> family_cuts = separator->separate(context);
             cuts.insert(cuts.end(), std::make_move_iterator(family_cuts.begin()),
                         std::make_move_iterator(family_cuts.end()));

@@ -111,6 +111,7 @@ class RevisedSimplex {
     LPSolution solve(const Eigen::MatrixXd& A_in, const Eigen::VectorXd& b_in,
                      const Eigen::VectorXd& c_in,
                      std::optional<std::vector<int>> basis_opt = std::nullopt) {
+        trace_line_("[solve dense] disable_presolve=" + std::to_string(opt_.disable_presolve));
         const int n = static_cast<int>(A_in.cols());
         const LPBasis* implicit_basis = nullptr;
         if (!basis_opt && has_cached_basis_state(A_in)) {
@@ -141,7 +142,9 @@ class RevisedSimplex {
                      std::optional<std::vector<int>> basis_opt = std::nullopt) {
         const int n = static_cast<int>(A_in.cols());
         const LPBasis* implicit_basis = nullptr;
-        if (!basis_opt && has_cached_basis_state(A_in)) {
+        const Eigen::VectorXd default_l = Eigen::VectorXd::Zero(n);
+        const Eigen::VectorXd default_u = Eigen::VectorXd::Constant(n, presolve::inf());
+        if (!basis_opt && has_cached_basis_state(A_in) && cached_basis_bounds_match_(l_in, u_in)) {
             implicit_basis = &*cached_basis_state_;
         }
         LPSolution sol = solve_impl_(A_in, b_in, c_in, l_in, u_in, basis_opt, implicit_basis);
@@ -160,9 +163,13 @@ class RevisedSimplex {
     LPSolution solve(const SparseMatrix& A_in, const Eigen::VectorXd& b_in,
                      const Eigen::VectorXd& c_in,
                      std::optional<std::vector<int>> basis_opt = std::nullopt) {
+        trace_line_("[solve sparse] disable_presolve=" + std::to_string(opt_.disable_presolve));
         const int n = static_cast<int>(A_in.cols());
         const LPBasis* implicit_basis = nullptr;
-        if (!basis_opt && has_cached_basis_state(A_in)) {
+        const Eigen::VectorXd default_l = Eigen::VectorXd::Zero(n);
+        const Eigen::VectorXd default_u = Eigen::VectorXd::Constant(n, presolve::inf());
+        if (!basis_opt && has_cached_basis_state(A_in) &&
+            cached_basis_bounds_match_(default_l, default_u)) {
             implicit_basis = &*cached_basis_state_;
         }
         LPSolution sol = solve_impl_sparse_(A_in, b_in, c_in, Eigen::VectorXd::Zero(n),
@@ -190,7 +197,7 @@ class RevisedSimplex {
                      std::optional<std::vector<int>> basis_opt = std::nullopt) {
         const int n = static_cast<int>(A_in.cols());
         const LPBasis* implicit_basis = nullptr;
-        if (!basis_opt && has_cached_basis_state(A_in)) {
+        if (!basis_opt && has_cached_basis_state(A_in) && cached_basis_bounds_match_(l_in, u_in)) {
             implicit_basis = &*cached_basis_state_;
         }
         LPSolution sol =
@@ -212,6 +219,21 @@ class RevisedSimplex {
         cached_basis_state_.reset();
         cached_basis_rows_ = -1;
         cached_basis_cols_ = -1;
+        cached_basis_l_.resize(0);
+        cached_basis_u_.resize(0);
+    }
+
+    bool cached_basis_bounds_match_(const Eigen::VectorXd& l,
+                                    const Eigen::VectorXd& u) const noexcept {
+        if (cached_basis_l_.size() != l.size() || cached_basis_u_.size() != u.size()) {
+            return false;
+        }
+        for (int j = 0; j < l.size(); ++j) {
+            if (cached_basis_l_(j) != l(j) || cached_basis_u_(j) != u(j)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     bool has_cached_basis_state(int rows, int cols) const noexcept {
@@ -227,9 +249,7 @@ class RevisedSimplex {
         opt_.objective_bound_internal = bound;
     }
 
-    double objective_bound_internal() const noexcept {
-        return opt_.objective_bound_internal;
-    }
+    double objective_bound_internal() const noexcept { return opt_.objective_bound_internal; }
 
   private:
     LPSolution solve_impl_(const Eigen::MatrixXd& A_in, const Eigen::VectorXd& b_in,
@@ -250,6 +270,7 @@ class RevisedSimplex {
                      basis_state_opt);
 
         trace_line_("[solve] start m=" + std::to_string(A_in.rows()) + " n=" + std::to_string(n));
+        trace_line_("[solve] disable_presolve=" + std::to_string(opt_.disable_presolve));
 
         const auto sanitized_bounds = canonicalize_inactive_huge_bounds_(A_in, b_in, l_in, u_in);
         const Eigen::VectorXd& l_use = sanitized_bounds.l;
@@ -459,7 +480,10 @@ class RevisedSimplex {
                     : (opt_.mode == SimplexMode::Primal ? "primal" : "auto");
             auto solve_reformulated = [&](SimplexMode mode) {
                 RevisedSimplexOptions solve_opt = opt_;
-                solve_opt.mode = mode;
+                solve_opt.mode = (mode == SimplexMode::Auto ? SimplexMode::Primal : mode);
+                solve_opt.disable_presolve = true;
+                trace_line_("[solve_reformulated] disable_presolve=" +
+                            std::to_string(solve_opt.disable_presolve));
                 RevisedSimplex reformulated_solver(solve_opt);
                 return basis_state_std ? reformulated_solver.solve(A_std, b_std, c_std, l_std,
                                                                    u_std, *basis_state_std)
@@ -644,6 +668,16 @@ class RevisedSimplex {
         popt.max_passes = warm_start_requested ? 0 : 8;
         popt.probing_max_rounds = warm_start_requested ? 0 : 1;
         popt.probing_max_vars = warm_start_requested ? 0 : 8;
+        if (opt_.disable_presolve) {
+            trace_line_("[solve] disable_presolve=1");
+            popt.enable_rowreduce = false;
+            popt.enable_scaling = false;
+            popt.enable_col_scaling = false;
+            popt.enable_objective_probing = false;
+            popt.max_passes = 0;
+            popt.probing_max_rounds = 0;
+            popt.probing_max_vars = 0;
+        }
         if (A_in.cols() > static_cast<int>(A_in.rows() * 1.2)) {
             popt.conservative_mode = true;
         }
@@ -953,8 +987,7 @@ class RevisedSimplex {
             }
 
             if (st == LPSolution::Status::Optimal || st == LPSolution::Status::Unbounded ||
-                st == LPSolution::Status::IterLimit ||
-                st == LPSolution::Status::ObjectiveBound ||
+                st == LPSolution::Status::IterLimit || st == LPSolution::Status::ObjectiveBound ||
                 (st == LPSolution::Status::Infeasible && !basis_guess_from_warm_start)) {
                 auto [z_full, obj_corr] = postsolve_primal(v2);
                 Eigen::VectorXd x_full = anchor + sign.cwiseProduct(z_full);
@@ -2550,6 +2583,8 @@ class RevisedSimplex {
                 cached_basis_cols_ = cols;
                 cached_matrix_signature_ = current_matrix_signature_;
                 cached_matrix_is_sparse_ = current_matrix_is_sparse_;
+                cached_basis_l_ = l;
+                cached_basis_u_ = u;
                 return;
             }
         }
@@ -2559,6 +2594,8 @@ class RevisedSimplex {
             cached_basis_cols_ = cols;
             cached_matrix_signature_ = current_matrix_signature_;
             cached_matrix_is_sparse_ = current_matrix_is_sparse_;
+            cached_basis_l_ = l;
+            cached_basis_u_ = u;
         } else {
             clear_basis_cache();
         }
@@ -2886,6 +2923,8 @@ class RevisedSimplex {
     std::optional<LPBasis> cached_basis_state_;
     int cached_basis_rows_ = -1;
     int cached_basis_cols_ = -1;
+    Eigen::VectorXd cached_basis_l_;
+    Eigen::VectorXd cached_basis_u_;
     std::uint64_t cached_matrix_signature_ = 0;
     bool cached_matrix_is_sparse_ = false;
     std::uint64_t current_matrix_signature_ = 0;
@@ -2932,6 +2971,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     begin_solve_(matrix_signature_(A_in), m_in, n, true, basis_state_opt);
 
     trace_line_("[solve] sparse start m=" + std::to_string(m_in) + " n=" + std::to_string(n));
+    trace_line_("[solve] sparse disable_presolve=" + std::to_string(opt_.disable_presolve));
 
     const auto sanitized_bounds = canonicalize_inactive_huge_bounds_(A_in, b_in, l_in, u_in);
     const Eigen::VectorXd& l_use = sanitized_bounds.l;
@@ -2966,7 +3006,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     const bool has_warm_basis_for_dual = opt_.mode == SimplexMode::Dual && basis_state_opt &&
                                          !basis_state_opt->column_status.empty();
 
-    if (!is_nonnegative_standard && !has_warm_basis_for_dual) {
+    if (!is_nonnegative_standard) {
         struct ReformVar {
             int y = -1;
             int y_pos = -1;
@@ -2978,9 +3018,8 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             bool has_upper_row = false;
         };
 
-        const bool cache_reuse =
-            sparse_bound_only_cache_.same_problem(A_in, b_in, c_in) &&
-            sparse_bound_only_cache_.orientation_matches(l_use, u_use);
+        const bool cache_reuse = sparse_bound_only_cache_.same_problem(A_in, b_in, c_in) &&
+                                 sparse_bound_only_cache_.orientation_matches(l_use, u_use);
         std::vector<ReformVar> map(n);
         std::vector<int> single_y(n, -1);
         std::vector<int> upper_slack(n, -1);
@@ -3181,12 +3220,16 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 : (opt_.mode == SimplexMode::Primal ? "primal" : "auto");
         auto solve_reformulated = [&](SimplexMode mode) {
             RevisedSimplexOptions solve_opt = opt_;
-            solve_opt.mode = mode;
+            solve_opt.mode = (mode == SimplexMode::Auto ? SimplexMode::Primal : mode);
+            solve_opt.disable_presolve = true;
+            trace_line_("[solve_reformulated] disable_presolve=" +
+                        std::to_string(solve_opt.disable_presolve));
             RevisedSimplex reformulated_solver(solve_opt);
-            return basis_state_std
-                       ? reformulated_solver.solve(A_std, b_std, c_std, l_std, u_std,
-                                                   *basis_state_std)
-                       : reformulated_solver.solve(A_std, b_std, c_std, l_std, u_std, basis_std);
+            const RevisedSimplex::SparseMatrix& A_std_sparse = A_std;
+            return basis_state_std ? reformulated_solver.solve(A_std_sparse, b_std, c_std, l_std,
+                                                               u_std, *basis_state_std)
+                                   : reformulated_solver.solve(A_std_sparse, b_std, c_std, l_std,
+                                                               u_std, basis_std);
         };
         try {
             std_sol = solve_reformulated(use_dual_first ? SimplexMode::Dual : opt_.mode);

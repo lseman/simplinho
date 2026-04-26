@@ -50,10 +50,19 @@ struct SeparatorContext {
     }
 };
 
+enum class CutSeparatorPhase {
+    ImpliedBound,
+    Clique,
+    OddCycle,
+    LP,
+    Proof,
+};
+
 class CutSeparator {
   public:
     virtual ~CutSeparator() = default;
     virtual std::string_view name() const = 0;
+    virtual CutSeparatorPhase phase() const = 0;
     virtual bool enabled(const SeparatorContext& context) const = 0;
     virtual std::vector<Cut> separate(const SeparatorContext& context) const = 0;
 };
@@ -92,6 +101,8 @@ class CutPool {
                                           double density_penalty_scale = 1.0);
 
     void reset(const Options& options);
+
+    void perform_aging();
 
     int cuts_generated() const { return cuts_generated_; }
     int cuts_applied() const { return cuts_applied_; }
@@ -177,6 +188,11 @@ std::vector<Cut> generate_dual_proof_cuts(const Problem& problem,
 
 std::vector<Cut> generate_cuts(const Problem& problem, const RelaxationSolution& relaxation,
                                const Options& options,
+                               const ImplicationStore* learned_implications = nullptr,
+                               const std::vector<Cut>* structural_cuts = nullptr);
+
+std::vector<Cut> generate_cuts(const Problem& problem, const RelaxationSolution& relaxation,
+                               const Options& options, CutSeparatorPhase phase,
                                const ImplicationStore* learned_implications = nullptr,
                                const std::vector<Cut>* structural_cuts = nullptr);
 

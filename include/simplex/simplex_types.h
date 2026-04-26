@@ -33,17 +33,17 @@ struct RevisedSimplexTiming {
 // identify wasted work (full refactorizations, DSE rebuilds) that should have
 // been avoided via warm-start reuse.
 struct LPSolveStats {
-    int refactorizations = 0;       // full LU rebuilds (dense_refactor_/sparse_refactor_)
-    int eta_stack_depth_entry = 0;  // inherited FT/eta depth when the solve started
-    int ft_updates = 0;             // final FT/eta chain length at end of solve
-    int dual_pool_builds = 0;       // full DSE/Devex weight rebuilds
-    int primal_pool_builds = 0;     // full primal edge-weight rebuilds
-    int warm_start_attempted = 0;   // 0/1: a prior basis was supplied
-    int warm_start_accepted = 0;    // 0/1: warm basis was used to seed the pivot loop
-    int warm_start_cold_retry = 0;  // 0/1: warm basis failed, fell back to cold start
-    int warm_factorization_reused = 0; // 0/1: reused cached LU/eta state
-    int warm_dual_weights_reused = 0;  // 0/1: reused cached dual pricing weights
-    std::uint64_t lu_build_ns = 0;  // cumulative time in refactor calls
+    int refactorizations = 0;           // full LU rebuilds (dense_refactor_/sparse_refactor_)
+    int eta_stack_depth_entry = 0;      // inherited FT/eta depth when the solve started
+    int ft_updates = 0;                 // final FT/eta chain length at end of solve
+    int dual_pool_builds = 0;           // full DSE/Devex weight rebuilds
+    int primal_pool_builds = 0;         // full primal edge-weight rebuilds
+    int warm_start_attempted = 0;       // 0/1: a prior basis was supplied
+    int warm_start_accepted = 0;        // 0/1: warm basis was used to seed the pivot loop
+    int warm_start_cold_retry = 0;      // 0/1: warm basis failed, fell back to cold start
+    int warm_factorization_reused = 0;  // 0/1: reused cached LU/eta state
+    int warm_dual_weights_reused = 0;   // 0/1: reused cached dual pricing weights
+    std::uint64_t lu_build_ns = 0;      // cumulative time in refactor calls
     std::uint64_t pricing_build_ns = 0; // cumulative time in build_*_pool calls
     std::uint64_t pivot_ns = 0;         // cumulative time in basis update / pivot maintenance
 };
@@ -208,4 +208,5 @@ struct RevisedSimplexOptions {
     int verbose_every = 1;
     bool verbose_include_basis = true;
     bool verbose_include_presolve = true;
+    bool disable_presolve = false;
 };

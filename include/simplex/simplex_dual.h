@@ -461,13 +461,12 @@ class RevisedSimplexDualEngine {
         const bool warm_views_provided =
             warm_status && warm_status->size() == static_cast<std::size_t>(n);
         self.bridge_.reset();
-        DualAdaptivePricer dual_pricer(self.opt_.pricing_rule, self.opt_.devex_reset,
-                                       self.opt_.adaptive_reset_freq, self.opt_.partial_pricing,
-                                       self.opt_.dual_pricing, self.opt_.row_pricing_threshold,
-                                       self.opt_.dual_edge_weight_strategy,
-                                       self.opt_.dual_steepest_edge_weight_log_error_threshold,
-                                       self.opt_.dual_warm_start_near_optimal,
-                                       RevisedSimplex::find_logical_basis_(A).empty());
+        DualAdaptivePricer dual_pricer(
+            self.opt_.pricing_rule, self.opt_.devex_reset, self.opt_.adaptive_reset_freq,
+            self.opt_.partial_pricing, self.opt_.dual_pricing, self.opt_.row_pricing_threshold,
+            self.opt_.dual_edge_weight_strategy,
+            self.opt_.dual_steepest_edge_weight_log_error_threshold,
+            self.opt_.dual_warm_start_near_optimal, RevisedSimplex::find_logical_basis_(A).empty());
 
         MatrixType Ahat = signed_matrix_copy(A, view);
         std::optional<SparseRowMatrix> Ahat_row;
@@ -1009,12 +1008,11 @@ class RevisedSimplexDualEngine {
             // handful of times before they're optimal or pruned; perturbing
             // their costs only adds a cleanup pass that the bailout check
             // makes irrelevant.
-            const bool suppress_perturbation =
-                self.opt_.dual_suppress_perturbation_when_warm &&
-                std::isfinite(self.opt_.objective_bound_internal);
-            if (!suppress_perturbation && (basis_cycle.cycling_detected ||
-                                           (is_degenerate &&
-                                            self.degen_.should_apply_perturbation()))) {
+            const bool suppress_perturbation = self.opt_.dual_suppress_perturbation_when_warm &&
+                                               std::isfinite(self.opt_.objective_bound_internal);
+            if (!suppress_perturbation &&
+                (basis_cycle.cycling_detected ||
+                 (is_degenerate && self.degen_.should_apply_perturbation()))) {
                 if (!costs_perturbed) {
                     const double rel_multiplier =
                         1e-8 * std::max(1e-6, self.opt_.dual_simplex_cost_perturbation_multiplier);
@@ -1111,10 +1109,10 @@ class RevisedSimplexDualEngine {
                     info_map["dual_bfrt_flips"] = std::to_string(total_flips);
                     info_map["objective_bound_bailout"] = "1";
                     info_map["objective_bound_bailout_obj"] = std::to_string(obj_check);
-                    self.trace_line_("[dual] objective-bound bailout iter=" +
-                                     std::to_string(iters) + " obj=" + std::to_string(obj_check) +
-                                     " bound=" +
-                                     std::to_string(self.opt_.objective_bound_internal));
+                    self.trace_line_(
+                        "[dual] objective-bound bailout iter=" + std::to_string(iters) +
+                        " obj=" + std::to_string(obj_check) +
+                        " bound=" + std::to_string(self.opt_.objective_bound_internal));
                     self.remember_warm_state_(basis, basis_factorization);
                     return {LPSolution::Status::ObjectiveBound, std::move(x_check), basis, iters,
                             std::move(info_map)};

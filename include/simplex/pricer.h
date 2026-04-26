@@ -79,8 +79,7 @@ inline double column_dot(const MatrixLike& A, int j, const Eigen::VectorXd& v) {
     return A.col(j).dot(v);
 }
 
-template <class MatrixLike>
-inline double column_dot(const MatrixLike& A, int j, const HVector& v) {
+template <class MatrixLike> inline double column_dot(const MatrixLike& A, int j, const HVector& v) {
     if (!v.has_pattern())
         return column_dot(A, j, v.value);
 
@@ -127,8 +126,7 @@ inline HVector pivot_column_delta(const HVector& s, int leave_rel) {
         present[static_cast<std::size_t>(i)] = 1;
         out.index.push_back(i);
     }
-    if (leave_rel >= 0 && leave_rel < s.size() &&
-        !present[static_cast<std::size_t>(leave_rel)]) {
+    if (leave_rel >= 0 && leave_rel < s.size() && !present[static_cast<std::size_t>(leave_rel)]) {
         out.index.push_back(leave_rel);
     }
     out.count = static_cast<int>(out.index.size());
@@ -859,8 +857,7 @@ class DualSteepestEdgePricer {
     template <class MatrixLike>
     void update_after_dual_pivot(int leave_rel, int e_abs, int old_abs, const HVector& s,
                                  double alpha, const MatrixLike& A, const std::vector<int>& /*N*/,
-                                 const HVector& dual_row,
-                                 bool insert_leaver_into_pool = true) {
+                                 const HVector& dual_row, bool insert_leaver_into_pool = true) {
         if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol) {
             need_rebuild_ = true;
             return;
@@ -902,8 +899,7 @@ class DualSteepestEdgePricer {
                 std::vector<char> seen(row_pool_.size(), 0);
                 for (int k = 0; k < s.count; ++k) {
                     const int i = s.index[k];
-                    if (i < 0 || i >= (int)row_pool_.size() ||
-                        seen[static_cast<std::size_t>(i)])
+                    if (i < 0 || i >= (int)row_pool_.size() || seen[static_cast<std::size_t>(i)])
                         continue;
                     seen[static_cast<std::size_t>(i)] = 1;
                     update_row(i);
@@ -1072,7 +1068,8 @@ class DualDevexPricer {
         : threshold_(threshold), reset_freq_(reset_frequency) {}
 
     template <class BasisLike, class MatrixLike>
-    void build_dual_pool(const BasisLike& /*B*/, const MatrixLike& A, const std::vector<int>& /*N*/) {
+    void build_dual_pool(const BasisLike& /*B*/, const MatrixLike& A,
+                         const std::vector<int>& /*N*/) {
         row_weights_.assign(A.rows(), 1.0);
         iter_count_ = 0;
         no_improvement_count_ = 0;
@@ -1105,8 +1102,8 @@ class DualDevexPricer {
     }
 
     template <class MatrixLike>
-    void update_after_dual_pivot(int leave_rel, int /*e_abs*/, int /*old_abs*/,
-                                 const HVector& s, double alpha, const MatrixLike& /*A*/,
+    void update_after_dual_pivot(int leave_rel, int /*e_abs*/, int /*old_abs*/, const HVector& s,
+                                 double alpha, const MatrixLike& /*A*/,
                                  const std::vector<int>& /*N*/, const HVector& /*dual_row*/,
                                  bool /*insert_leaver_into_pool*/ = true) {
         if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol) {
@@ -1266,9 +1263,8 @@ class DualRowPricer {
 
     template <class MatrixLike>
     void update_after_dual_pivot(int /*leave_rel*/, int /*e_abs*/, int /*old_abs*/,
-                                 const HVector& /*s*/, double alpha,
-                                 const MatrixLike& /*A*/, const std::vector<int>& /*N*/,
-                                 const HVector& /*dual_row*/,
+                                 const HVector& /*s*/, double alpha, const MatrixLike& /*A*/,
+                                 const std::vector<int>& /*N*/, const HVector& /*dual_row*/,
                                  bool /*insert_leaver_into_pool*/ = true) {
         ++iter_count_;
         if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol || iter_count_ >= reset_freq_) {
@@ -1278,7 +1274,9 @@ class DualRowPricer {
 
     bool needs_rebuild() const { return need_rebuild_; }
     void clear_rebuild_flag() { need_rebuild_ = false; }
-    WarmStartState export_state() const { return WarmStartState{row_weights_, prefer_row_pricing_}; }
+    WarmStartState export_state() const {
+        return WarmStartState{row_weights_, prefer_row_pricing_};
+    }
     bool import_state(const WarmStartState& state, int rows) {
         if (rows < 0 || static_cast<int>(state.row_weights.size()) != rows ||
             static_cast<int>(state.prefer_row_pricing.size()) != rows) {
@@ -1480,8 +1478,7 @@ class DualAdaptivePricer {
     template <class MatrixLike>
     void update_after_dual_pivot(int leave_rel, int e_abs, int old_abs, const HVector& s,
                                  double alpha, const MatrixLike& A, const std::vector<int>& N,
-                                 const HVector& dual_row,
-                                 bool insert_leaver_into_pool = true) {
+                                 const HVector& dual_row, bool insert_leaver_into_pool = true) {
         switch (active_rule_) {
             case Rule::SteepestEdge:
                 steepest_pricer_.update_after_dual_pivot(leave_rel, e_abs, old_abs, s, alpha, A, N,

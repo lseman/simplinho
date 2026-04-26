@@ -1376,9 +1376,7 @@ class MIPSolution {
     int lp_dual_pool_builds() const { return lp_dual_pool_builds_; }
     int lp_primal_pool_builds() const { return lp_primal_pool_builds_; }
     int lp_warm_factorization_reuse_count() const { return lp_warm_factorization_reuse_count_; }
-    int lp_warm_dual_weights_reuse_count() const {
-        return lp_warm_dual_weights_reuse_count_;
-    }
+    int lp_warm_dual_weights_reuse_count() const { return lp_warm_dual_weights_reuse_count_; }
     int strong_branching_probe_count() const { return strong_branching_probe_count_; }
     int strong_branching_probe_iterations() const { return strong_branching_probe_iterations_; }
     std::uint64_t relaxation_core_solve_time_ns() const { return relaxation_core_solve_time_ns_; }
@@ -1396,9 +1394,7 @@ class MIPSolution {
         return relaxation_lp_internal_serialize_ns_;
     }
     std::uint64_t relaxation_lp_lu_build_ns() const { return relaxation_lp_lu_build_ns_; }
-    std::uint64_t relaxation_lp_pricing_build_ns() const {
-        return relaxation_lp_pricing_build_ns_;
-    }
+    std::uint64_t relaxation_lp_pricing_build_ns() const { return relaxation_lp_pricing_build_ns_; }
     std::uint64_t relaxation_lp_pivot_ns() const { return relaxation_lp_pivot_ns_; }
     std::uint64_t strong_branching_probe_core_solve_time_ns() const {
         return strong_branching_probe_core_solve_time_ns_;
@@ -2118,10 +2114,10 @@ class Model {
                        sol->status == LPSolution::Status::NeedPhase1;
             }
 
-            simplex_bnb::RelaxationSolution solve_node(
-                const Eigen::VectorXd& node_l, const Eigen::VectorXd& node_u,
-                const std::vector<simplex_bnb::Cut>& cuts, const LPBasis* parent_basis,
-                double objective_bound_internal = std::numeric_limits<double>::infinity()) {
+            simplex_bnb::RelaxationSolution
+            solve_node(const Eigen::VectorXd& node_l, const Eigen::VectorXd& node_u,
+                       const std::vector<simplex_bnb::Cut>& cuts, const LPBasis* parent_basis,
+                       double objective_bound_internal = std::numeric_limits<double>::infinity()) {
                 const auto t0_assembly = std::chrono::steady_clock::now();
                 const NodeLPSolverView entry = get_node_lp_entry(cuts);
                 // HiGHS-style objective-bound bailout: tell every solver in the
@@ -2130,8 +2126,8 @@ class Model {
                 entry.cold_solver->set_objective_bound_internal(objective_bound_internal);
                 entry.warm_solver->set_objective_bound_internal(objective_bound_internal);
                 if (entry.fallback_solver->has_value()) {
-                    (*entry.fallback_solver)->set_objective_bound_internal(
-                        objective_bound_internal);
+                    (*entry.fallback_solver)
+                        ->set_objective_bound_internal(objective_bound_internal);
                 }
                 const auto t1_assembly = std::chrono::steady_clock::now();
                 const ModelLPData& node_data = *entry.lp_data;
@@ -2160,9 +2156,9 @@ class Model {
                     attach_basis(*parent_basis)) {
                     warm_start_source = WarmStartSource::ParentBasis;
                 } else if (parent_basis && entry.root_warm_start_fallback->allow_parent_basis) {
-                    effective_basis_state = adapt_warm_start_basis_state(
-                        std::optional<LPBasis>(*parent_basis), node_data.total_vars,
-                        node_data.rows);
+                    effective_basis_state =
+                        adapt_warm_start_basis_state(std::optional<LPBasis>(*parent_basis),
+                                                     node_data.total_vars, node_data.rows);
                     if (effective_basis_state.has_value()) {
                         effective_basis = &*effective_basis_state;
                         warm_start_source = WarmStartSource::ParentBasis;
@@ -2173,8 +2169,7 @@ class Model {
                         warm_start_source = WarmStartSource::RootBasisState;
                     } else {
                         effective_basis_state = adapt_warm_start_basis_state(
-                            node_data.warm_start_basis_state, node_data.total_vars,
-                            node_data.rows);
+                            node_data.warm_start_basis_state, node_data.total_vars, node_data.rows);
                         if (effective_basis_state.has_value()) {
                             effective_basis = &*effective_basis_state;
                             warm_start_source = WarmStartSource::RootBasisState;
@@ -3241,12 +3236,10 @@ void bind_model_bindings(py::module_& m) {
                                &MIPSolution::relaxation_lp_internal_iters_ns)
         .def_property_readonly("relaxation_lp_internal_serialize_ns",
                                &MIPSolution::relaxation_lp_internal_serialize_ns)
-        .def_property_readonly("relaxation_lp_lu_build_ns",
-                               &MIPSolution::relaxation_lp_lu_build_ns)
+        .def_property_readonly("relaxation_lp_lu_build_ns", &MIPSolution::relaxation_lp_lu_build_ns)
         .def_property_readonly("relaxation_lp_pricing_build_ns",
                                &MIPSolution::relaxation_lp_pricing_build_ns)
-        .def_property_readonly("relaxation_lp_pivot_ns",
-                               &MIPSolution::relaxation_lp_pivot_ns)
+        .def_property_readonly("relaxation_lp_pivot_ns", &MIPSolution::relaxation_lp_pivot_ns)
         .def_property_readonly("strong_branching_probe_core_solve_time_ns",
                                &MIPSolution::strong_branching_probe_core_solve_time_ns)
         .def_property_readonly("strong_branching_probe_lp_assembly_time_ns",

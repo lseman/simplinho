@@ -83,6 +83,72 @@ class SparseSimplexApiTests(unittest.TestCase):
         self.assertEqual(simplinho.status_to_string(second.status), "optimal")
         self.assertEqual(second.info.get("sparse_pipeline"), "1")
 
+    def test_sparse_matrix_reformulated_finite_bounds_with_auto_mode(self):
+        A = sp.csc_matrix(
+            [
+                [
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.1,
+                    1.1,
+                    1.1,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ]
+            ]
+        )
+        b = np.array([10.0], dtype=float)
+        c = np.array(
+            [
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                1.1,
+                1.1,
+                1.1,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            dtype=float,
+        )
+        l = np.zeros(20, dtype=float)
+        u = np.array([1.0] * 11 + [np.inf] * 9, dtype=float)
+
+        options = simplinho.RevisedSimplexOptions()
+        options.mode = simplinho.SimplexMode.Auto
+
+        solver = simplinho.RevisedSimplex(options)
+        sol = solver.solve(A, b, c, l, u)
+
+        self.assertEqual(simplinho.status_to_string(sol.status), "optimal")
+        self.assertTrue(math.isclose(sol.obj, 10.3, rel_tol=0.0, abs_tol=1e-8))
+        self.assertEqual(sol.info.get("sparse_pipeline"), "1")
+
     def test_sparse_matrix_hyper_sparse_rhs_solve(self):
         rows = 20
         cols = 40
@@ -145,7 +211,9 @@ class SparseSimplexApiTests(unittest.TestCase):
         )
         self.assertNotIn("bound_reformulation_retry_mode", second.info)
 
-    def test_sparse_matrix_reuses_bound_only_cache_after_same_orientation_bound_change(self):
+    def test_sparse_matrix_reuses_bound_only_cache_after_same_orientation_bound_change(
+        self,
+    ):
         A = sp.csc_matrix([[1.0, 1.0]])
         b = np.array([4.0], dtype=float)
         c = np.array([1.0, 2.0], dtype=float)
@@ -169,7 +237,9 @@ class SparseSimplexApiTests(unittest.TestCase):
         self.assertEqual(second.info.get("sparse_pipeline"), "1")
         self.assertEqual(second.info.get("sparse_bound_only_fast_path"), "1")
 
-    def test_sparse_matrix_warm_start_reuses_internal_solver_basis_on_bound_change(self):
+    def test_sparse_matrix_warm_start_reuses_internal_solver_basis_on_bound_change(
+        self,
+    ):
         A = sp.csc_matrix([[1.0, 1.0]])
         b = np.array([4.0], dtype=float)
         c = np.array([1.0, 2.0], dtype=float)

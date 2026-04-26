@@ -37,3 +37,9 @@ bnb_website/
 Cgl/
 highs-source/
 .cache/
+
+..cursorrules
+.mcp.json
+.opencode.json
+.code-review-graph/
+.openclaude/

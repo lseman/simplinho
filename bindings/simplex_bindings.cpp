@@ -312,33 +312,27 @@ void bind_solve_stats_type(py::module_& m) {
                                [](const SolveStats& self) { return self.refactorizations; })
         .def_property_readonly("eta_stack_depth_entry",
                                [](const SolveStats& self) { return self.eta_stack_depth_entry; })
-        .def_property_readonly("ft_updates",
-                               [](const SolveStats& self) { return self.ft_updates; })
+        .def_property_readonly("ft_updates", [](const SolveStats& self) { return self.ft_updates; })
         .def_property_readonly("dual_pool_builds",
                                [](const SolveStats& self) { return self.dual_pool_builds; })
         .def_property_readonly("primal_pool_builds",
                                [](const SolveStats& self) { return self.primal_pool_builds; })
-        .def_property_readonly(
-            "warm_start_attempted",
-            [](const SolveStats& self) { return self.warm_start_attempted; })
-        .def_property_readonly(
-            "warm_start_accepted",
-            [](const SolveStats& self) { return self.warm_start_accepted; })
-        .def_property_readonly(
-            "warm_start_cold_retry",
-            [](const SolveStats& self) { return self.warm_start_cold_retry; })
+        .def_property_readonly("warm_start_attempted",
+                               [](const SolveStats& self) { return self.warm_start_attempted; })
+        .def_property_readonly("warm_start_accepted",
+                               [](const SolveStats& self) { return self.warm_start_accepted; })
+        .def_property_readonly("warm_start_cold_retry",
+                               [](const SolveStats& self) { return self.warm_start_cold_retry; })
         .def_property_readonly(
             "warm_factorization_reused",
             [](const SolveStats& self) { return self.warm_factorization_reused; })
-        .def_property_readonly(
-            "warm_dual_weights_reused",
-            [](const SolveStats& self) { return self.warm_dual_weights_reused; })
+        .def_property_readonly("warm_dual_weights_reused",
+                               [](const SolveStats& self) { return self.warm_dual_weights_reused; })
         .def_property_readonly("lu_build_ns",
                                [](const SolveStats& self) { return self.lu_build_ns; })
         .def_property_readonly("pricing_build_ns",
                                [](const SolveStats& self) { return self.pricing_build_ns; })
-        .def_property_readonly("pivot_ns",
-                               [](const SolveStats& self) { return self.pivot_ns; })
+        .def_property_readonly("pivot_ns", [](const SolveStats& self) { return self.pivot_ns; })
         .def_property_readonly("presolve_actions",
                                [](const SolveStats& self) { return self.presolve_actions; })
         .def_property_readonly(

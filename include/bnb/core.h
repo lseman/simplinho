@@ -1714,6 +1714,7 @@ class Solver {
         std::vector<Cut> conflict_cuts = generate_conflict_cuts_(relaxation);
         cuts.insert(cuts.end(), std::make_move_iterator(conflict_cuts.begin()),
                     std::make_move_iterator(conflict_cuts.end()));
+
         return cuts;
     }
 
@@ -2762,81 +2763,104 @@ class Solver {
                 const auto cut_fractional = detail::collect_fractional_candidates(
                     relaxation.primal, problem_.variable_types, options_.integrality_tol);
                 const std::vector<Cut> relaxation_cuts = current_relaxation_cuts_snapshot_();
-                const auto generation_start = SteadyClock::now();
-                std::vector<Cut> generated =
-                    generate_cut_candidates_(node, relaxation, cut_fractional, relaxation_cuts);
-                timing.root_cut_generation_wall_ns +=
-                    elapsed_ns_(generation_start, SteadyClock::now());
-                timing.root_cuts_generated += static_cast<int>(generated.size());
-                for (const Cut& cut : generated) {
-                    cut_pool_.add_cut(problem_, cut);
-                }
-                std::vector<Cut> selected;
                 const auto selection_start = SteadyClock::now();
-                selected = cut_pool_.select_violated_cuts(relaxation.primal, node.lower_bounds,
-                                                          node.upper_bounds,
-                                                          options_.max_cuts_added_per_round, 1.0);
-                timing.root_cut_selection_wall_ns +=
-                    elapsed_ns_(selection_start, SteadyClock::now());
-                timing.root_cuts_selected += static_cast<int>(selected.size());
-                if (selected.empty())
-                    break;
-
-                int added_count = 0;
-                const auto activation_start = SteadyClock::now();
-                {
-                    std::lock_guard<std::mutex> lock(cuts_mutex_);
-                    for (const Cut& cut : selected) {
-                        const detail::CutSignature signature = detail::cut_signature(cut);
-                        if (active_cut_signatures_.contains(signature))
-                            continue;
-                        active_cut_signatures_.insert(signature);
-                        active_cuts_.push_back(cut);
-                        ++added_count;
+                std::vector<Cut> selected;
+                const std::array<detail::CutSeparatorPhase, 5> phase_order = {
+                    detail::CutSeparatorPhase::ImpliedBound,
+                    detail::CutSeparatorPhase::Clique,
+                    detail::CutSeparatorPhase::OddCycle,
+                    detail::CutSeparatorPhase::LP,
+                    detail::CutSeparatorPhase::Proof,
+                };
+                bool any_cuts_applied = false;
+                for (detail::CutSeparatorPhase phase : phase_order) {
+                    const auto phase_generation_start = SteadyClock::now();
+                    std::vector<Cut> phase_generated =
+                        detail::generate_cuts(problem_, relaxation, options_, phase,
+                                              nullptr, &relaxation_cuts);
+                    timing.root_cut_generation_wall_ns +=
+                        elapsed_ns_(phase_generation_start, SteadyClock::now());
+                    timing.root_cuts_generated += static_cast<int>(phase_generated.size());
+                    for (const Cut& cut : phase_generated) {
+                        cut_pool_.add_cut(problem_, cut);
                     }
-                    // Keep queued node bases alive across global cut activation.
-                    // The LP assembly path can extend those bases with newly added
-                    // cut slacks on demand, which is much cheaper than forcing all
-                    // workers back to a cold start at once.
+
+                    const auto phase_selection_start = SteadyClock::now();
+                    selected = cut_pool_.select_violated_cuts(relaxation.primal, node.lower_bounds,
+                                                              node.upper_bounds,
+                                                              options_.max_cuts_added_per_round,
+                                                              1.0);
+                    timing.root_cut_selection_wall_ns +=
+                        elapsed_ns_(phase_selection_start, SteadyClock::now());
+                    timing.root_cuts_selected += static_cast<int>(selected.size());
+                    cut_pool_.perform_aging();
+
+                    if (selected.empty())
+                        continue;
+
+                    int added_count = 0;
+                    const auto activation_start = SteadyClock::now();
+                    {
+                        std::lock_guard<std::mutex> lock(cuts_mutex_);
+                        for (const Cut& cut : selected) {
+                            const detail::CutSignature signature = detail::cut_signature(cut);
+                            if (active_cut_signatures_.contains(signature))
+                                continue;
+                            active_cut_signatures_.insert(signature);
+                            active_cuts_.push_back(cut);
+                            ++added_count;
+                        }
+                    }
+                    timing.root_cut_activation_wall_ns +=
+                        elapsed_ns_(activation_start, SteadyClock::now());
+                    timing.root_cuts_applied += added_count;
+                    if (added_count > 0) {
+                        any_cuts_applied = true;
+                        re_solved_with_cuts = true;
+                        const auto resolve_start = SteadyClock::now();
+                        relaxation = current_relaxation(node);
+                        timing.root_cut_resolve_wall_ns +=
+                            elapsed_ns_(resolve_start, SteadyClock::now());
+                        timing.final_relaxation_objective = relaxation.objective;
+                        node.basis = relaxation.basis;
+                        note_lp_work_(relaxation);
+                        const auto cut_estimate = detail::node_estimate(
+                            relaxation, problem_.variable_types, pseudocosts_snapshot_(),
+                            options_.integrality_tol, problem_.maximize);
+                        update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                            tree_node.bound = relaxation.objective;
+                            tree_node.estimate = cut_estimate;
+                        });
+                        maybe_log_progress_("cut");
+                        if (relaxation.status == RelaxationStatus::Unbounded) {
+                            update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                tree_node.status = TreeNodeStatus::Unbounded;
+                            });
+                            mark_unbounded_();
+                            search_coordinator_.notify_all();
+                            finalize_node_timing("root_cut_resolve", "unbounded");
+                            return;
+                        }
+                        if (relaxation.status == RelaxationStatus::Infeasible) {
+                            update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                tree_node.status = TreeNodeStatus::Infeasible;
+                            });
+                            finalize_node_timing("root_cut_resolve", "infeasible");
+                            return;
+                        }
+                        const auto incumbent = incumbent_snapshot_();
+                        if (incumbent.has_incumbent &&
+                            bound_prunes_(relaxation.objective, incumbent.objective)) {
+                            update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                tree_node.status = TreeNodeStatus::PrunedByBound;
+                            });
+                            finalize_node_timing("root_cut_bound_prune", "pruned_by_bound");
+                            return;
+                        }
+                    }
                 }
-                timing.root_cut_activation_wall_ns +=
-                    elapsed_ns_(activation_start, SteadyClock::now());
-                timing.root_cuts_applied += added_count;
-                if (added_count == 0)
+                if (!any_cuts_applied)
                     break;
-
-                const auto resolve_start = SteadyClock::now();
-                relaxation = current_relaxation(node);
-                timing.root_cut_resolve_wall_ns += elapsed_ns_(resolve_start, SteadyClock::now());
-                timing.final_relaxation_objective = relaxation.objective;
-                node.basis = relaxation.basis;
-                note_lp_work_(relaxation);
-                const auto cut_estimate = detail::node_estimate(
-                    relaxation, problem_.variable_types, pseudocosts_snapshot_(),
-                    options_.integrality_tol, problem_.maximize);
-                update_tree_node_(node.id, [&](TreeNode& tree_node) {
-                    tree_node.bound = relaxation.objective;
-                    tree_node.estimate = cut_estimate;
-                });
-                maybe_log_progress_("cut");
-                re_solved_with_cuts = true;
-
-                if (relaxation.status == RelaxationStatus::Unbounded) {
-                    update_tree_node_(node.id, [&](TreeNode& tree_node) {
-                        tree_node.status = TreeNodeStatus::Unbounded;
-                    });
-                    mark_unbounded_();
-                    search_coordinator_.notify_all();
-                    finalize_node_timing("root_cut_resolve", "unbounded");
-                    return;
-                }
-                if (relaxation.status == RelaxationStatus::Infeasible) {
-                    update_tree_node_(node.id, [&](TreeNode& tree_node) {
-                        tree_node.status = TreeNodeStatus::Infeasible;
-                    });
-                    finalize_node_timing("root_cut_resolve", "infeasible");
-                    return;
-                }
             }
 
             if (re_solved_with_cuts) {
@@ -2863,74 +2887,111 @@ class Solver {
                 std::vector<Cut> probing_relaxation_cuts = current_relaxation_cuts_snapshot_();
                 probing_relaxation_cuts.insert(probing_relaxation_cuts.end(), local_cuts.begin(),
                                                local_cuts.end());
-                const auto generation_start = SteadyClock::now();
-                std::vector<Cut> generated =
-                    generate_cut_candidates_(node, relaxation, fractional, probing_relaxation_cuts);
-                timing.node_cut_generation_wall_ns +=
-                    elapsed_ns_(generation_start, SteadyClock::now());
-                timing.node_cuts_generated += static_cast<int>(generated.size());
-                for (const Cut& cut : generated) {
-                    cut_pool_.add_cut(problem_, cut);
-                }
+                const std::array<detail::CutSeparatorPhase, 5> phase_order = {
+                    detail::CutSeparatorPhase::ImpliedBound,
+                    detail::CutSeparatorPhase::Clique,
+                    detail::CutSeparatorPhase::OddCycle,
+                    detail::CutSeparatorPhase::LP,
+                    detail::CutSeparatorPhase::Proof,
+                };
+                bool any_cuts_applied = false;
+                for (detail::CutSeparatorPhase phase : phase_order) {
+                    const auto phase_generation_start = SteadyClock::now();
+                    std::vector<Cut> phase_generated =
+                        detail::generate_cuts(problem_, relaxation, options_, phase,
+                                              nullptr, &probing_relaxation_cuts);
+                    timing.node_cut_generation_wall_ns +=
+                        elapsed_ns_(phase_generation_start, SteadyClock::now());
+                    timing.node_cuts_generated += static_cast<int>(phase_generated.size());
+                    for (const Cut& cut : phase_generated) {
+                        cut_pool_.add_cut(problem_, cut);
+                    }
 
-                std::vector<Cut> selected;
-                const auto selection_start = SteadyClock::now();
-                selected = cut_pool_.select_violated_cuts(relaxation.primal, node.lower_bounds,
-                                                          node.upper_bounds,
-                                                          options_.max_cuts_added_per_round, 1.6);
-                timing.node_cut_selection_wall_ns +=
-                    elapsed_ns_(selection_start, SteadyClock::now());
-                timing.node_cuts_selected += static_cast<int>(selected.size());
+                    const auto selection_start = SteadyClock::now();
+                    std::vector<Cut> selected = cut_pool_.select_violated_cuts(
+                        relaxation.primal, node.lower_bounds, node.upper_bounds,
+                        options_.max_cuts_added_per_round, 1.6);
+                    timing.node_cut_selection_wall_ns +=
+                        elapsed_ns_(selection_start, SteadyClock::now());
+                    timing.node_cuts_selected += static_cast<int>(selected.size());
+                    cut_pool_.perform_aging();
 
-                int added_count = 0;
-                {
-                    std::lock_guard<std::mutex> lock(cuts_mutex_);
-                    for (const Cut& cut : selected) {
-                        const detail::CutSignature signature = detail::cut_signature(cut);
-                        if (active_cut_signatures_.contains(signature) ||
-                            local_cut_signatures.contains(signature)) {
-                            continue;
+                    if (selected.empty())
+                        continue;
+
+                    int added_count = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(cuts_mutex_);
+                        for (const Cut& cut : selected) {
+                            const detail::CutSignature signature = detail::cut_signature(cut);
+                            if (active_cut_signatures_.contains(signature) ||
+                                local_cut_signatures.contains(signature)) {
+                                continue;
+                            }
+                            local_cut_signatures.insert(signature);
+                            local_cuts.push_back(cut);
+                            ++added_count;
                         }
-                        local_cut_signatures.insert(signature);
-                        local_cuts.push_back(cut);
-                        ++added_count;
+                    }
+                    timing.node_cuts_applied += added_count;
+                    if (added_count > 0) {
+                        any_cuts_applied = true;
+                        const auto resolve_start = SteadyClock::now();
+                        relaxation = solve_relaxation_with_cuts(node, local_cuts);
+                        timing.node_cut_resolve_wall_ns +=
+                            elapsed_ns_(resolve_start, SteadyClock::now());
+                        timing.final_relaxation_objective = relaxation.objective;
+                        node.basis = relaxation.basis;
+                        note_lp_work_(relaxation);
+                        const auto cut_estimate = detail::node_estimate(
+                            relaxation, problem_.variable_types, pseudocosts_snapshot_(),
+                            options_.integrality_tol, problem_.maximize);
+                        update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                            tree_node.bound = relaxation.objective;
+                            tree_node.estimate = cut_estimate;
+                        });
+                        maybe_log_progress_("node-cut");
+                        if (relaxation.status == RelaxationStatus::Unbounded) {
+                            update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                tree_node.status = TreeNodeStatus::Unbounded;
+                            });
+                            mark_unbounded_();
+                            search_coordinator_.notify_all();
+                            finalize_node_timing("node_cut_resolve", "unbounded");
+                            return;
+                        }
+                        if (relaxation.status == RelaxationStatus::Infeasible) {
+                            update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                tree_node.status = TreeNodeStatus::Infeasible;
+                            });
+                            finalize_node_timing("node_cut_resolve", "infeasible");
+                            return;
+                        }
+                        const auto incumbent = incumbent_snapshot_();
+                        if (incumbent.has_incumbent &&
+                            bound_prunes_(relaxation.objective, incumbent.objective)) {
+                            update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                tree_node.status = TreeNodeStatus::PrunedByBound;
+                            });
+                            finalize_node_timing("node_cut_bound_prune", "pruned_by_bound");
+                            return;
+                        }
+                        fractional = detail::collect_fractional_candidates(
+                            relaxation.primal, problem_.variable_types, options_.integrality_tol);
+                        if (fractional.empty()) {
+                            timing.fractional_count = 0;
+                            update_tree_node_(node.id, [&](TreeNode& tree_node) {
+                                tree_node.status = TreeNodeStatus::Integral;
+                            });
+                            maybe_update_incumbent_(relaxation.primal, relaxation.objective);
+                            search_coordinator_.notify_all();
+                            finalize_node_timing("node_cut_integral", "integral");
+                            return;
+                        }
                     }
                 }
-                timing.node_cuts_applied += added_count;
-                if (added_count == 0)
+                if (!any_cuts_applied)
                     break;
-
-                const auto resolve_start = SteadyClock::now();
-                relaxation = solve_relaxation_with_cuts(node, local_cuts);
-                timing.node_cut_resolve_wall_ns += elapsed_ns_(resolve_start, SteadyClock::now());
-                timing.final_relaxation_objective = relaxation.objective;
-                node.basis = relaxation.basis;
-                note_lp_work_(relaxation);
-                const auto cut_estimate = detail::node_estimate(
-                    relaxation, problem_.variable_types, pseudocosts_snapshot_(),
-                    options_.integrality_tol, problem_.maximize);
-                update_tree_node_(node.id, [&](TreeNode& tree_node) {
-                    tree_node.bound = relaxation.objective;
-                    tree_node.estimate = cut_estimate;
-                });
-                maybe_log_progress_("node-cut");
-
-                if (relaxation.status == RelaxationStatus::Unbounded) {
-                    update_tree_node_(node.id, [&](TreeNode& tree_node) {
-                        tree_node.status = TreeNodeStatus::Unbounded;
-                    });
-                    mark_unbounded_();
-                    search_coordinator_.notify_all();
-                    finalize_node_timing("node_cut_resolve", "unbounded");
-                    return;
-                }
-                if (relaxation.status == RelaxationStatus::Infeasible) {
-                    update_tree_node_(node.id, [&](TreeNode& tree_node) {
-                        tree_node.status = TreeNodeStatus::Infeasible;
-                    });
-                    finalize_node_timing("node_cut_resolve", "infeasible");
-                    return;
-                }
 
                 {
                     const auto incumbent = incumbent_snapshot_();
