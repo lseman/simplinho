@@ -4,107 +4,100 @@
 
 # simplinho
 
-`simplinho` is a standalone revised simplex LP solver with a Python extension module and a small modeling API.
+`simplinho` is a compact revised simplex LP solver with early branch-and-bound MIP support and Python bindings via `pybind11`.
 
-The core solver is header-only C++ in `include/simplex/`, the Python bindings live in `bindings/`, and the top-level build produces a `simplinho` module via `pybind11`.
+The solver core is implemented as header-only C++ under `include/simplex/`.
+The MIP branch-and-bound layer lives in `include/bnb/`, and the Python bindings are defined in `bindings/`.
+
+## Overview
+
+`simplinho` is designed to provide:
+
+- a fast revised simplex engine for bounded LPs
+- MIP search with branch-and-bound, cuts, and primal heuristics
+- warm starts across repeated solves and node relaxations
+- a small Python modeling API for algebraic model construction and solve control
 
 ## Highlights
 
-- Primal revised simplex and dual revised simplex in one solver
-- Automatic mode selection with `Auto`, `Primal`, and `Dual` modes
-- Direct Phase II attempts with Phase I fallback when a feasible basis is not available
-- Explicit handling of lower and upper bounds, including automatic reformulation of nonstandard variable bounds
-- Dual bound flipping with Beale-style bound-flip ratio logic
-- Presolve passes for row reduction, scaling, singleton elimination, bound tightening, dual fixing, and early infeasible/unbounded detection
-- Markowitz LU factorization with rook pivoting and iterative refinement
-- Forrest-Tomlin basis updates, with eta-stack updates as an alternative
-- Multi-attempt crash basis construction with Markowitz-threshold triangularization,
-  rotating `hybrid`/`sprint`/`crash_ii`/`crash_iii` heuristics, and
-  presolved warm-start repair
-- Adaptive pricing, Devex pricing, and most-negative pricing in both primal
-  and dual simplex
-- Degeneracy management, anti-cycling support, and Harris-style ratio tests
-- Rich solve outputs: basis data, reduced costs, dual values, shadow prices, internal tableau data, traces, and Farkas certificates
-- A higher-level Python modeling layer with algebraic expressions, named variables, named constraints, and post-solve dual access
-- Early mixed-integer support on top of the LP engine with integer/binary variables
-  and branch-and-bound node selection strategies such as depth-first, breadth-first,
-  and best-bound
-- A modular branch-and-bound layer under `include/bnb/` with split responsibilities
-  for core solve flow, branching rules, search policies, and heuristics
-- Diving heuristics for MIP incumbent search, including fractional, vector-length,
-  objective-value, and coefficient-inspired diving
-- Incumbent heuristics for restricted neighborhood search, including RINS-style
-  fixing and a lightweight local search around the current incumbent
+- Primal and dual revised simplex with automatic mode selection
+- Crash basis construction with multiple Markowitz-based strategies
+- Presolve, scaling, singleton elimination, and bound tightening
+- Robust numerics via rook pivoting and iterative refinement
+- Branch-and-bound with flexible search policies and branching rules
+- Cut generation for Gomory, MIR, cover, implied-bound, clique, odd-cycle, conflict, and dual-proof cuts
+- Dedicated root cut repeat and cut pool aging for better bound tightening
+- MIP heuristics including diving, feasibility pump, RINS, RENS, local search, and local branching
 
-## What The Project Exposes
+## Python API
 
-There are two main ways to use the solver:
+Two main solver interfaces are exposed:
 
-1. `simplinho.RevisedSimplex`
-   Use the low-level matrix API directly:
-   `solve(A, b, c, l, u)` for `min c^T x` subject to `Ax = b` and `l <= x <= u`.
+1. `simplinho.RevisedSimplex` — low-level matrix LP solves
+2. `simplinho.Model` — algebraic modeling and LP/MIP solving
 
-2. `simplinho.Model`
-   Use the modeling API with variables, expressions, constraints, and `minimize(...)` / `maximize(...)`.
-
-The Python module also exposes:
+The module also exposes options and enums such as:
 
 - `RevisedSimplexOptions`
-- `SimplexMode`
-- `LPStatus`
-- `MIPStatus`
-- `LPBasis`
-- `LPBasisStatus`
-- `VarType`
 - `BranchAndBoundOptions`
+- `SimplexMode`
 - `NodeSelectionStrategy`
 - `BranchingStrategy`
 - `DivingStrategy`
+- `VarType`
 - `status_to_string(...)`
 - `mip_status_to_string(...)`
 
 ## Solver Features
 
-### Algorithms
+### Linear Programming
 
-- Revised simplex implementation with both primal and dual pivoting
-- Automatic fallback behavior when a direct solve needs Phase I work
-- Support for bounded variables, free variables, shifted variables, and internally added slacks
-- Bound-flip logic for dual iterations when enabled through `dual_allow_bound_flip`
-- Branch-and-bound for integer and binary models with depth-first, breadth-first, and best-bound search
-- Branching rules including most-fractional, pseudocost, and strong branching
-- Primal heuristics including diving, feasibility-pump-style repair, RENS, RINS-style fixing, and local search
-- Global cut pool support with Gomory mixed-integer and cover cuts
+- Revised simplex with primal and dual pivoting
+- Phase I fallback when a feasible initial basis is unavailable
+- Support for bounded variables, shifted/free variable handling, and slack reformulation
+- Bound-flip logic for better dual iterations
+- Crash basis heuristics with Markowitz thresholding
+- Presolve reduction, scaling, singleton elimination, and bound tightening
+- Detailed solver diagnostics including tableau, duals, reduced costs, and Farkas certificates
 
-### Numerics
+### Mixed-Integer Programming
+
+- Branch-and-bound on integer and binary variables
+- Node selection strategies: depth-first, breadth-first, best-bound, best-estimate, hybrid, best-first plunging, best-estimate plunging, and interleaved best-first/best-estimate
+- Branching rules: most-fractional, pseudo-cost, and strong branching
+- Diving strategies: fractional, vector-length, objective-value, coefficient, guided, and adaptive
+- Heuristics: LP rounding, diving heuristics, feasibility pump, RINS, RENS, local search, and local branching
+- Configurable root and node cut budgets
+
+### Cut Engine
+
+- Implied-bound cuts
+- Clique cuts and implication-strengthened cliques
+- Odd-cycle cuts
+- Gomory mixed-integer cuts
+- MIR cuts
+- Cover cuts
+- Conflict cuts with age-based pool management
+- Dual-proof cuts
+- Cut pool selection tuned by violation, efficacy, density, and type balance
+
+### Numerics and Stability
 
 - Dense Markowitz LU factorization
-- Rook pivoting for more robust pivot selection
-- Iterative refinement in both forward and transpose solves
-- Configurable pivot tolerances, refactor frequency, and compression thresholds
-- Forrest-Tomlin updates by default, or eta-stack updates via `basis_update = "eta"`
+- Rook pivoting and pivot quality control
+- Iterative refinement in forward and transpose solves
+- Configurable refactor frequency and matrix compression
+- Forrest-Tomlin updates by default, optional eta updates available
+- Degeneracy management and anti-cycling support
+- Pricing rules: adaptive, Devex, and most-negative
 
-### Pricing And Stability
+### Presolve and Diagnostics
 
-- `pricing_rule = "adaptive"` for steepest-edge on smaller dual bases and
-  Devex on larger ones, with periodic weight resets
-- `pricing_rule = "devex"` for Devex pricing
-- `pricing_rule = "most_negative"` for a simple reduced-cost rule in primal and
-  most-infeasible-row pricing in dual
-- `crash_attempts`, `crash_markowitz_tol`, `crash_strategy`, and
-  `repair_mapped_basis` tune the initial basis search and post-presolve basis
-  repair
-- Degeneracy tracking and anti-cycling support
-- Harris-style primal and dual ratio tests
-- Optional Bland rule toggle
-
-### Presolve And Diagnostics
-
-- Presolve with row/column simplifications, scaling, singleton eliminations, and bound tightening
-- Early `infeasible` and `unbounded` detection in presolve when possible
-- Verbose tracing with optional basis and presolve details
-- Final internal tableau, reduced costs, dual values, and shadow prices on the solved internal model
-- Farkas certificate output when infeasibility is proven through the dual path
+- Presolve with row/column simplification, scaling, singleton elimination, and bound tightening
+- Early detection of infeasible and unbounded models in presolve
+- Verbose tracing with optional basis and presolve diagnostics
+- Internal tableau exposure, duals, reduced costs, and shadow prices
+- Farkas certificate output for infeasibility proofs
 
 ## Build
 
@@ -308,9 +301,9 @@ The modeling layer wraps that in `ModelSolution`, while still exposing the raw s
 
 ## Repository Layout
 
-- `include/simplex/`: umbrella headers for the simplex solver and compatibility includes
-- `include/bnb/`: branch-and-bound core, branching rules, search policies, diving strategies, primal heuristics, cut management, and shared MIP types
-- `bindings/`: `pybind11` bindings and modeling API
-- `src/`: reserved for future non-header sources
-- `simplex_modeling_api_demo.ipynb`: notebook showing the modeling API in action
-- `CMakeLists.txt`: standalone build for the Python module
+- `include/simplex/`: revised simplex headers and solver internals
+- `include/bnb/`: branch-and-bound core, branching rules, search policies, heuristics, and cut management
+- `bindings/`: Python bindings and modeling API implementation
+- `src/`: C++ implementation sources and helpers
+- `tests/`: test coverage for solver and modeling behavior
+- `CMakeLists.txt`: build configuration for the Python extension module

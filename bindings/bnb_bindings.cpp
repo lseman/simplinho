@@ -157,7 +157,10 @@ void bind_bnb_bindings(py::module_& m) {
                        &BranchAndBoundOptions::heuristic_subproblem_max_nodes)
         .def_readwrite("use_cut_pool", &BranchAndBoundOptions::use_cut_pool)
         .def_readwrite("max_cut_rounds_per_node", &BranchAndBoundOptions::max_cut_rounds_per_node)
+        .def_readwrite("max_root_cut_rounds", &BranchAndBoundOptions::max_root_cut_rounds)
         .def_readwrite("max_cuts_added_per_round", &BranchAndBoundOptions::max_cuts_added_per_round)
+        .def_readwrite("max_root_cuts_added_per_round",
+                       &BranchAndBoundOptions::max_root_cuts_added_per_round)
         .def_readwrite("max_cut_pool_size", &BranchAndBoundOptions::max_cut_pool_size)
         .def_readwrite("min_cut_violation", &BranchAndBoundOptions::min_cut_violation)
         .def_readwrite("max_cut_age", &BranchAndBoundOptions::max_cut_age)

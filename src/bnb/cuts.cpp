@@ -29,10 +29,10 @@ class FunctionCutSeparator final : public CutSeparator {
     using EnabledFn = std::function<bool(const SeparatorContext&)>;
     using SeparateFn = std::function<std::vector<Cut>(const SeparatorContext&)>;
 
-    FunctionCutSeparator(std::string_view name, CutSeparatorPhase phase,
-                         EnabledFn enabled, SeparateFn separate)
-        : name_(name), phase_(phase), enabled_(std::move(enabled)),
-          separate_(std::move(separate)) {}
+    FunctionCutSeparator(std::string_view name, CutSeparatorPhase phase, EnabledFn enabled,
+                         SeparateFn separate)
+        : name_(name), phase_(phase), enabled_(std::move(enabled)), separate_(std::move(separate)) {
+    }
 
     std::string_view name() const override { return name_; }
     CutSeparatorPhase phase() const override { return phase_; }
@@ -315,8 +315,7 @@ double cut_dynamism_(const Cut& cut, const Eigen::VectorXd& primal, double viola
     return normalized_violation * (0.5 + 0.5 * focus) / (1.0 + 0.1 * activity);
 }
 
-double cut_retention_score_(const Cut& cut, double norm, int type_usage,
-                               double age_decay_rate) {
+double cut_retention_score_(const Cut& cut, double norm, int type_usage, double age_decay_rate) {
     const double age_decay = std::exp(-age_decay_rate * static_cast<double>(cut.age));
     const double usage_reward = std::log1p(1.0 + static_cast<double>(cut.times_used));
     const double density_reward =
@@ -2083,8 +2082,8 @@ CutPool::CutPool(const Options& options)
     : max_pool_size_(options.max_cut_pool_size), min_violation_(options.min_cut_violation),
       max_age_(options.max_cut_age), cut_age_decay_(options.cut_age_decay),
       cut_selection_age_bonus_(options.cut_selection_age_bonus),
-      max_cuts_per_type_(options.max_cuts_per_type),
-      max_parallelism_(options.cut_max_parallelism) {}
+      max_cuts_per_type_(options.max_cuts_per_type), max_parallelism_(options.cut_max_parallelism) {
+}
 
 void CutPool::reset(const Options& options) {
     const std::lock_guard<std::shared_mutex> lock(cuts_mutex_);
@@ -2229,7 +2228,8 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         violated[i] = 1;
         const double full_norm =
             i < static_cast<int>(row_norms_.size()) ? row_norms_[i] : cut_norm_(cuts_[i]);
-        const double age_bonus = std::exp(-cut_selection_age_bonus_ * static_cast<double>(cuts_[i].age));
+        const double age_bonus =
+            std::exp(-cut_selection_age_bonus_ * static_cast<double>(cuts_[i].age));
         candidates.push_back(Candidate{i, violation, full_norm, 0.0, 0.0, 0.0, 0.0, 0.0,
                                        cuts_[i].strength, age_bonus,
                                        violation <= 2.5 * min_violation_});
@@ -2316,10 +2316,11 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
             double score = 0.40 * candidate.active_efficacy + 0.15 * candidate.efficacy +
                            0.20 * (1.0 - max_parallelism) + 0.12 * candidate.age_bonus +
                            0.10 * candidate.density_adjusted_efficacy + 0.08 * candidate.strength +
-                           dynamism_weight_ * candidate.dynamism + 0.05 * candidate.fractional_focus;
+                           dynamism_weight_ * candidate.dynamism +
+                           0.05 * candidate.fractional_focus;
             if (candidate.marginal) {
-                score += 0.06 * candidate.density_adjusted_efficacy +
-                         0.04 * candidate.fractional_focus;
+                score +=
+                    0.06 * candidate.density_adjusted_efficacy + 0.04 * candidate.fractional_focus;
             }
             score += 0.02 * std::log1p(static_cast<double>(type_usage_stats_[cut.cut_type]));
             if (score > best_score) {
@@ -2378,11 +2379,9 @@ void CutPool::manage_pool_size_() {
     if (keep_indices.size() > static_cast<std::size_t>(max_pool_size_)) {
         std::sort(keep_indices.begin(), keep_indices.end(), [&](int lhs, int rhs) {
             return cut_retention_score_(cuts_[lhs], row_norms_[lhs],
-                                        type_usage_stats_[cuts_[lhs].cut_type],
-                                        cut_age_decay_) >
+                                        type_usage_stats_[cuts_[lhs].cut_type], cut_age_decay_) >
                    cut_retention_score_(cuts_[rhs], row_norms_[rhs],
-                                        type_usage_stats_[cuts_[rhs].cut_type],
-                                        cut_age_decay_);
+                                        type_usage_stats_[cuts_[rhs].cut_type], cut_age_decay_);
         });
         keep_indices.resize(max_pool_size_);
     }
@@ -3638,7 +3637,7 @@ std::vector<Cut> generate_clique_cuts(const Problem& problem, const RelaxationSo
         add_implication_conflicts_(&graph, problem, learned_implications, options);
         std::unordered_set<CutSignature, CutSignatureHash> signatures;
         const int max_found =
-            std::max(options.max_cuts_added_per_round * 4, options.max_cuts_per_type);
+            std::max(options.max_cuts_added_per_round * 6, options.max_cuts_per_type);
 
         struct StoredCliqueCandidate {
             int index = -1;
@@ -3664,8 +3663,8 @@ std::vector<Cut> generate_clique_cuts(const Problem& problem, const RelaxationSo
                           return lhs.activity > rhs.activity;
                       return graph.cliques()[lhs.index].size() > graph.cliques()[rhs.index].size();
                   });
-        if (stored_candidates.size() > static_cast<std::size_t>(max_found * 4))
-            stored_candidates.resize(max_found * 4);
+        if (stored_candidates.size() > static_cast<std::size_t>(max_found * 6))
+            stored_candidates.resize(max_found * 6);
         for (const StoredCliqueCandidate& candidate : stored_candidates) {
             append_clique_cut_candidate_(problem, relaxation, options, &graph,
                                          graph.cliques()[candidate.index], "Clique", &signatures,
@@ -3729,7 +3728,7 @@ std::vector<Cut> generate_clique_cuts(const Problem& problem, const RelaxationSo
             }
         }
 
-        constexpr int kMaxCliqueCalls = 5000;
+        constexpr int kMaxCliqueCalls = 10000;
         int calls = 0;
         std::vector<std::vector<int>> found;
 
@@ -3885,7 +3884,7 @@ std::vector<Cut> generate_odd_cycle_cuts(const Problem& problem,
     });
 
     std::unordered_set<CutSignature, CutSignatureHash> signatures;
-    const int max_found = std::max(options.max_cuts_added_per_round * 2, options.max_cuts_per_type);
+    const int max_found = std::max(options.max_cuts_added_per_round * 4, options.max_cuts_per_type);
     for (const int start_pos : start_positions) {
         const std::vector<int> cycle_literals = find_weighted_odd_cycle_(
             graph, relaxation.primal, options, vertices, start_pos, position_of);
@@ -3968,9 +3967,17 @@ static std::vector<Cut> filter_generated_cuts_(std::vector<Cut> cuts, const Prob
             active_stats.nnz > 0 ? active_stats.nnz : static_cast<int>(cut.indices.size()),
             fractional_focus, 1.0);
         const double dynamism = cut_dynamism_(cut, primal, violation, norm);
-        const double score = 0.40 * active_efficacy + 0.25 * efficacy +
-                             0.20 * density_adjusted_efficacy + 0.10 * dynamism +
-                             0.05 * fractional_focus;
+        const double base_score = 0.40 * active_efficacy + 0.25 * efficacy +
+                                  0.20 * density_adjusted_efficacy + 0.10 * dynamism +
+                                  0.05 * fractional_focus;
+        const std::string_view type = cut.cut_type;
+        const double type_bonus =
+            (type == "OddCycle" || type == "Conflict" || type == "ConflictClique" ||
+             type == "Clique" || type == "ImplicationClique" || type == "WeightedClique" ||
+             type == "CliquePartition")
+                ? 1.08
+                : 1.0;
+        const double score = base_score * type_bonus;
         if (cut.indices.size() > 128 && score < std::max(0.02, options.min_cut_violation * 2.0))
             continue;
         scored.emplace_back(score, i);
@@ -4013,11 +4020,8 @@ std::vector<Cut> generate_cuts(const Problem& problem, const RelaxationSolution&
     const auto& separators = default_cut_separators_();
     std::vector<Cut> cuts;
     const std::array<CutSeparatorPhase, 5> phase_order = {
-        CutSeparatorPhase::ImpliedBound,
-        CutSeparatorPhase::Clique,
-        CutSeparatorPhase::OddCycle,
-        CutSeparatorPhase::LP,
-        CutSeparatorPhase::Proof,
+        CutSeparatorPhase::ImpliedBound, CutSeparatorPhase::Clique, CutSeparatorPhase::OddCycle,
+        CutSeparatorPhase::LP,           CutSeparatorPhase::Proof,
     };
 
     for (CutSeparatorPhase phase : phase_order) {
@@ -4034,8 +4038,8 @@ std::vector<Cut> generate_cuts(const Problem& problem, const RelaxationSolution&
             continue;
 
         if (options.parallel_workers > 1 && phase_separators.size() > 1) {
-            const int worker_count = std::min<int>(options.parallel_workers,
-                                                   phase_separators.size());
+            const int worker_count =
+                std::min<int>(options.parallel_workers, phase_separators.size());
             detail::ParallelDispatcher dispatcher(worker_count);
             std::vector<std::vector<Cut>> family_cuts(phase_separators.size());
             dispatcher.run(static_cast<int>(phase_separators.size()), [&](int index) {
@@ -4066,8 +4070,7 @@ std::vector<Cut> generate_cuts(const Problem& problem, const RelaxationSolution&
     std::vector<Cut> cuts;
     std::vector<const CutSeparator*> phase_separators;
     for (const auto& separator : separators) {
-        if (separator == nullptr || separator->phase() != phase ||
-            !separator->enabled(context)) {
+        if (separator == nullptr || separator->phase() != phase || !separator->enabled(context)) {
             continue;
         }
         phase_separators.push_back(separator.get());
@@ -4077,8 +4080,7 @@ std::vector<Cut> generate_cuts(const Problem& problem, const RelaxationSolution&
         return {};
 
     if (options.parallel_workers > 1 && phase_separators.size() > 1) {
-        const int worker_count = std::min<int>(options.parallel_workers,
-                                               phase_separators.size());
+        const int worker_count = std::min<int>(options.parallel_workers, phase_separators.size());
         ParallelDispatcher dispatcher(worker_count);
         std::vector<std::vector<Cut>> family_cuts(phase_separators.size());
         dispatcher.run(static_cast<int>(phase_separators.size()), [&](int index) {

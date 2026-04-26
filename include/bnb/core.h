@@ -549,6 +549,12 @@ class Solver {
         if (options_.max_conflict_cuts_per_round < 0) {
             throw std::invalid_argument("simplex::bnb: max_conflict_cuts_per_round must be >= 0");
         }
+        if (options_.max_root_cut_rounds < 0) {
+            throw std::invalid_argument("simplex::bnb: max_root_cut_rounds must be >= 0");
+        }
+        if (options_.max_root_cuts_added_per_round < 0) {
+            throw std::invalid_argument("simplex::bnb: max_root_cuts_added_per_round must be >= 0");
+        }
         if (options_.max_cuts_per_type < 0) {
             throw std::invalid_argument("simplex::bnb: max_cuts_per_type must be >= 0");
         }
@@ -2705,7 +2711,7 @@ class Solver {
         };
 
         auto tighten_bounds_from_implied_cuts = [&](const std::vector<Cut>& cuts,
-                                                   detail::ActiveNode& current_node) {
+                                                    detail::ActiveNode& current_node) {
             int tightened_bounds = 0;
             for (const Cut& cut : cuts) {
                 if (!propagate_row_bounds_(cut.indices, cut.values, cut.rhs, cut.sense,
@@ -2771,7 +2777,13 @@ class Solver {
 
         if (allow_root_cuts && options_.use_cut_pool && node.depth == 0) {
             bool re_solved_with_cuts = false;
-            for (int round = 0; round < options_.max_cut_rounds_per_node; ++round) {
+            const int root_cut_rounds = options_.max_root_cut_rounds > 0
+                                            ? options_.max_root_cut_rounds
+                                            : options_.max_cut_rounds_per_node;
+            const int root_cuts_added_per_round = options_.max_root_cuts_added_per_round > 0
+                                                      ? options_.max_root_cuts_added_per_round
+                                                      : options_.max_cuts_added_per_round;
+            for (int round = 0; round < root_cut_rounds; ++round) {
                 ++timing.root_cut_rounds;
                 const auto cut_fractional = detail::collect_fractional_candidates(
                     relaxation.primal, problem_.variable_types, options_.integrality_tol);
@@ -2779,23 +2791,21 @@ class Solver {
                 const auto selection_start = SteadyClock::now();
                 std::vector<Cut> selected;
                 const std::array<detail::CutSeparatorPhase, 5> phase_order = {
-                    detail::CutSeparatorPhase::ImpliedBound,
-                    detail::CutSeparatorPhase::Clique,
-                    detail::CutSeparatorPhase::OddCycle,
-                    detail::CutSeparatorPhase::LP,
+                    detail::CutSeparatorPhase::ImpliedBound, detail::CutSeparatorPhase::Clique,
+                    detail::CutSeparatorPhase::OddCycle,     detail::CutSeparatorPhase::LP,
                     detail::CutSeparatorPhase::Proof,
                 };
                 bool any_cuts_applied = false;
                 for (detail::CutSeparatorPhase phase : phase_order) {
                     const auto phase_generation_start = SteadyClock::now();
-                    std::vector<Cut> phase_generated =
-                        detail::generate_cuts(problem_, relaxation, options_, phase,
-                                              nullptr, &relaxation_cuts);
+                    std::vector<Cut> phase_generated = detail::generate_cuts(
+                        problem_, relaxation, options_, phase, nullptr, &relaxation_cuts);
                     timing.root_cut_generation_wall_ns +=
                         elapsed_ns_(phase_generation_start, SteadyClock::now());
                     timing.root_cuts_generated += static_cast<int>(phase_generated.size());
                     if (phase == detail::CutSeparatorPhase::ImpliedBound) {
-                        const int tightened = tighten_bounds_from_implied_cuts(phase_generated, node);
+                        const int tightened =
+                            tighten_bounds_from_implied_cuts(phase_generated, node);
                         if (tightened < 0) {
                             update_tree_node_(node.id, [&](TreeNode& tree_node) {
                                 tree_node.status = TreeNodeStatus::Infeasible;
@@ -2854,8 +2864,7 @@ class Solver {
                     const auto phase_selection_start = SteadyClock::now();
                     selected = cut_pool_.select_violated_cuts(relaxation.primal, node.lower_bounds,
                                                               node.upper_bounds,
-                                                              options_.max_cuts_added_per_round,
-                                                              1.0);
+                                                              root_cuts_added_per_round, 1.0);
                     timing.root_cut_selection_wall_ns +=
                         elapsed_ns_(phase_selection_start, SteadyClock::now());
                     timing.root_cuts_selected += static_cast<int>(selected.size());
@@ -2954,23 +2963,21 @@ class Solver {
                 probing_relaxation_cuts.insert(probing_relaxation_cuts.end(), local_cuts.begin(),
                                                local_cuts.end());
                 const std::array<detail::CutSeparatorPhase, 5> phase_order = {
-                    detail::CutSeparatorPhase::ImpliedBound,
-                    detail::CutSeparatorPhase::Clique,
-                    detail::CutSeparatorPhase::OddCycle,
-                    detail::CutSeparatorPhase::LP,
+                    detail::CutSeparatorPhase::ImpliedBound, detail::CutSeparatorPhase::Clique,
+                    detail::CutSeparatorPhase::OddCycle,     detail::CutSeparatorPhase::LP,
                     detail::CutSeparatorPhase::Proof,
                 };
                 bool any_cuts_applied = false;
                 for (detail::CutSeparatorPhase phase : phase_order) {
                     const auto phase_generation_start = SteadyClock::now();
-                    std::vector<Cut> phase_generated =
-                        detail::generate_cuts(problem_, relaxation, options_, phase,
-                                              nullptr, &probing_relaxation_cuts);
+                    std::vector<Cut> phase_generated = detail::generate_cuts(
+                        problem_, relaxation, options_, phase, nullptr, &probing_relaxation_cuts);
                     timing.node_cut_generation_wall_ns +=
                         elapsed_ns_(phase_generation_start, SteadyClock::now());
                     timing.node_cuts_generated += static_cast<int>(phase_generated.size());
                     if (phase == detail::CutSeparatorPhase::ImpliedBound) {
-                        const int tightened = tighten_bounds_from_implied_cuts(phase_generated, node);
+                        const int tightened =
+                            tighten_bounds_from_implied_cuts(phase_generated, node);
                         if (tightened < 0) {
                             update_tree_node_(node.id, [&](TreeNode& tree_node) {
                                 tree_node.status = TreeNodeStatus::Infeasible;
@@ -3020,7 +3027,8 @@ class Solver {
                                 return;
                             }
                             fractional = detail::collect_fractional_candidates(
-                                relaxation.primal, problem_.variable_types, options_.integrality_tol);
+                                relaxation.primal, problem_.variable_types,
+                                options_.integrality_tol);
                             if (fractional.empty()) {
                                 timing.fractional_count = 0;
                                 update_tree_node_(node.id, [&](TreeNode& tree_node) {
