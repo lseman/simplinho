@@ -1,6 +1,6 @@
-import json
 import importlib.machinery
 import importlib.util
+import json
 import math
 import subprocess
 import sys
@@ -21,7 +21,9 @@ def import_simplinho():
             continue
         extension = extensions[0]
         try:
-            loader = importlib.machinery.ExtensionFileLoader("simplinho", str(extension))
+            loader = importlib.machinery.ExtensionFileLoader(
+                "simplinho", str(extension)
+            )
             spec = importlib.util.spec_from_loader("simplinho", loader)
             module = importlib.util.module_from_spec(spec)
             sys.modules["simplinho"] = module

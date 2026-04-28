@@ -8,13 +8,14 @@
 #include <array>
 #include <bit>
 #include <cmath>
-#include <thread>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <numeric>
 #include <shared_mutex>
 #include <string_view>
+#include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -909,6 +910,37 @@ void maybe_add_cover_cut_(const Problem& problem, const RelaxationSolution& rela
             cut.rhs -= 1.0;
         }
     }
+    if (!postprocess_cover_cut_(problem, options, &cut))
+        return;
+    if (cut.indices.empty())
+        return;
+
+    const double violation = cut_violation(cut, relaxation.primal);
+    if (violation <= options.min_cut_violation)
+        return;
+
+    cut.strength = violation;
+    const CutSignature signature = cut_signature(cut);
+    if (signatures != nullptr && !signatures->insert(signature).second)
+        return;
+    cuts->push_back(std::move(cut));
+}
+
+void maybe_add_lifted_cover_cut_(const Problem& problem, const RelaxationSolution& relaxation,
+                                 const Options& options, const std::vector<int>& indices,
+                                 const std::vector<double>& values, double rhs,
+                                 const std::string& cut_type,
+                                 std::unordered_set<CutSignature, CutSignatureHash>* signatures,
+                                 std::vector<Cut>* cuts) {
+    if (cuts == nullptr || indices.size() != values.size() || indices.empty())
+        return;
+
+    Cut cut;
+    cut.sense = LinearConstraintSense::LessEqual;
+    cut.rhs = rhs;
+    cut.cut_type = cut_type;
+    cut.indices = indices;
+    cut.values = values;
     if (!postprocess_cover_cut_(problem, options, &cut))
         return;
     if (cut.indices.empty())
@@ -3515,6 +3547,14 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
                     canonical_binary_cover_literals_(kn, partition->cover_positions));
             }
 
+            if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
+                    lifted_cover = lifted_binary_cover_cut_(kn)) {
+                const auto& [lifted_indices, lifted_values, lifted_rhs] = *lifted_cover;
+                maybe_add_lifted_cover_cut_(problem, relaxation, options, lifted_indices,
+                                            lifted_values, lifted_rhs, "LiftedCover", &signatures,
+                                            &cuts);
+            }
+
             queue_literal_cover(canonical_binary_cover_literals_(
                 kn, greedy_binary_cover_positions_(kn, BinaryCoverOrdering::ActivityFirst)));
             queue_literal_cover(canonical_binary_cover_literals_(
@@ -3647,19 +3687,20 @@ std::vector<Cut> generate_clique_cuts(const Problem& problem, const RelaxationSo
         };
         std::vector<StoredCliqueCandidate> stored_candidates;
         stored_candidates.reserve(graph.cliques().size());
-        const int worker_count = std::max(
-            1,
-            static_cast<int>(std::floor(std::thread::hardware_concurrency() *
-                                       options.cut_max_parallelism)));
+        const int worker_count =
+            std::max(1, static_cast<int>(std::floor(std::thread::hardware_concurrency() *
+                                                    options.cut_max_parallelism)));
         if (worker_count <= 1) {
             for (int i = 0; i < static_cast<int>(graph.cliques().size()); ++i) {
                 const auto& clique_literals = graph.cliques()[i];
                 if (clique_literals.size() < 2)
                     continue;
-                const double activity = clique_literal_activity_(clique_literals, relaxation.primal);
+                const double activity =
+                    clique_literal_activity_(clique_literals, relaxation.primal);
                 const double seed_threshold =
-                    clique_literals.size() >= 3 ? 1.0 + 0.5 * options.min_cut_violation
-                                                : 1.0 - std::max(0.05, 8.0 * options.min_cut_violation);
+                    clique_literals.size() >= 3
+                        ? 1.0 + 0.5 * options.min_cut_violation
+                        : 1.0 - std::max(0.05, 8.0 * options.min_cut_violation);
                 if (activity <= seed_threshold)
                     continue;
                 stored_candidates.push_back(StoredCliqueCandidate{i, activity});
@@ -3671,10 +3712,12 @@ std::vector<Cut> generate_clique_cuts(const Problem& problem, const RelaxationSo
                 const auto& clique_literals = graph.cliques()[i];
                 if (clique_literals.size() < 2)
                     return;
-                const double activity = clique_literal_activity_(clique_literals, relaxation.primal);
+                const double activity =
+                    clique_literal_activity_(clique_literals, relaxation.primal);
                 const double seed_threshold =
-                    clique_literals.size() >= 3 ? 1.0 + 0.5 * options.min_cut_violation
-                                                : 1.0 - std::max(0.05, 8.0 * options.min_cut_violation);
+                    clique_literals.size() >= 3
+                        ? 1.0 + 0.5 * options.min_cut_violation
+                        : 1.0 - std::max(0.05, 8.0 * options.min_cut_violation);
                 if (activity <= seed_threshold)
                     return;
                 const StoredCliqueCandidate candidate{i, activity};
