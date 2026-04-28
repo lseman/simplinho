@@ -1,4 +1,6 @@
 import json
+import importlib.machinery
+import importlib.util
 import math
 import subprocess
 import sys
@@ -14,13 +16,17 @@ def import_simplinho():
         candidate = ROOT / build_dir
         if not candidate.exists():
             continue
-        if not any(candidate.glob("*.so")):
+        extensions = list(candidate.glob("simplinho*.so"))
+        if not extensions:
             continue
-        sys.path.insert(0, str(candidate))
+        extension = extensions[0]
         try:
-            import simplinho
-
-            return simplinho
+            loader = importlib.machinery.ExtensionFileLoader("simplinho", str(extension))
+            spec = importlib.util.spec_from_loader("simplinho", loader)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["simplinho"] = module
+            loader.exec_module(module)
+            return module
         except ImportError:
             continue
     raise ImportError("could not find a built simplinho module")
@@ -52,6 +58,44 @@ class MIPModelingApiTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             model.add_var("bad", lb=0.0, ub=2.0, var_type=simplinho.VarType.Binary)
+
+    def test_solve_mip_branches_on_sos1_sets(self):
+        model = simplinho.Model()
+        x = model.add_binary_var("x")
+        y = model.add_binary_var("y")
+        model.add_constr(2.0 * x + 2.0 * y <= 3.0)
+        model.add_sos1([x, y], [0.0, 1.0])
+        model.maximize(x + y)
+
+        solution = model.solve_mip()
+
+        self.assertEqual(solution.status, simplinho.MIPStatus.Optimal)
+        self.assertTrue(math.isclose(solution.obj, 1.0, rel_tol=0.0, abs_tol=1e-8))
+        self.assertLessEqual(
+            sum(1 for var in (x, y) if abs(solution.value(var)) > 1e-8), 1
+        )
+
+    def test_solve_mip_branches_on_sos2_sets(self):
+        model = simplinho.Model()
+        x = model.add_binary_var("x")
+        y = model.add_binary_var("y")
+        middle = model.add_var("middle", lb=0.0, ub=0.0)
+        model.add_constr(2.0 * x + 2.0 * y <= 3.0)
+        model.add_sos2([x, middle, y], [0.0, 1.0, 2.0])
+        model.maximize(x + y)
+
+        solution = model.solve_mip()
+
+        self.assertEqual(solution.status, simplinho.MIPStatus.Optimal)
+        self.assertTrue(math.isclose(solution.obj, 1.0, rel_tol=0.0, abs_tol=1e-8))
+        active = [
+            pos
+            for pos, var in enumerate((x, middle, y))
+            if abs(solution.value(var)) > 1e-8
+        ]
+        self.assertLessEqual(len(active), 2)
+        if len(active) == 2:
+            self.assertEqual(active[1], active[0] + 1)
 
     def test_model_reoptimize_explicit_basis_warm_start(self):
         options = simplinho.RevisedSimplexOptions()
@@ -1208,6 +1252,61 @@ print('status', module.mip_status_to_string(solution.status))
                 abs_tol=1e-8,
             )
         )
+
+    def test_solve_mip_disable_graph_clique_separator(self):
+        model = simplinho.Model()
+        x = model.add_binary_var("x")
+        y = model.add_binary_var("y")
+        z = model.add_binary_var("z")
+        model.add_constr(2.0 * x + 2.0 * y + 2.0 * z <= 3.0)
+        model.maximize(x + y + z)
+
+        options = simplinho.BranchAndBoundOptions()
+        options.use_cut_pool = True
+        options.use_gomory_cuts = False
+        options.use_cover_cuts = False
+        options.use_implied_bound_cuts = False
+        options.use_clique_cuts = True
+        options.use_graph_clique_cuts = False
+        options.max_cut_rounds_per_node = 2
+        options.max_cuts_added_per_round = 4
+
+        solution = model.solve_mip(options)
+
+        self.assertEqual(solution.status, simplinho.MIPStatus.Optimal)
+        self.assertTrue(solution.has_solution)
+        self.assertTrue(
+            math.isclose(
+                solution.value(x) + solution.value(y) + solution.value(z),
+                1.0,
+                rel_tol=0.0,
+                abs_tol=1e-8,
+            )
+        )
+
+    def test_solve_mip_clique_merge_parallel_columns_general_knapsack(self):
+        model = simplinho.Model()
+        x = model.add_binary_var("x")
+        y = model.add_binary_var("y")
+        z = model.add_binary_var("z")
+        model.add_constr(3.0 * x + 1.0 * y + 3.0 * z <= 5.0)
+        model.add_constr(x + z <= 2.0)
+        model.maximize(2.0 * x + 1.0 * z + 0.0 * y)
+
+        options = simplinho.BranchAndBoundOptions()
+        options.use_cut_pool = False
+        options.use_gomory_cuts = False
+        options.use_cover_cuts = False
+        options.use_implied_bound_cuts = False
+        options.use_conflict_cuts = False
+
+        solution = model.solve_mip(options)
+
+        self.assertEqual(solution.status, simplinho.MIPStatus.Optimal)
+        self.assertTrue(solution.has_solution)
+        self.assertEqual(solution.value(x), 1.0)
+        self.assertEqual(solution.value(z), 0.0)
+        self.assertGreaterEqual(solution.root_presolve_tightened_bounds, 1)
 
     def test_solve_mip_odd_cycle_cuts(self):
         model = simplinho.Model()

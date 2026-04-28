@@ -1991,6 +1991,12 @@ class Solver {
     void mark_unbounded_() { search_coordinator_.mark_unbounded(); }
 
     void maybe_update_incumbent_(const Eigen::VectorXd& primal, double objective) {
+        if (!detail::is_integer_feasible_solution(primal, problem_.variable_types,
+                                                  options_.integrality_tol) ||
+            !detail::is_sos_feasible_solution(primal, problem_.sos_constraints,
+                                              options_.integrality_tol)) {
+            return;
+        }
         bool updated = false;
         {
             std::lock_guard<std::mutex> lock(incumbent_mutex_);
@@ -3029,7 +3035,11 @@ class Solver {
                             fractional = detail::collect_fractional_candidates(
                                 relaxation.primal, problem_.variable_types,
                                 options_.integrality_tol);
-                            if (fractional.empty()) {
+                            if (fractional.empty() &&
+                                detail::choose_sos_branching_constraint(node, relaxation.primal,
+                                                                        problem_.sos_constraints,
+                                                                        options_.integrality_tol)
+                                        .variable < 0) {
                                 timing.fractional_count = 0;
                                 update_tree_node_(node.id, [&](TreeNode& tree_node) {
                                     tree_node.status = TreeNodeStatus::Integral;
@@ -3116,7 +3126,11 @@ class Solver {
                         }
                         fractional = detail::collect_fractional_candidates(
                             relaxation.primal, problem_.variable_types, options_.integrality_tol);
-                        if (fractional.empty()) {
+                        if (fractional.empty() &&
+                            detail::choose_sos_branching_constraint(node, relaxation.primal,
+                                                                    problem_.sos_constraints,
+                                                                    options_.integrality_tol)
+                                    .variable < 0) {
                             timing.fractional_count = 0;
                             update_tree_node_(node.id, [&](TreeNode& tree_node) {
                                 tree_node.status = TreeNodeStatus::Integral;
@@ -3145,7 +3159,10 @@ class Solver {
 
                 fractional = detail::collect_fractional_candidates(
                     relaxation.primal, problem_.variable_types, options_.integrality_tol);
-                if (fractional.empty()) {
+                if (fractional.empty() &&
+                    detail::choose_sos_branching_constraint(
+                        node, relaxation.primal, problem_.sos_constraints, options_.integrality_tol)
+                            .variable < 0) {
                     timing.fractional_count = 0;
                     update_tree_node_(node.id, [&](TreeNode& tree_node) {
                         tree_node.status = TreeNodeStatus::Integral;
@@ -3157,7 +3174,9 @@ class Solver {
                 }
             }
         }
-        if (fractional.empty()) {
+        detail::BranchDecision sos_decision = detail::choose_sos_branching_constraint(
+            node, relaxation.primal, problem_.sos_constraints, options_.integrality_tol);
+        if (fractional.empty() && sos_decision.variable < 0) {
             timing.fractional_count = 0;
             update_tree_node_(
                 node.id, [&](TreeNode& tree_node) { tree_node.status = TreeNodeStatus::Integral; });
@@ -3166,7 +3185,8 @@ class Solver {
             finalize_node_timing("integral", "integral");
             return;
         }
-        timing.fractional_count = static_cast<int>(fractional.size());
+        timing.fractional_count =
+            static_cast<int>(fractional.size()) + (sos_decision.variable >= 0 ? 1 : 0);
         const HeuristicSchedule schedule = build_heuristic_schedule_(node, relaxation);
 
         const auto rounding_start = SteadyClock::now();
@@ -3461,9 +3481,19 @@ class Solver {
         const auto pseudocost_before = pseudocosts_snapshot_();
         auto local_pseudocosts = pseudocost_before;
         const auto branching_start = SteadyClock::now();
-        detail::BranchDecision decision = detail::choose_branching_variable(
-            node, relaxation, fractional, options_, problem_.maximize, local_pseudocosts,
-            parallel_task_dispatcher_.get(), node_relaxation_solver);
+        const bool branch_on_sos = sos_decision.variable >= 0;
+        detail::BranchDecision decision =
+            branch_on_sos
+                ? std::move(sos_decision)
+                : detail::choose_branching_variable(
+                      node, relaxation, fractional, options_, problem_.maximize, local_pseudocosts,
+                      parallel_task_dispatcher_.get(), node_relaxation_solver);
+        if (branch_on_sos) {
+            const LPBasis* basis = node.basis ? &*node.basis : nullptr;
+            decision.down_child.relaxation =
+                node_relaxation_solver(decision.down_child.state, basis);
+            decision.up_child.relaxation = node_relaxation_solver(decision.up_child.state, basis);
+        }
         timing.branching_wall_ns += elapsed_ns_(branching_start, SteadyClock::now());
         timing.strong_branching_probe_count = decision.strong_branching_probe_count;
         timing.strong_branching_probe_iterations = decision.strong_branching_probe_iterations;
@@ -3671,7 +3701,9 @@ class Solver {
                 return;
             }
         }
-        if (fractional.empty()) {
+        if (fractional.empty() &&
+            detail::is_sos_feasible_solution(child.relaxation->primal, problem_.sos_constraints,
+                                             options_.integrality_tol)) {
             update_tree_node_(child_id, [&](TreeNode& tree_node) {
                 tree_node.status = TreeNodeStatus::Integral;
             });

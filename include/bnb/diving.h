@@ -183,6 +183,63 @@ inline ChildState make_child_state(const ActiveNode& node, int variable, bool br
     return child;
 }
 
+inline ChildState make_upper_zero_child_state(const ActiveNode& node,
+                                              const std::vector<int>& variables) {
+    ChildState child;
+    child.domain_change_count = node.domain_change_count;
+    child.domain = node.domain;
+    child.reasons = node.reasons;
+    if (has_materialized_bounds(node.lower_bounds, node.upper_bounds)) {
+        child.lower_bounds = node.lower_bounds;
+        child.upper_bounds = node.upper_bounds;
+    }
+
+    const bool has_node_bounds = has_materialized_bounds(node.lower_bounds, node.upper_bounds);
+    auto domain = std::make_shared<NodeDomain>();
+    domain->parent = node.domain;
+    int variable_count = node.domain != nullptr ? node.domain->variable_count
+                                                : static_cast<int>(node.lower_bounds.size());
+    for (const int variable : variables) {
+        variable_count = std::max(variable_count, variable + 1);
+    }
+    domain->variable_count = variable_count;
+    domain->chain_depth = node.domain != nullptr ? node.domain->chain_depth + 1 : 1;
+    domain->total_change_count = node.domain != nullptr ? node.domain->total_change_count : 0;
+
+    for (const int variable : variables) {
+        double base_lower = std::numeric_limits<double>::quiet_NaN();
+        double base_upper = std::numeric_limits<double>::quiet_NaN();
+        if (has_node_bounds) {
+            if (variable >= 0 && variable < node.lower_bounds.size() &&
+                variable < node.upper_bounds.size()) {
+                base_lower = node.lower_bounds(variable);
+                base_upper = node.upper_bounds(variable);
+            }
+        } else {
+            const auto [resolved_lower, resolved_upper] =
+                resolve_domain_variable_bounds(node.domain, variable);
+            base_lower = resolved_lower;
+            base_upper = resolved_upper;
+        }
+        if (variable < 0 || !std::isfinite(base_lower) || !std::isfinite(base_upper) ||
+            base_upper <= 1e-12) {
+            continue;
+        }
+        if (has_node_bounds) {
+            child.upper_bounds(variable) = 0.0;
+        }
+        child.changed_variables_hint.push_back(variable);
+        domain->changes.push_back(DomainChange{variable, base_lower, 0.0});
+        ++child.domain_change_count;
+        ++domain->total_change_count;
+    }
+
+    if (!domain->changes.empty()) {
+        child.domain = std::move(domain);
+    }
+    return child;
+}
+
 inline ChildState make_fixed_child_state(const ActiveNode& node, int variable, bool branch_up,
                                          double value) {
     ChildState child;
@@ -272,6 +329,30 @@ inline bool is_integer_feasible_solution(const Eigen::VectorXd& primal,
         if (variable_types[j] == VariableType::Continuous)
             continue;
         if (!is_effectively_integral(primal(j), tol)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool is_sos_feasible_solution(const Eigen::VectorXd& primal,
+                                     const std::vector<SOSConstraint>& sos_constraints,
+                                     double tol) {
+    for (const SOSConstraint& sos : sos_constraints) {
+        std::vector<int> active_positions;
+        for (int pos = 0; pos < static_cast<int>(sos.variables.size()); ++pos) {
+            const int variable = sos.variables[pos];
+            if (variable >= 0 && variable < primal.size() && std::abs(primal(variable)) > tol) {
+                active_positions.push_back(pos);
+            }
+        }
+        if (sos.type == SOSType::SOS1) {
+            if (active_positions.size() > 1) {
+                return false;
+            }
+        } else if (active_positions.size() > 2) {
+            return false;
+        } else if (active_positions.size() == 2 && active_positions[1] != active_positions[0] + 1) {
             return false;
         }
     }

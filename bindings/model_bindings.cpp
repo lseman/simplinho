@@ -15,12 +15,14 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #if defined(__unix__) || defined(__APPLE__)
@@ -277,11 +279,18 @@ struct ConstraintData {
     std::string name;
 };
 
+struct SOSData {
+    simplex_bnb::SOSType type = simplex_bnb::SOSType::SOS1;
+    std::vector<int> variables;
+    std::vector<double> weights;
+};
+
 struct ModelState {
     RevisedSimplexOptions options;
     std::vector<VarData> vars;
     std::unordered_map<std::string, int> name_to_index;
     std::vector<ConstraintData> constraints;
+    std::vector<SOSData> sos_constraints;
     LinearExprData objective;
     bool maximize = false;
     std::vector<double> last_constraint_pi;
@@ -1643,6 +1652,16 @@ class Model {
         return ConstraintHandle(state_, static_cast<int>(state_->constraints.size()) - 1, id);
     }
 
+    void add_sos1(const std::vector<Var>& vars,
+                  const std::optional<std::vector<double>>& weights = std::nullopt) {
+        add_sos_(simplex_bnb::SOSType::SOS1, vars, weights);
+    }
+
+    void add_sos2(const std::vector<Var>& vars,
+                  const std::optional<std::vector<double>>& weights = std::nullopt) {
+        add_sos_(simplex_bnb::SOSType::SOS2, vars, weights);
+    }
+
     void set_objective(const LinearExpr& expr, const std::string& sense = "min") {
         touch_();
         if (expr.state() && expr.state().get() != state_.get()) {
@@ -1717,6 +1736,32 @@ class Model {
         erase_and_reindex_coeffs(state_->objective, removed_index);
         for (auto& constr : state_->constraints) {
             erase_and_reindex_coeffs(constr.expr, removed_index);
+        }
+        for (auto sos_it = state_->sos_constraints.begin();
+             sos_it != state_->sos_constraints.end();) {
+            std::vector<int> kept_variables;
+            std::vector<double> kept_weights;
+            kept_variables.reserve(sos_it->variables.size());
+            kept_weights.reserve(sos_it->weights.size());
+            for (int i = 0; i < static_cast<int>(sos_it->variables.size()); ++i) {
+                int index = sos_it->variables[i];
+                if (index == removed_index) {
+                    continue;
+                }
+                if (index > removed_index) {
+                    --index;
+                }
+                kept_variables.push_back(index);
+                kept_weights.push_back(sos_it->weights[i]);
+            }
+            sos_it->variables = std::move(kept_variables);
+            sos_it->weights = std::move(kept_weights);
+            const int min_size = sos_it->type == simplex_bnb::SOSType::SOS1 ? 1 : 2;
+            if (static_cast<int>(sos_it->variables.size()) < min_size) {
+                sos_it = state_->sos_constraints.erase(sos_it);
+            } else {
+                ++sos_it;
+            }
         }
     }
 
@@ -1817,6 +1862,7 @@ class Model {
             }
         }
         problem.base_constraints = build_base_constraints_();
+        problem.sos_constraints = build_sos_constraints_();
 
         if (mip_options.verbose) {
             print_verbose_solver_banner();
@@ -2856,6 +2902,71 @@ class Model {
         return out;
     }
 
+    void add_sos_(simplex_bnb::SOSType type, const std::vector<Var>& vars,
+                  const std::optional<std::vector<double>>& weights) {
+        if (vars.empty()) {
+            throw std::invalid_argument("simplex: SOS constraint must contain variables");
+        }
+        if (type == simplex_bnb::SOSType::SOS2 && vars.size() < 2) {
+            throw std::invalid_argument(
+                "simplex: SOS2 constraint must contain at least two variables");
+        }
+        if (weights.has_value() && weights->size() != vars.size()) {
+            throw std::invalid_argument("simplex: SOS weights must match variable count");
+        }
+
+        touch_(true);
+        SOSData sos;
+        sos.type = type;
+        sos.variables.reserve(vars.size());
+        sos.weights.reserve(vars.size());
+        std::unordered_set<int> seen_variables;
+        for (int i = 0; i < static_cast<int>(vars.size()); ++i) {
+            ensure_same_model_(vars[i].state(), "add_sos");
+            const int variable = vars[i].index();
+            if (!seen_variables.insert(variable).second) {
+                throw std::invalid_argument("simplex: SOS variables must be distinct");
+            }
+            sos.variables.push_back(variable);
+            sos.weights.push_back(weights.has_value() ? (*weights)[i] : static_cast<double>(i));
+        }
+        std::vector<int> order(sos.variables.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int lhs, int rhs) {
+            if (std::abs(sos.weights[lhs] - sos.weights[rhs]) > 1e-12) {
+                return sos.weights[lhs] < sos.weights[rhs];
+            }
+            return sos.variables[lhs] < sos.variables[rhs];
+        });
+
+        SOSData sorted;
+        sorted.type = type;
+        sorted.variables.reserve(order.size());
+        sorted.weights.reserve(order.size());
+        for (const int old_pos : order) {
+            if (!sorted.weights.empty() &&
+                std::abs(sorted.weights.back() - sos.weights[old_pos]) <= 1e-12) {
+                throw std::invalid_argument("simplex: SOS weights must be distinct");
+            }
+            sorted.variables.push_back(sos.variables[old_pos]);
+            sorted.weights.push_back(sos.weights[old_pos]);
+        }
+        state_->sos_constraints.push_back(std::move(sorted));
+    }
+
+    std::vector<simplex_bnb::SOSConstraint> build_sos_constraints_() const {
+        std::vector<simplex_bnb::SOSConstraint> out;
+        out.reserve(state_->sos_constraints.size());
+        for (const SOSData& src : state_->sos_constraints) {
+            simplex_bnb::SOSConstraint sos;
+            sos.type = src.type;
+            sos.variables = src.variables;
+            sos.weights = src.weights;
+            out.push_back(std::move(sos));
+        }
+        return out;
+    }
+
     ModelSolution make_model_solution_(LPSolution raw, const ModelLPData& data) const {
         Eigen::VectorXd primal =
             Eigen::VectorXd::Constant(data.original_vars, std::numeric_limits<double>::quiet_NaN());
@@ -3317,6 +3428,10 @@ void bind_model_bindings(py::module_& m) {
              py::arg("obj") = 0.0)
         .def("add_constr", &Model::add_constr, py::arg("constraint"), py::arg("name") = py::none())
         .def("addConstr", &Model::add_constr, py::arg("constraint"), py::arg("name") = py::none())
+        .def("add_sos1", &Model::add_sos1, py::arg("vars"), py::arg("weights") = py::none())
+        .def("addSOS1", &Model::add_sos1, py::arg("vars"), py::arg("weights") = py::none())
+        .def("add_sos2", &Model::add_sos2, py::arg("vars"), py::arg("weights") = py::none())
+        .def("addSOS2", &Model::add_sos2, py::arg("vars"), py::arg("weights") = py::none())
         .def("set_objective", &Model::set_objective, py::arg("expr"), py::arg("sense") = "min")
         .def(
             "set_objective",

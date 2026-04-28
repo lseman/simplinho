@@ -40,6 +40,7 @@ enum class DivingStrategy {
 };
 enum class RelaxationStatus { Optimal, Infeasible, Unbounded };
 enum class LinearConstraintSense { LessEqual, GreaterEqual, Equal };
+enum class SOSType { SOS1, SOS2 };
 enum class TreeNodeStatus {
     Created,
     Fractional,
@@ -213,6 +214,7 @@ struct Options {
     bool use_cover_cuts = true;
     bool use_implied_bound_cuts = true;
     bool use_clique_cuts = true;
+    bool use_graph_clique_cuts = true; // enable the new graph-based clique separator
     bool use_odd_cycle_cuts = true;
     bool use_probing_implications = true;
     int probing_max_candidates = 4;
@@ -248,6 +250,12 @@ struct SparseLinearConstraint {
     LinearConstraintSense sense = LinearConstraintSense::LessEqual;
 };
 
+struct SOSConstraint {
+    SOSType type = SOSType::SOS1;
+    std::vector<int> variables;
+    std::vector<double> weights;
+};
+
 struct Cut {
     std::vector<int> indices;
     std::vector<double> values;
@@ -266,6 +274,7 @@ struct Problem {
     double objective_constant = 0.0;
     std::vector<VariableType> variable_types;
     std::vector<SparseLinearConstraint> base_constraints;
+    std::vector<SOSConstraint> sos_constraints;
     bool maximize = false;
     std::vector<int> warm_start_basis; // Basis column indices from root relaxation for warm-start
     std::optional<LPBasis> warm_start_basis_state;

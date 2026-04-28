@@ -8,6 +8,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <thread>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -3626,7 +3627,8 @@ std::vector<Cut> generate_clique_cuts(const Problem& problem, const RelaxationSo
                     [](VariableType type) { return type == VariableType::Binary; });
     auto generate_graph_clique_cuts = [&]() {
         std::vector<Cut> cuts;
-        if (!options.use_clique_cuts || relaxation.primal.size() != problem.lower_bounds.size())
+        if (!options.use_clique_cuts || !options.use_graph_clique_cuts ||
+            relaxation.primal.size() != problem.lower_bounds.size())
             return cuts;
 
         ConflictGraph graph(problem);
@@ -3645,17 +3647,40 @@ std::vector<Cut> generate_clique_cuts(const Problem& problem, const RelaxationSo
         };
         std::vector<StoredCliqueCandidate> stored_candidates;
         stored_candidates.reserve(graph.cliques().size());
-        for (int i = 0; i < static_cast<int>(graph.cliques().size()); ++i) {
-            const auto& clique_literals = graph.cliques()[i];
-            if (clique_literals.size() < 2)
-                continue;
-            const double activity = clique_literal_activity_(clique_literals, relaxation.primal);
-            const double seed_threshold =
-                clique_literals.size() >= 3 ? 1.0 + 0.5 * options.min_cut_violation
-                                            : 1.0 - std::max(0.05, 8.0 * options.min_cut_violation);
-            if (activity <= seed_threshold)
-                continue;
-            stored_candidates.push_back(StoredCliqueCandidate{i, activity});
+        const int worker_count = std::max(
+            1,
+            static_cast<int>(std::floor(std::thread::hardware_concurrency() *
+                                       options.cut_max_parallelism)));
+        if (worker_count <= 1) {
+            for (int i = 0; i < static_cast<int>(graph.cliques().size()); ++i) {
+                const auto& clique_literals = graph.cliques()[i];
+                if (clique_literals.size() < 2)
+                    continue;
+                const double activity = clique_literal_activity_(clique_literals, relaxation.primal);
+                const double seed_threshold =
+                    clique_literals.size() >= 3 ? 1.0 + 0.5 * options.min_cut_violation
+                                                : 1.0 - std::max(0.05, 8.0 * options.min_cut_violation);
+                if (activity <= seed_threshold)
+                    continue;
+                stored_candidates.push_back(StoredCliqueCandidate{i, activity});
+            }
+        } else {
+            std::mutex stored_mutex;
+            ParallelDispatcher dispatcher(worker_count);
+            dispatcher.run(static_cast<int>(graph.cliques().size()), [&](int i) {
+                const auto& clique_literals = graph.cliques()[i];
+                if (clique_literals.size() < 2)
+                    return;
+                const double activity = clique_literal_activity_(clique_literals, relaxation.primal);
+                const double seed_threshold =
+                    clique_literals.size() >= 3 ? 1.0 + 0.5 * options.min_cut_violation
+                                                : 1.0 - std::max(0.05, 8.0 * options.min_cut_violation);
+                if (activity <= seed_threshold)
+                    return;
+                const StoredCliqueCandidate candidate{i, activity};
+                std::lock_guard<std::mutex> lock(stored_mutex);
+                stored_candidates.push_back(candidate);
+            });
         }
         std::sort(stored_candidates.begin(), stored_candidates.end(),
                   [&](const StoredCliqueCandidate& lhs, const StoredCliqueCandidate& rhs) {

@@ -1,4 +1,5 @@
 #include "bnb/mip_presolve.h"
+#include "bnb/conflict_graph.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1445,42 +1446,85 @@ inline std::string exact_column_signature(const SparseColumn& column, int precis
     return oss.str();
 }
 
-inline bool row_forms_binary_clique(const Problem& problem, const SparseLinearConstraint& row,
-                                    double tol, std::vector<int>* clique_out) {
-    if (row.sense != LinearConstraintSense::LessEqual || row.indices.size() < 2 ||
-        row.values.size() < 2) {
-        return false;
+inline void extract_binary_knapsack_cliques_from_row(const Problem& problem,
+                                                     const SparseLinearConstraint& row, double tol,
+                                                     std::vector<std::vector<int>>* cliques) {
+    if (cliques == nullptr || row.sense != LinearConstraintSense::LessEqual ||
+        row.indices.size() < 2 || row.values.size() < 2 || !std::isfinite(row.rhs)) {
+        return;
     }
 
-    double reference = 0.0;
-    bool have_reference = false;
-    std::vector<int> vars;
+    double effective_tol = std::max(tol, 1e-12);
+    std::vector<std::pair<double, int>> coeffs;
+    coeffs.reserve(row.indices.size());
     for (int k = 0;
          k < static_cast<int>(row.indices.size()) && k < static_cast<int>(row.values.size()); ++k) {
         const int index = row.indices[k];
         const double coeff = row.values[k];
         if (index < 0 || index >= static_cast<int>(problem.variable_types.size()) ||
-            problem.variable_types[index] != VariableType::Binary || coeff <= tol) {
-            return false;
+            problem.variable_types[index] != VariableType::Binary || coeff <= effective_tol) {
+            return;
         }
-        if (!have_reference) {
-            reference = coeff;
-            have_reference = true;
-        } else if (std::abs(coeff - reference) > tol * std::max(1.0, std::abs(reference))) {
-            return false;
-        }
-        vars.push_back(index);
+        coeffs.emplace_back(coeff, index);
     }
 
-    if (!have_reference || row.rhs > reference + tol)
-        return false;
-    std::sort(vars.begin(), vars.end());
-    vars.erase(std::unique(vars.begin(), vars.end()), vars.end());
-    if (vars.size() < 2)
-        return false;
-    if (clique_out)
-        *clique_out = std::move(vars);
-    return true;
+    if (static_cast<int>(coeffs.size()) < 2)
+        return;
+
+    std::sort(coeffs.begin(), coeffs.end(), [](const auto& lhs, const auto& rhs) {
+        if (std::abs(lhs.first - rhs.first) > 1e-12)
+            return lhs.first < rhs.first;
+        return lhs.second < rhs.second;
+    });
+
+    const int n = static_cast<int>(coeffs.size());
+    if (coeffs[n - 2].first + coeffs[n - 1].first <= row.rhs + effective_tol)
+        return;
+
+    auto push_clique = [&](int suffix_start, int outside_index) {
+        std::vector<int> clique;
+        if (outside_index >= 0)
+            clique.push_back(coeffs[outside_index].second);
+        for (int pos = suffix_start; pos < n; ++pos)
+            clique.push_back(coeffs[pos].second);
+        std::sort(clique.begin(), clique.end());
+        clique.erase(std::unique(clique.begin(), clique.end()), clique.end());
+        if (clique.size() >= 2)
+            cliques->push_back(std::move(clique));
+    };
+
+    int left = 0;
+    int right = n - 2;
+    int first = n - 2;
+    while (left <= right) {
+        const int mid = left + (right - left) / 2;
+        if (coeffs[mid].first + coeffs[mid + 1].first > row.rhs + effective_tol) {
+            first = mid;
+            right = mid - 1;
+        } else {
+            left = mid + 1;
+        }
+    }
+
+    push_clique(first, -1);
+
+    for (int outside = first - 1; outside >= 0; --outside) {
+        int lo = first;
+        int hi = n - 1;
+        int suffix_start = -1;
+        while (lo <= hi) {
+            const int mid = lo + (hi - lo) / 2;
+            if (coeffs[outside].first + coeffs[mid].first > row.rhs + effective_tol) {
+                suffix_start = mid;
+                hi = mid - 1;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        if (suffix_start < 0)
+            break;
+        push_clique(suffix_start, outside);
+    }
 }
 
 inline void ensure_structure_cache(RootPresolveContext* context) {
@@ -1491,14 +1535,15 @@ inline void ensure_structure_cache(RootPresolveContext* context) {
     context->cliques.clear();
     std::unordered_set<std::string> seen_cliques;
     for (const auto& row : context->problem->base_constraints) {
-        std::vector<int> clique_vars;
-        if (!row_forms_binary_clique(*context->problem, row, context->tol, &clique_vars))
-            continue;
-        std::ostringstream key;
-        for (int var : clique_vars)
-            key << var << ';';
-        if (seen_cliques.insert(key.str()).second) {
-            context->cliques.push_back(BinaryClique{std::move(clique_vars)});
+        std::vector<std::vector<int>> cliques;
+        extract_binary_knapsack_cliques_from_row(*context->problem, row, context->tol, &cliques);
+        for (auto& clique_vars : cliques) {
+            std::ostringstream key;
+            for (int var : clique_vars)
+                key << var << ';';
+            if (seen_cliques.insert(key.str()).second) {
+                context->cliques.push_back(BinaryClique{std::move(clique_vars)});
+            }
         }
     }
     context->structure_dirty = false;
@@ -3289,7 +3334,7 @@ NodeBoundPresolveResult presolve_mip_node_bounds(const Problem& problem,
         add_row(cut);
 
     std::vector<char> dirty_rows(rows.size(), 1);
-    const int propagation_rounds = 2;  // Reduced from max(2, 2*max_passes) for speed
+    const int propagation_rounds = 2; // Reduced from max(2, 2*max_passes) for speed
     for (int round = 0; round < propagation_rounds; ++round) {
         bool any_dirty = false;
         bool changed = false;

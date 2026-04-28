@@ -169,6 +169,7 @@ void bind_bnb_bindings(py::module_& m) {
         .def_readwrite("use_cover_cuts", &BranchAndBoundOptions::use_cover_cuts)
         .def_readwrite("use_implied_bound_cuts", &BranchAndBoundOptions::use_implied_bound_cuts)
         .def_readwrite("use_clique_cuts", &BranchAndBoundOptions::use_clique_cuts)
+        .def_readwrite("use_graph_clique_cuts", &BranchAndBoundOptions::use_graph_clique_cuts)
         .def_readwrite("use_odd_cycle_cuts", &BranchAndBoundOptions::use_odd_cycle_cuts)
         .def_readwrite("use_probing_implications", &BranchAndBoundOptions::use_probing_implications)
         .def_readwrite("probing_max_candidates", &BranchAndBoundOptions::probing_max_candidates)

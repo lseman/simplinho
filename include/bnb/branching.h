@@ -110,4 +110,9 @@ BranchDecision choose_branching_variable(const ActiveNode& node,
                                          ParallelDispatcher* parallel_dispatcher,
                                          const RelaxationSolveCallback& relaxation_solver);
 
+BranchDecision choose_sos_branching_constraint(const ActiveNode& node,
+                                               const Eigen::VectorXd& primal,
+                                               const std::vector<SOSConstraint>& sos_constraints,
+                                               double feasibility_tol);
+
 } // namespace simplex::bnb::detail

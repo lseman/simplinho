@@ -111,7 +111,8 @@ std::optional<RelaxationSolution> make_incumbent_if_feasible(const Problem& prob
                                                              const Options& options,
                                                              const Eigen::VectorXd& candidate,
                                                              const std::vector<Cut>& cuts = {}) {
-    if (!is_integer_feasible_solution(candidate, problem.variable_types, options.integrality_tol)) {
+    if (!is_integer_feasible_solution(candidate, problem.variable_types, options.integrality_tol) ||
+        !is_sos_feasible_solution(candidate, problem.sos_constraints, options.integrality_tol)) {
         return std::nullopt;
     }
     if (!satisfies_all_constraints(problem, candidate, options.integrality_tol, cuts)) {
@@ -748,7 +749,9 @@ try_integer_subproblem(const Problem& problem, const Options& options, const Eig
     result->lp_iterations += subproblem.lp_iterations;
     if (!subproblem.has_solution ||
         !is_integer_feasible_solution(subproblem.primal, problem.variable_types,
-                                      options.integrality_tol)) {
+                                      options.integrality_tol) ||
+        !is_sos_feasible_solution(subproblem.primal, problem.sos_constraints,
+                                  options.integrality_tol)) {
         return std::nullopt;
     }
 
@@ -1777,6 +1780,8 @@ run_local_branching_heuristic(const Problem& problem, const Options& options,
         subproblem.status == Status::Unbounded || !std::isfinite(subproblem.objective) ||
         !is_integer_feasible_solution(subproblem.primal, problem.variable_types,
                                       options.integrality_tol) ||
+        !is_sos_feasible_solution(subproblem.primal, problem.sos_constraints,
+                                  options.integrality_tol) ||
         !objective_improves_for_problem(subproblem.objective, incumbent_objective, problem.maximize,
                                         options.integrality_tol)) {
         return result;
