@@ -2609,6 +2609,7 @@ class RevisedSimplex {
         Eigen::VectorXd c_in;
         std::vector<char> has_lower;
         std::vector<char> has_upper;
+        std::vector<char> fixed_bound;
         std::vector<int> single_y;
         std::vector<int> split_pos;
         std::vector<int> split_neg;
@@ -2665,8 +2666,10 @@ class RevisedSimplex {
             for (int j = 0; j < cols; ++j) {
                 const bool has_l = std::isfinite(l_use(j));
                 const bool has_u = std::isfinite(u_use(j));
+                const bool fixed = has_l && has_u && std::abs(u_use(j) - l_use(j)) <= 1e-12;
                 if (has_lower[j] != static_cast<char>(has_l) ||
-                    has_upper[j] != static_cast<char>(has_u)) {
+                    has_upper[j] != static_cast<char>(has_u) ||
+                    fixed_bound[j] != static_cast<char>(fixed)) {
                     return false;
                 }
             }
@@ -2688,6 +2691,7 @@ class RevisedSimplex {
             c_in.resize(0);
             has_lower.clear();
             has_upper.clear();
+            fixed_bound.clear();
             single_y.clear();
             split_pos.clear();
             split_neg.clear();
@@ -2713,6 +2717,7 @@ class RevisedSimplex {
         const int n = sparse_bound_only_cache_.cols;
         sparse_bound_only_cache_.has_lower.assign(n, 0);
         sparse_bound_only_cache_.has_upper.assign(n, 0);
+        sparse_bound_only_cache_.fixed_bound.assign(n, 0);
         sparse_bound_only_cache_.single_y.assign(n, -1);
         sparse_bound_only_cache_.split_pos.assign(n, -1);
         sparse_bound_only_cache_.split_neg.assign(n, -1);
@@ -2724,8 +2729,13 @@ class RevisedSimplex {
         for (int j = 0; j < n; ++j) {
             const bool has_l = std::isfinite(l_use(j));
             const bool has_u = std::isfinite(u_use(j));
+            const bool fixed = has_l && has_u && std::abs(u_use(j) - l_use(j)) <= opt_.tol;
             sparse_bound_only_cache_.has_lower[j] = static_cast<char>(has_l);
             sparse_bound_only_cache_.has_upper[j] = static_cast<char>(has_u);
+            sparse_bound_only_cache_.fixed_bound[j] = static_cast<char>(fixed);
+            if (fixed) {
+                continue;
+            }
             if (has_l || has_u) {
                 sparse_bound_only_cache_.single_y[j] = sparse_bound_only_cache_.nv++;
                 if (has_l && has_u)
@@ -2751,6 +2761,10 @@ class RevisedSimplex {
             const int y_neg = sparse_bound_only_cache_.split_neg[j];
             const bool has_l = static_cast<bool>(sparse_bound_only_cache_.has_lower[j]);
             const bool has_u = static_cast<bool>(sparse_bound_only_cache_.has_upper[j]);
+            const bool fixed = static_cast<bool>(sparse_bound_only_cache_.fixed_bound[j]);
+            if (fixed) {
+                continue;
+            }
             if (has_l && has_u) {
                 sparse_bound_only_cache_.c_std[y] += c(j);
             } else if (has_l) {
@@ -2769,11 +2783,14 @@ class RevisedSimplex {
             const int y_neg = sparse_bound_only_cache_.split_neg[j];
             const bool has_l = static_cast<bool>(sparse_bound_only_cache_.has_lower[j]);
             const bool has_u = static_cast<bool>(sparse_bound_only_cache_.has_upper[j]);
-            const bool uses_single = has_l || has_u;
+            const bool fixed = static_cast<bool>(sparse_bound_only_cache_.fixed_bound[j]);
+            const bool uses_single = (has_l || has_u) && !fixed;
             for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
                 const int row = it.row();
                 const double aij = it.value();
-                if (uses_single) {
+                if (fixed) {
+                    continue;
+                } else if (uses_single) {
                     const double sign = has_l ? 1.0 : -1.0;
                     trips.emplace_back(row, y, sign * aij);
                 } else {
@@ -2785,7 +2802,8 @@ class RevisedSimplex {
         int upper_row = 0;
         for (int j = 0; j < n; ++j) {
             if (!static_cast<bool>(sparse_bound_only_cache_.has_lower[j]) ||
-                !static_cast<bool>(sparse_bound_only_cache_.has_upper[j])) {
+                !static_cast<bool>(sparse_bound_only_cache_.has_upper[j]) ||
+                static_cast<bool>(sparse_bound_only_cache_.fixed_bound[j])) {
                 continue;
             }
             const int slack = sparse_bound_only_cache_.nv + upper_row;
@@ -2813,6 +2831,7 @@ class RevisedSimplex {
         for (int j = 0; j < cache.cols; ++j) {
             const bool has_l = static_cast<bool>(cache.has_lower[j]);
             const bool has_u = static_cast<bool>(cache.has_upper[j]);
+            const bool fixed = static_cast<bool>(cache.fixed_bound[j]);
             const bool uses_single = has_l || has_u;
             const double shift = has_l ? l_use(j) : u_use(j);
             if (!uses_single)
@@ -2826,7 +2845,7 @@ class RevisedSimplex {
             b_std(i) += cache.b_in(i);
         int upper_row = 0;
         for (int j = 0; j < cache.cols; ++j) {
-            if (!cache.has_lower[j] || !cache.has_upper[j])
+            if (!cache.has_lower[j] || !cache.has_upper[j] || cache.fixed_bound[j])
                 continue;
             const int row = cache.m_eq + upper_row;
             b_std(row) = u_use(j) - l_use(j);
@@ -3051,12 +3070,13 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             for (int j = 0; j < n; ++j) {
                 const bool has_l = static_cast<bool>(cache.has_lower[j]);
                 const bool has_u = static_cast<bool>(cache.has_upper[j]);
+                const bool fixed = static_cast<bool>(cache.fixed_bound[j]);
                 if (has_l || has_u) {
                     map[j].uses_single_var = true;
                     map[j].y = cache.single_y[j];
                     map[j].shift = has_l ? l_use(j) : u_use(j);
-                    map[j].sign = has_l ? 1 : -1;
-                    map[j].has_upper_row = has_l && has_u;
+                    map[j].sign = fixed ? 0 : (has_l ? 1 : -1);
+                    map[j].has_upper_row = has_l && has_u && !fixed;
                 } else {
                     map[j].y_pos = cache.split_pos[j];
                     map[j].y_neg = cache.split_neg[j];
@@ -3076,6 +3096,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             for (int j = 0; j < n; ++j) {
                 const bool has_l = std::isfinite(l_use(j));
                 const bool has_u = std::isfinite(u_use(j));
+                const bool fixed = has_l && has_u && std::abs(u_use(j) - l_use(j)) <= opt_.tol;
                 if (has_l && has_u && u_use(j) < l_use(j) - opt_.tol) {
                     Eigen::VectorXd xnan =
                         Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
@@ -3084,7 +3105,13 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                                        std::numeric_limits<double>::infinity(), {}, 0,
                                        {{"reason", "invalid_bounds"}}));
                 }
-                if (has_l) {
+                if (fixed) {
+                    map[j].uses_single_var = true;
+                    map[j].y = -1;
+                    map[j].shift = l_use(j);
+                    map[j].sign = 0;
+                    obj_shift += c_in(j) * l_use(j);
+                } else if (has_l) {
                     map[j].uses_single_var = true;
                     map[j].y = nv++;
                     single_y[j] = map[j].y;
@@ -3119,6 +3146,9 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
 
             for (int j = 0; j < n; ++j) {
                 if (map[j].uses_single_var) {
+                    if (map[j].y < 0) {
+                        continue;
+                    }
                     c_std(map[j].y) += static_cast<double>(map[j].sign) * c_in(j);
                 } else {
                     c_std(map[j].y_pos) += c_in(j);
@@ -3134,7 +3164,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                     const double aij = it.value();
                     if (map[j].uses_single_var) {
                         b_std(row) -= aij * map[j].shift;
-                        trips.emplace_back(row, map[j].y, static_cast<double>(map[j].sign) * aij);
+                        if (map[j].y >= 0) {
+                            trips.emplace_back(row, map[j].y,
+                                               static_cast<double>(map[j].sign) * aij);
+                        }
                     } else {
                         trips.emplace_back(row, map[j].y_pos, aij);
                         trips.emplace_back(row, map[j].y_neg, -aij);
@@ -3249,7 +3282,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         if (std_sol.x.size() == n_total && std_sol.x.array().isFinite().all()) {
             for (int j = 0; j < n; ++j) {
                 if (map[j].uses_single_var) {
-                    x(j) = map[j].shift + static_cast<double>(map[j].sign) * std_sol.x(map[j].y);
+                    x(j) = map[j].y >= 0
+                               ? map[j].shift +
+                                     static_cast<double>(map[j].sign) * std_sol.x(map[j].y)
+                               : map[j].shift;
                 } else {
                     x(j) = std_sol.x(map[j].y_pos) - std_sol.x(map[j].y_neg);
                 }

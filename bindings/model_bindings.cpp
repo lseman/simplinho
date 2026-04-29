@@ -1653,6 +1653,7 @@ class Model {
                 RevisedSimplex warm_solver;
                 std::optional<RevisedSimplex> fallback_solver;
                 RootWarmStartFallbackState root_warm_start_fallback;
+                std::optional<std::vector<int>> slack_basis_guess;
 
                 NodeLPCacheEntry(ModelLPData data, const RevisedSimplexOptions& cold_options,
                                  const RevisedSimplexOptions& warm_options)
@@ -1676,6 +1677,7 @@ class Model {
                 RevisedSimplex* warm_solver;
                 std::optional<RevisedSimplex>* fallback_solver;
                 RootWarmStartFallbackState* root_warm_start_fallback;
+                const std::optional<std::vector<int>>* slack_basis_guess;
             };
 
             static std::optional<std::vector<int>>
@@ -1731,7 +1733,10 @@ class Model {
             RevisedSimplex warm_solver;
             std::optional<RevisedSimplex> fallback_solver;
             RootWarmStartFallbackState root_warm_start_fallback;
+            std::optional<std::vector<int>> base_slack_basis_guess;
             std::unordered_map<std::string, NodeLPCacheEntry> node_lp_cache;
+            Eigen::VectorXd solve_l_scratch;
+            Eigen::VectorXd solve_u_scratch;
             RevisedSimplexOptions cold_options_;
             RevisedSimplexOptions warm_options_;
             double objective_constant_ = 0.0;
@@ -1748,6 +1753,7 @@ class Model {
                   cold_solver(cold_options), warm_solver(warm_options), cold_options_(cold_options),
                   warm_options_(warm_options), objective_constant_(objective_constant),
                   maximize_(maximize), verbose_(verbose) {
+                base_slack_basis_guess = build_slack_basis_guess(base_data);
                 if (cold_options.mode == SimplexMode::Dual) {
                     RevisedSimplexOptions fallback_options = cold_options;
                     fallback_options.mode = SimplexMode::Auto;
@@ -1807,21 +1813,25 @@ class Model {
             NodeLPSolverView get_node_lp_entry(const std::vector<simplex_bnb::Cut>& cuts) {
                 if (cuts.empty()) {
                     return NodeLPSolverView{&base_data, &cold_solver, &warm_solver,
-                                            &fallback_solver, &root_warm_start_fallback};
+                                            &fallback_solver, &root_warm_start_fallback,
+                                            &base_slack_basis_guess};
                 }
                 const std::string cache_key = cut_set_signature(cuts);
                 auto it = node_lp_cache.find(cache_key);
                 if (it != node_lp_cache.end()) {
                     return NodeLPSolverView{&it->second.lp_data, &it->second.cold_solver,
                                             &it->second.warm_solver, &it->second.fallback_solver,
-                                            &it->second.root_warm_start_fallback};
+                                            &it->second.root_warm_start_fallback,
+                                            &it->second.slack_basis_guess};
                 }
                 ModelLPData lp_data = build_node_lp_data_(base_data, cuts);
                 auto inserted = node_lp_cache.emplace(
                     cache_key, NodeLPCacheEntry(std::move(lp_data), cold_options_, warm_options_));
                 auto& entry = inserted.first->second;
+                entry.slack_basis_guess = build_slack_basis_guess(entry.lp_data);
                 return NodeLPSolverView{&entry.lp_data, &entry.cold_solver, &entry.warm_solver,
-                                        &entry.fallback_solver, &entry.root_warm_start_fallback};
+                                        &entry.fallback_solver, &entry.root_warm_start_fallback,
+                                        &entry.slack_basis_guess};
             }
 
             std::optional<LPSolution> try_lp_solve(RevisedSimplex& solver,
@@ -1901,10 +1911,12 @@ class Model {
                 }
                 const auto t1_assembly = std::chrono::steady_clock::now();
                 const ModelLPData& node_data = *entry.lp_data;
-                Eigen::VectorXd solve_l = node_data.l;
-                Eigen::VectorXd solve_u = node_data.u;
-                solve_l.head(node_data.original_vars) = node_l;
-                solve_u.head(node_data.original_vars) = node_u;
+                solve_l_scratch = node_data.l;
+                solve_u_scratch = node_data.u;
+                solve_l_scratch.head(node_data.original_vars) = node_l;
+                solve_u_scratch.head(node_data.original_vars) = node_u;
+                const Eigen::VectorXd& solve_l = solve_l_scratch;
+                const Eigen::VectorXd& solve_u = solve_u_scratch;
 
                 enum class WarmStartSource {
                     None,
@@ -1995,8 +2007,8 @@ class Model {
                     // }
                     return attempt;
                 };
-                const std::optional<std::vector<int>> slack_basis_guess =
-                    build_slack_basis_guess(node_data);
+                const std::optional<std::vector<int>>& slack_basis_guess =
+                    *entry.slack_basis_guess;
                 // Debugging helper: slack_basis_guess may be used for fallback solves.
                 auto try_solver_with_basis_guess =
                     [&](RevisedSimplex& solver,
@@ -2259,9 +2271,16 @@ class Model {
                                                      : std::numeric_limits<double>::infinity();
                     return out;
                 }
-                const NodeBoundPresolveResult node_presolve = presolve_mip_node_bounds(
-                    problem, node_l.head(data.original_vars), node_u.head(data.original_vars),
-                    simplified_presolve_cuts.cuts);
+                const bool run_binding_node_presolve = mip_options.use_node_presolve;
+                NodeBoundPresolveResult node_presolve;
+                if (run_binding_node_presolve) {
+                    node_presolve = presolve_mip_node_bounds(
+                        problem, node_l.head(data.original_vars), node_u.head(data.original_vars),
+                        simplified_presolve_cuts.cuts);
+                } else {
+                    node_presolve.lower = node_l.head(data.original_vars);
+                    node_presolve.upper = node_u.head(data.original_vars);
+                }
                 if (node_presolve.infeasible) {
                     // if (mip_options.verbose) {
                     //     std::cerr << "[MIP Root Debug] node bound presolve infeasible after "
