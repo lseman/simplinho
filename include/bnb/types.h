@@ -212,6 +212,7 @@ struct Options {
     bool use_gomory_cuts = true;
     bool use_mir_cuts = true; // Enable MIR cuts (more powerful than Gomory cover)
     bool use_cover_cuts = true;
+    bool use_zero_half_cuts = false;
     bool use_implied_bound_cuts = true;
     bool use_clique_cuts = true;
     bool use_graph_clique_cuts = true; // enable the new graph-based clique separator

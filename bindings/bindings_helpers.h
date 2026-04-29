@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "simplex/simplex.h"
+#include "solve_stats.h"
 
 namespace simplinho::bindings {
 
@@ -243,4 +244,4 @@ inline SolveStats build_solve_stats(const LPSolution& sol) {
     return stats;
 }
 
-}  // namespace simplinho::bindings
+} // namespace simplinho::bindings

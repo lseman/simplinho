@@ -102,6 +102,14 @@ const std::vector<std::unique_ptr<CutSeparator>>& default_cut_separators_() {
             }));
 
         built.push_back(std::make_unique<FunctionCutSeparator>(
+            "ZeroHalf", CutSeparatorPhase::LP,
+            [](const SeparatorContext& context) { return context.options.use_zero_half_cuts; },
+            [](const SeparatorContext& context) {
+                return generate_zero_half_cuts(context.problem, context.relaxation,
+                                               context.options);
+            }));
+
+        built.push_back(std::make_unique<FunctionCutSeparator>(
             "DualProof", CutSeparatorPhase::Proof,
             [](const SeparatorContext& context) { return context.options.use_dual_proof_cuts; },
             [](const SeparatorContext& context) {
@@ -356,6 +364,17 @@ struct BinaryCoverPartition {
     std::vector<int> remainder_positions;
 };
 
+enum class BinaryCoverOrdering { ActivityFirst, CoefficientFirst, RatioFirst };
+std::vector<int> greedy_binary_cover_positions_(const CanonicalKnapsack& kn,
+                                                BinaryCoverOrdering ordering, double tol);
+std::vector<int> minimize_binary_cover_positions_(std::vector<int> positions,
+                                                  const CanonicalKnapsack& kn, double tol);
+std::optional<BinaryCoverPartition>
+make_binary_cover_partition_(const CanonicalKnapsack& kn, std::vector<int> indices, double tol);
+std::optional<BinaryCoverPartition>
+find_greedy_violated_minimal_cover_(const CanonicalKnapsack& kn, BinaryCoverOrdering ordering,
+                                    double tol);
+
 // Build canonical knapsack ax <= b from a row, only if all variables are binary
 CanonicalKnapsack build_canonical_binary_knapsack_(const Problem& problem,
                                                    const RelaxationSolution& relaxation,
@@ -429,6 +448,16 @@ std::optional<BinaryCoverPartition> find_lp_violated_minimal_cover_(const Canoni
         lp_cover_objective += 1.0 - kn.lp_values[ratio_order[i]];
     }
     if (lp_cover_objective > 1.0 - tol) {
+        // fallback to greedy minimal cover candidates when the LP-based ratio
+        // cover is not sufficiently violated.
+        for (BinaryCoverOrdering ordering :
+             {BinaryCoverOrdering::ActivityFirst, BinaryCoverOrdering::CoefficientFirst,
+              BinaryCoverOrdering::RatioFirst}) {
+            if (const auto greedy_partition =
+                    find_greedy_violated_minimal_cover_(kn, ordering, tol)) {
+                return greedy_partition;
+            }
+        }
         return std::nullopt;
     }
 
@@ -472,6 +501,58 @@ std::optional<BinaryCoverPartition> find_lp_violated_minimal_cover_(const Canoni
             partition.remainder_positions.push_back(pos);
         }
     }
+
+    return partition;
+}
+
+std::optional<BinaryCoverPartition> make_binary_cover_partition_(const CanonicalKnapsack& kn,
+                                                                 std::vector<int> indices,
+                                                                 double tol = 1e-9) {
+    if (indices.size() < 2 || !kn.valid || !std::isfinite(kn.rhs) || kn.rhs < 0.0)
+        return std::nullopt;
+
+    indices = minimize_binary_cover_positions_(std::move(indices), kn, tol);
+    if (indices.size() < 2)
+        return std::nullopt;
+
+    double cover_sum = 0.0;
+    for (int pos : indices) {
+        if (pos < 0 || pos >= static_cast<int>(kn.coeffs.size()))
+            return std::nullopt;
+        cover_sum += kn.coeffs[pos];
+    }
+    if (cover_sum <= kn.rhs + tol)
+        return std::nullopt;
+
+    BinaryCoverPartition partition;
+    partition.cover_positions = std::move(indices);
+    std::vector<char> in_cover(kn.variables.size(), 0);
+    for (int pos : partition.cover_positions)
+        in_cover[pos] = 1;
+    for (int pos = 0; pos < static_cast<int>(kn.variables.size()); ++pos) {
+        if (!in_cover[pos])
+            partition.remainder_positions.push_back(pos);
+    }
+    return partition;
+}
+
+std::optional<BinaryCoverPartition>
+find_greedy_violated_minimal_cover_(const CanonicalKnapsack& kn, BinaryCoverOrdering ordering,
+                                    double tol = 1e-9) {
+    const std::vector<int> greedy_positions = greedy_binary_cover_positions_(kn, ordering, tol);
+    std::optional<BinaryCoverPartition> partition =
+        make_binary_cover_partition_(kn, greedy_positions, tol);
+    if (!partition.has_value())
+        return std::nullopt;
+
+    double lp_cover_activity = 0.0;
+    for (int pos : partition->cover_positions) {
+        if (pos < 0 || pos >= static_cast<int>(kn.lp_values.size()))
+            return std::nullopt;
+        lp_cover_activity += kn.lp_values[pos];
+    }
+    if (lp_cover_activity <= static_cast<double>(partition->cover_positions.size() - 1) + tol)
+        return std::nullopt;
 
     return partition;
 }
@@ -589,6 +670,117 @@ lifted_binary_cover_cut_(const CanonicalKnapsack& kn, double tol = 1e-9) {
     return std::make_tuple(indices, values, cut_rhs);
 }
 
+std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
+highs_lifted_binary_cover_cut_(const CanonicalKnapsack& kn,
+                               const BinaryCoverPartition& partition, double tol = 1e-9) {
+    const int n = static_cast<int>(kn.variables.size());
+    std::vector<int> cover = partition.cover_positions;
+    if (n < 2 || cover.size() < 2 || !kn.valid || !std::isfinite(kn.rhs) || kn.rhs <= tol)
+        return std::nullopt;
+
+    double cover_sum = 0.0;
+    for (int pos : cover) {
+        if (pos < 0 || pos >= n)
+            return std::nullopt;
+        cover_sum += kn.coeffs[pos];
+    }
+    const double lambda = cover_sum - kn.rhs;
+    if (lambda <= std::max(10.0 * tol, tol * std::abs(kn.rhs)))
+        return std::nullopt;
+
+    std::sort(cover.begin(), cover.end(), [&](int lhs, int rhs) {
+        if (std::abs(kn.coeffs[lhs] - kn.coeffs[rhs]) > tol)
+            return kn.coeffs[lhs] > kn.coeffs[rhs];
+        return lhs < rhs;
+    });
+
+    const int cover_size = static_cast<int>(cover.size());
+    double abar = kn.coeffs[cover.front()];
+    double sigma = lambda;
+    for (int i = 1; i < cover_size; ++i) {
+        const double delta = abar - kn.coeffs[cover[i]];
+        const double scaled_delta = static_cast<double>(i) * delta;
+        if (scaled_delta < sigma) {
+            abar = kn.coeffs[cover[i]];
+            sigma -= scaled_delta;
+        } else {
+            abar -= sigma / static_cast<double>(i);
+            sigma = 0.0;
+            break;
+        }
+    }
+    if (sigma > tol)
+        abar = kn.rhs / static_cast<double>(cover_size);
+    if (!(abar > tol) || !std::isfinite(abar))
+        return std::nullopt;
+
+    std::vector<double> prefix_min(static_cast<std::size_t>(cover_size), 0.0);
+    double prefix = 0.0;
+    int cplus_size = 0;
+    std::vector<char> cover_flag(static_cast<std::size_t>(n), 0);
+    for (int i = 0; i < cover_size; ++i) {
+        const int pos = cover[i];
+        prefix += std::min(abar, kn.coeffs[pos]);
+        prefix_min[static_cast<std::size_t>(i)] = prefix;
+        cover_flag[static_cast<std::size_t>(pos)] = kn.coeffs[pos] > abar + tol ? 1 : -1;
+        if (kn.coeffs[pos] > abar + tol)
+            ++cplus_size;
+    }
+    if (std::abs(prefix - kn.rhs) > std::max(1e-7, 1e-7 * std::abs(kn.rhs)))
+        return std::nullopt;
+
+    bool half_integral = false;
+    auto lift_function = [&](double coeff) {
+        const double hfrac = coeff / abar;
+        double lifted = 0.0;
+        int h = static_cast<int>(std::floor(hfrac + 0.5));
+        if (h != 0 && std::abs(hfrac - static_cast<double>(h)) * std::max(1.0, abar) <=
+                          std::max(1e-9, 10.0 * tol) &&
+            h <= cplus_size - 1) {
+            half_integral = true;
+            lifted = 0.5;
+        }
+        h = std::max(h - 1, 0);
+        for (; h < cover_size; ++h) {
+            if (coeff <= prefix_min[static_cast<std::size_t>(h)] + tol)
+                break;
+        }
+        return lifted + static_cast<double>(std::min(h, cover_size));
+    };
+
+    std::vector<double> canonical_coeffs(static_cast<std::size_t>(n), 0.0);
+    for (int pos = 0; pos < n; ++pos) {
+        if (cover_flag[static_cast<std::size_t>(pos)] == -1) {
+            canonical_coeffs[static_cast<std::size_t>(pos)] = 1.0;
+        } else if (cover_flag[static_cast<std::size_t>(pos)] == 1 ||
+                   kn.coeffs[pos] > tol) {
+            canonical_coeffs[static_cast<std::size_t>(pos)] = lift_function(kn.coeffs[pos]);
+        }
+    }
+
+    double multiplier = half_integral ? 2.0 : 1.0;
+    double cut_rhs = multiplier * static_cast<double>(cover_size - 1);
+    std::vector<int> indices;
+    std::vector<double> values;
+    indices.reserve(static_cast<std::size_t>(n));
+    values.reserve(static_cast<std::size_t>(n));
+    for (int pos = 0; pos < n; ++pos) {
+        double coeff = multiplier * canonical_coeffs[static_cast<std::size_t>(pos)];
+        if (std::abs(coeff) <= tol)
+            continue;
+        if (kn.complemented[pos]) {
+            cut_rhs -= coeff;
+            coeff = -coeff;
+        }
+        indices.push_back(kn.variables[pos]);
+        values.push_back(coeff);
+    }
+
+    if (indices.empty())
+        return std::nullopt;
+    return std::make_tuple(std::move(indices), std::move(values), cut_rhs);
+}
+
 std::vector<int> minimize_binary_cover_positions_(std::vector<int> positions,
                                                   const CanonicalKnapsack& kn, double tol = 1e-9) {
     if (positions.size() < 2) {
@@ -637,8 +829,6 @@ std::vector<int> minimize_binary_cover_positions_(std::vector<int> positions,
     positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
     return positions;
 }
-
-enum class BinaryCoverOrdering { ActivityFirst, CoefficientFirst, RatioFirst };
 
 std::vector<int> greedy_binary_cover_positions_(const CanonicalKnapsack& kn,
                                                 BinaryCoverOrdering ordering, double tol = 1e-9) {
@@ -2243,6 +2433,7 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         double full_norm = 0.0;
         double efficacy = 0.0;
         double active_efficacy = 0.0;
+        double highs_active_score = 0.0;
         double density_adjusted_efficacy = 0.0;
         double dynamism = 0.0;
         double fractional_focus = 0.0;
@@ -2263,7 +2454,7 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
             i < static_cast<int>(row_norms_.size()) ? row_norms_[i] : cut_norm_(cuts_[i]);
         const double age_bonus =
             std::exp(-cut_selection_age_bonus_ * static_cast<double>(cuts_[i].age));
-        candidates.push_back(Candidate{i, violation, full_norm, 0.0, 0.0, 0.0, 0.0, 0.0,
+        candidates.push_back(Candidate{i, violation, full_norm, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                                        cuts_[i].strength, age_bonus,
                                        violation <= 2.5 * min_violation_});
     }
@@ -2296,6 +2487,12 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         candidate.active_efficacy = active_stats.norm > 1e-16
                                         ? candidate.violation / active_stats.norm
                                         : candidate.efficacy;
+        const int active_nnz = std::max(
+            1, active_stats.nnz > 0 ? active_stats.nnz : static_cast<int>(cut.indices.size()));
+        candidate.highs_active_score =
+            active_stats.norm > 1e-16
+                ? candidate.violation / (static_cast<double>(active_nnz) * active_stats.norm)
+                : candidate.efficacy / static_cast<double>(active_nnz);
         candidate.fractional_focus = fractional_focus_(cut, primal);
         candidate.density_adjusted_efficacy = density_adjusted_efficacy_(
             candidate.violation, norm,
@@ -2305,10 +2502,12 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
     }
 
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {
-        const double lhs_score = 0.45 * lhs.active_efficacy + 0.20 * lhs.efficacy +
+        const double lhs_score = 0.35 * lhs.active_efficacy + 0.20 * lhs.highs_active_score +
+                                 0.15 * lhs.efficacy +
                                  0.15 * lhs.density_adjusted_efficacy + 0.10 * lhs.dynamism +
                                  0.10 * lhs.fractional_focus;
-        const double rhs_score = 0.45 * rhs.active_efficacy + 0.20 * rhs.efficacy +
+        const double rhs_score = 0.35 * rhs.active_efficacy + 0.20 * rhs.highs_active_score +
+                                 0.15 * rhs.efficacy +
                                  0.15 * rhs.density_adjusted_efficacy + 0.10 * rhs.dynamism +
                                  0.10 * rhs.fractional_focus;
         return lhs_score > rhs_score;
@@ -2321,6 +2520,7 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
     selected.reserve(static_cast<std::size_t>(std::max(0, max_cuts)));
     selected_indices.reserve(static_cast<std::size_t>(std::max(0, max_cuts)));
 
+    double selection_parallelism_limit = std::min(max_parallelism_, 0.10);
     while (selected.size() < static_cast<std::size_t>(max_cuts)) {
         double best_score = -std::numeric_limits<double>::infinity();
         int best_pos = -1;
@@ -2343,10 +2543,11 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
                              cut_parallelism_with_norms_(cut, candidate_norm, cuts_[selected_index],
                                                          row_norms_[selected_index]));
             }
-            if (max_parallelism > max_parallelism_)
+            if (max_parallelism > selection_parallelism_limit)
                 continue;
 
-            double score = 0.40 * candidate.active_efficacy + 0.15 * candidate.efficacy +
+            double score = 0.32 * candidate.active_efficacy + 0.18 * candidate.highs_active_score +
+                           0.12 * candidate.efficacy +
                            0.20 * (1.0 - max_parallelism) + 0.12 * candidate.age_bonus +
                            0.10 * candidate.density_adjusted_efficacy + 0.08 * candidate.strength +
                            dynamism_weight_ * candidate.dynamism +
@@ -2362,8 +2563,13 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
             }
         }
 
-        if (best_pos < 0)
+        if (best_pos < 0) {
+            if (selection_parallelism_limit < max_parallelism_) {
+                selection_parallelism_limit = max_parallelism_;
+                continue;
+            }
             break;
+        }
 
         const int index = candidates[best_pos].index;
         chosen[index] = 1;
@@ -2752,6 +2958,8 @@ std::vector<int> select_gmi_rows_(const Problem& problem, const RelaxationSoluti
         double min_abs = std::numeric_limits<double>::infinity();
         double max_abs = 0.0;
         int nnz = 0;
+        int fractional_support = 0;
+        int integer_support = 0;
         std::vector<std::pair<int, double>> support_terms;
         support_terms.reserve(static_cast<std::size_t>(lp.tableau.cols()));
         for (int col = 0; col < lp.tableau.cols(); ++col) {
@@ -2774,6 +2982,15 @@ std::vector<int> select_gmi_rows_(const Problem& problem, const RelaxationSoluti
             min_abs = std::min(min_abs, abs_value);
             max_abs = std::max(max_abs, abs_value);
             ++nnz;
+
+            if (problem.variable_types[*mapped_index] != VariableType::Continuous) {
+                ++integer_support;
+                const double primal_value = relaxation.primal(*mapped_index);
+                if (primal_value > options.integrality_tol &&
+                    primal_value < 1.0 - options.integrality_tol) {
+                    ++fractional_support;
+                }
+            }
         }
 
         if (nnz <= 1 || norm_sq <= 1e-16)
@@ -2781,7 +2998,11 @@ std::vector<int> select_gmi_rows_(const Problem& problem, const RelaxationSoluti
         if (max_abs / std::max(min_abs, 1e-16) > 1e6)
             continue;
 
-        const double score = frac * (1.0 - frac) / norm_sq;
+        const double support_bonus =
+            1.0 + 0.10 * std::min(1.0, static_cast<double>(fractional_support) / 8.0) +
+            0.05 * std::min(1.0, static_cast<double>(integer_support) / 12.0);
+        const double density_penalty = 1.0 + 0.08 * static_cast<double>(nnz);
+        const double score = frac * (1.0 - frac) * support_bonus / (std::max(1.0, norm_sq) * density_penalty);
         std::sort(support_terms.begin(), support_terms.end(),
                   [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
         std::vector<int> support_indices;
@@ -2889,9 +3110,12 @@ std::vector<int> select_mir_rows_(const Problem& problem, const RelaxationSoluti
         if (violation <= std::max(options.min_cut_violation, 1e-9))
             continue;
 
-        const double density_penalty = 1.0 + 0.1 * static_cast<double>(row.indices.size());
+        const double fractional_density =
+            std::min(1.0, static_cast<double>(fractional_support) / 8.0);
+        const double integer_density = std::min(1.0, static_cast<double>(integer_support) / 10.0);
+        const double density_penalty = 1.0 + 0.08 * static_cast<double>(row.indices.size());
         const double score = violation *
-                             (1.0 + 0.05 * fractional_support + 0.04 * integer_support) /
+                             (1.0 + 0.08 * fractional_density + 0.05 * integer_density) /
                              density_penalty;
         candidates.push_back(Candidate{row_index, score});
     }
@@ -3446,6 +3670,233 @@ std::vector<Cut> generate_mir_cuts(const Problem& problem, const RelaxationSolut
     return cuts;
 }
 
+namespace {
+
+struct ModKIntegerRow {
+    std::vector<int> indices;
+    std::vector<long long> values;
+    long long rhs = 0;
+    double score = 0.0;
+};
+
+bool variable_is_nonnegative_integer_for_cg_(const Problem& problem, int index,
+                                             const Options& options) {
+    if (index < 0 || index >= static_cast<int>(problem.variable_types.size()) ||
+        index >= problem.lower_bounds.size())
+        return false;
+    if (problem.variable_types[index] == VariableType::Continuous)
+        return false;
+    return problem.lower_bounds(index) >= -options.feasibility_tol;
+}
+
+std::optional<ModKIntegerRow> build_modk_integer_row_(const Problem& problem,
+                                                      const RelaxationSolution& relaxation,
+                                                      const Options& options,
+                                                      const SparseLinearConstraint& source_row,
+                                                      double row_sign) {
+    constexpr std::array<int, 12> kCandidateScales = {1, 2, 4, 8, 16, 32, 64, 128,
+                                                      256, 512, 1024, 2048};
+    const double coeff_tol = std::max(1e-8, 50.0 * options.integrality_tol);
+    std::vector<std::pair<int, double>> dense_terms;
+    dense_terms.reserve(source_row.indices.size());
+    const double rhs = row_sign * source_row.rhs;
+    double activity = 0.0;
+
+    for (int k = 0; k < static_cast<int>(source_row.indices.size()) &&
+                    k < static_cast<int>(source_row.values.size());
+         ++k) {
+        const int index = source_row.indices[k];
+        const double value = row_sign * source_row.values[k];
+        if (std::abs(value) <= 1e-12)
+            continue;
+        if (!variable_is_nonnegative_integer_for_cg_(problem, index, options))
+            return std::nullopt;
+        if (index >= relaxation.primal.size())
+            return std::nullopt;
+        dense_terms.emplace_back(index, value);
+        activity += value * relaxation.primal(index);
+    }
+    if (dense_terms.size() < 2 || !std::isfinite(rhs))
+        return std::nullopt;
+
+    std::sort(dense_terms.begin(), dense_terms.end(),
+              [](const auto& lhs, const auto& rhs_term) { return lhs.first < rhs_term.first; });
+    std::vector<std::pair<int, double>> merged_terms;
+    merged_terms.reserve(dense_terms.size());
+    for (const auto& [index, value] : dense_terms) {
+        if (!merged_terms.empty() && merged_terms.back().first == index) {
+            merged_terms.back().second += value;
+        } else {
+            merged_terms.emplace_back(index, value);
+        }
+    }
+    merged_terms.erase(std::remove_if(merged_terms.begin(), merged_terms.end(),
+                                      [](const auto& term) {
+                                          return std::abs(term.second) <= 1e-12;
+                                      }),
+                       merged_terms.end());
+    if (merged_terms.size() < 2)
+        return std::nullopt;
+
+    for (const int scale : kCandidateScales) {
+        bool good = true;
+        ModKIntegerRow row;
+        row.indices.reserve(merged_terms.size());
+        row.values.reserve(merged_terms.size());
+        long long max_abs = 0;
+        for (const auto& [index, value] : merged_terms) {
+            const double scaled = static_cast<double>(scale) * value;
+            const double rounded = std::round(scaled);
+            if (std::abs(scaled - rounded) > coeff_tol) {
+                good = false;
+                break;
+            }
+            const long long integer_value = static_cast<long long>(rounded);
+            if (integer_value == 0)
+                continue;
+            max_abs = std::max(max_abs, std::llabs(integer_value));
+            row.indices.push_back(index);
+            row.values.push_back(integer_value);
+        }
+        if (!good || row.indices.size() < 2 || max_abs > (1LL << 30))
+            continue;
+
+        const double scaled_rhs = static_cast<double>(scale) * rhs;
+        const double rounded_rhs = std::round(scaled_rhs);
+        if (std::abs(scaled_rhs - rounded_rhs) > coeff_tol)
+            continue;
+        row.rhs = static_cast<long long>(rounded_rhs);
+        if (std::llabs(row.rhs) > (1LL << 40))
+            continue;
+        row.score = std::max(0.0, activity - rhs) + 0.01 * static_cast<double>(row.indices.size());
+        return row;
+    }
+
+    return std::nullopt;
+}
+
+std::optional<Cut> build_modk_cg_cut_(const Problem& problem,
+                                      const RelaxationSolution& relaxation,
+                                      const Options& options,
+                                      const std::vector<const ModKIntegerRow*>& rows,
+                                      int modulus) {
+    if (rows.empty() || modulus <= 1)
+        return std::nullopt;
+
+    std::unordered_map<int, long long> aggregate;
+    long long aggregate_rhs = 0;
+    for (const ModKIntegerRow* row : rows) {
+        if (row == nullptr)
+            return std::nullopt;
+        aggregate_rhs += row->rhs;
+        for (int k = 0; k < static_cast<int>(row->indices.size()) &&
+                        k < static_cast<int>(row->values.size());
+             ++k) {
+            aggregate[row->indices[k]] += row->values[k];
+        }
+    }
+
+    Cut cut;
+    cut.sense = LinearConstraintSense::LessEqual;
+    cut.cut_type = modulus == 2 ? "ZeroHalf" : "ModK";
+    cut.rhs = std::floor(static_cast<double>(aggregate_rhs) / static_cast<double>(modulus));
+
+    std::vector<std::pair<int, double>> terms;
+    terms.reserve(aggregate.size());
+    for (const auto& [index, value] : aggregate) {
+        const long long coeff = static_cast<long long>(
+            std::floor(static_cast<double>(value) / static_cast<double>(modulus)));
+        if (coeff == 0)
+            continue;
+        terms.emplace_back(index, static_cast<double>(coeff));
+    }
+    if (terms.size() < 2)
+        return std::nullopt;
+
+    std::sort(terms.begin(), terms.end(),
+              [](const auto& lhs, const auto& rhs_term) { return lhs.first < rhs_term.first; });
+    for (const auto& [index, value] : terms) {
+        cut.indices.push_back(index);
+        cut.values.push_back(value);
+    }
+
+    if (!postprocess_cover_cut_(problem, options, &cut) || cut.indices.empty())
+        return std::nullopt;
+    const double violation = cut_violation(cut, relaxation.primal);
+    if (violation <= options.min_cut_violation)
+        return std::nullopt;
+    cut.strength = density_adjusted_efficacy_(
+        violation, cut_norm_(cut), static_cast<int>(cut.indices.size()),
+        fractional_focus_(cut, relaxation.primal), 1.0);
+    return cut;
+}
+
+} // namespace
+
+std::vector<Cut> generate_zero_half_cuts(const Problem& problem,
+                                         const RelaxationSolution& relaxation,
+                                         const Options& options) {
+    std::vector<Cut> cuts;
+    if (!options.use_zero_half_cuts || relaxation.primal.size() != problem.lower_bounds.size())
+        return cuts;
+
+    std::vector<ModKIntegerRow> rows;
+    rows.reserve(problem.base_constraints.size() * 2);
+    for (const SparseLinearConstraint& row : problem.base_constraints) {
+        if (row.sense == LinearConstraintSense::LessEqual ||
+            row.sense == LinearConstraintSense::Equal) {
+            if (auto converted = build_modk_integer_row_(problem, relaxation, options, row, 1.0))
+                rows.push_back(std::move(*converted));
+        }
+        if (row.sense == LinearConstraintSense::GreaterEqual ||
+            row.sense == LinearConstraintSense::Equal) {
+            if (auto converted = build_modk_integer_row_(problem, relaxation, options, row, -1.0))
+                rows.push_back(std::move(*converted));
+        }
+    }
+    if (rows.empty())
+        return cuts;
+
+    std::sort(rows.begin(), rows.end(), [](const ModKIntegerRow& lhs, const ModKIntegerRow& rhs) {
+        if (std::abs(lhs.score - rhs.score) > 1e-12)
+            return lhs.score > rhs.score;
+        return lhs.indices.size() < rhs.indices.size();
+    });
+    const int row_limit = std::min<int>(static_cast<int>(rows.size()),
+                                        std::max(16, 4 * options.max_cuts_added_per_round));
+    rows.resize(static_cast<std::size_t>(row_limit));
+
+    std::unordered_set<CutSignature, CutSignatureHash> signatures;
+    auto maybe_add = [&](std::optional<Cut> cut) {
+        if (!cut.has_value())
+            return;
+        const CutSignature signature = cut_signature(*cut);
+        if (!signatures.insert(signature).second)
+            return;
+        cuts.push_back(std::move(*cut));
+    };
+
+    constexpr std::array<int, 3> kModuli = {2, 3, 5};
+    for (const int modulus : kModuli) {
+        for (int i = 0; i < row_limit; ++i) {
+            const ModKIntegerRow* first = &rows[static_cast<std::size_t>(i)];
+            if (((first->rhs % modulus) + modulus) % modulus != 0)
+                maybe_add(build_modk_cg_cut_(problem, relaxation, options, {first}, modulus));
+
+            for (int j = i + 1; j < row_limit; ++j) {
+                const ModKIntegerRow* second = &rows[static_cast<std::size_t>(j)];
+                maybe_add(build_modk_cg_cut_(problem, relaxation, options, {first, second},
+                                             modulus));
+                if (static_cast<int>(cuts.size()) >=
+                    std::max(4, 2 * options.max_cuts_added_per_round))
+                    return cuts;
+            }
+        }
+    }
+
+    return cuts;
+}
+
 std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSolution& relaxation,
                                      const Options& options) {
     std::vector<Cut> cuts;
@@ -3525,6 +3976,7 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
             kn.rhs >= 0.0) {
             const std::vector<CoverLiteralTerm> canonical_terms = canonical_binary_cover_terms_(kn);
             std::vector<std::vector<int>> candidate_literal_covers;
+            std::vector<BinaryCoverPartition> candidate_partitions;
             auto queue_literal_cover = [&](std::vector<int> cover_literals) {
                 if (cover_literals.size() < 2) {
                     return;
@@ -3540,9 +3992,23 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
                     candidate_literal_covers.push_back(std::move(cover_literals));
                 }
             };
+            auto queue_partition = [&](BinaryCoverPartition partition) {
+                std::vector<int> key = partition.cover_positions;
+                std::sort(key.begin(), key.end());
+                if (key.size() < 2)
+                    return;
+                for (const BinaryCoverPartition& existing : candidate_partitions) {
+                    std::vector<int> existing_key = existing.cover_positions;
+                    std::sort(existing_key.begin(), existing_key.end());
+                    if (existing_key == key)
+                        return;
+                }
+                candidate_partitions.push_back(std::move(partition));
+            };
 
             if (const std::optional<BinaryCoverPartition> partition =
                     find_lp_violated_minimal_cover_(kn)) {
+                queue_partition(*partition);
                 queue_literal_cover(
                     canonical_binary_cover_literals_(kn, partition->cover_positions));
             }
@@ -3555,16 +4021,34 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
                                             &cuts);
             }
 
-            queue_literal_cover(canonical_binary_cover_literals_(
-                kn, greedy_binary_cover_positions_(kn, BinaryCoverOrdering::ActivityFirst)));
-            queue_literal_cover(canonical_binary_cover_literals_(
-                kn, greedy_binary_cover_positions_(kn, BinaryCoverOrdering::CoefficientFirst)));
-            queue_literal_cover(canonical_binary_cover_literals_(
-                kn, greedy_binary_cover_positions_(kn, BinaryCoverOrdering::RatioFirst)));
+            for (BinaryCoverOrdering ordering :
+                 {BinaryCoverOrdering::ActivityFirst, BinaryCoverOrdering::CoefficientFirst,
+                  BinaryCoverOrdering::RatioFirst}) {
+                if (const std::optional<BinaryCoverPartition> partition =
+                        find_greedy_violated_minimal_cover_(kn, ordering)) {
+                    queue_literal_cover(
+                        canonical_binary_cover_literals_(kn, partition->cover_positions));
+                    queue_partition(*partition);
+                }
+            }
+
+            for (const BinaryCoverPartition& partition : candidate_partitions) {
+                if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
+                        lifted_cover = highs_lifted_binary_cover_cut_(kn, partition)) {
+                    const auto& [lifted_indices, lifted_values, lifted_rhs] = *lifted_cover;
+                    maybe_add_lifted_cover_cut_(problem, relaxation, options, lifted_indices,
+                                                lifted_values, lifted_rhs, "LiftedCoverHighs",
+                                                &signatures, &cuts);
+                }
+            }
 
             for (const std::vector<int>& cover_literals : candidate_literal_covers) {
                 maybe_add_cover_cut_(problem, relaxation, options, cover_literals, "Cover",
                                      &signatures, &cuts);
+                const std::vector<int> lifted_cover_literals =
+                    extend_cover_literals_(canonical_terms, cover_literals, kn.rhs);
+                maybe_add_cover_cut_(problem, relaxation, options, lifted_cover_literals,
+                                     "LiftedCoverLite", &signatures, &cuts);
             }
             if (!candidate_literal_covers.empty()) {
                 return;
@@ -3597,11 +4081,17 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
             extend_cover_literals_(context.literals, activity_cover, context.rhs);
         const std::vector<int> lifted_coeff =
             extend_cover_literals_(context.literals, coeff_cover, context.rhs);
+        const std::vector<int> lifted_ratio =
+            extend_cover_literals_(context.literals, ratio_cover, context.rhs);
         maybe_add_cover_cut_(problem, relaxation, options, lifted_activity,
                              context.has_nonbinary_component ? "LiftedMixedBinaryCover"
                                                              : "LiftedCoverLite",
                              &signatures, &cuts);
         maybe_add_cover_cut_(problem, relaxation, options, lifted_coeff,
+                             context.has_nonbinary_component ? "LiftedMixedBinaryCover"
+                                                             : "LiftedCoverLite",
+                             &signatures, &cuts);
+        maybe_add_cover_cut_(problem, relaxation, options, lifted_ratio,
                              context.has_nonbinary_component ? "LiftedMixedBinaryCover"
                                                              : "LiftedCoverLite",
                              &signatures, &cuts);

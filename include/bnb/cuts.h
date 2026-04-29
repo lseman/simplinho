@@ -162,6 +162,10 @@ std::vector<Cut> generate_mir_cuts(const Problem& problem, const RelaxationSolut
 std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSolution& relaxation,
                                      const Options& options);
 
+std::vector<Cut> generate_zero_half_cuts(const Problem& problem,
+                                         const RelaxationSolution& relaxation,
+                                         const Options& options);
+
 std::vector<Cut> generate_implied_bound_cuts(const Problem& problem,
                                              const RelaxationSolution& relaxation,
                                              const Options& options);

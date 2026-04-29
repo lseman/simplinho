@@ -167,6 +167,7 @@ void bind_bnb_bindings(py::module_& m) {
         .def_readwrite("use_gomory_cuts", &BranchAndBoundOptions::use_gomory_cuts)
         .def_readwrite("use_mir_cuts", &BranchAndBoundOptions::use_mir_cuts)
         .def_readwrite("use_cover_cuts", &BranchAndBoundOptions::use_cover_cuts)
+        .def_readwrite("use_zero_half_cuts", &BranchAndBoundOptions::use_zero_half_cuts)
         .def_readwrite("use_implied_bound_cuts", &BranchAndBoundOptions::use_implied_bound_cuts)
         .def_readwrite("use_clique_cuts", &BranchAndBoundOptions::use_clique_cuts)
         .def_readwrite("use_graph_clique_cuts", &BranchAndBoundOptions::use_graph_clique_cuts)

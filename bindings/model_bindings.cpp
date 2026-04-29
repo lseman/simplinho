@@ -30,10 +30,10 @@
 #endif
 
 #include "bindings.h"
+#include "bindings_helpers.h"
 #include "simplex/bnb.h"
 #include "simplex/simplex.h"
 #include "solve_stats.h"
-#include "bindings_helpers.h"
 
 #ifndef SIMPLEX_PROJECT_VERSION
 #    define SIMPLEX_PROJECT_VERSION "unknown"
@@ -178,6 +178,7 @@ void print_verbose_solver_configuration(const BranchAndBoundOptions& options) {
         {"gomory", options.use_gomory_cuts},
         {"mir", options.use_mir_cuts},
         {"cover", options.use_cover_cuts},
+        {"zero-half", options.use_zero_half_cuts},
         {"impl-bound", options.use_implied_bound_cuts},
         {"clique", options.use_clique_cuts},
         {"odd-cycle", options.use_odd_cycle_cuts},
@@ -490,7 +491,6 @@ std::string expr_repr(const LinearExprData& data, const std::shared_ptr<ModelSta
 
     return oss.str();
 }
-
 
 bool basis_matches_dimensions(const LPBasis& basis, int columns, int rows) {
     if (basis.column_status.size() != static_cast<std::size_t>(columns)) {
