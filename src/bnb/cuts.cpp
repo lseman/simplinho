@@ -1924,15 +1924,49 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
 
         double coefficient = 0.0;
         if (problem.variable_types[*mapped_index] != VariableType::Continuous) {
-            const double fj = fractional_part(tij);
-            coefficient =
-                (fj <= f0) ? fj
-                           : ((std::abs(1.0 - f0) > 1e-10) ? (f0 * (1.0 - fj)) / (1.0 - f0) : 0.0);
+            // Standard GMI function: g(fj, f0)
+            // For a bounded integer y_j in [0, U] (non-basic at lower 0), the
+            // Cook-Kannan-Schrijver (CKS) strengthening gives a tighter coefficient
+            // by accounting for the finite range U:
+            //   alpha_j = floor(tij/U)*f0 + g(tij - floor(tij/U)*U, f0)
+            // This reduces to standard GMI when tij < U (floor = 0).
+            const auto gmi_g = [&](double t) -> double {
+                const double fj = fractional_part(t);
+                if (fj <= f0) return fj;
+                return (std::abs(1.0 - f0) > 1e-10) ? (f0 * (1.0 - fj)) / (1.0 - f0) : 0.0;
+            };
+
+            // Determine effective tableau entry and range.
+            // tij > 0: variable enters from lower bound (y_j = x_j - lb, y_j in [0, U]).
+            // tij < 0: internal model complements upper-bounded variables, so |tij| is
+            //          the entry for s_j = ub - x_j in [0, U]; U is the same range.
+            const double lb = *mapped_index < static_cast<int>(problem.lower_bounds.size())
+                                  ? problem.lower_bounds(*mapped_index) : 0.0;
+            const double ub = *mapped_index < static_cast<int>(problem.upper_bounds.size())
+                                  ? problem.upper_bounds(*mapped_index)
+                                  : std::numeric_limits<double>::infinity();
+            const double U = (std::isfinite(lb) && std::isfinite(ub)) ? (ub - lb)
+                                                                        : std::numeric_limits<double>::infinity();
+            const double abs_tij = std::abs(tij);
+            if (std::isfinite(U) && U >= 2.0 && abs_tij >= U - 1e-10) {
+                // CKS strengthening: floor(|tij|/U)*f0 + g(|tij| mod U, f0)
+                const double q = std::floor(abs_tij / U);
+                const double r = abs_tij - q * U;
+                coefficient = q * f0 + gmi_g(r);
+            } else {
+                coefficient = gmi_g(tij);
+            }
+            // Sign: for variables at upper bound in the internal model, the cut
+            // coefficient on x_j is negated (we built the cut in terms of the slack s_j).
+            if (tij < 0.0) {
+                coefficient = -coefficient;
+            }
         } else {
             coefficient = (tij > 0.0)
                               ? tij
                               : ((std::abs(1.0 - f0) > 1e-10) ? (-(f0 * tij) / (1.0 - f0)) : 0.0);
         }
+
 
         if (std::abs(coefficient) > 1e-8) {
             cut.indices.push_back(*mapped_index);
@@ -2418,7 +2452,8 @@ bool CutPool::add_cut(const Problem& problem, const Cut& cut) {
 std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
                                                const Eigen::VectorXd& lower_bounds,
                                                const Eigen::VectorXd& upper_bounds, int max_cuts,
-                                               double density_penalty_scale) {
+                                               double density_penalty_scale,
+                                               const Eigen::VectorXd* objective, bool maximize) {
     detail::TimingTrace timing_trace("cutpool_select_violated_cuts");
     detail::LockTrace lock_trace("cuts_mutex_");
     std::unique_lock<std::shared_mutex> lock(cuts_mutex_);
@@ -2437,6 +2472,7 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         double density_adjusted_efficacy = 0.0;
         double dynamism = 0.0;
         double fractional_focus = 0.0;
+        double obj_parallelism = 0.0; // |a^T c| / (||a|| ||c||)
         double strength = 0.0;
         double age_bonus = 0.0;
         bool marginal = false;
@@ -2455,7 +2491,7 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         const double age_bonus =
             std::exp(-cut_selection_age_bonus_ * static_cast<double>(cuts_[i].age));
         candidates.push_back(Candidate{i, violation, full_norm, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                                       cuts_[i].strength, age_bonus,
+                                       0.0, cuts_[i].strength, age_bonus,
                                        violation <= 2.5 * min_violation_});
     }
 
@@ -2499,17 +2535,40 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
             active_stats.nnz > 0 ? active_stats.nnz : static_cast<int>(cut.indices.size()),
             candidate.fractional_focus, density_penalty_scale);
         candidate.dynamism = cut_dynamism_(cut, primal, candidate.violation, norm);
+
+        // Objective parallelism: cosine similarity between the cut normal and the
+        // objective direction. Higher means the cut is more likely to directly tighten
+        // the LP bound. Sign is flipped for maximization (objective is negated in min form).
+        if (objective != nullptr && candidate.full_norm > 1e-16) {
+            double dot = 0.0;
+            double obj_sq = 0.0;
+            const double obj_sign = maximize ? -1.0 : 1.0;
+            for (int ki = 0; ki < static_cast<int>(cut.indices.size()) &&
+                             ki < static_cast<int>(cut.values.size());
+                 ++ki) {
+                const int col = cut.indices[ki];
+                if (col >= 0 && col < static_cast<int>(objective->size())) {
+                    const double obj_coeff = obj_sign * (*objective)(col);
+                    dot += cut.values[ki] * obj_coeff;
+                    obj_sq += obj_coeff * obj_coeff;
+                }
+            }
+            if (obj_sq > 1e-16) {
+                candidate.obj_parallelism =
+                    std::abs(dot) / (candidate.full_norm * std::sqrt(obj_sq));
+            }
+        }
     }
 
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {
-        const double lhs_score = 0.35 * lhs.active_efficacy + 0.20 * lhs.highs_active_score +
-                                 0.15 * lhs.efficacy +
-                                 0.15 * lhs.density_adjusted_efficacy + 0.10 * lhs.dynamism +
-                                 0.10 * lhs.fractional_focus;
-        const double rhs_score = 0.35 * rhs.active_efficacy + 0.20 * rhs.highs_active_score +
-                                 0.15 * rhs.efficacy +
-                                 0.15 * rhs.density_adjusted_efficacy + 0.10 * rhs.dynamism +
-                                 0.10 * rhs.fractional_focus;
+        const double lhs_score = 0.33 * lhs.active_efficacy + 0.19 * lhs.highs_active_score +
+                                 0.14 * lhs.efficacy +
+                                 0.14 * lhs.density_adjusted_efficacy + 0.10 * lhs.dynamism +
+                                 0.07 * lhs.fractional_focus + 0.08 * lhs.obj_parallelism;
+        const double rhs_score = 0.33 * rhs.active_efficacy + 0.19 * rhs.highs_active_score +
+                                 0.14 * rhs.efficacy +
+                                 0.14 * rhs.density_adjusted_efficacy + 0.10 * rhs.dynamism +
+                                 0.07 * rhs.fractional_focus + 0.08 * rhs.obj_parallelism;
         return lhs_score > rhs_score;
     });
 
@@ -2546,12 +2605,13 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
             if (max_parallelism > selection_parallelism_limit)
                 continue;
 
-            double score = 0.32 * candidate.active_efficacy + 0.18 * candidate.highs_active_score +
-                           0.12 * candidate.efficacy +
-                           0.20 * (1.0 - max_parallelism) + 0.12 * candidate.age_bonus +
-                           0.10 * candidate.density_adjusted_efficacy + 0.08 * candidate.strength +
+            double score = 0.30 * candidate.active_efficacy + 0.17 * candidate.highs_active_score +
+                           0.11 * candidate.efficacy +
+                           0.18 * (1.0 - max_parallelism) + 0.11 * candidate.age_bonus +
+                           0.09 * candidate.density_adjusted_efficacy + 0.07 * candidate.strength +
                            dynamism_weight_ * candidate.dynamism +
-                           0.05 * candidate.fractional_focus;
+                           0.05 * candidate.fractional_focus +
+                           0.10 * candidate.obj_parallelism;
             if (candidate.marginal) {
                 score +=
                     0.06 * candidate.density_adjusted_efficacy + 0.04 * candidate.fractional_focus;
@@ -3290,6 +3350,30 @@ std::optional<Cut> build_mir_cut_from_canonical_row_(const Problem& problem,
                                        }),
                            delta_candidates.end());
 
+    // Supplement with deltas that target specific fractionalities of beta = rhs/delta.
+    // For a target f* in (0,1): rhs/delta = k + f* => delta = rhs/(k + f*).
+    // This explores regions of the delta grid that coefficient-based deltas miss,
+    // improving the chance that fractional_part(beta) is far from 0 and 1 (=> strong cut).
+    if (std::isfinite(row.rhs) && std::abs(row.rhs) > away) {
+        const double abs_rhs = std::abs(row.rhs);
+        constexpr std::array<double, 9> kTargetFracs = {0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85};
+        const std::size_t base_size = delta_candidates.size();
+        for (const double f_star : kTargetFracs) {
+            for (int k = 1; k <= 4; ++k) {
+                const double d = abs_rhs / (static_cast<double>(k) + f_star);
+                if (d > away)
+                    delta_candidates.push_back(d);
+            }
+        }
+        if (delta_candidates.size() > base_size) {
+            std::sort(delta_candidates.begin(), delta_candidates.end());
+            delta_candidates.erase(
+                std::unique(delta_candidates.begin(), delta_candidates.end(),
+                            [](double a, double b) { return std::abs(a - b) <= 1e-9; }),
+                delta_candidates.end());
+        }
+    }
+
     std::optional<Cut> best_cut;
     double best_score = 0.0;
 
@@ -3611,6 +3695,73 @@ std::vector<Cut> generate_mir_cuts(const Problem& problem, const RelaxationSolut
         try_row(row.indices, row.values, row.rhs, "MIR");
     }
 
+    // Process LP tableau rows as C-MIR base rows.
+    // Tableau row i represents the equality: x_{B_i} + sum_{j nonbasic} T_{ij} x_j = b_i
+    // where x_{B_i} is the (fractional) basic variable.  These rows are optimal linear
+    // combinations of the original constraints and tend to produce stronger MIR cuts
+    // than raw base constraint rows because the fractionality is concentrated in one variable.
+    std::vector<MirRowData> tableau_mir_rows;
+    if (options.use_gomory_cuts && relaxation.lp_solution.has_value()) {
+        const LPSolution& lp = *relaxation.lp_solution;
+        const int n_cols = static_cast<int>(lp.tableau.cols());
+        const int n_rows = static_cast<int>(lp.tableau.rows());
+        if (lp.has_internal_tableau && n_rows > 0 &&
+            static_cast<int>(lp.tableau_rhs.size()) == n_rows &&
+            static_cast<int>(lp.internal_column_labels.size()) == n_cols &&
+            static_cast<int>(lp.basis_internal.size()) == n_rows) {
+            const std::vector<int> tableau_row_sel =
+                select_gmi_rows_(problem, relaxation, options, lp);
+            const int tmir_limit = std::max(4, options.max_cuts_added_per_round * 2);
+            constexpr double kTmirTol = 1e-10;
+            for (const int row_idx : tableau_row_sel) {
+                if (static_cast<int>(tableau_mir_rows.size()) >= tmir_limit)
+                    break;
+                const int basic_col = lp.basis_internal[row_idx];
+                if (basic_col < 0 || basic_col >= n_cols)
+                    continue;
+                const auto basic_idx =
+                    parse_internal_label_index_impl_(lp.internal_column_labels[basic_col]);
+                if (!basic_idx.has_value() || *basic_idx < 0 ||
+                    *basic_idx >= static_cast<int>(problem.variable_types.size()))
+                    continue;
+
+                // Build problem-variable-indexed row from tableau entries.
+                // Slack columns (where parse returns nullopt) are projected out —
+                // the resulting constraint is a valid relaxation of the tableau row.
+                std::vector<int> t_indices;
+                std::vector<double> t_values;
+                t_indices.push_back(*basic_idx);
+                t_values.push_back(1.0);
+                for (int col = 0; col < n_cols; ++col) {
+                    if (col == basic_col)
+                        continue;
+                    const double tij = lp.tableau(row_idx, col);
+                    if (std::abs(tij) <= kTmirTol)
+                        continue;
+                    const auto mapped =
+                        parse_internal_label_index_impl_(lp.internal_column_labels[col]);
+                    if (!mapped.has_value())
+                        continue; // skip slack columns
+                    if (*mapped < 0 || *mapped >= static_cast<int>(problem.variable_types.size()))
+                        continue;
+                    t_indices.push_back(*mapped);
+                    t_values.push_back(tij);
+                }
+                if (t_indices.size() < 2)
+                    continue;
+                const double t_rhs = lp.tableau_rhs(row_idx);
+                // Tableau row is an equality: try both LE orientations.
+                try_row(t_indices, t_values, t_rhs, "TMIR");
+                std::vector<double> neg = t_values;
+                for (auto& v : neg)
+                    v = -v;
+                try_row(t_indices, neg, -t_rhs, "TMIR");
+                tableau_mir_rows.push_back(
+                    MirRowData{std::move(t_indices), std::move(t_values), t_rhs});
+            }
+        }
+    }
+
     const int max_pair_aggregations = std::max(4, 2 * options.max_cuts_added_per_round);
     int pair_aggregations = 0;
     std::vector<MirRowData> aggregated_rows;
@@ -3651,6 +3802,31 @@ std::vector<Cut> generate_mir_cuts(const Problem& problem, const RelaxationSolut
                 continue;
             try_row(aggregated->indices, aggregated->values, aggregated->rhs, "CMIR-3");
             ++multi_aggregations;
+        }
+    }
+
+    // Aggregate each tableau row with each base constraint row (cross-aggregation).
+    // This produces TCMIR cuts that benefit from both the pivoted tableau structure
+    // and the original constraint coefficients.
+    if (!tableau_mir_rows.empty() && !rows.empty()) {
+        const int max_tcmir = std::max(2, options.max_cuts_added_per_round);
+        int tcmir_count = 0;
+        for (const MirRowData& trow : tableau_mir_rows) {
+            for (const MirRowData& brow : rows) {
+                if (tcmir_count >= max_tcmir)
+                    break;
+                const std::optional<int> pivot =
+                    choose_mir_aggregation_pivot_(trow, brow, relaxation.primal);
+                if (!pivot.has_value())
+                    continue;
+                std::optional<MirRowData> agg = aggregate_rows_for_mir_(trow, brow, *pivot);
+                if (!agg.has_value())
+                    continue;
+                try_row(agg->indices, agg->values, agg->rhs, "TCMIR");
+                ++tcmir_count;
+            }
+            if (tcmir_count >= max_tcmir)
+                break;
         }
     }
 

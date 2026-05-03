@@ -4,30 +4,50 @@
 
 # simplinho
 
-`simplinho` is a compact revised simplex LP solver with early branch-and-bound MIP support and Python bindings via `pybind11`.
+`simplinho` is a C++ revised simplex and branch-and-bound solver exposed as a
+small Python optimization package through `pybind11`.
 
-The solver core is implemented as header-only C++ under `include/simplex/`.
-The MIP branch-and-bound layer lives in `include/bnb/`, and the Python bindings are defined in `bindings/`.
+The LP core focuses on repeated bounded LP solves, warm starts, and useful
+diagnostics. The MIP layer builds on that core with branch-and-bound, presolve,
+cut separation, primal heuristics, SOS constraints, and parallel work sharing
+for the expensive parts of the search.
+
+The project is still compact and hackable: the simplex core lives under
+`include/simplex/`, the branch-and-bound layer under `include/bnb/`, and the
+Python bindings/modeling API under `bindings/`.
 
 ## Overview
 
-`simplinho` is designed to provide:
+`simplinho` is designed for experimentation with practical LP/MIP solver
+machinery:
 
-- a fast revised simplex engine for bounded LPs
-- MIP search with branch-and-bound, cuts, and primal heuristics
-- warm starts across repeated solves and node relaxations
-- a small Python modeling API for algebraic model construction and solve control
+- fast revised simplex solves for bounded LPs
+- reliable basis reuse across re-solves and branch-and-bound node relaxations
+- a Python modeling API that stays close to common algebraic modeling syntax
+- MIP search with configurable branching, node selection, cuts, and heuristics
+- detailed telemetry for inspecting numerics, warm starts, cuts, heuristics, and
+  branch-and-bound progress
 
 ## Highlights
 
 - Primal and dual revised simplex with automatic mode selection
-- Crash basis construction with multiple Markowitz-based strategies
-- Presolve, scaling, singleton elimination, and bound tightening
-- Robust numerics via rook pivoting and iterative refinement
+- Warm-started reoptimization through saved bases and per-solver basis caching
+- Crash basis construction with hybrid, repair, sprint, Crash II, and Crash III
+  strategies
+- Presolve, scaling, singleton elimination, row/column reduction, and bound
+  tightening
+- Robust numerics with Markowitz LU, rook-style pivot quality controls,
+  Forrest-Tomlin updates, and iterative refinement
 - Branch-and-bound with flexible search policies and branching rules
-- Cut generation for Gomory, MIR, cover, implied-bound, clique, odd-cycle, conflict, and dual-proof cuts
-- Dedicated root cut repeat and cut pool aging for better bound tightening
-- MIP heuristics including diving, feasibility pump, RINS, RENS, local search, and local branching
+- Cut generation for Gomory, MIR, cover, zero-half, implied-bound, clique,
+  odd-cycle, conflict, and dual-proof cuts
+- Dedicated root cut rounds, cut pool aging, duplicate filtering, and balanced
+  cut selection by violation, efficacy, density, and type
+- MIP heuristics including rounding, diving, feasibility pump, feasibility jump,
+  RENS, RINS, local search, and local branching
+- SOS1/SOS2 modeling support with dedicated feasibility checks and branching
+- Parallel workers for node processing, cut separation, strong-branching probes,
+  and asynchronous heuristics
 
 ## Python API
 
@@ -52,52 +72,85 @@ The module also exposes options and enums such as:
 
 ### Linear Programming
 
-- Revised simplex with primal and dual pivoting
+The LP engine is the foundation of the package and is meant to be useful both
+directly and as the relaxation engine for MIP search.
+
+- Revised simplex with primal, dual, and automatic modes
 - Phase I fallback when a feasible initial basis is unavailable
-- Support for bounded variables, shifted/free variable handling, and slack reformulation
-- Bound-flip logic for better dual iterations
-- Crash basis heuristics with Markowitz thresholding
+- Bounded-variable handling, shifted/free variable support, and slack
+  reformulation
+- Dual bound-flip logic for faster progress on bound-heavy relaxations
+- Markowitz-based crash basis construction with several strategy profiles
 - Presolve reduction, scaling, singleton elimination, and bound tightening
-- Detailed solver diagnostics including tableau, duals, reduced costs, and Farkas certificates
+- Warm starts from explicit `LPBasis` objects or the solver's cached last basis
+- Diagnostics for tableau data, duals, reduced costs, shadow prices, Farkas
+  certificates, primal rays, trace logs, and solve statistics
 
 ### Mixed-Integer Programming
 
-- Branch-and-bound on integer and binary variables
-- Node selection strategies: depth-first, breadth-first, best-bound, best-estimate, hybrid, best-first plunging, best-estimate plunging, and interleaved best-first/best-estimate
-- Branching rules: most-fractional, pseudo-cost, and strong branching
-- Diving strategies: fractional, vector-length, objective-value, coefficient, guided, and adaptive
-- Heuristics: LP rounding, diving heuristics, feasibility pump, RINS, RENS, local search, and local branching
-- Configurable root and node cut budgets
+The MIP layer solves integer and binary models through branch-and-bound, using
+the simplex engine for node relaxations.
+
+- Integer and binary variables through `VarType.Integer` and `VarType.Binary`
+- SOS1 and SOS2 constraints through `add_sos1(...)` / `add_sos2(...)`
+- Node selection strategies: depth-first, breadth-first, best-bound,
+  best-estimate, hybrid, best-first plunging, best-estimate plunging, and
+  interleaved best-first/best-estimate
+- Branching rules: most-fractional, pseudo-cost, and reduced strong branching
+- SOS-aware branching when SOS feasibility drives the split
+- Diving strategies: fractional, vector-length, objective-value, coefficient,
+  guided, and adaptive
+- Root and node cut budgets with separate root cut limits
+- Node presolve, relaxation warm starts, and LP reoptimization profiling
+- Parallel workers and thread-local caches for reduced contention in larger
+  searches
+- Stopping controls for node limits, absolute MIP gap, and relative MIP gap
 
 ### Cut Engine
 
+`simplinho` has a deliberately visible cut engine: each family can be toggled
+from `BranchAndBoundOptions`, and the solution object reports generated,
+applied, duplicate, and retained-pool counts.
+
+- Gomory mixed-integer cuts from the LP tableau
+- MIR cuts, including substitution choices for bounded variables
+- Cover cuts for binary knapsack-like rows
+- Zero-half cuts, available behind `use_zero_half_cuts`
 - Implied-bound cuts
-- Clique cuts and implication-strengthened cliques
-- Odd-cycle cuts
-- Gomory mixed-integer cuts
-- MIR cuts
-- Cover cuts
-- Conflict cuts with age-based pool management
+- Clique cuts, including graph-based clique separation and
+  implication-strengthened cliques
+- Odd-cycle cuts from binary conflict structure
+- Conflict cuts with a HiGHS-style conflict pool, age limits, and per-round caps
 - Dual-proof cuts
-- Cut pool selection tuned by violation, efficacy, density, and type balance
+- Probing implications used by conflict and graph-based separators
+- Cut pool scoring that balances violation, efficacy, density, age, parallelism,
+  and per-family diversity
 
 ### Numerics and Stability
 
-- Dense Markowitz LU factorization
-- Rook pivoting and pivot quality control
+- Markowitz LU factorization and sparse/dense solver utilities
+- Pivot quality controls and growth/condition guards
 - Iterative refinement in forward and transpose solves
 - Configurable refactor frequency and matrix compression
-- Forrest-Tomlin updates by default, optional eta updates available
-- Degeneracy management and anti-cycling support
-- Pricing rules: adaptive, Devex, and most-negative
+- Forrest-Tomlin updates by default, with eta-stack and hybrid update options
+- Degeneracy management, cost perturbation, and anti-cycling support
+- Pricing rules including adaptive, Devex, row pricing, most-infeasible, and
+  most-negative style choices
+- Optional quadratic warm-start repair paths for difficult reused bases
 
 ### Presolve and Diagnostics
 
-- Presolve with row/column simplification, scaling, singleton elimination, and bound tightening
+- LP presolve with row/column simplification, scaling, singleton elimination,
+  and bound tightening
+- MIP root and node presolve with bound tightening, row removal, coefficient
+  removal, and aggregation counters
 - Early detection of infeasible and unbounded models in presolve
 - Verbose tracing with optional basis and presolve diagnostics
-- Internal tableau exposure, duals, reduced costs, and shadow prices
-- Farkas certificate output for infeasibility proofs
+- Internal tableau exposure, duals, reduced costs, and shadow prices for LPs
+- MIP telemetry for root bounds, node counts, relaxation solves, heuristic
+  successes, cut activity, strong-branching probes, warm-start reuse, and phase
+  timing
+- Farkas certificates and primal rays for LP proof/debug workflows
 
 ## Build
 
@@ -106,10 +159,11 @@ The CMake project currently builds a Python extension named `simplinho`.
 ### Requirements
 
 - CMake 3.16+
-- A C++20 compiler
+- A C++23 compiler
 - Python 3.13 development headers
 
-If local copies of Eigen or `pybind11` are not present in a nearby `_deps` directory, CMake will fetch them with `FetchContent`.
+CMake fetches Eigen, `pybind11`, `stdexec`, and `ankerl::unordered_dense` when
+they are not already available through the configured local dependency paths.
 
 ### Build Commands
 

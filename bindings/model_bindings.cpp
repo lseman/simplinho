@@ -2481,7 +2481,7 @@ class Model {
         out.original_vars = n;
         out.total_vars = n + base_slack_count + cut_slack_count;
         out.rows = static_cast<int>(problem.base_constraints.size() + cuts.size());
-        out.A = Eigen::MatrixXd::Zero(out.rows, out.total_vars);
+        // No dense A allocation — build A_sparse directly from triplets.
         out.b = Eigen::VectorXd::Zero(out.rows);
         out.c = Eigen::VectorXd::Zero(out.total_vars);
         out.l = Eigen::VectorXd::Zero(out.total_vars);
@@ -2496,6 +2496,20 @@ class Model {
             out.c(j) = out.objective_sign * problem.objective_coefficients(j);
         }
 
+        // Count total non-zeros for reserve
+        int total_nnz = 0;
+        for (const auto& row : problem.base_constraints) {
+            total_nnz += static_cast<int>(row.indices.size());
+        }
+        total_nnz += base_slack_count; // slack columns
+        for (const auto& cut : cuts) {
+            total_nnz += static_cast<int>(cut.indices.size());
+        }
+        total_nnz += cut_slack_count;
+
+        std::vector<Eigen::Triplet<double>> trips;
+        trips.reserve(static_cast<std::size_t>(total_nnz));
+
         int next_slack = n;
         int row_index = 0;
         for (const auto& row : problem.base_constraints) {
@@ -2507,13 +2521,15 @@ class Model {
                     throw std::out_of_range(
                         "simplex: sparse problem row references invalid variable");
                 }
-                out.A(row_index, index) = row.values[k];
+                if (std::abs(row.values[k]) > kCoeffTol) {
+                    trips.emplace_back(row_index, index, row.values[k]);
+                }
             }
             out.b(row_index) = row.rhs;
             if (row.sense == simplex_bnb::LinearConstraintSense::LessEqual) {
-                out.A(row_index, next_slack++) = 1.0;
+                trips.emplace_back(row_index, next_slack++, 1.0);
             } else if (row.sense == simplex_bnb::LinearConstraintSense::GreaterEqual) {
-                out.A(row_index, next_slack++) = -1.0;
+                trips.emplace_back(row_index, next_slack++, -1.0);
             }
             ++row_index;
         }
@@ -2526,18 +2542,24 @@ class Model {
                 if (index < 0 || index >= n + base_slack_count) {
                     throw std::out_of_range("simplex: cut references invalid base variable");
                 }
-                out.A(row_index, index) = cut.values[k];
+                if (std::abs(cut.values[k]) > kCoeffTol) {
+                    trips.emplace_back(row_index, index, cut.values[k]);
+                }
             }
             out.b(row_index) = cut.rhs;
             if (cut.sense == simplex_bnb::LinearConstraintSense::LessEqual) {
-                out.A(row_index, next_slack++) = 1.0;
+                trips.emplace_back(row_index, next_slack++, 1.0);
             } else if (cut.sense == simplex_bnb::LinearConstraintSense::GreaterEqual) {
-                out.A(row_index, next_slack++) = -1.0;
+                trips.emplace_back(row_index, next_slack++, -1.0);
             }
             ++row_index;
         }
 
-        out.A_sparse = out.A.sparseView(kCoeffTol, 1.0);
+        out.A_sparse = Eigen::SparseMatrix<double>(out.rows, out.total_vars);
+        if (!trips.empty()) {
+            out.A_sparse.setFromTriplets(trips.begin(), trips.end());
+        }
+        out.A_sparse.makeCompressed();
         return out;
     }
 

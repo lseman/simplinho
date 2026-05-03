@@ -94,9 +94,20 @@ struct ActDualFix {
     double x_fix;
 };
 
+// Doubleton equality row: x_elim = (b_i - a_keep * x_keep) / a_elim
+struct ActDoubletonEq {
+    int col_elim;                  // column that was eliminated (expressed via col_keep)
+    int col_keep;                  // column that remains in the reduced problem
+    double a_elim;                 // coefficient of col_elim in the doubleton row
+    double a_keep;                 // coefficient of col_keep in the doubleton row
+    double b_row;                  // RHS of the doubleton equality row
+    double old_l_elim, old_u_elim; // original bounds of col_elim
+    double c_elim;                 // original objective coefficient of col_elim
+};
+
 using Action =
     std::variant<ActRowReduce, ActRemoveRow, ActRemoveCol, ActFixVar, ActTightenBound, ActScaleRow,
-                 ActScaleCol, ActSingletonRowElim, ActSingletonColElim, ActDualFix>;
+                 ActScaleCol, ActSingletonRowElim, ActSingletonColElim, ActDualFix, ActDoubletonEq>;
 
 struct PresolveResult {
     LP reduced;
@@ -376,6 +387,10 @@ class Presolver {
         int probing_max_vars = 3;              // Reduce from 6
         int probing_max_rounds = 1;            // Reduce from 2
         double probing_obj_tol = 1e-6;         // Relax tolerance
+
+        // doubleton equation elimination: x_elim = (b - a_keep*x_keep) / a_elim
+        // Only active when allow_structural_changes && !non_destructive
+        bool enable_doubleton_elim = false;
     };
 
     Presolver() : opt_() { domprop_min_delta_ = 1e3 * opt_.infeas_tol; }
@@ -444,6 +459,9 @@ class Presolver {
             }
         }
 
+        // Build sparse index once; maintained incrementally throughout the pass loop
+        build_sparse_index(P);
+
         int pass = 0;
         bool changed = true;
         while (changed && pass < opt_.max_passes) {
@@ -505,6 +523,11 @@ class Presolver {
             // Exact duplicate row removal (safe)
             changed |= redundancy_duplicate_rows(P);
 
+            // Doubleton equation elimination (structural, opt-in)
+            changed |= doubleton_equation_elimination(P);
+            if (res_.proven_infeasible)
+                break;
+
             // No structural or objective-changing passes unless explicitly
             // enabled
             ++pass;
@@ -553,6 +576,98 @@ class Presolver {
     const PresolveResult& result() const noexcept { return res_; }
 
   private:
+    // ---------- sparse index (maintained during run()) ----------
+    // row_nz_[i] = sorted column indices with A(i,j) != 0
+    // col_nz_[j] = sorted row indices with A(i,j) != 0
+    std::vector<std::vector<int>> row_nz_;
+    std::vector<std::vector<int>> col_nz_;
+
+    // ---------- sparse index management ----------
+    void build_sparse_index(const LP& P) {
+        const int m = (int)P.A.rows(), n = (int)P.A.cols();
+        row_nz_.assign(m, {});
+        col_nz_.assign(n, {});
+        for (int i = 0; i < m; ++i) {
+            for (int j = 0; j < n; ++j) {
+                if (std::abs(P.A(i, j)) > opt_.zero_tol) {
+                    row_nz_[i].push_back(j);
+                    col_nz_[j].push_back(i);
+                }
+            }
+        }
+    }
+
+    // Update sparse index when row i is about to be physically erased
+    // Must be called BEFORE the actual erase so row_nz_[i] is still valid
+    void update_index_erase_row(int i) {
+        // Remove row i from each col's list
+        for (int j : row_nz_[i]) {
+            auto& cv = col_nz_[j];
+            cv.erase(std::remove(cv.begin(), cv.end(), i), cv.end());
+        }
+        // Remove row_nz_[i]
+        row_nz_.erase(row_nz_.begin() + i);
+        // Decrement all row indices > i in all col_nz_ entries
+        for (auto& cv : col_nz_)
+            for (int& r : cv)
+                if (r > i)
+                    --r;
+    }
+
+    // Update sparse index when col j is about to be physically erased
+    // Must be called BEFORE the actual erase so col_nz_[j] is still valid
+    void update_index_erase_col(int j) {
+        // Remove col j from each row's list
+        for (int i : col_nz_[j]) {
+            auto& rv = row_nz_[i];
+            rv.erase(std::remove(rv.begin(), rv.end(), j), rv.end());
+        }
+        // Remove col_nz_[j]
+        col_nz_.erase(col_nz_.begin() + j);
+        // Decrement all col indices > j in all row_nz_ entries
+        for (auto& rv : row_nz_)
+            for (int& c : rv)
+                if (c > j)
+                    --c;
+    }
+
+    // Remove all entries for column j (when A(:,j) is zeroed out)
+    void zero_col_in_index(int j) {
+        if (j >= (int)col_nz_.size())
+            return;
+        for (int i : col_nz_[j]) {
+            auto& rv = row_nz_[i];
+            rv.erase(std::remove(rv.begin(), rv.end(), j), rv.end());
+        }
+        col_nz_[j].clear();
+    }
+
+    // Remove a single entry (i,j) from the index (when A(i,j) is set to zero)
+    void zero_entry_in_index(int i, int j) {
+        if (i < (int)row_nz_.size()) {
+            auto& rv = row_nz_[i];
+            rv.erase(std::remove(rv.begin(), rv.end(), j), rv.end());
+        }
+        if (j < (int)col_nz_.size()) {
+            auto& cv = col_nz_[j];
+            cv.erase(std::remove(cv.begin(), cv.end(), i), cv.end());
+        }
+    }
+
+    // Add entry (i,j) to the index (when a new nonzero appears at A(i,j))
+    void add_entry_to_index(int i, int j) {
+        if (i >= (int)row_nz_.size() || j >= (int)col_nz_.size())
+            return;
+        auto& rv = row_nz_[i];
+        auto it = std::lower_bound(rv.begin(), rv.end(), j);
+        if (it == rv.end() || *it != j)
+            rv.insert(it, j);
+        auto& cv = col_nz_[j];
+        auto it2 = std::lower_bound(cv.begin(), cv.end(), i);
+        if (it2 == cv.end() || *it2 != i)
+            cv.insert(it2, i);
+    }
+
     // ---------- numerics helpers ----------
     static double cond2_estimate_upper(const Eigen::MatrixXd& R11) {
         if (R11.size() == 0)
@@ -921,6 +1036,7 @@ class Presolver {
                 res_.stack.emplace_back(ActTightenBound{j, oldL, oldU});
                 P.l(j) = xfix;
                 P.u(j) = xfix;
+                zero_col_in_index(j);
                 P.A.col(j).setZero();
                 changed = true;
                 ++j;
@@ -953,6 +1069,7 @@ class Presolver {
             } else {
                 // keep column for ranking: zero it out, keep c_j, set l=u=xfix
                 res_.stack.emplace_back(ActTightenBound{j, P.l(j), P.u(j)});
+                zero_col_in_index(j);
                 P.A.col(j).setZero();
                 P.l(j) = xfix;
                 P.u(j) = xfix;
@@ -974,6 +1091,7 @@ class Presolver {
         }
         P.b.noalias() -= P.A.col(j) * xfix;
         res_.stack.emplace_back(ActTightenBound{j, P.l(j), P.u(j)});
+        zero_col_in_index(j);
         P.A.col(j).setZero();
         P.l(j) = xfix;
         P.u(j) = xfix;
@@ -987,13 +1105,20 @@ class Presolver {
         for (int i = 0; i < m; ++i) {
             int j = -1;
             int count = 0;
-            for (int k = 0; k < n; ++k) {
-                if (std::abs(P.A(i, k)) <= opt_.zero_tol)
-                    continue;
-                j = k;
-                ++count;
-                if (count > 1)
-                    break;
+            // Use sparse index for fast singleton check when available
+            if (i < (int)row_nz_.size()) {
+                count = (int)row_nz_[i].size();
+                if (count == 1)
+                    j = row_nz_[i][0];
+            } else {
+                for (int k = 0; k < n; ++k) {
+                    if (std::abs(P.A(i, k)) <= opt_.zero_tol)
+                        continue;
+                    j = k;
+                    ++count;
+                    if (count > 1)
+                        break;
+                }
             }
             if (count != 1)
                 continue;
@@ -1116,17 +1241,26 @@ class Presolver {
         if (m == 0 || n == 0)
             return false;
 
-        std::vector<std::vector<int>> row_cols(m), col_rows(n);
-        row_cols.assign(m, {});
-        col_rows.assign(n, {});
-        for (int i = 0; i < m; ++i) {
-            for (int j = 0; j < n; ++j) {
-                if (std::abs(P.A(i, j)) <= opt_.zero_tol)
-                    continue;
-                row_cols[i].push_back(j);
-                col_rows[j].push_back(i);
+        // Use persistent sparse index if available; otherwise build locally
+        const bool use_global = ((int)row_nz_.size() == m && (int)col_nz_.size() == n);
+
+        std::vector<std::vector<int>> local_row_cols, local_col_rows;
+        const std::vector<std::vector<int>>& row_cols = use_global ? row_nz_ : local_row_cols;
+        const std::vector<std::vector<int>>& col_rows = use_global ? col_nz_ : local_col_rows;
+
+        if (!use_global) {
+            local_row_cols.assign(m, {});
+            local_col_rows.assign(n, {});
+            for (int i = 0; i < m; ++i) {
+                for (int j = 0; j < n; ++j) {
+                    if (std::abs(P.A(i, j)) <= opt_.zero_tol)
+                        continue;
+                    local_row_cols[i].push_back(j);
+                    local_col_rows[j].push_back(i);
+                }
             }
         }
+        (void)row_cols; // silence unused-variable warning (used via references above)
 
         std::vector<char> dirty_rows(m, 1), dirty_cols(n, 0);
         const int max_rounds = std::max(2, opt_.max_passes);
@@ -1223,26 +1357,66 @@ class Presolver {
     }
 
     bool rows_feasible_(const LP& P, const std::vector<char>* active_rows) {
-        for (int i = 0; i < (int)P.A.rows(); ++i) {
-            if (active_rows && (i >= (int)active_rows->size() || !(*active_rows)[i])) {
+        const int m = (int)P.A.rows();
+        const int n = (int)P.A.cols();
+        for (int i = 0; i < m; ++i) {
+            if (active_rows && (i >= (int)active_rows->size() || !(*active_rows)[i]))
                 continue;
+
+            // Compute row activity using sparse index when available
+            double min_finite = 0.0, max_finite = 0.0;
+            int min_inf_cnt = 0, max_inf_cnt = 0;
+
+            auto process_row_col = [&](int j) {
+                const double aij = P.A(i, j);
+                if (std::abs(aij) <= opt_.zero_tol)
+                    return;
+                if (aij > 0.0) {
+                    if (is_finite(P.l(j)))
+                        min_finite += aij * P.l(j);
+                    else
+                        ++min_inf_cnt;
+                    if (is_finite(P.u(j)))
+                        max_finite += aij * P.u(j);
+                    else
+                        ++max_inf_cnt;
+                } else {
+                    if (is_finite(P.u(j)))
+                        min_finite += aij * P.u(j);
+                    else
+                        ++min_inf_cnt;
+                    if (is_finite(P.l(j)))
+                        max_finite += aij * P.l(j);
+                    else
+                        ++max_inf_cnt;
+                }
+            };
+
+            if (i < (int)row_nz_.size()) {
+                for (int j : row_nz_[i])
+                    process_row_col(j);
+            } else {
+                for (int j = 0; j < n; ++j)
+                    process_row_col(j);
             }
-            const ActivityRange ab =
-                row_activity_range_excluding(P.A.row(i), P.l, P.u, -1, opt_.zero_tol);
+
             const double rhs = P.b(i);
+            const bool min_f = (min_inf_cnt == 0);
+            const bool max_f = (max_inf_cnt == 0);
+
             if (P.sense[i] == RowSense::LE) {
-                if (ab.min_finite && ab.min_act > rhs + opt_.infeas_tol) {
+                if (min_f && min_finite > rhs + opt_.infeas_tol) {
                     res_.proven_infeasible = true;
                     return false;
                 }
             } else if (P.sense[i] == RowSense::GE) {
-                if (ab.max_finite && ab.max_act < rhs - opt_.infeas_tol) {
+                if (max_f && max_finite < rhs - opt_.infeas_tol) {
                     res_.proven_infeasible = true;
                     return false;
                 }
             } else {
-                if ((ab.min_finite && ab.min_act > rhs + opt_.infeas_tol) ||
-                    (ab.max_finite && ab.max_act < rhs - opt_.infeas_tol)) {
+                if ((min_f && min_finite > rhs + opt_.infeas_tol) ||
+                    (max_f && max_finite < rhs - opt_.infeas_tol)) {
                     res_.proven_infeasible = true;
                     return false;
                 }
@@ -1271,15 +1445,133 @@ class Presolver {
 
     ImpliedBoundsSummary collect_implied_bounds_(const LP& P,
                                                  const std::vector<char>* active_rows) const {
-        ImpliedBoundsSummary summary(P.A.cols());
-        for (int i = 0; i < (int)P.A.rows(); ++i) {
-            if (active_rows && (i >= (int)active_rows->size() || !(*active_rows)[i])) {
+        const int m = (int)P.A.rows();
+        const int n = (int)P.A.cols();
+        ImpliedBoundsSummary summary(n);
+
+        for (int i = 0; i < m; ++i) {
+            if (active_rows && (i >= (int)active_rows->size() || !(*active_rows)[i]))
                 continue;
+
+            // Use sparse index when available, else scan densely
+            const std::vector<int>* nz_cols_ptr = (i < (int)row_nz_.size()) ? &row_nz_[i] : nullptr;
+
+            // Build local sparse list + row activity summary in one pass
+            struct NzEntry {
+                int j;
+                double aij;
+            };
+            std::vector<NzEntry> entries;
+
+            double min_finite = 0.0, max_finite = 0.0;
+            int min_inf_cnt = 0, max_inf_cnt = 0;
+
+            auto process_col = [&](int j) {
+                const double aij = P.A(i, j);
+                if (std::abs(aij) <= opt_.zero_tol)
+                    return;
+                entries.push_back({j, aij});
+                if (aij > 0.0) {
+                    if (is_finite(P.l(j)))
+                        min_finite += aij * P.l(j);
+                    else
+                        ++min_inf_cnt;
+                    if (is_finite(P.u(j)))
+                        max_finite += aij * P.u(j);
+                    else
+                        ++max_inf_cnt;
+                } else {
+                    if (is_finite(P.u(j)))
+                        min_finite += aij * P.u(j);
+                    else
+                        ++min_inf_cnt;
+                    if (is_finite(P.l(j)))
+                        max_finite += aij * P.l(j);
+                    else
+                        ++max_inf_cnt;
+                }
+            };
+
+            if (nz_cols_ptr) {
+                entries.reserve(nz_cols_ptr->size());
+                for (int j : *nz_cols_ptr)
+                    process_col(j);
+            } else {
+                for (int j = 0; j < n; ++j)
+                    process_col(j);
             }
-            for (int j = 0; j < (int)P.A.cols(); ++j) {
-                if (std::abs(P.A(i, j)) <= opt_.zero_tol)
-                    continue;
-                merge_implied_interval_(summary, j, singleton_implied_interval(P, i, j));
+
+            if (entries.empty())
+                continue;
+
+            const double rhs = P.b(i);
+
+            for (const auto& [j, aij] : entries) {
+                // Subtract column j's contribution from row activity to get "other" activity
+                double other_min = min_finite;
+                int other_min_inf = min_inf_cnt;
+                const bool j_contributes_to_min_inf =
+                    (aij > 0.0) ? !is_finite(P.l(j)) : !is_finite(P.u(j));
+                if (j_contributes_to_min_inf) {
+                    --other_min_inf;
+                } else {
+                    other_min -= (aij > 0.0) ? aij * P.l(j) : aij * P.u(j);
+                }
+
+                double other_max = max_finite;
+                int other_max_inf = max_inf_cnt;
+                const bool j_contributes_to_max_inf =
+                    (aij > 0.0) ? !is_finite(P.u(j)) : !is_finite(P.l(j));
+                if (j_contributes_to_max_inf) {
+                    --other_max_inf;
+                } else {
+                    other_max -= (aij > 0.0) ? aij * P.u(j) : aij * P.l(j);
+                }
+
+                const bool omin_finite = (other_min_inf == 0);
+                const bool omax_finite = (other_max_inf == 0);
+
+                ImpliedInterval impl;
+                if (P.sense[i] == RowSense::LE) {
+                    if (aij > 0.0 && omin_finite) {
+                        impl.upper = (rhs - other_min) / aij;
+                        impl.has_upper = true;
+                    } else if (aij < 0.0 && omin_finite) {
+                        impl.lower = (rhs - other_min) / aij;
+                        impl.has_lower = true;
+                    }
+                } else if (P.sense[i] == RowSense::GE) {
+                    if (aij > 0.0 && omax_finite) {
+                        impl.lower = (rhs - other_max) / aij;
+                        impl.has_lower = true;
+                    } else if (aij < 0.0 && omax_finite) {
+                        impl.upper = (rhs - other_max) / aij;
+                        impl.has_upper = true;
+                    }
+                } else { // EQ
+                    if (aij > 0.0) {
+                        if (omax_finite) {
+                            impl.lower = (rhs - other_max) / aij;
+                            impl.has_lower = true;
+                        }
+                        if (omin_finite) {
+                            impl.upper = (rhs - other_min) / aij;
+                            impl.has_upper = true;
+                        }
+                    } else {
+                        if (omin_finite) {
+                            impl.lower = (rhs - other_min) / aij;
+                            impl.has_lower = true;
+                        }
+                        if (omax_finite) {
+                            impl.upper = (rhs - other_max) / aij;
+                            impl.has_upper = true;
+                        }
+                    }
+                }
+                if (impl.has_lower && impl.has_upper && impl.lower > impl.upper)
+                    std::swap(impl.lower, impl.upper);
+                merge_implied_interval_(summary, j, impl);
             }
         }
         return summary;
@@ -1496,30 +1788,57 @@ class Presolver {
             bool up_relaxes = false;
             bool down_relaxes = false;
 
-            for (int i = 0; i < m; ++i) {
-                const double aij = P.A(i, j);
-                if (std::abs(aij) <= opt_.zero_tol)
-                    continue;
-
-                if (P.sense[i] == RowSense::EQ) {
-                    has_eq = true;
-                    break;
+            // Use col_nz_ for sparse row iteration when available
+            const bool use_nz = (j < (int)col_nz_.size());
+            if (use_nz) {
+                for (int i : col_nz_[j]) {
+                    const double aij = P.A(i, j);
+                    if (std::abs(aij) <= opt_.zero_tol)
+                        continue;
+                    if (P.sense[i] == RowSense::EQ) {
+                        has_eq = true;
+                        break;
+                    }
+                    if (P.sense[i] == RowSense::LE) {
+                        if (aij < 0.0)
+                            up_relaxes = true;
+                        if (aij > 0.0)
+                            down_relaxes = true;
+                    } else if (P.sense[i] == RowSense::GE) {
+                        if (aij > 0.0)
+                            up_relaxes = true;
+                        if (aij < 0.0)
+                            down_relaxes = true;
+                    }
+                    if ((can_fix_lower && up_relaxes) || (can_fix_upper && down_relaxes))
+                        break;
                 }
+            } else {
+                for (int i = 0; i < m; ++i) {
+                    const double aij = P.A(i, j);
+                    if (std::abs(aij) <= opt_.zero_tol)
+                        continue;
 
-                if (P.sense[i] == RowSense::LE) {
-                    if (aij < 0.0)
-                        up_relaxes = true;
-                    if (aij > 0.0)
-                        down_relaxes = true;
-                } else if (P.sense[i] == RowSense::GE) {
-                    if (aij > 0.0)
-                        up_relaxes = true;
-                    if (aij < 0.0)
-                        down_relaxes = true;
-                }
+                    if (P.sense[i] == RowSense::EQ) {
+                        has_eq = true;
+                        break;
+                    }
 
-                if ((can_fix_lower && up_relaxes) || (can_fix_upper && down_relaxes)) {
-                    break;
+                    if (P.sense[i] == RowSense::LE) {
+                        if (aij < 0.0)
+                            up_relaxes = true;
+                        if (aij > 0.0)
+                            down_relaxes = true;
+                    } else if (P.sense[i] == RowSense::GE) {
+                        if (aij > 0.0)
+                            up_relaxes = true;
+                        if (aij < 0.0)
+                            down_relaxes = true;
+                    }
+
+                    if ((can_fix_lower && up_relaxes) || (can_fix_upper && down_relaxes)) {
+                        break;
+                    }
                 }
             }
 
@@ -1543,6 +1862,7 @@ class Presolver {
                 erase_col(P, j);
                 --j;
             } else {
+                zero_col_in_index(j);
                 P.A.col(j).setZero();
                 P.l(j) = xfix;
                 P.u(j) = xfix;
@@ -1562,13 +1882,19 @@ class Presolver {
         for (int j = 0; j < (int)P.A.cols(); ++j) {
             int row_idx = -1;
             int col_nnz = 0;
-            for (int i = 0; i < (int)P.A.rows(); ++i) {
-                if (std::abs(P.A(i, j)) <= opt_.zero_tol)
-                    continue;
-                row_idx = i;
-                ++col_nnz;
-                if (col_nnz > 1)
-                    break;
+            if (j < (int)col_nz_.size()) {
+                col_nnz = (int)col_nz_[j].size();
+                if (col_nnz == 1)
+                    row_idx = col_nz_[j][0];
+            } else {
+                for (int i = 0; i < (int)P.A.rows(); ++i) {
+                    if (std::abs(P.A(i, j)) <= opt_.zero_tol)
+                        continue;
+                    row_idx = i;
+                    ++col_nnz;
+                    if (col_nnz > 1)
+                        break;
+                }
             }
             if (col_nnz != 1 || row_idx < 0)
                 continue;
@@ -1578,9 +1904,13 @@ class Presolver {
             const double aij = row(j);
 
             int row_nnz = 0;
-            for (int k = 0; k < row.size(); ++k)
-                if (std::abs(row(k)) > opt_.zero_tol)
-                    ++row_nnz;
+            if (row_idx < (int)row_nz_.size()) {
+                row_nnz = (int)row_nz_[row_idx].size();
+            } else {
+                for (int k = 0; k < row.size(); ++k)
+                    if (std::abs(row(k)) > opt_.zero_tol)
+                        ++row_nnz;
+            }
 
             const ImpliedInterval implied = singleton_implied_interval(P, row_idx, j);
             double eff_l = is_finite(P.l(j)) ? P.l(j) : ninf();
@@ -1654,26 +1984,237 @@ class Presolver {
         return changed;
     }
 
-    bool redundancy_duplicate_rows(LP& P) {
+    bool doubleton_equation_elimination(LP& P) {
+        // For each equality row with exactly 2 nonzeros (a1*x_j1 + a2*x_j2 = b),
+        // substitute x_elim = (b - a_keep * x_keep) / a_elim, eliminating one variable.
+        // Only active when allow_structural_changes && !non_destructive.
+        if (!opt_.enable_doubleton_elim || !opt_.allow_structural_changes || opt_.non_destructive)
+            return false;
+
         bool changed = false;
         for (int i = 0; i < (int)P.A.rows();) {
-            if (i >= (int)P.A.rows())
-                break;
-            bool removed = false;
-            for (int k = i + 1; k < (int)P.A.rows(); ++k) {
-                if ((P.sense[i] == P.sense[k]) &&
-                    safe_abs_max(P.A.row(i) - P.A.row(k)) <= opt_.zero_tol &&
-                    std::abs(P.b(i) - P.b(k)) <= opt_.infeas_tol) {
-                    res_.stack.emplace_back(
-                        ActRemoveRow{k, P.sense[k], P.b(k), P.A.row(k).transpose()});
-                    erase_row(P, k);
-                    removed = true;
-                    changed = true;
-                    break;
+            if (P.sense[i] != RowSense::EQ) {
+                ++i;
+                continue;
+            }
+
+            // Check for exactly 2 nonzeros using sparse index
+            const int nnz_i = (i < (int)row_nz_.size()) ? (int)row_nz_[i].size() : -1;
+            if (nnz_i != 2) {
+                if (nnz_i >= 0) {
+                    ++i;
+                    continue;
+                }
+                // Fall back to dense count
+                int cnt = 0;
+                for (int j = 0; j < (int)P.A.cols(); ++j)
+                    if (std::abs(P.A(i, j)) > opt_.zero_tol && ++cnt > 2)
+                        break;
+                if (cnt != 2) {
+                    ++i;
+                    continue;
                 }
             }
-            if (!removed)
+
+            // Get the two nonzero columns
+            int j1, j2;
+            if (i < (int)row_nz_.size()) {
+                j1 = row_nz_[i][0];
+                j2 = row_nz_[i][1];
+            } else {
+                j1 = j2 = -1;
+                for (int j = 0; j < (int)P.A.cols(); ++j) {
+                    if (std::abs(P.A(i, j)) > opt_.zero_tol) {
+                        if (j1 < 0)
+                            j1 = j;
+                        else
+                            j2 = j;
+                    }
+                }
+            }
+            if (j1 < 0 || j2 < 0) {
                 ++i;
+                continue;
+            }
+
+            const double a1 = P.A(i, j1), a2 = P.A(i, j2), bi = P.b(i);
+            if (std::abs(a1) < opt_.zero_tol || std::abs(a2) < opt_.zero_tol) {
+                ++i;
+                continue;
+            }
+
+            // Choose which variable to eliminate: prefer the one with fewer column nonzeros
+            // (less fill-in in the substitution step)
+            const int nnz1 = (j1 < (int)col_nz_.size()) ? (int)col_nz_[j1].size() : 9999;
+            const int nnz2 = (j2 < (int)col_nz_.size()) ? (int)col_nz_[j2].size() : 9999;
+            int elim = (nnz1 <= nnz2) ? j1 : j2;
+            int keep = (nnz1 <= nnz2) ? j2 : j1;
+            double a_elim = P.A(i, elim), a_keep = P.A(i, keep);
+
+            // Compute new bounds on 'keep' implied by 'elim's bounds via the equation:
+            //   x_elim = (bi - a_keep * x_keep) / a_elim
+            //   x_keep = (bi - a_elim * x_elim) / a_keep
+            double new_l_keep = P.l(keep), new_u_keep = P.u(keep);
+            if (is_finite(P.l(elim))) {
+                // x_elim >= l_elim → x_keep bounded
+                double val = (bi - a_elim * P.l(elim)) / a_keep;
+                if (a_keep > 0)
+                    new_u_keep = std::min(new_u_keep, val);
+                else
+                    new_l_keep = std::max(new_l_keep, val);
+            }
+            if (is_finite(P.u(elim))) {
+                double val = (bi - a_elim * P.u(elim)) / a_keep;
+                if (a_keep > 0)
+                    new_l_keep = std::max(new_l_keep, val);
+                else
+                    new_u_keep = std::min(new_u_keep, val);
+            }
+            if (new_l_keep > new_u_keep + opt_.infeas_tol) {
+                res_.proven_infeasible = true;
+                return true;
+            }
+
+            // Record postsolve action BEFORE modifying
+            res_.stack.emplace_back(
+                ActDoubletonEq{elim, keep, a_elim, a_keep, bi, P.l(elim), P.u(elim), P.c(elim)});
+
+            // Update objective: c(elim)*x_elim = c(elim)*(bi - a_keep*x_keep)/a_elim
+            res_.obj_shift += P.c(elim) * bi / a_elim;
+            P.c(keep) -= P.c(elim) * a_keep / a_elim;
+            P.c(elim) = 0.0;
+
+            // Substitute into all rows containing 'elim' (except row i itself)
+            // Make a copy since col_nz_[elim] will be modified during iteration
+            const std::vector<int> affected =
+                (elim < (int)col_nz_.size()) ? col_nz_[elim] : std::vector<int>{};
+            for (int k : affected) {
+                if (k == i)
+                    continue;
+                const double a_k_elim = P.A(k, elim);
+                if (std::abs(a_k_elim) <= opt_.zero_tol)
+                    continue;
+
+                // b(k) -= a_k_elim * bi / a_elim
+                P.b(k) -= a_k_elim * bi / a_elim;
+
+                // A(k, keep) += -a_k_elim * a_keep / a_elim
+                const double old_val = P.A(k, keep);
+                const double new_val = old_val - a_k_elim * a_keep / a_elim;
+                P.A(k, keep) = new_val;
+                if (std::abs(old_val) <= opt_.zero_tol && std::abs(new_val) > opt_.zero_tol) {
+                    // New nonzero: add to index
+                    add_entry_to_index(k, keep);
+                } else if (std::abs(old_val) > opt_.zero_tol &&
+                           std::abs(new_val) <= opt_.zero_tol) {
+                    // Became zero: remove from index
+                    zero_entry_in_index(k, keep);
+                }
+
+                // Zero out A(k, elim)
+                P.A(k, elim) = 0.0;
+                zero_entry_in_index(k, elim);
+            }
+
+            // Tighten bounds on 'keep'
+            if (new_l_keep > P.l(keep) + opt_.zero_tol || new_u_keep < P.u(keep) - opt_.zero_tol) {
+                res_.stack.emplace_back(ActTightenBound{keep, P.l(keep), P.u(keep)});
+                if (new_l_keep > P.l(keep))
+                    P.l(keep) = new_l_keep;
+                if (new_u_keep < P.u(keep))
+                    P.u(keep) = new_u_keep;
+            }
+
+            // Remove row i (doubleton row) and column elim
+            erase_row(P, i); // updates sparse index
+            erase_col(P, elim);
+            // After erase_col, if elim < keep, 'keep' index shifted down by 1
+            // erase_col already adjusts col_nz_ entries — nothing extra needed
+
+            changed = true;
+            // Don't increment i: row i was erased, so current i now points to next row
+        }
+        return changed;
+    }
+
+    bool redundancy_duplicate_rows(LP& P) {
+        // Hash-based duplicate detection: O(m * avg_row_nnz) vs naïve O(m^2 * n)
+        // Key: (sense, rhs_rounded, sorted nonzero (col, val_rounded) pairs)
+        struct RowKey {
+            int sense_int;
+            int64_t rhs_hash;
+            std::vector<std::pair<int, int64_t>> entries; // (col, coeff_hash)
+            bool operator==(const RowKey& o) const {
+                return sense_int == o.sense_int && rhs_hash == o.rhs_hash && entries == o.entries;
+            }
+        };
+        // Map hash → first row index with that hash
+        std::unordered_map<std::size_t, std::vector<int>> hash_to_rows;
+        hash_to_rows.reserve((int)P.A.rows());
+
+        // Scale hash values to reduce false collisions
+        const double hash_scale = 1.0 / std::max(opt_.zero_tol, 1e-15);
+
+        auto hash_double = [&](double v) -> int64_t {
+            return static_cast<int64_t>(std::round(v * hash_scale));
+        };
+
+        // Build row hashes
+        std::vector<RowKey> keys;
+        keys.resize(P.A.rows());
+        for (int i = 0; i < (int)P.A.rows(); ++i) {
+            keys[i].sense_int = static_cast<int>(P.sense[i]);
+            keys[i].rhs_hash = hash_double(P.b(i));
+            if (i < (int)row_nz_.size()) {
+                keys[i].entries.reserve(row_nz_[i].size());
+                for (int j : row_nz_[i])
+                    keys[i].entries.emplace_back(j, hash_double(P.A(i, j)));
+            } else {
+                for (int j = 0; j < (int)P.A.cols(); ++j) {
+                    if (std::abs(P.A(i, j)) > opt_.zero_tol)
+                        keys[i].entries.emplace_back(j, hash_double(P.A(i, j)));
+                }
+            }
+            // Compute combined hash
+            std::size_t h = std::hash<int>{}(keys[i].sense_int);
+            h ^= std::hash<int64_t>{}(keys[i].rhs_hash) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            for (const auto& [c, v] : keys[i].entries) {
+                h ^= std::hash<int>{}(c) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= std::hash<int64_t>{}(v) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            }
+            hash_to_rows[h].push_back(i);
+        }
+
+        bool changed = false;
+        std::vector<bool> deleted(P.A.rows(), false);
+        for (auto& [h, row_list] : hash_to_rows) {
+            if (row_list.size() < 2)
+                continue;
+            // Within candidates with same hash, do exact comparison
+            for (int a = 0; a < (int)row_list.size(); ++a) {
+                int i = row_list[a];
+                if (deleted[i])
+                    continue;
+                for (int b = a + 1; b < (int)row_list.size(); ++b) {
+                    int k = row_list[b];
+                    if (deleted[k])
+                        continue;
+                    if (keys[i] == keys[k] && std::abs(P.b(i) - P.b(k)) <= opt_.infeas_tol &&
+                        safe_abs_max(P.A.row(i) - P.A.row(k)) <= opt_.zero_tol) {
+                        deleted[k] = true;
+                    }
+                }
+            }
+        }
+
+        // Erase duplicate rows in reverse order to preserve indices
+        for (int i = (int)P.A.rows() - 1; i >= 0; --i) {
+            if (deleted[i]) {
+                res_.stack.emplace_back(
+                    ActRemoveRow{i, P.sense[i], P.b(i), P.A.row(i).transpose()});
+                erase_row(P, i);
+                changed = true;
+            }
         }
         return changed;
     }
@@ -1704,6 +2245,7 @@ class Presolver {
     }
 
     void erase_row(LP& P, int i) {
+        update_index_erase_row(i);
         const int m = (int)P.A.rows(), n = (int)P.A.cols();
         if (i < m - 1) {
             P.A.block(i, 0, m - i - 1, n) = P.A.block(i + 1, 0, m - i - 1, n);
@@ -1719,6 +2261,7 @@ class Presolver {
     }
 
     void erase_col(LP& P, int j) {
+        update_index_erase_col(j);
         const int m = (int)P.A.rows(), n = (int)P.A.cols();
         if (j < n - 1) {
             P.A.block(0, j, m, n - j - 1) = P.A.block(0, j + 1, m, n - j - 1);
@@ -1788,6 +2331,33 @@ class Presolver {
         if (!std::isfinite(x(a.j)))
             x(a.j) = a.x_fix;
     }
+    static void undo_action(const ActDoubletonEq& a, Eigen::VectorXd& x, double&) {
+        // x_elim = (b_row - a_keep * x_keep) / a_elim
+        // We need x[col_elim]; x[col_keep] must already be filled in.
+        // Expand x if needed
+        const int need = std::max(a.col_elim, a.col_keep) + 1;
+        if (need > (int)x.size()) {
+            Eigen::VectorXd xnew(need);
+            xnew.setConstant(std::numeric_limits<double>::quiet_NaN());
+            xnew.head(x.size()) = x;
+            x.swap(xnew);
+        }
+        if (std::abs(a.a_elim) > 1e-14) {
+            const double x_keep = std::isfinite(x(a.col_keep)) ? x(a.col_keep) : 0.0;
+            const double x_elim_val = (a.b_row - a.a_keep * x_keep) / a.a_elim;
+            // Clamp to original bounds if needed
+            double xv = x_elim_val;
+            if (is_finite(a.old_l_elim))
+                xv = std::max(xv, a.old_l_elim);
+            if (is_finite(a.old_u_elim))
+                xv = std::min(xv, a.old_u_elim);
+            x(a.col_elim) = xv;
+        } else if (!std::isfinite(x(a.col_elim))) {
+            x(a.col_elim) = is_finite(a.old_l_elim)   ? a.old_l_elim
+                            : is_finite(a.old_u_elim) ? a.old_u_elim
+                                                      : 0.0;
+        }
+    }
     static void undo_action(const ActRemoveCol& a, Eigen::VectorXd& x, double&) {
         if (a.j >= (int)x.size()) {
             Eigen::VectorXd xnew(a.j + 1);
@@ -1837,6 +2407,7 @@ class Presolver {
     static void undo_dual_action(const ActSingletonRowElim&, Eigen::VectorXd&) {}
     static void undo_dual_action(const ActSingletonColElim&, Eigen::VectorXd&) {}
     static void undo_dual_action(const ActDualFix&, Eigen::VectorXd&) {}
+    static void undo_dual_action(const ActDoubletonEq&, Eigen::VectorXd&) {}
     static void undo_dual_action(const ActRemoveCol&, Eigen::VectorXd&) {}
 
   private:

@@ -1,9 +1,12 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -18,225 +21,219 @@ struct PopResult {
     int stolen_worker_id = -1; // -1 if node came from local queue
 };
 
+// Per-worker wait/notify state.  Allocated on the heap so it remains at a fixed
+// address even when the outer vector is resized.
+struct WorkerWaiter {
+    std::mutex mutex;
+    std::condition_variable cv;
+    // Set to true by the pusher before notify_one; read by the waiter while
+    // holding mutex to avoid missed wakeups between the queue-empty check and
+    // the cv.wait call.
+    bool wakeup_pending = false;
+};
+
 class SearchCoordinator {
   public:
     explicit SearchCoordinator(int worker_count = 1) : worker_count_(worker_count) {
-        for (int i = 0; i < worker_count; ++i) {
-            worker_queues_.emplace_back();
-        }
+        rebuild_per_worker_state_(worker_count);
     }
 
     void configure(int worker_count) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(coord_mutex_);
         worker_count_ = worker_count;
-        worker_queues_.clear();
-        for (int i = 0; i < worker_count; ++i) {
-            worker_queues_.emplace_back();
-        }
-        hybrid_counter_ = 0;
-        active_workers_ = 0;
-        hit_node_limit_ = false;
-        found_unbounded_ = false;
-        steal_attempts_ = 0;
-        local_pops_ = 0;
-        stolen_pops_ = 0;
+        rebuild_per_worker_state_locked_(worker_count);
+        hybrid_counter_.store(0, std::memory_order_relaxed);
+        active_workers_.store(0, std::memory_order_relaxed);
+        hit_node_limit_.store(false, std::memory_order_release);
+        found_unbounded_.store(false, std::memory_order_release);
+        steal_attempts_.store(0, std::memory_order_relaxed);
+        local_pops_.store(0, std::memory_order_relaxed);
+        stolen_pops_.store(0, std::memory_order_relaxed);
     }
 
     void reset() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        worker_queues_.clear();
-        for (int i = 0; i < worker_count_; ++i) {
-            worker_queues_.emplace_back();
-        }
-        hybrid_counter_ = 0;
-        active_workers_ = 0;
-        hit_node_limit_ = false;
-        found_unbounded_ = false;
-        steal_attempts_ = 0;
-        local_pops_ = 0;
-        stolen_pops_ = 0;
+        std::lock_guard<std::mutex> lock(coord_mutex_);
+        rebuild_per_worker_state_locked_(worker_count_);
+        hybrid_counter_.store(0, std::memory_order_relaxed);
+        active_workers_.store(0, std::memory_order_relaxed);
+        hit_node_limit_.store(false, std::memory_order_release);
+        found_unbounded_.store(false, std::memory_order_release);
+        steal_attempts_.store(0, std::memory_order_relaxed);
+        local_pops_.store(0, std::memory_order_relaxed);
+        stolen_pops_.store(0, std::memory_order_relaxed);
     }
 
-    // Push a node to the designated worker's queue (or distribute round-robin if -1)
+    // Push a node to the designated worker's queue (or distribute round-robin if -1).
+    // Hot path: takes only the target WLQ mutex, then notifies one waiter.
     void push(ActiveNode node, NodeSelectionStrategy strategy, bool maximize,
               int preferred_worker = -1) {
-        std::lock_guard<std::mutex> lock(mutex_);
         int target_worker = preferred_worker;
         if (target_worker < 0) {
-            target_worker = next_worker_index_++ % static_cast<int>(worker_queues_.size());
+            const std::uint64_t idx =
+                next_worker_index_.fetch_add(1, std::memory_order_relaxed);
+            target_worker = static_cast<int>(idx % static_cast<std::uint64_t>(worker_queues_.size()));
         }
-        // Ensure target_worker is valid
         if (target_worker >= static_cast<int>(worker_queues_.size())) {
-            target_worker = worker_queues_.size() - 1;
+            target_worker = static_cast<int>(worker_queues_.size()) - 1;
         }
 
         worker_queues_[target_worker].push(std::move(node), strategy, maximize);
-        cv_.notify_one();
+        notify_worker_(target_worker);
     }
 
-    // Try to pop a node from the worker's local queue (no waiting)
+    // Try to pop a node from the worker's local queue (no waiting).
     std::optional<ActiveNode> try_pop(NodeSelectionStrategy strategy, bool maximize,
                                       int hybrid_depth_bias = 5, int plunging_bestfreq = 10,
                                       int worker_id = -1) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        int target_worker = worker_id;
-        if (target_worker < 0) {
-            target_worker = 0;
-        }
-
-        auto local_result = worker_queues_[target_worker].pop(strategy, maximize, hybrid_depth_bias,
-                                                              plunging_bestfreq, &hybrid_counter_);
+        int target_worker = worker_id < 0 ? 0 : worker_id;
+        auto hc = hybrid_counter_.load(std::memory_order_relaxed);
+        auto local_result = worker_queues_[target_worker].pop(
+            strategy, maximize, hybrid_depth_bias, plunging_bestfreq, &hc);
+        hybrid_counter_.store(hc, std::memory_order_relaxed);
         if (local_result.has_value()) {
-            ++local_pops_;
+            local_pops_.fetch_add(1, std::memory_order_relaxed);
             return local_result;
         }
-
         return std::nullopt;
     }
 
-    // Wait for a node from local queue or steal from other workers
+    // Wait for a node from the local queue or steal from other workers.
+    // Hot path: does NOT hold any global lock during the steal scan.
     PopResult wait_pop(NodeSelectionStrategy strategy, bool maximize, int hybrid_depth_bias = 5,
                        int plunging_bestfreq = 10, int worker_id = -1) {
-        std::unique_lock<std::mutex> lock(mutex_);
+        const int wid = worker_id < 0 ? 0 : worker_id;
+
         while (true) {
-            if (found_unbounded_ || hit_node_limit_) {
+            if (found_unbounded_.load(std::memory_order_acquire) ||
+                hit_node_limit_.load(std::memory_order_acquire)) {
                 return {.node = std::nullopt, .terminated = true, .stolen_worker_id = -1};
             }
 
-            // First, try local queue
-            int target_worker = worker_id;
-            if (target_worker < 0) {
-                target_worker = 0;
-            }
-            auto local_result = worker_queues_[target_worker].pop(
-                strategy, maximize, hybrid_depth_bias, plunging_bestfreq, &hybrid_counter_);
+            // Try local queue first (takes only the per-queue WLQ mutex).
+            auto hc = hybrid_counter_.load(std::memory_order_relaxed);
+            auto local_result = worker_queues_[wid].pop(strategy, maximize, hybrid_depth_bias,
+                                                        plunging_bestfreq, &hc);
+            hybrid_counter_.store(hc, std::memory_order_relaxed);
             if (local_result.has_value()) {
-                ++local_pops_;
-                ++active_workers_;
+                local_pops_.fetch_add(1, std::memory_order_relaxed);
+                active_workers_.fetch_add(1, std::memory_order_acq_rel);
                 return {.node = local_result, .terminated = false, .stolen_worker_id = -1};
             }
 
-            // Local queue empty, attempt to steal from other workers
-            ++steal_attempts_;
-            int steal_rounds = 3;
-            std::optional<ActiveNode> stolen_node;
-            int best_stolen_worker = -1;
-
-            while (steal_rounds-- > 0 && !stolen_node.has_value()) {
-                for (int other_id = 0; other_id < static_cast<int>(worker_queues_.size());
-                     ++other_id) {
-                    if (other_id == worker_id) {
+            // Attempt to steal from other workers.
+            steal_attempts_.fetch_add(1, std::memory_order_relaxed);
+            const int nw = static_cast<int>(worker_queues_.size());
+            for (int round = 0; round < 3; ++round) {
+                for (int other = 0; other < nw; ++other) {
+                    if (other == wid)
                         continue;
-                    }
-                    auto steal_result = worker_queues_[other_id].steal(
-                        strategy, maximize, hybrid_depth_bias, plunging_bestfreq, &hybrid_counter_);
-                    if (steal_result.has_value()) {
-                        stolen_node = std::move(steal_result);
-                        best_stolen_worker = other_id;
-                        ++stolen_pops_;
-                        break;
+                    auto hc2 = hybrid_counter_.load(std::memory_order_relaxed);
+                    auto stolen = worker_queues_[other].steal(strategy, maximize,
+                                                              hybrid_depth_bias, plunging_bestfreq, &hc2);
+                    hybrid_counter_.store(hc2, std::memory_order_relaxed);
+                    if (stolen.has_value()) {
+                        stolen_pops_.fetch_add(1, std::memory_order_relaxed);
+                        active_workers_.fetch_add(1, std::memory_order_acq_rel);
+                        return {.node = stolen, .terminated = false, .stolen_worker_id = other};
                     }
                 }
             }
 
-            if (stolen_node.has_value()) {
-                ++active_workers_;
-                return {.node = stolen_node,
-                        .terminated = false,
-                        .stolen_worker_id = best_stolen_worker};
-            }
-
-            if (active_workers_ == 0 && !should_work_locked_()) {
+            // Nothing available: check if we should terminate.
+            if (active_workers_.load(std::memory_order_acquire) == 0 &&
+                !should_work_atomic_()) {
                 return {.node = std::nullopt, .terminated = true, .stolen_worker_id = -1};
             }
 
-            cv_.wait(lock);
+            // Block on per-worker CV (short timeout to guard against missed wakeups).
+            WorkerWaiter& waiter = *worker_waiters_[wid];
+            std::unique_lock<std::mutex> lk(waiter.mutex);
+            if (waiter.wakeup_pending) {
+                waiter.wakeup_pending = false;
+                // A notification arrived while we weren't waiting — re-check immediately.
+                continue;
+            }
+            waiter.cv.wait_for(lk, std::chrono::microseconds(500));
+            waiter.wakeup_pending = false;
         }
     }
 
-    // Report that a worker has finished processing a node
+    // Report that a worker has finished processing a node.
     void on_worker_finished() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (active_workers_ > 0) {
-            --active_workers_;
-        }
-        if (active_workers_ == 0) {
-            cv_.notify_all();
+        const int prev = active_workers_.fetch_sub(1, std::memory_order_acq_rel);
+        if (prev == 1) {
+            // Last active worker — wake all so they can check termination.
+            notify_all();
         }
     }
 
-    // Signal that all workers are idle (no more work)
-    void notify_all() { cv_.notify_all(); }
+    void notify_all() {
+        for (auto& w : worker_waiters_) {
+            std::lock_guard<std::mutex> lk(w->mutex);
+            w->wakeup_pending = true;
+            w->cv.notify_one();
+        }
+    }
 
-    // Empty the coordinator
     void clear() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        worker_queues_.clear();
-        for (int i = 0; i < worker_count_; ++i) {
-            worker_queues_.emplace_back();
+        std::lock_guard<std::mutex> lock(coord_mutex_);
+        for (auto& q : worker_queues_) {
+            q.clear();
         }
-        active_workers_ = 0;
-        hit_node_limit_ = false;
-        found_unbounded_ = false;
-        steal_attempts_ = 0;
-        local_pops_ = 0;
-        stolen_pops_ = 0;
+        active_workers_.store(0, std::memory_order_release);
+        hit_node_limit_.store(false, std::memory_order_release);
+        found_unbounded_.store(false, std::memory_order_release);
+        steal_attempts_.store(0, std::memory_order_relaxed);
+        local_pops_.store(0, std::memory_order_relaxed);
+        stolen_pops_.store(0, std::memory_order_relaxed);
     }
 
-    // Check if empty (all queues empty and no workers active)
     bool empty() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return size_locked_() == 0;
+        for (const auto& q : worker_queues_) {
+            if (!q.empty())
+                return false;
+        }
+        return true;
     }
 
-    // Get the number of nodes across all queues
     int size() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return size_locked_();
+        int total = 0;
+        for (const auto& q : worker_queues_) {
+            total += q.size();
+        }
+        return total;
     }
 
-    // Check if any node available
-    bool should_work() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return should_work_locked_();
-    }
+    bool should_work() const { return should_work_atomic_(); }
 
     bool should_terminate() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return hit_node_limit_ || found_unbounded_;
+        return hit_node_limit_.load(std::memory_order_acquire) ||
+               found_unbounded_.load(std::memory_order_acquire);
     }
 
     void mark_unbounded() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            found_unbounded_ = true;
-        }
-        cv_.notify_all();
+        found_unbounded_.store(true, std::memory_order_release);
+        notify_all();
     }
 
     void mark_node_limit_reached() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            hit_node_limit_ = true;
-        }
-        cv_.notify_all();
+        hit_node_limit_.store(true, std::memory_order_release);
+        notify_all();
     }
 
     bool found_unbounded() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return found_unbounded_;
+        return found_unbounded_.load(std::memory_order_acquire);
     }
 
     bool hit_node_limit() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return hit_node_limit_;
+        return hit_node_limit_.load(std::memory_order_acquire);
     }
 
-    // Compute best bound across all local queues
+    // Compute best bound across all local queues.
     double compute_best_bound(bool has_incumbent, double incumbent_objective, bool maximize,
                               const std::optional<double>& root_relaxation_objective) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        double best = incumbent_objective;
+        double best = has_incumbent ? incumbent_objective
+                                    : std::numeric_limits<double>::quiet_NaN();
 
         for (const auto& q : worker_queues_) {
             const ActiveNode* best_node = q.peek_valid_node();
@@ -258,13 +255,11 @@ class SearchCoordinator {
     }
 
     template <typename Fn> void for_each_mutable_node(Fn&& fn) {
-        std::lock_guard<std::mutex> lock(mutex_);
         for (auto& q : worker_queues_) {
             q.for_each_mutable(fn);
         }
     }
 
-    // Get statistics about work stealing
     struct WorkStatistics {
         int total_steal_attempts = 0;
         int local_pops = 0;
@@ -273,18 +268,14 @@ class SearchCoordinator {
     };
 
     WorkStatistics get_work_statistics() const {
-        std::lock_guard<std::mutex> lock(mutex_);
         WorkStatistics stats;
-        stats.total_steal_attempts = steal_attempts_;
-        stats.local_pops = local_pops_;
-        stats.stolen_pops = stolen_pops_;
-        // total_nodes_processed is tracked per worker in worker_stats_
+        stats.total_steal_attempts = steal_attempts_.load(std::memory_order_relaxed);
+        stats.local_pops = local_pops_.load(std::memory_order_relaxed);
+        stats.stolen_pops = stolen_pops_.load(std::memory_order_relaxed);
         return stats;
     }
 
-    // Get individual worker queue sizes for load balancing diagnostics
     std::vector<int> get_queue_sizes() const {
-        std::lock_guard<std::mutex> lock(mutex_);
         std::vector<int> sizes;
         sizes.reserve(worker_queues_.size());
         for (const auto& q : worker_queues_) {
@@ -296,36 +287,57 @@ class SearchCoordinator {
     int worker_count() const { return worker_count_; }
 
   private:
-    int size_locked_() const {
-        int total = 0;
+    bool should_work_atomic_() const {
         for (const auto& q : worker_queues_) {
-            total += q.size();
-        }
-        return total;
-    }
-
-    bool should_work_locked_() const {
-        for (const auto& q : worker_queues_) {
-            if (!q.empty()) {
+            if (!q.empty())
                 return true;
-            }
         }
         return false;
     }
 
-    mutable std::mutex mutex_;
+    void notify_worker_(int worker_id) {
+        WorkerWaiter& waiter = *worker_waiters_[worker_id];
+        {
+            std::lock_guard<std::mutex> lk(waiter.mutex);
+            waiter.wakeup_pending = true;
+        }
+        waiter.cv.notify_one();
+    }
+
+    void rebuild_per_worker_state_(int count) {
+        worker_queues_.clear();
+        worker_waiters_.clear();
+        for (int i = 0; i < count; ++i) {
+            worker_queues_.emplace_back();
+            worker_waiters_.push_back(std::make_unique<WorkerWaiter>());
+        }
+    }
+
+    void rebuild_per_worker_state_locked_(int count) {
+        // Must be called with coord_mutex_ held.
+        worker_queues_.clear();
+        worker_waiters_.clear();
+        for (int i = 0; i < count; ++i) {
+            worker_queues_.emplace_back();
+            worker_waiters_.push_back(std::make_unique<WorkerWaiter>());
+        }
+    }
+
+    mutable std::mutex coord_mutex_; // only for configure/reset
 
     std::vector<WorkerLocalQueue> worker_queues_;
-    std::uint64_t hybrid_counter_ = 0;
-    int active_workers_ = 0;
+    std::vector<std::unique_ptr<WorkerWaiter>> worker_waiters_;
+
+    std::atomic<std::uint64_t> hybrid_counter_{0};
+    std::atomic<int> active_workers_{0};
     int worker_count_ = 1;
-    bool hit_node_limit_ = false;
-    bool found_unbounded_ = false;
-    int steal_attempts_ = 0;
-    int local_pops_ = 0;
-    int stolen_pops_ = 0;
-    std::uint64_t next_worker_index_ = 0;
-    std::condition_variable cv_;
+    std::atomic<bool> hit_node_limit_{false};
+    std::atomic<bool> found_unbounded_{false};
+    std::atomic<int> steal_attempts_{0};
+    std::atomic<int> local_pops_{0};
+    std::atomic<int> stolen_pops_{0};
+    std::atomic<std::uint64_t> next_worker_index_{0};
 };
 
 } // namespace simplex::bnb::detail
+

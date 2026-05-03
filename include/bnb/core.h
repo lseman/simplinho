@@ -2441,6 +2441,20 @@ class Solver {
 
                 WorkerFinishedGuard guard{&search_coordinator_, true};
                 process_node(std::move(*pop_result.node), false, worker_id);
+
+                // Direct continuation: after processing a node this worker may have just
+                // pushed children.  Try to pick up local work immediately (once) before
+                // yielding back to wait_pop.  This avoids an extra lock-acquire-sleep-wake
+                // cycle and keeps the hot cache lines on the same core.
+                {
+                    auto next = search_coordinator_.try_pop(
+                        options_.node_selection, problem_.maximize,
+                        options_.hybrid_depth_bias, options_.plunging_bestfreq, worker_id);
+                    if (next.has_value()) {
+                        process_node(std::move(*next), false, worker_id);
+                    }
+                }
+
                 guard.release();
                 search_coordinator_.on_worker_finished();
             }
@@ -2868,9 +2882,10 @@ class Solver {
                     }
 
                     const auto phase_selection_start = SteadyClock::now();
-                    selected = cut_pool_.select_violated_cuts(relaxation.primal, node.lower_bounds,
-                                                              node.upper_bounds,
-                                                              root_cuts_added_per_round, 1.0);
+                    selected = cut_pool_.select_violated_cuts(
+                        relaxation.primal, node.lower_bounds, node.upper_bounds,
+                        root_cuts_added_per_round, 1.0,
+                        &problem_.objective_coefficients, problem_.maximize);
                     timing.root_cut_selection_wall_ns +=
                         elapsed_ns_(phase_selection_start, SteadyClock::now());
                     timing.root_cuts_selected += static_cast<int>(selected.size());
@@ -3058,7 +3073,8 @@ class Solver {
                     const auto selection_start = SteadyClock::now();
                     std::vector<Cut> selected = cut_pool_.select_violated_cuts(
                         relaxation.primal, node.lower_bounds, node.upper_bounds,
-                        options_.max_cuts_added_per_round, 1.6);
+                        options_.max_cuts_added_per_round, 1.6,
+                        &problem_.objective_coefficients, problem_.maximize);
                     timing.node_cut_selection_wall_ns +=
                         elapsed_ns_(selection_start, SteadyClock::now());
                     timing.node_cuts_selected += static_cast<int>(selected.size());

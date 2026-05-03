@@ -2607,6 +2607,10 @@ class RevisedSimplex {
         SparseMatrix A_in;
         Eigen::VectorXd b_in;
         Eigen::VectorXd c_in;
+        // Pointer identity of the last A seen — if same pointer is passed we skip
+        // the O(nnz) comparison. Valid only because in BnB the same A_sparse object
+        // (owned by NodeLPCacheEntry) is reused across all node solves.
+        const double* cached_A_value_ptr = nullptr;
         std::vector<char> has_lower;
         std::vector<char> has_upper;
         std::vector<char> fixed_bound;
@@ -2616,6 +2620,12 @@ class RevisedSimplex {
         std::vector<int> upper_slack;
         SparseMatrix A_std;
         Eigen::VectorXd c_std;
+        // Pre-allocated scratch buffer for reconstruct_sparse_reformulated_rhs_
+        mutable Eigen::VectorXd b_std_scratch;
+        // Standard-form l/u: always 0 / +inf for shifted/reformulated variables.
+        // Cached here to avoid re-allocation on every node solve.
+        Eigen::VectorXd l_std;
+        Eigen::VectorXd u_std;
         int m_eq = 0;
         int nv = 0;
         int upper_rows = 0;
@@ -2631,6 +2641,15 @@ class RevisedSimplex {
                 return false;
             if (b.size() != rows || c.size() != cols)
                 return false;
+            // Fast path: if the same compressed matrix object (same value pointer),
+            // skip the O(nnz) element-by-element comparison.
+            if (A.isCompressed() && A_in.isCompressed() &&
+                A.valuePtr() == cached_A_value_ptr &&
+                A.nonZeros() == A_in.nonZeros()) {
+                if (!b.isApprox(b_in) || !c.isApprox(c_in))
+                    return false;
+                return true;
+            }
             if (!b.isApprox(b_in) || !c.isApprox(c_in))
                 return false;
             if (A.nonZeros() != A_in.nonZeros())
@@ -2712,6 +2731,10 @@ class RevisedSimplex {
         sparse_bound_only_cache_.cols = static_cast<int>(A.cols());
         sparse_bound_only_cache_.A_in = A;
         sparse_bound_only_cache_.A_in.makeCompressed();
+        // Store the value pointer of the INPUT for identity fast-path in same_problem.
+        // We take it from A (before copying) since A_in may be a different allocation.
+        sparse_bound_only_cache_.cached_A_value_ptr =
+            A.isCompressed() ? A.valuePtr() : nullptr;
         sparse_bound_only_cache_.b_in = b;
         sparse_bound_only_cache_.c_in = c;
         const int n = sparse_bound_only_cache_.cols;
@@ -2820,14 +2843,19 @@ class RevisedSimplex {
         if (!trips.empty())
             sparse_bound_only_cache_.A_std.setFromTriplets(trips.begin(), trips.end());
         sparse_bound_only_cache_.A_std.makeCompressed();
+        sparse_bound_only_cache_.l_std =
+            Eigen::VectorXd::Zero(sparse_bound_only_cache_.n_total);
+        sparse_bound_only_cache_.u_std =
+            Eigen::VectorXd::Constant(sparse_bound_only_cache_.n_total, presolve::inf());
         sparse_bound_only_cache_.valid = true;
     }
 
-    Eigen::VectorXd reconstruct_sparse_reformulated_rhs_(const Eigen::VectorXd& l_use,
-                                                         const Eigen::VectorXd& u_use) const {
+    const Eigen::VectorXd& reconstruct_sparse_reformulated_rhs_(const Eigen::VectorXd& l_use,
+                                                                 const Eigen::VectorXd& u_use) const {
         const auto& cache = sparse_bound_only_cache_;
-        Eigen::VectorXd b_std = cache.b_in;
-        b_std = Eigen::VectorXd::Zero(cache.m_total);
+        // Reuse pre-allocated scratch buffer to avoid per-node heap allocation.
+        cache.b_std_scratch.setZero(cache.m_total);
+        Eigen::VectorXd& b_std = cache.b_std_scratch;
         for (int j = 0; j < cache.cols; ++j) {
             const bool has_l = static_cast<bool>(cache.has_lower[j]);
             const bool has_u = static_cast<bool>(cache.has_upper[j]);
@@ -2950,6 +2978,13 @@ class RevisedSimplex {
     int current_matrix_rows_ = -1;
     int current_matrix_cols_ = -1;
     bool current_matrix_is_sparse_ = false;
+    // Cache the last sparse-matrix value pointer + its signature to avoid
+    // recomputing the O(nnz) hash when the same A_sparse object is reused
+    // across consecutive solves (e.g., successive BnB node LP solves).
+    const double* last_sparse_a_value_ptr_ = nullptr;
+    int last_sparse_a_rows_ = -1;
+    int last_sparse_a_cols_ = -1;
+    std::uint64_t last_sparse_a_signature_ = 0;
     std::shared_ptr<LPWarmStateData> solve_input_warm_state_;
     std::shared_ptr<LPWarmStateData> solve_output_warm_state_;
     mutable std::vector<std::string> trace_;
@@ -2987,7 +3022,21 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     if (c_in.size() != n || l_in.size() != n || u_in.size() != n) {
         throw std::invalid_argument("simplex: c/l/u sizes must equal cols(A)");
     }
-    begin_solve_(matrix_signature_(A_in), m_in, n, true, basis_state_opt);
+    // Fast-path: if the same compressed A_in is passed as last time, reuse the
+    // cached signature and skip the O(nnz) hash computation.
+    const double* a_value_ptr = A_in.isCompressed() ? A_in.valuePtr() : nullptr;
+    const std::uint64_t sig =
+        (a_value_ptr != nullptr && a_value_ptr == last_sparse_a_value_ptr_ &&
+         m_in == last_sparse_a_rows_ && n == last_sparse_a_cols_)
+            ? last_sparse_a_signature_
+            : matrix_signature_(A_in);
+    if (a_value_ptr != nullptr) {
+        last_sparse_a_value_ptr_ = a_value_ptr;
+        last_sparse_a_rows_ = m_in;
+        last_sparse_a_cols_ = n;
+        last_sparse_a_signature_ = sig;
+    }
+    begin_solve_(sig, m_in, n, true, basis_state_opt);
 
     trace_line_("[solve] sparse start m=" + std::to_string(m_in) + " n=" + std::to_string(n));
     trace_line_("[solve] sparse disable_presolve=" + std::to_string(opt_.disable_presolve));
@@ -3050,11 +3099,20 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         const int m_eq = m_in;
         int n_total = 0;
         int m_total = 0;
-        Eigen::VectorXd b_std;
-        Eigen::VectorXd c_std;
-        Eigen::VectorXd l_std;
-        Eigen::VectorXd u_std;
-        SparseMatrix A_std;
+        // Use pointers to dispatch between cached data (no allocation) and locally
+        // owned buffers (non-cache path only). In the cache path, we point directly
+        // into SparseBoundOnlyCache to avoid all per-node copies.
+        const SparseMatrix* A_std_ptr = nullptr;
+        const Eigen::VectorXd* b_std_ptr = nullptr;
+        const Eigen::VectorXd* c_std_ptr = nullptr;
+        const Eigen::VectorXd* l_std_ptr = nullptr;
+        const Eigen::VectorXd* u_std_ptr = nullptr;
+        // Owned storage — only used in the non-cache path.
+        SparseMatrix A_std_owned;
+        Eigen::VectorXd b_std_owned;
+        Eigen::VectorXd c_std_owned;
+        Eigen::VectorXd l_std_owned;
+        Eigen::VectorXd u_std_owned;
 
         if (cache_reuse) {
             reused_sparse_bound_cache = true;
@@ -3062,11 +3120,14 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             n_total = cache.n_total;
             m_total = cache.m_total;
             upper_rows = cache.upper_rows;
-            b_std = reconstruct_sparse_reformulated_rhs_(l_use, u_use);
-            c_std = cache.c_std;
-            l_std = Eigen::VectorXd::Zero(n_total);
-            u_std = Eigen::VectorXd::Constant(n_total, presolve::inf());
-            A_std = cache.A_std;
+            // Fill b_std_scratch in-place (no allocation); use by reference below.
+            reconstruct_sparse_reformulated_rhs_(l_use, u_use);
+            // Point directly into cached data — no copies.
+            A_std_ptr = &cache.A_std;
+            b_std_ptr = &cache.b_std_scratch;
+            c_std_ptr = &cache.c_std;
+            l_std_ptr = &cache.l_std;
+            u_std_ptr = &cache.u_std;
             for (int j = 0; j < n; ++j) {
                 const bool has_l = static_cast<bool>(cache.has_lower[j]);
                 const bool has_u = static_cast<bool>(cache.has_upper[j]);
@@ -3139,20 +3200,20 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
 
             n_total = nv + upper_rows;
             m_total = m_eq + upper_rows;
-            b_std = Eigen::VectorXd::Zero(m_total);
-            c_std = Eigen::VectorXd::Zero(n_total);
-            l_std = Eigen::VectorXd::Zero(n_total);
-            u_std = Eigen::VectorXd::Constant(n_total, presolve::inf());
+            b_std_owned = Eigen::VectorXd::Zero(m_total);
+            c_std_owned = Eigen::VectorXd::Zero(n_total);
+            l_std_owned = Eigen::VectorXd::Zero(n_total);
+            u_std_owned = Eigen::VectorXd::Constant(n_total, presolve::inf());
 
             for (int j = 0; j < n; ++j) {
                 if (map[j].uses_single_var) {
                     if (map[j].y < 0) {
                         continue;
                     }
-                    c_std(map[j].y) += static_cast<double>(map[j].sign) * c_in(j);
+                    c_std_owned(map[j].y) += static_cast<double>(map[j].sign) * c_in(j);
                 } else {
-                    c_std(map[j].y_pos) += c_in(j);
-                    c_std(map[j].y_neg) += -c_in(j);
+                    c_std_owned(map[j].y_pos) += c_in(j);
+                    c_std_owned(map[j].y_neg) += -c_in(j);
                 }
             }
 
@@ -3163,7 +3224,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                     const int row = it.row();
                     const double aij = it.value();
                     if (map[j].uses_single_var) {
-                        b_std(row) -= aij * map[j].shift;
+                        b_std_owned(row) -= aij * map[j].shift;
                         if (map[j].y >= 0) {
                             trips.emplace_back(row, map[j].y,
                                                static_cast<double>(map[j].sign) * aij);
@@ -3175,7 +3236,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 }
             }
             for (int i = 0; i < m_eq; ++i)
-                b_std(i) += b_in(i);
+                b_std_owned(i) += b_in(i);
 
             int upper_row = 0;
             for (int j = 0; j < n; ++j) {
@@ -3187,16 +3248,28 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 upper_slack[j] = slack;
                 trips.emplace_back(row, map[j].y, 1.0);
                 trips.emplace_back(row, slack, 1.0);
-                b_std(row) = u_use(j) - l_use(j);
+                b_std_owned(row) = u_use(j) - l_use(j);
                 ++upper_row;
             }
 
-            A_std = SparseMatrix(m_total, n_total);
+            A_std_owned = SparseMatrix(m_total, n_total);
             if (!trips.empty())
-                A_std.setFromTriplets(trips.begin(), trips.end());
-            A_std.makeCompressed();
+                A_std_owned.setFromTriplets(trips.begin(), trips.end());
+            A_std_owned.makeCompressed();
             build_sparse_bound_only_cache_(A_in, b_in, c_in, l_use, u_use);
+
+            A_std_ptr = &A_std_owned;
+            b_std_ptr = &b_std_owned;
+            c_std_ptr = &c_std_owned;
+            l_std_ptr = &l_std_owned;
+            u_std_ptr = &u_std_owned;
         }
+        // Uniform reference bindings — used from here on in both paths.
+        const SparseMatrix& A_std = *A_std_ptr;
+        const Eigen::VectorXd& b_std = *b_std_ptr;
+        const Eigen::VectorXd& c_std = *c_std_ptr;
+        const Eigen::VectorXd& l_std = *l_std_ptr;
+        const Eigen::VectorXd& u_std = *u_std_ptr;
         std::optional<std::vector<int>> basis_std = std::nullopt;
         std::optional<LPBasis> basis_state_std = std::nullopt;
         if (basis_opt && !basis_opt->empty()) {
