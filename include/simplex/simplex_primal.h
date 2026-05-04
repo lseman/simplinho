@@ -14,9 +14,10 @@ class RevisedSimplexPrimalEngine {
     // sparse pattern, the caller iterates only the pattern rows; otherwise
     // it scans all m rows. The arithmetic from the initial filter onward is
     // identical in both paths.
-    static std::pair<std::optional<int>, double>
-    harris_ratio_core_(const Eigen::VectorXd& xB, const Eigen::VectorXd& dB,
-                       const std::vector<int>& pos, double eta) {
+    static std::pair<std::optional<int>, double> harris_ratio_core_(const Eigen::VectorXd& xB,
+                                                                    const Eigen::VectorXd& dB,
+                                                                    const std::vector<int>& pos,
+                                                                    double eta) {
         if (pos.empty())
             return {std::nullopt, std::numeric_limits<double>::infinity()};
 
@@ -176,8 +177,8 @@ class RevisedSimplexPrimalEngine {
                             B_dense.col(i) = A.col(basis[i]);
                         std::vector<int> dense_basis(m);
                         std::iota(dense_basis.begin(), dense_basis.end(), 0);
-                        basis_factorization = std::make_shared<FTBasis>(
-                            B_dense, dense_basis, self.make_basis_options_());
+                        basis_factorization = std::make_shared<FTBasis>(B_dense, dense_basis,
+                                                                        self.make_basis_options_());
                     } else {
                         basis_factorization =
                             std::make_shared<FTBasis>(A, basis, self.make_basis_options_());
@@ -228,9 +229,8 @@ class RevisedSimplexPrimalEngine {
             popts.primal_weight_log_error_threshold =
                 self.opt_.primal_steepest_edge_weight_log_error_threshold;
             self.adaptive_pricer_ = AdaptivePricer(n, popts);
-            self.measure_pricing_build_(false, [&]() {
-                self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
-            });
+            self.measure_pricing_build_(
+                false, [&]() { self.adaptive_pricer_.build_primal_pools(read_basis(), A, N); });
             self.bridge_ = std::make_unique<PrimalPricingBridge<AdaptivePricer>>(
                 self.degen_, self.adaptive_pricer_);
         }
@@ -512,7 +512,7 @@ class RevisedSimplexPrimalEngine {
             N[idxN] = oldAbs;
 
             try {
-                write_basis().replace_column(r, A.col(e));
+                write_basis().replace_column(r, eAbs, A.col(e));
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
@@ -531,9 +531,8 @@ class RevisedSimplexPrimalEngine {
             }
 
             if (self.opt_.pricing_rule == "adaptive" && self.adaptive_pricer_.needs_rebuild()) {
-                self.measure_pricing_build_(false, [&]() {
-                    self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
-                });
+                self.measure_pricing_build_(
+                    false, [&]() { self.adaptive_pricer_.build_primal_pools(read_basis(), A, N); });
                 self.adaptive_pricer_.clear_rebuild_flag();
             }
         }

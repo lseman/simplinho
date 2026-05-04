@@ -3431,6 +3431,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             (opt_.mode == SimplexMode::Dual)
                 ? (use_dual_first ? "dual" : "auto")
                 : (opt_.mode == SimplexMode::Primal ? "primal" : "auto");
+        bool reformulated_inner_cache_used = false;
         auto solve_reformulated = [&](SimplexMode mode) {
             RevisedSimplexOptions solve_opt = opt_;
             solve_opt.mode = (mode == SimplexMode::Auto ? SimplexMode::Primal : mode);
@@ -3447,6 +3448,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             RevisedSimplex& reformulated_solver =
                 *sparse_bound_only_cache_.reformulated_solver_cache;
             const RevisedSimplex::SparseMatrix& A_std_sparse = A_std;
+            if (reformulated_solver.has_cached_basis_state(A_std_sparse)) {
+                reformulated_inner_cache_used = true;
+                return reformulated_solver.solve(A_std_sparse, b_std, c_std, l_std, u_std);
+            }
             return basis_state_std ? reformulated_solver.solve(A_std_sparse, b_std, c_std, l_std,
                                                                u_std, *basis_state_std)
                                    : reformulated_solver.solve(A_std_sparse, b_std, c_std, l_std,
@@ -3501,6 +3506,9 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         info["sparse_pipeline"] = "1";
         if (reused_sparse_bound_cache) {
             info["sparse_bound_only_fast_path"] = "1";
+        }
+        if (reformulated_inner_cache_used) {
+            info["bound_reformulation_inner_cache"] = "1";
         }
         info["bound_reformulation_initial_mode"] = reformulated_initial_mode;
         if (reformulated_warm_basis_quality) {

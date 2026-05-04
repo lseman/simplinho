@@ -1070,7 +1070,7 @@ class RevisedSimplexDualEngine {
 
             bool backtracked_this_iter = false;
             try {
-                write_basis().replace_column(r_leave, Ahat.col(eAbs));
+                write_basis().replace_column(r_leave, eAbs, Ahat.col(eAbs));
             } catch (...) {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
