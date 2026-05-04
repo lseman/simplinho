@@ -4,32 +4,30 @@
 #include <vector>
 #define EIGEN_USE_MKL_ALL
 
-#include "Evaluator.h"
-// #include "EvaluatorGPU.h"
-
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
+#include <cstring>
 #include <execution>
 #include <experimental/simd>
 #include <limits>
 #include <set>
 #include <stdexec/execution.hpp>
+#include <thread>
 
 #include "AMD.h"
-template <typename T>
-using BVector = std::vector<T>;
+template <typename T> using BVector = std::vector<T>;
 
 class Permutation {
-   public:
+  public:
     std::vector<int> perm;
 
     Permutation(int size) : perm(size) {
-        for (int i = 0; i < size; ++i) perm[i] = i;
+        for (int i = 0; i < size; ++i)
+            perm[i] = i;
     }
 
     // Apply the permutation to a vector
-    template <typename T>
-    std::vector<T> apply(const std::vector<T> &vec) const {
+    template <typename T> std::vector<T> apply(const std::vector<T>& vec) const {
         std::vector<T> result(vec.size());
         for (int i = 0; i < vec.size(); ++i) {
             result[i] = vec[perm[i]];
@@ -52,7 +50,7 @@ namespace Eigen {
 template <typename MatrixType_, int UpLo_ = Lower,
           typename Ordering_ = AMDOrdering<typename MatrixType_::StorageIndex>>
 class CustomSimplicialLDLT {
-   public:
+  public:
     typedef MatrixType_ MatrixType;
     enum { UpLo = UpLo_ };
     typedef typename MatrixType::Scalar Scalar;
@@ -62,42 +60,32 @@ class CustomSimplicialLDLT {
     typedef Matrix<Scalar, Dynamic, 1> VectorType;
 
     typedef TriangularView<const CholMatrixType, Eigen::UnitLower> MatrixL;
-    typedef TriangularView<const typename CholMatrixType::AdjointReturnType,
-                           Eigen::UnitUpper>
+    typedef TriangularView<const typename CholMatrixType::AdjointReturnType, Eigen::UnitUpper>
         MatrixU;
-    typedef CholMatrixType const *ConstCholMatrixPtr;
+    typedef CholMatrixType const* ConstCholMatrixPtr;
 
     CustomSimplicialLDLT()
-        : m_isInitialized(false),
-          m_info(Success),
-          m_P(0),
-          m_Pinv(0),
-          m_matrix(1, 1),
-          m_L(m_matrix),
-          m_U(m_matrix.adjoint()),
-          m_epsilon(1e-9),
-          m_factorizationIsOk(false) {}
+        : m_isInitialized(false), m_info(Success), m_P(0), m_Pinv(0), m_matrix(1, 1), m_L(m_matrix),
+          m_U(m_matrix.adjoint()), m_epsilon(1e-9), m_factorizationIsOk(false) {}
 
-    template <typename Lhs, typename Rhs, int Mode, bool IsLower,
-              bool IsRowMajor>
+    template <typename Lhs, typename Rhs, int Mode, bool IsLower, bool IsRowMajor>
     struct SparseSolveTriangular;
 
-    explicit CustomSimplicialLDLT(const MatrixType &matrix)
+    explicit CustomSimplicialLDLT(const MatrixType& matrix)
         : m_isInitialized(false), m_info(Success), m_epsilon(1e-9) {
         // compute(matrix);
     }
 
-    exec::static_thread_pool pool =
-        exec::static_thread_pool(std::thread::hardware_concurrency());
+    exec::static_thread_pool pool = exec::static_thread_pool(std::thread::hardware_concurrency());
     exec::static_thread_pool::scheduler sched = pool.get_scheduler();
 
-    CustomSimplicialLDLT &compute(const MatrixType &matrix) {
+    CustomSimplicialLDLT& compute(const MatrixType& matrix) {
         analyzePattern(matrix);
         factorize_preordered<true, false>(m_matrix);
         return *this;
     }
 
-    void analyzePattern_preordered(const CholMatrixType &ap, bool doLDLT) {
+    void analyzePattern_preordered(const CholMatrixType& ap, bool doLDLT) {
         const StorageIndex size = StorageIndex(ap.rows());
 
         // Pre-allocate all vectors at once with appropriate sizes
@@ -112,7 +100,7 @@ class CustomSimplicialLDLT {
 
         // Compute elimination tree and count nonzeros per column
         for (StorageIndex k = 0; k < size; ++k) {
-            tags[k] = k;  // Mark node k as visited
+            tags[k] = k; // Mark node k as visited
 
             // Traverse column k using iterator
             for (typename CholMatrixType::InnerIterator it(ap, k); it; ++it) {
@@ -138,7 +126,7 @@ class CustomSimplicialLDLT {
         }
 
         // Build column pointers array
-        StorageIndex *Lp = m_matrix.outerIndexPtr();
+        StorageIndex* Lp = m_matrix.outerIndexPtr();
         StorageIndex running_total = 0;
 
         // Use prefix sum for better cache utilization
@@ -170,33 +158,27 @@ class CustomSimplicialLDLT {
     }
 
     bool patternAnalyzed = false;
-    void factorizeMatrix(const MatrixType &matrix) {
+    void factorizeMatrix(const MatrixType& matrix) {
         auto matrixToFactorize = matrix;
         if (!patternAnalyzed) {
-            analyzePattern(matrixToFactorize);  // Analyze the sparsity pattern
+            analyzePattern(matrixToFactorize); // Analyze the sparsity pattern
             patternAnalyzed = true;
         }
         factorize(matrixToFactorize);
     }
 
-    template <bool DoLDLT, bool NonHermitian>
-    void factorize_preordered(const CholMatrixType &ap) {
+    template <bool DoLDLT, bool NonHermitian> void factorize_preordered(const CholMatrixType& ap) {
         // Matrix size and pointers into the factorized matrix storage.
         const StorageIndex size = StorageIndex(ap.rows());
-        const StorageIndex *Lp = m_matrix.outerIndexPtr();
-        StorageIndex *Li = m_matrix.innerIndexPtr();
-        Scalar *Lx = m_matrix.valuePtr();
+        const StorageIndex* Lp = m_matrix.outerIndexPtr();
+        StorageIndex* Li = m_matrix.innerIndexPtr();
+        Scalar* Lx = m_matrix.valuePtr();
 
         // Temporary aligned storage for working vectors.
         alignas(64) std::vector<Scalar> y(size, Scalar(0));
         alignas(64) std::vector<StorageIndex> pattern(size, 0);
         alignas(64) std::vector<StorageIndex> tags(size, 0);
         m_diag.resize(size);
-
-        // Preallocate thread-local storage for the main factorization loop.
-        const int hardware_threads = std::thread::hardware_concurrency();
-        std::vector<std::vector<Scalar>> y_local_storage(
-            hardware_threads, std::vector<Scalar>(size, Scalar(0)));
 
         // Precompute the elimination patterns for each column.
         // (Sequential due to dependencies in the tags vector.)
@@ -211,7 +193,8 @@ class CustomSimplicialLDLT {
                     for (; tags[i] != k; i = m_parent[i]) {
                         pattern[len++] = i;
                         tags[i] = k;
-                        if (m_parent[i] == -1) break;
+                        if (m_parent[i] == -1)
+                            break;
                     }
                     while (len > 0) {
                         pattern[--top] = pattern[--len];
@@ -221,90 +204,73 @@ class CustomSimplicialLDLT {
             column_patterns[k].assign(pattern.begin() + top, pattern.end());
         }
 
-        // Parallel factorization of each column using a bulk sender.
-        auto bulk_sender = stdexec::bulk(
-            stdexec::just(),
-            size,  // Each column is processed as an independent task.
-            [this, &y, &tags, Lp, Li, Lx, size, &ap, &y_local_storage,
-             hardware_threads, &column_patterns](std::size_t k) {
-                // Identify thread-local storage using a hash of the thread id.
-                size_t thread_id =
-                    std::hash<std::thread::id>{}(std::this_thread::get_id()) %
-                    hardware_threads;
-                auto &y_local = y_local_storage[thread_id];
+        std::fill(m_nonZerosPerCol.begin(), m_nonZerosPerCol.end(), 0);
 
-                // Reinitialize the tag for column k and count nonzeros.
-                tags[k] = k;
-                m_nonZerosPerCol[k] = 0;
+        // Numeric LDLT has column dependencies through the elimination tree.
+        // Process columns deterministically; parallelism belongs in independent
+        // tree branches or dense frontal updates, not across arbitrary columns.
+        for (StorageIndex k = 0; k < size; ++k) {
+            tags[k] = k;
 
-                // Accumulate contributions from the original matrix.
-                for (typename CholMatrixType::InnerIterator it(ap, k); it;
-                     ++it) {
-                    StorageIndex i = it.index();
-                    if (i <= k) {
-                        y_local[i] += getSymm(it.value());
-                    }
+            // Accumulate contributions from the original matrix.
+            for (typename CholMatrixType::InnerIterator it(ap, k); it; ++it) {
+                StorageIndex i = it.index();
+                if (i <= k) {
+                    y[i] += getSymm(it.value());
                 }
+            }
 
-                // Compute the shifted diagonal element.
-                DiagonalScalar d =
-                    getDiag(y_local[k]) * m_shiftScale + m_shiftOffset;
-                y_local[k] = Scalar(0);
+            // Compute the shifted diagonal element.
+            DiagonalScalar d = getDiag(y[k]) * m_shiftScale + m_shiftOffset;
+            y[k] = Scalar(0);
 
-                // Use the precomputed pattern to update off-diagonals.
-                const auto &pattern = column_patterns[k];
-                for (StorageIndex i : pattern) {
-                    const Scalar yi = y_local[i];
-                    y_local[i] = Scalar(0);
-                    if (yi != Scalar(0)) {
-                        const Scalar diag_i =
-                            getDiag(m_diag[i]);  // Cache diagonal value.
-                        const Scalar l_ki = yi / diag_i;
-                        const StorageIndex p2 = Lp[i] + m_nonZerosPerCol[i];
+            // Use the precomputed pattern to update off-diagonals.
+            const auto& pattern = column_patterns[k];
+            for (StorageIndex i : pattern) {
+                const Scalar yi = y[i];
+                y[i] = Scalar(0);
+                if (yi != Scalar(0)) {
+                    const Scalar diag_i = getDiag(m_diag[i]); // Cache diagonal value.
+                    const Scalar l_ki = yi / diag_i;
+                    const StorageIndex p2 = Lp[i] + m_nonZerosPerCol[i];
 
-                        // Update entries in the local buffer (SIMD-friendly
-                        // inner loop hint).
-                        for (StorageIndex p = Lp[i]; p < p2; ++p) {
-                            y_local[Li[p]] -= getSymm(Lx[p]) * yi;
-                        }
-
-                        d -= getDiag(l_ki * getSymm(yi));
-                        Li[p2] = k;
-                        Lx[p2] = l_ki;
-                        ++m_nonZerosPerCol[i];
+                    // Update entries in the local buffer (SIMD-friendly
+                    // inner loop hint).
+                    for (StorageIndex p = Lp[i]; p < p2; ++p) {
+                        y[Li[p]] -= getSymm(Lx[p]) * yi;
                     }
-                }
-                m_diag[k] = d;
-            });
 
-        stdexec::sync_wait(stdexec::when_all(bulk_sender));
+                    d -= getDiag(l_ki * getSymm(yi));
+                    Li[p2] = k;
+                    Lx[p2] = l_ki;
+                    ++m_nonZerosPerCol[i];
+                }
+            }
+            m_diag[k] = d;
+        }
 
         // Finalize factorization status.
         m_info = Success;
         m_factorizationIsOk = true;
     }
 
-    template <int SrcMode_, int DstMode_, bool NonHermitian,
-              typename MatrixType, int DstOrder>
-    void permute_symm_to_symm(
-        const MatrixType &mat,
-        SparseMatrix<typename MatrixType::Scalar, DstOrder,
-                     typename MatrixType::StorageIndex> &_dest,
-        const typename MatrixType::StorageIndex *perm) {
+    template <int SrcMode_, int DstMode_, bool NonHermitian, typename MatrixType, int DstOrder>
+    void permute_symm_to_symm(const MatrixType& mat,
+                              SparseMatrix<typename MatrixType::Scalar, DstOrder,
+                                           typename MatrixType::StorageIndex>& _dest,
+                              const typename MatrixType::StorageIndex* perm) {
         using StorageIndex = typename MatrixType::StorageIndex;
         using Scalar = typename MatrixType::Scalar;
-        SparseMatrix<Scalar, DstOrder, StorageIndex> &dest(_dest.derived());
+        SparseMatrix<Scalar, DstOrder, StorageIndex>& dest(_dest.derived());
         using VectorI = Matrix<StorageIndex, Dynamic, 1>;
         using MatEval = internal::evaluator<MatrixType>;
-        using MatIterator = CustomMatIterator<MatrixType>;
+        using MatIterator = typename internal::evaluator<MatrixType>::InnerIterator;
 
         enum {
             SrcOrder = MatrixType::IsRowMajor ? RowMajor : ColMajor,
             StorageOrderMatch = int(SrcOrder) == int(DstOrder),
-            DstMode = DstOrder == RowMajor ? (DstMode_ == Upper ? Lower : Upper)
-                                           : DstMode_,
-            SrcMode = SrcOrder == RowMajor ? (SrcMode_ == Upper ? Lower : Upper)
-                                           : SrcMode_
+            DstMode = DstOrder == RowMajor ? (DstMode_ == Upper ? Lower : Upper) : DstMode_,
+            SrcMode = SrcOrder == RowMajor ? (SrcMode_ == Upper ? Lower : Upper) : SrcMode_
         };
 
         MatEval matEval(mat);
@@ -329,7 +295,8 @@ class CustomSimplicialLDLT {
 
             for (MatIterator it(matEval, j); it; ++it) {
                 StorageIndex i = it.index();
-                if ((isLower && i < j) || (isUpper && i > j)) continue;
+                if ((isLower && i < j) || (isUpper && i > j))
+                    continue;
 
                 StorageIndex ip = perm_cache[i];
 
@@ -359,7 +326,8 @@ class CustomSimplicialLDLT {
 
             for (MatIterator it(matEval, j); it; ++it) {
                 StorageIndex i = it.index();
-                if ((isLower && i < j) || (isUpper && i > j)) continue;
+                if ((isLower && i < j) || (isUpper && i > j))
+                    continue;
 
                 StorageIndex ip = perm_cache[i];
 
@@ -370,10 +338,10 @@ class CustomSimplicialLDLT {
                 Index k = count[isDstLower ? min_ip_jp : max_ip_jp]++;
                 dest.innerIndexPtr()[k] = isDstLower ? max_ip_jp : min_ip_jp;
 
-                if (!StorageOrderMatch) std::swap(ip, jp);
+                if (!StorageOrderMatch)
+                    std::swap(ip, jp);
                 if ((isDstLower && ip < jp) || (!isDstLower && ip > jp)) {
-                    dest.valuePtr()[k] =
-                        NonHermitian ? it.value() : numext::conj(it.value());
+                    dest.valuePtr()[k] = NonHermitian ? it.value() : numext::conj(it.value());
                 } else {
                     dest.valuePtr()[k] = it.value();
                 }
@@ -382,26 +350,21 @@ class CustomSimplicialLDLT {
     }
 
     template <int Mode, bool NonHermitian, typename MatrixType, int DestOrder>
-    void permute_symm_to_fullsymm(
-        const MatrixType &mat,
-        SparseMatrix<typename MatrixType::Scalar, DestOrder,
-                     typename MatrixType::StorageIndex> &_dest,
-        const typename MatrixType::StorageIndex *perm) {
+    void permute_symm_to_fullsymm(const MatrixType& mat,
+                                  SparseMatrix<typename MatrixType::Scalar, DestOrder,
+                                               typename MatrixType::StorageIndex>& _dest,
+                                  const typename MatrixType::StorageIndex* perm) {
         using StorageIndex = typename MatrixType::StorageIndex;
         using Scalar = typename MatrixType::Scalar;
         using Dest = SparseMatrix<Scalar, DestOrder, StorageIndex>;
         using VectorI = Matrix<StorageIndex, Dynamic, 1>;
         using MatEval = internal::evaluator<MatrixType>;
-        using MatIterator =
-            typename internal::evaluator<MatrixType>::InnerIterator;
+        using MatIterator = typename internal::evaluator<MatrixType>::InnerIterator;
 
         MatEval matEval(mat);
-        Dest &dest(_dest.derived());
+        Dest& dest(_dest.derived());
 
-        enum {
-            StorageOrderMatch =
-                int(Dest::IsRowMajor) == int(MatrixType::IsRowMajor)
-        };
+        enum { StorageOrderMatch = int(Dest::IsRowMajor) == int(MatrixType::IsRowMajor) };
 
         Index size = mat.rows();
         VectorI count(size);
@@ -428,8 +391,7 @@ class CustomSimplicialLDLT {
                     count[StorageOrderMatch ? jp : ip]++;
                 } else if (r == c) {
                     count[ip]++;
-                } else if ((Mode == Lower && r > c) ||
-                           (Mode == Upper && r < c)) {
+                } else if ((Mode == Lower && r > c) || (Mode == Upper && r < c)) {
                     count[ip]++;
                     count[jp]++;
                 }
@@ -455,8 +417,7 @@ class CustomSimplicialLDLT {
         // Second pass: Copy data into destination matrix
         for (StorageIndex j = 0; j < size; ++j) {
             for (MatIterator it(matEval, j); it; ++it) {
-                StorageIndex i =
-                    internal::convert_index<StorageIndex>(it.index());
+                StorageIndex i = internal::convert_index<StorageIndex>(it.index());
                 Index r = it.row();
                 Index c = it.col();
 
@@ -473,22 +434,21 @@ class CustomSimplicialLDLT {
                     dest.valuePtr()[k] = it.value();
                 } else if (((Mode & Lower) == Lower && r > c) ||
                            ((Mode & Upper) == Upper && r < c)) {
-                    if (!StorageOrderMatch) std::swap(ip, jp);
+                    if (!StorageOrderMatch)
+                        std::swap(ip, jp);
                     Index k = count[jp]++;
                     dest.innerIndexPtr()[k] = ip;
                     dest.valuePtr()[k] = it.value();
                     k = count[ip]++;
                     dest.innerIndexPtr()[k] = jp;
-                    dest.valuePtr()[k] =
-                        (NonHermitian ? it.value() : numext::conj(it.value()));
+                    dest.valuePtr()[k] = (NonHermitian ? it.value() : numext::conj(it.value()));
                 }
             }
         }
     }
 
     template <bool NonHermitian>
-    void ordering_local(const MatrixType &a, ConstCholMatrixPtr &pmat,
-                        CholMatrixType &ap) {
+    void ordering_local(const MatrixType& a, ConstCholMatrixPtr& pmat, CholMatrixType& ap) {
         const Index size = a.rows();
         pmat = &ap;
 
@@ -511,7 +471,7 @@ class CustomSimplicialLDLT {
         permute_symm_to_symm<UpLo, Upper, false>(a, ap, m_P.indices().data());
     }
 
-    void analyzePattern(const MatrixType &a) {
+    void analyzePattern(const MatrixType& a) {
         Index size = a.cols();
 
         CholMatrixType tmp(size, size);
@@ -525,45 +485,25 @@ class CustomSimplicialLDLT {
     const MatrixL matrixL() const { return m_L; }
     const MatrixU matrixU() const { return m_U; }
 
-    template <typename Rhs>
-    Eigen::VectorXd solve(const MatrixBase<Rhs> &b) const {
+    template <typename Rhs> Eigen::VectorXd solve(const MatrixBase<Rhs>& b) const {
         eigen_assert(m_isInitialized && "Decomposition not initialized.");
 
         Eigen::VectorXd dest;
 
         // Apply forward permutation
         if (m_P.size() > 0) {
-            dest.noalias() = m_P * b;  // Use noalias to avoid temporary
+            dest.noalias() = m_P * b; // Use noalias to avoid temporary
         } else {
             dest = b;
         }
 
-        // Precompute diagonal norm (if not already done)
-        static Scalar cachedDiagonalNorm = m_diag.norm();
-
-        // Compute the residual norm (only if necessary)
-        const Scalar residualNorm = (matrixL() * dest - b).norm();
-
-        // Compute an adaptive regularization factor
-        const Scalar minRegularization =
-            Scalar(1e-12);  // Minimum regularization
-        const Scalar maxRegularization =
-            Scalar(1e-6);  // Maximum regularization
-        const Scalar adaptiveRegularization = std::max(
-            minRegularization,
-            std::min(maxRegularization,
-                     residualNorm / (cachedDiagonalNorm + residualNorm)));
-
-        // Regular solve path with adaptive regularization
-        solveTriangular<decltype(matrixL()), decltype(dest), Lower>(
-            matrixL(), dest, adaptiveRegularization);
+        matrixL().solveInPlace(dest);
         dest.array() /= m_diag.array();
-        solveTriangular<decltype(matrixU()), decltype(dest), Upper>(
-            matrixU(), dest, adaptiveRegularization);
+        matrixU().solveInPlace(dest);
 
         // Apply backward permutation
         if (m_Pinv.size() > 0) {
-            dest.noalias() = m_Pinv * dest;  // Use noalias to avoid temporary
+            dest.noalias() = m_Pinv * dest; // Use noalias to avoid temporary
         }
 
         return dest;
@@ -572,7 +512,7 @@ class CustomSimplicialLDLT {
     void setRegularization(Scalar epsilon) { m_epsilon = epsilon; }
 
     bool isFactorized = false;
-    void factorize(const MatrixType &a) {
+    void factorize(const MatrixType& a) {
         bool DoLDLT = true;
         bool NonHermitian = false;
         eigen_assert(a.rows() == a.cols());
@@ -588,7 +528,7 @@ class CustomSimplicialLDLT {
         isFactorized = true;
     }
 
-   private:
+  private:
     CholMatrixType m_matrix;
     VectorType m_diag;
     MatrixL m_L;
@@ -600,11 +540,11 @@ class CustomSimplicialLDLT {
     bool m_analysisIsOk;
     bool m_factorizationIsOk;
     ComputationInfo m_info;
-    Scalar m_epsilon;  // Regularization parameter for numerical stability
+    Scalar m_epsilon; // Regularization parameter for numerical stability
     Scalar m_shiftScale = Scalar(1);
     Scalar m_shiftOffset = Scalar(0);
 };
 
-}  // namespace Eigen
+} // namespace Eigen
 
-#endif  // EIGEN_CUSTOM_SIMPLICIAL_LDLT_H
+#endif // EIGEN_CUSTOM_SIMPLICIAL_LDLT_H

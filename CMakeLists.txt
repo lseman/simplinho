@@ -142,6 +142,15 @@ if(SIMPLEX_ENABLE_PCH)
     )
 endif()
 
+# ====================== IPM Sources ======================
+set(SIMPLINHO_IPM_SOURCES
+    src/ipm/IPSolver.cpp
+)
+
+set(SIMPLINHO_IPM_BINDING_SOURCES
+    bindings/ipm_bindings.cpp
+)
+
 # ====================== Python Module ======================
 set(PYBIND11_FINDPYTHON ON)
 set(PYBIND11_PYTHON_VERSION 3.13)
@@ -153,9 +162,11 @@ find_package(Threads REQUIRED)
 
 pybind11_add_module(simplinho
     bindings/bnb_bindings.cpp
+    ${SIMPLINHO_IPM_BINDING_SOURCES}
     bindings/model_bindings.cpp
     bindings/module.cpp
     bindings/simplex_bindings.cpp
+    ${SIMPLINHO_IPM_SOURCES}
     src/bnb/async_heuristic_manager.cpp
     src/bnb/branching.cpp
     src/bnb/conflict_engine.cpp
