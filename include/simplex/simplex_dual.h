@@ -659,6 +659,7 @@ class RevisedSimplexDualEngine {
         self.trace_line_("[dual] start basis=" + self.format_basis_(basis));
 
         int rebuild_attempts = 0;
+        int backtrack_repairs = 0;
         int total_flips = 0;
         Eigen::VectorXd rhs_eff = b - transformed_rhs(A, view, l, u);
         bool ydual_cached = false;
@@ -1067,17 +1068,47 @@ class RevisedSimplexDualEngine {
             N[e_rel] = oldAbs;
             rN(e_rel) = chat(oldAbs) - column_dot(Ahat, oldAbs, ydual);
 
+            bool backtracked_this_iter = false;
             try {
                 write_basis().replace_column(r_leave, Ahat.col(eAbs));
             } catch (...) {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
-                write_basis().refactor();
-                if (auto failed = rebuild_dual_pool(
-                        "dual pricing rebuild failed after replace_column", iters)) {
-                    return *failed;
+                std::vector<int> restored_basis;
+                if (backtrack_repairs == 0 &&
+                    write_basis().try_backtrack_to_last_good(restored_basis)) {
+                    ++backtrack_repairs;
+                    self.trace_line_("[dual] iter=" + std::to_string(iters) +
+                                     " backtracked to last full-rank basis");
+                    basis = std::move(restored_basis);
+
+                    std::vector<char> in_basis(static_cast<size_t>(n), 0);
+                    for (int b_var : basis)
+                        in_basis[static_cast<size_t>(b_var)] = 1;
+                    N.clear();
+                    N.reserve(static_cast<size_t>(n - m));
+                    for (int j = 0; j < n; ++j)
+                        if (!in_basis[static_cast<size_t>(j)])
+                            N.push_back(j);
+
+                    ydual_cached = false;
+                    rhs_eff = b - transformed_rhs(A, view, l, u);
+                    if (auto failed = rebuild_dual_pool(
+                            "dual pricing rebuild failed after backtrack", iters)) {
+                        return *failed;
+                    }
+                    backtracked_this_iter = true;
+                } else {
+                    write_basis().refactor();
+                    if (auto failed = rebuild_dual_pool(
+                            "dual pricing rebuild failed after replace_column", iters)) {
+                        return *failed;
+                    }
                 }
             }
+
+            if (backtracked_this_iter)
+                continue; // restored basis changes N/ydual state; restart from optimality check
 
             dual_pricer.update_after_dual_pivot(r_leave, eAbs, oldAbs, s_enter, s_enter(r_leave),
                                                 Ahat, N, w, true);

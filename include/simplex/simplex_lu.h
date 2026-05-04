@@ -391,6 +391,52 @@ class FTBasis {
             dense_refactor_();
     }
 
+    // Restore the last successfully-refactored basis snapshot and refactor it.
+    // Returns true if a snapshot existed and the restored basis factored
+    // cleanly. On success, `engine_basis` is overwritten with the restored
+    // basis indices so the caller can resync its parallel basis vector.
+    // Halves the adaptive refactor budget (HiGHS-style) to force more frequent
+    // refactors on the recovered chain.
+    bool try_backtrack_to_last_good(std::vector<int>& engine_basis) {
+        if (!backtracking_snapshot_.has_value())
+            return false;
+        const Snapshot& snap = *backtracking_snapshot_;
+        if (static_cast<int>(snap.basis.size()) != m_)
+            return false;
+
+        basis_ = snap.basis;
+        if (A_is_sparse_) {
+            Bcols_sparse_ = snap.Bcols_sparse;
+            current_B_sparse_dirty_ = true;
+        } else {
+            Bcols_dense_ = snap.Bcols_dense;
+            initialize_dense_basis_cache_();
+        }
+
+        try {
+            if (A_is_sparse_)
+                sparse_refactor_();
+            else
+                dense_refactor_();
+        } catch (...) {
+            // The snapshot itself is now unusable — drop it so we don't loop.
+            backtracking_snapshot_.reset();
+            return false;
+        }
+
+        // Halve the adaptive refactor cadence on the recovered chain. Floor at 1
+        // so we don't disable updates entirely. We halve current_refactor_every_
+        // (not opt_.refactor_every) so the original setting is restored on the
+        // next clean refactor.
+        current_refactor_every_ = std::max(1, current_refactor_every_ / 2);
+        engine_basis = basis_;
+        return true;
+    }
+
+    bool has_backtracking_snapshot() const noexcept {
+        return backtracking_snapshot_.has_value();
+    }
+
     Eigen::MatrixXd explicit_B_dense() const {
         if (A_is_sparse_) {
             ensure_current_B_sparse_();
@@ -591,7 +637,7 @@ class FTBasis {
     }
 
     int adaptive_refactor_limit_() const noexcept {
-        const int base = std::max(1, opt_.refactor_every);
+        const int base = std::max(1, current_refactor_every_);
         const double pressure = std::clamp(stats_.stability_score, 0.0, 1.0);
         const double scaled =
             1.0 - (1.0 - std::clamp(opt_.min_refactor_interval_fraction, 0.1, 1.0)) * pressure;
@@ -760,9 +806,11 @@ class FTBasis {
         refactor_baseline_max_element_ = std::max(1.0, max_element_);
         if (initial_refactor_max_element_ == 0.0)
             initial_refactor_max_element_ = refactor_baseline_max_element_;
+        current_refactor_every_ = opt_.refactor_every; // restore after any backtrack halving
         reset_update_state_();
         refresh_refactor_diagnostics_();
         report_refactor_telemetry_(t0);
+        put_backtracking_basis_();
     }
 
     void sparse_build_B_(SparseMat& B) const {
@@ -793,9 +841,11 @@ class FTBasis {
             lu_sparse_.factor(B, opt_.pivot_rel, opt_.abs_floor, opt_.rook_iters,
                               opt_.ft_bandwidth_cap, nullptr, nullptr, config);
         }
+        current_refactor_every_ = opt_.refactor_every; // restore after any backtrack halving
         reset_update_state_();
         refresh_refactor_diagnostics_();
         report_refactor_telemetry_(t0);
+        put_backtracking_basis_();
     }
 
     void report_refactor_telemetry_(
@@ -1494,6 +1544,7 @@ class FTBasis {
     Options opt_;
     std::vector<Eta> etas_;
     int update_count_{0};
+    int current_refactor_every_{32}; // mirrors opt_.refactor_every; halved on backtrack, restored on clean refactor
     double max_element_{0.0};
     double refactor_baseline_max_element_{0.0};
     double initial_refactor_max_element_{0.0};
@@ -1508,4 +1559,24 @@ class FTBasis {
 
     // Small reusable workspace
     mutable Eigen::VectorXd workspace_ej_;
+
+    // Last successfully-refactored basis snapshot. Captured at the end of
+    // dense_refactor_/sparse_refactor_; consumed by try_backtrack_to_last_good
+    // when an FT-updated basis later goes singular.
+    struct Snapshot {
+        std::vector<int> basis;
+        std::vector<Eigen::VectorXd> Bcols_dense;
+        std::vector<SparseMat> Bcols_sparse;
+    };
+    std::optional<Snapshot> backtracking_snapshot_;
+
+    void put_backtracking_basis_() {
+        Snapshot snap;
+        snap.basis = basis_;
+        if (A_is_sparse_)
+            snap.Bcols_sparse = Bcols_sparse_;
+        else
+            snap.Bcols_dense = Bcols_dense_;
+        backtracking_snapshot_ = std::move(snap);
+    }
 };

@@ -23,6 +23,7 @@ PYBIND11_MODULE(simplinho, m) {
     m.attr("__git_branch__") = SIMPLEX_GIT_BRANCH;
 
     bind_bnb_bindings(m);
+    bind_ipm_bindings(m);
     bind_simplex_bindings(m);
     bind_model_bindings(m);
 

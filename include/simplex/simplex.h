@@ -197,7 +197,12 @@ class RevisedSimplex {
                      std::optional<std::vector<int>> basis_opt = std::nullopt) {
         const int n = static_cast<int>(A_in.cols());
         const LPBasis* implicit_basis = nullptr;
-        if (!basis_opt && has_cached_basis_state(A_in) && cached_basis_bounds_match_(l_in, u_in)) {
+        if (!basis_opt && has_cached_basis_state(A_in)) {
+            // has_cached_basis_state already requires opt_.mode == Dual.
+            // In Dual mode pass the cached basis even when bounds changed:
+            // rebase_basis_state_for_bounds_ adjusts non-basic statuses, then the dual
+            // simplex restores primal feasibility in O(pivots).  This is the HiGHS/SCIP
+            // hot-restart pattern and avoids a full crash+simplex on every BnB node.
             implicit_basis = &*cached_basis_state_;
         }
         LPSolution sol =
@@ -2557,8 +2562,15 @@ class RevisedSimplex {
     }
 
     bool has_cached_basis_state(const SparseMatrix& A) const noexcept {
-        return has_cached_basis_state(static_cast<int>(A.rows()), static_cast<int>(A.cols()),
-                                      matrix_signature_(A), true);
+        // Fast path: reuse cached signature when the same compressed matrix pointer is seen.
+        const double* ptr = A.isCompressed() ? A.valuePtr() : nullptr;
+        const std::uint64_t sig = (ptr != nullptr && ptr == last_sparse_a_value_ptr_ &&
+                                   static_cast<int>(A.rows()) == last_sparse_a_rows_ &&
+                                   static_cast<int>(A.cols()) == last_sparse_a_cols_)
+                                      ? last_sparse_a_signature_
+                                      : matrix_signature_(A);
+        return has_cached_basis_state(static_cast<int>(A.rows()), static_cast<int>(A.cols()), sig,
+                                      true);
     }
 
   private:
@@ -2601,6 +2613,21 @@ class RevisedSimplex {
         }
     }
 
+    // Reformulation variable descriptor: maps original x_j into the standard-form
+    // variable(s) y_j used in the bound-shifted problem.  Lives here (not inside
+    // solve_impl_sparse_) so that SparseBoundOnlyCache can pre-allocate a reusable
+    // scratch vector and avoid a heap allocation on every BnB node solve.
+    struct ReformVar {
+        int y = -1;           // single shifted var (uses_single_var path)
+        int y_pos = -1;       // positive part (free var split path)
+        int y_neg = -1;       // negative part
+        int upper_slack = -1; // upper-bound row slack column index
+        double shift = 0.0;   // x_j = shift + sign * y
+        int sign = 1;         // +1 for lb-shift, -1 for ub-shift, 0 for fixed
+        bool uses_single_var = false;
+        bool has_upper_row = false;
+    };
+
     struct SparseBoundOnlyCache {
         int rows = 0;
         int cols = 0;
@@ -2626,6 +2653,20 @@ class RevisedSimplex {
         // Cached here to avoid re-allocation on every node solve.
         Eigen::VectorXd l_std;
         Eigen::VectorXd u_std;
+        // Pre-allocated map scratch: reused each node solve to avoid the
+        // std::vector<ReformVar>(n) heap allocation in the hot path.
+        mutable std::vector<ReformVar> map_scratch;
+        // Scaled data_scale = max(1, max_abs(A), max_abs(b)), computed once
+        // at cache build to skip the O(nnz) matrix scan in canonicalize_inactive_huge_bounds_.
+        double cached_data_scale = 0.0;
+        // Incremental RHS: store previous bounds so we can update only changed columns.
+        mutable Eigen::VectorXd l_prev_scratch;
+        mutable Eigen::VectorXd u_prev_scratch;
+        mutable bool b_std_scratch_valid = false; // true after first reconstruct post-build
+        // Persistent solver for the reformulated subproblem.  Keeps the LU factorization
+        // alive across BnB node solves (HiGHS/SCIP hot-restart pattern).
+        // unique_ptr because RevisedSimplex is an incomplete type at this point in the header.
+        mutable std::unique_ptr<RevisedSimplex> reformulated_solver_cache;
         int m_eq = 0;
         int nv = 0;
         int upper_rows = 0;
@@ -2643,8 +2684,7 @@ class RevisedSimplex {
                 return false;
             // Fast path: if the same compressed matrix object (same value pointer),
             // skip the O(nnz) element-by-element comparison.
-            if (A.isCompressed() && A_in.isCompressed() &&
-                A.valuePtr() == cached_A_value_ptr &&
+            if (A.isCompressed() && A_in.isCompressed() && A.valuePtr() == cached_A_value_ptr &&
                 A.nonZeros() == A_in.nonZeros()) {
                 if (!b.isApprox(b_in) || !c.isApprox(c_in))
                     return false;
@@ -2717,6 +2757,10 @@ class RevisedSimplex {
             upper_slack.clear();
             A_std.resize(0, 0);
             c_std.resize(0);
+            map_scratch.clear();
+            cached_data_scale = 0.0;
+            b_std_scratch_valid = false;
+            reformulated_solver_cache.reset();
             m_eq = nv = upper_rows = n_total = m_total = 0;
             valid = false;
         }
@@ -2733,8 +2777,7 @@ class RevisedSimplex {
         sparse_bound_only_cache_.A_in.makeCompressed();
         // Store the value pointer of the INPUT for identity fast-path in same_problem.
         // We take it from A (before copying) since A_in may be a different allocation.
-        sparse_bound_only_cache_.cached_A_value_ptr =
-            A.isCompressed() ? A.valuePtr() : nullptr;
+        sparse_bound_only_cache_.cached_A_value_ptr = A.isCompressed() ? A.valuePtr() : nullptr;
         sparse_bound_only_cache_.b_in = b;
         sparse_bound_only_cache_.c_in = c;
         const int n = sparse_bound_only_cache_.cols;
@@ -2843,51 +2886,106 @@ class RevisedSimplex {
         if (!trips.empty())
             sparse_bound_only_cache_.A_std.setFromTriplets(trips.begin(), trips.end());
         sparse_bound_only_cache_.A_std.makeCompressed();
-        sparse_bound_only_cache_.l_std =
-            Eigen::VectorXd::Zero(sparse_bound_only_cache_.n_total);
+        sparse_bound_only_cache_.l_std = Eigen::VectorXd::Zero(sparse_bound_only_cache_.n_total);
         sparse_bound_only_cache_.u_std =
             Eigen::VectorXd::Constant(sparse_bound_only_cache_.n_total, presolve::inf());
+        // Compute data_scale once so canonicalize_inactive_huge_bounds_ can skip the O(nnz) scan.
+        {
+            double max_abs = 0.0;
+            for (int jj = 0; jj < A.outerSize(); ++jj)
+                for (SparseMatrix::InnerIterator it(A, jj); it; ++it)
+                    if (const double av = std::abs(it.value()); av > max_abs)
+                        max_abs = av;
+            if (b.size() > 0)
+                max_abs = std::max(max_abs, b.cwiseAbs().maxCoeff());
+            sparse_bound_only_cache_.cached_data_scale = std::max(1.0, max_abs);
+        }
+        // Invalidate incremental RHS state and persistent reformulated solver —
+        // next call will do a full RHS recompute, and the solver must be recreated
+        // since the reformulated problem structure (A_std) changed.
+        sparse_bound_only_cache_.b_std_scratch_valid = false;
+        sparse_bound_only_cache_.reformulated_solver_cache.reset();
         sparse_bound_only_cache_.valid = true;
     }
 
-    const Eigen::VectorXd& reconstruct_sparse_reformulated_rhs_(const Eigen::VectorXd& l_use,
-                                                                 const Eigen::VectorXd& u_use) const {
+    const Eigen::VectorXd&
+    reconstruct_sparse_reformulated_rhs_(const Eigen::VectorXd& l_use,
+                                         const Eigen::VectorXd& u_use) const {
         const auto& cache = sparse_bound_only_cache_;
-        // Reuse pre-allocated scratch buffer to avoid per-node heap allocation.
-        cache.b_std_scratch.setZero(cache.m_total);
         Eigen::VectorXd& b_std = cache.b_std_scratch;
-        for (int j = 0; j < cache.cols; ++j) {
-            const bool has_l = static_cast<bool>(cache.has_lower[j]);
-            const bool has_u = static_cast<bool>(cache.has_upper[j]);
-            const bool fixed = static_cast<bool>(cache.fixed_bound[j]);
-            const bool uses_single = has_l || has_u;
-            const double shift = has_l ? l_use(j) : u_use(j);
-            if (!uses_single)
-                continue;
-            for (SparseMatrix::InnerIterator it(cache.A_in, j); it; ++it) {
-                const int row = it.row();
-                b_std(row) -= it.value() * shift;
+
+        if (cache.b_std_scratch_valid) {
+            // Incremental update: scan bounds for changes and apply column-delta only.
+            // In BnB, typically only 1 bound changes per node → O(n + changed_col_nnz)
+            // vs O(total_nnz) for a full recompute.
+            const Eigen::VectorXd& l_prev = cache.l_prev_scratch;
+            const Eigen::VectorXd& u_prev = cache.u_prev_scratch;
+            for (int j = 0; j < cache.cols; ++j) {
+                const bool has_l = static_cast<bool>(cache.has_lower[j]);
+                const bool has_u = static_cast<bool>(cache.has_upper[j]);
+                const bool fixed = static_cast<bool>(cache.fixed_bound[j]);
+                if (!has_l && !has_u)
+                    continue;
+
+                const double old_shift = has_l ? l_prev(j) : u_prev(j);
+                const double new_shift = has_l ? l_use(j) : u_use(j);
+                const bool shift_changed = (old_shift != new_shift);
+                const bool upper_changed =
+                    has_l && has_u && !fixed && (u_prev(j) != u_use(j) || l_prev(j) != l_use(j));
+
+                if (shift_changed) {
+                    // delta = old_shift - new_shift; b_std -= A*shift so:
+                    // b_new = b_old + A_col * (old_shift - new_shift)
+                    const double delta = old_shift - new_shift;
+                    for (SparseMatrix::InnerIterator it(cache.A_in, j); it; ++it)
+                        b_std(it.row()) += it.value() * delta;
+                }
+                if (upper_changed) {
+                    // Upper row: b_std[m_eq + (slack_col - nv)] = u(j) - l(j)
+                    const int row = cache.m_eq + (cache.upper_slack[j] - cache.nv);
+                    b_std(row) = u_use(j) - l_use(j);
+                }
             }
+        } else {
+            // Full recompute (first call after cache build).
+            b_std.setZero(cache.m_total);
+            for (int j = 0; j < cache.cols; ++j) {
+                const bool has_l = static_cast<bool>(cache.has_lower[j]);
+                const bool has_u = static_cast<bool>(cache.has_upper[j]);
+                if (!has_l && !has_u)
+                    continue;
+                const double shift = has_l ? l_use(j) : u_use(j);
+                for (SparseMatrix::InnerIterator it(cache.A_in, j); it; ++it)
+                    b_std(it.row()) -= it.value() * shift;
+            }
+            for (int i = 0; i < cache.m_eq; ++i)
+                b_std(i) += cache.b_in(i);
+            int upper_row = 0;
+            for (int j = 0; j < cache.cols; ++j) {
+                if (!cache.has_lower[j] || !cache.has_upper[j] || cache.fixed_bound[j])
+                    continue;
+                b_std(cache.m_eq + upper_row) = u_use(j) - l_use(j);
+                upper_row++;
+            }
+            cache.b_std_scratch_valid = true;
         }
-        for (int i = 0; i < cache.m_eq; ++i)
-            b_std(i) += cache.b_in(i);
-        int upper_row = 0;
-        for (int j = 0; j < cache.cols; ++j) {
-            if (!cache.has_lower[j] || !cache.has_upper[j] || cache.fixed_bound[j])
-                continue;
-            const int row = cache.m_eq + upper_row;
-            b_std(row) = u_use(j) - l_use(j);
-            upper_row++;
-        }
+        // Save current bounds for the next incremental update.
+        cache.l_prev_scratch = l_use;
+        cache.u_prev_scratch = u_use;
         return b_std;
     }
 
     SanitizedBounds canonicalize_inactive_huge_bounds_(const SparseMatrix& A,
                                                        const Eigen::VectorXd& b,
                                                        const Eigen::VectorXd& l,
-                                                       const Eigen::VectorXd& u) const {
+                                                       const Eigen::VectorXd& u,
+                                                       double precomputed_data_scale = 0.0) const {
         double data_scale = 1.0;
-        if (A.nonZeros() > 0) {
+        if (precomputed_data_scale > 0.0) {
+            // Fast path: caller already computed data_scale from the same A and b
+            // (cached in SparseBoundOnlyCache after first build).  Skip O(nnz) scan.
+            data_scale = precomputed_data_scale;
+        } else if (A.nonZeros() > 0) {
             double max_abs = 0.0;
             for (int j = 0; j < A.outerSize(); ++j) {
                 for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
@@ -2897,9 +2995,9 @@ class RevisedSimplex {
                 }
             }
             data_scale = std::max(data_scale, max_abs);
+            if (b.size() > 0)
+                data_scale = std::max(data_scale, b.cwiseAbs().maxCoeff());
         }
-        if (b.size() > 0)
-            data_scale = std::max(data_scale, b.cwiseAbs().maxCoeff());
         const double huge_bound = 1e6 * data_scale;
         bool any_huge = false;
         for (int j = 0; j < A.cols(); ++j) {
@@ -3025,11 +3123,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     // Fast-path: if the same compressed A_in is passed as last time, reuse the
     // cached signature and skip the O(nnz) hash computation.
     const double* a_value_ptr = A_in.isCompressed() ? A_in.valuePtr() : nullptr;
-    const std::uint64_t sig =
+    const bool same_sparse_ptr =
         (a_value_ptr != nullptr && a_value_ptr == last_sparse_a_value_ptr_ &&
-         m_in == last_sparse_a_rows_ && n == last_sparse_a_cols_)
-            ? last_sparse_a_signature_
-            : matrix_signature_(A_in);
+         m_in == last_sparse_a_rows_ && n == last_sparse_a_cols_);
+    const std::uint64_t sig = same_sparse_ptr ? last_sparse_a_signature_ : matrix_signature_(A_in);
     if (a_value_ptr != nullptr) {
         last_sparse_a_value_ptr_ = a_value_ptr;
         last_sparse_a_rows_ = m_in;
@@ -3041,7 +3138,13 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     trace_line_("[solve] sparse start m=" + std::to_string(m_in) + " n=" + std::to_string(n));
     trace_line_("[solve] sparse disable_presolve=" + std::to_string(opt_.disable_presolve));
 
-    const auto sanitized_bounds = canonicalize_inactive_huge_bounds_(A_in, b_in, l_in, u_in);
+    // Pass cached data_scale to skip the O(nnz) max-abs matrix scan when A hasn't changed.
+    const double precomputed_ds = (same_sparse_ptr && sparse_bound_only_cache_.valid &&
+                                   sparse_bound_only_cache_.cached_data_scale > 0.0)
+                                      ? sparse_bound_only_cache_.cached_data_scale
+                                      : 0.0;
+    const auto sanitized_bounds =
+        canonicalize_inactive_huge_bounds_(A_in, b_in, l_in, u_in, precomputed_ds);
     const Eigen::VectorXd& l_use = sanitized_bounds.l;
     const Eigen::VectorXd& u_use = sanitized_bounds.u;
     bool reused_sparse_bound_cache = false;
@@ -3075,24 +3178,14 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                                          !basis_state_opt->column_status.empty();
 
     if (!is_nonnegative_standard) {
-        struct ReformVar {
-            int y = -1;
-            int y_pos = -1;
-            int y_neg = -1;
-            int upper_slack = -1;
-            double shift = 0.0;
-            int sign = 1;
-            bool uses_single_var = false;
-            bool has_upper_row = false;
-        };
-
         const bool cache_reuse = sparse_bound_only_cache_.same_problem(A_in, b_in, c_in) &&
                                  sparse_bound_only_cache_.orientation_matches(l_use, u_use);
-        std::vector<ReformVar> map(n);
-        std::vector<int> single_y(n, -1);
-        std::vector<int> upper_slack(n, -1);
-        std::vector<int> split_pos(n, -1);
-        std::vector<int> split_neg(n, -1);
+        // Reuse pre-allocated map_scratch to avoid heap allocation on every BnB node solve.
+        // ReformVar is defined at class scope so SparseBoundOnlyCache can own this buffer.
+        auto& map = sparse_bound_only_cache_.map_scratch;
+        map.assign(n, ReformVar{});
+        // The 4 int index vectors live in the cache; references are set after the
+        // cache-hit / cache-miss block below (both paths ensure the cache is up-to-date).
         int nv = 0;
         int upper_rows = 0;
         double obj_shift = 0.0;
@@ -3143,10 +3236,8 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                     map[j].y_neg = cache.split_neg[j];
                 }
                 map[j].upper_slack = cache.upper_slack[j];
-                single_y[j] = cache.single_y[j];
-                split_pos[j] = cache.split_pos[j];
-                split_neg[j] = cache.split_neg[j];
-                upper_slack[j] = cache.upper_slack[j];
+                // single_y/split_pos/split_neg/upper_slack are NOT copied to local vectors;
+                // use sparse_bound_only_cache_.* directly via references below.
                 if (has_l) {
                     obj_shift += c_in(j) * l_use(j);
                 } else if (has_u) {
@@ -3175,7 +3266,6 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 } else if (has_l) {
                     map[j].uses_single_var = true;
                     map[j].y = nv++;
-                    single_y[j] = map[j].y;
                     map[j].shift = l_use(j);
                     map[j].sign = 1;
                     obj_shift += c_in(j) * l_use(j);
@@ -3186,15 +3276,12 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 } else if (has_u) {
                     map[j].uses_single_var = true;
                     map[j].y = nv++;
-                    single_y[j] = map[j].y;
                     map[j].shift = u_use(j);
                     map[j].sign = -1;
                     obj_shift += c_in(j) * u_use(j);
                 } else {
                     map[j].y_pos = nv++;
                     map[j].y_neg = nv++;
-                    split_pos[j] = map[j].y_pos;
-                    split_neg[j] = map[j].y_neg;
                 }
             }
 
@@ -3245,7 +3332,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 const int slack = nv + upper_row;
                 const int row = m_eq + upper_row;
                 map[j].upper_slack = slack;
-                upper_slack[j] = slack;
+                // upper_slack vector lives in the cache (filled by build_sparse_bound_only_cache_).
                 trips.emplace_back(row, map[j].y, 1.0);
                 trips.emplace_back(row, slack, 1.0);
                 b_std_owned(row) = u_use(j) - l_use(j);
@@ -3270,6 +3357,13 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         const Eigen::VectorXd& c_std = *c_std_ptr;
         const Eigen::VectorXd& l_std = *l_std_ptr;
         const Eigen::VectorXd& u_std = *u_std_ptr;
+        // Cache int-index vectors are now authoritative in both paths.
+        // Cache path: never wrote to them (used cache directly).
+        // Non-cache path: build_sparse_bound_only_cache_ populated them.
+        const std::vector<int>& single_y = sparse_bound_only_cache_.single_y;
+        const std::vector<int>& upper_slack = sparse_bound_only_cache_.upper_slack;
+        const std::vector<int>& split_pos = sparse_bound_only_cache_.split_pos;
+        const std::vector<int>& split_neg = sparse_bound_only_cache_.split_neg;
         std::optional<std::vector<int>> basis_std = std::nullopt;
         std::optional<LPBasis> basis_state_std = std::nullopt;
         if (basis_opt && !basis_opt->empty()) {
@@ -3312,7 +3406,20 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             reformulated_basis_guess = basis_columns_from_basis_state_(*basis_state_std, m_total);
         }
         std::optional<BasisQuality> reformulated_warm_basis_quality = std::nullopt;
-        if (reformulated_basis_guess && !reformulated_basis_guess->empty()) {
+        // SCIP/HiGHS insight: on a cache-hit (same A/b/c, only bounds changed), the warm basis
+        // from an optimal dual-simplex solve is ALWAYS dual feasible after a bound tightening.
+        // Skip the O(m^2) SparseLU quality check in this common BnB case.
+        const bool skip_quality_check = cache_reuse && opt_.mode == SimplexMode::Dual &&
+                                        basis_state_std.has_value() &&
+                                        !basis_state_std->column_status.empty();
+        if (skip_quality_check) {
+            // Assume dual feasible — the dual simplex will correct any violations in O(pivots).
+            BasisQuality assumed_quality;
+            assumed_quality.valid = true;
+            assumed_quality.dual_feasible = true;
+            assumed_quality.primal_feasible = false; // conservative; dual simplex handles this
+            reformulated_warm_basis_quality = assumed_quality;
+        } else if (reformulated_basis_guess && !reformulated_basis_guess->empty()) {
             reformulated_warm_basis_quality =
                 evaluate_basis_quality_(A_std, b_std, c_std, *reformulated_basis_guess, opt_.tol);
         }
@@ -3330,7 +3437,15 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             solve_opt.disable_presolve = true;
             trace_line_("[solve_reformulated] disable_presolve=" +
                         std::to_string(solve_opt.disable_presolve));
-            RevisedSimplex reformulated_solver(solve_opt);
+            // HiGHS/SCIP hot-restart: reuse the persistent reformulated solver so the
+            // FTBasis factorization (and signature cache) survive across BnB node solves.
+            // Created fresh only after a cache miss (when reformulated structure changed).
+            if (!sparse_bound_only_cache_.reformulated_solver_cache) {
+                sparse_bound_only_cache_.reformulated_solver_cache =
+                    std::make_unique<RevisedSimplex>(solve_opt);
+            }
+            RevisedSimplex& reformulated_solver =
+                *sparse_bound_only_cache_.reformulated_solver_cache;
             const RevisedSimplex::SparseMatrix& A_std_sparse = A_std;
             return basis_state_std ? reformulated_solver.solve(A_std_sparse, b_std, c_std, l_std,
                                                                u_std, *basis_state_std)
@@ -3355,10 +3470,9 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         if (std_sol.x.size() == n_total && std_sol.x.array().isFinite().all()) {
             for (int j = 0; j < n; ++j) {
                 if (map[j].uses_single_var) {
-                    x(j) = map[j].y >= 0
-                               ? map[j].shift +
-                                     static_cast<double>(map[j].sign) * std_sol.x(map[j].y)
-                               : map[j].shift;
+                    x(j) = map[j].y >= 0 ? map[j].shift + static_cast<double>(map[j].sign) *
+                                                              std_sol.x(map[j].y)
+                                         : map[j].shift;
                 } else {
                     x(j) = std_sol.x(map[j].y_pos) - std_sol.x(map[j].y_neg);
                 }

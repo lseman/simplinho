@@ -5,5 +5,6 @@
 namespace py = pybind11;
 
 void bind_bnb_bindings(py::module_& m);
+void bind_ipm_bindings(py::module_& m);
 void bind_simplex_bindings(py::module_& m);
 void bind_model_bindings(py::module_& m);
