@@ -69,9 +69,9 @@ class SearchCoordinator {
               int preferred_worker = -1) {
         int target_worker = preferred_worker;
         if (target_worker < 0) {
-            const std::uint64_t idx =
-                next_worker_index_.fetch_add(1, std::memory_order_relaxed);
-            target_worker = static_cast<int>(idx % static_cast<std::uint64_t>(worker_queues_.size()));
+            const std::uint64_t idx = next_worker_index_.fetch_add(1, std::memory_order_relaxed);
+            target_worker =
+                static_cast<int>(idx % static_cast<std::uint64_t>(worker_queues_.size()));
         }
         if (target_worker >= static_cast<int>(worker_queues_.size())) {
             target_worker = static_cast<int>(worker_queues_.size()) - 1;
@@ -87,8 +87,8 @@ class SearchCoordinator {
                                       int worker_id = -1) {
         int target_worker = worker_id < 0 ? 0 : worker_id;
         auto hc = hybrid_counter_.load(std::memory_order_relaxed);
-        auto local_result = worker_queues_[target_worker].pop(
-            strategy, maximize, hybrid_depth_bias, plunging_bestfreq, &hc);
+        auto local_result = worker_queues_[target_worker].pop(strategy, maximize, hybrid_depth_bias,
+                                                              plunging_bestfreq, &hc);
         hybrid_counter_.store(hc, std::memory_order_relaxed);
         if (local_result.has_value()) {
             local_pops_.fetch_add(1, std::memory_order_relaxed);
@@ -128,8 +128,8 @@ class SearchCoordinator {
                     if (other == wid)
                         continue;
                     auto hc2 = hybrid_counter_.load(std::memory_order_relaxed);
-                    auto stolen = worker_queues_[other].steal(strategy, maximize,
-                                                              hybrid_depth_bias, plunging_bestfreq, &hc2);
+                    auto stolen = worker_queues_[other].steal(strategy, maximize, hybrid_depth_bias,
+                                                              plunging_bestfreq, &hc2);
                     hybrid_counter_.store(hc2, std::memory_order_relaxed);
                     if (stolen.has_value()) {
                         stolen_pops_.fetch_add(1, std::memory_order_relaxed);
@@ -140,8 +140,7 @@ class SearchCoordinator {
             }
 
             // Nothing available: check if we should terminate.
-            if (active_workers_.load(std::memory_order_acquire) == 0 &&
-                !should_work_atomic_()) {
+            if (active_workers_.load(std::memory_order_acquire) == 0 && !should_work_atomic_()) {
                 return {.node = std::nullopt, .terminated = true, .stolen_worker_id = -1};
             }
 
@@ -221,19 +220,15 @@ class SearchCoordinator {
         notify_all();
     }
 
-    bool found_unbounded() const {
-        return found_unbounded_.load(std::memory_order_acquire);
-    }
+    bool found_unbounded() const { return found_unbounded_.load(std::memory_order_acquire); }
 
-    bool hit_node_limit() const {
-        return hit_node_limit_.load(std::memory_order_acquire);
-    }
+    bool hit_node_limit() const { return hit_node_limit_.load(std::memory_order_acquire); }
 
     // Compute best bound across all local queues.
     double compute_best_bound(bool has_incumbent, double incumbent_objective, bool maximize,
                               const std::optional<double>& root_relaxation_objective) const {
-        double best = has_incumbent ? incumbent_objective
-                                    : std::numeric_limits<double>::quiet_NaN();
+        double best =
+            has_incumbent ? incumbent_objective : std::numeric_limits<double>::quiet_NaN();
 
         for (const auto& q : worker_queues_) {
             const ActiveNode* best_node = q.peek_valid_node();
@@ -340,4 +335,3 @@ class SearchCoordinator {
 };
 
 } // namespace simplex::bnb::detail
-

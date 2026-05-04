@@ -671,8 +671,8 @@ lifted_binary_cover_cut_(const CanonicalKnapsack& kn, double tol = 1e-9) {
 }
 
 std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
-highs_lifted_binary_cover_cut_(const CanonicalKnapsack& kn,
-                               const BinaryCoverPartition& partition, double tol = 1e-9) {
+highs_lifted_binary_cover_cut_(const CanonicalKnapsack& kn, const BinaryCoverPartition& partition,
+                               double tol = 1e-9) {
     const int n = static_cast<int>(kn.variables.size());
     std::vector<int> cover = partition.cover_positions;
     if (n < 2 || cover.size() < 2 || !kn.valid || !std::isfinite(kn.rhs) || kn.rhs <= tol)
@@ -734,8 +734,9 @@ highs_lifted_binary_cover_cut_(const CanonicalKnapsack& kn,
         const double hfrac = coeff / abar;
         double lifted = 0.0;
         int h = static_cast<int>(std::floor(hfrac + 0.5));
-        if (h != 0 && std::abs(hfrac - static_cast<double>(h)) * std::max(1.0, abar) <=
-                          std::max(1e-9, 10.0 * tol) &&
+        if (h != 0 &&
+            std::abs(hfrac - static_cast<double>(h)) * std::max(1.0, abar) <=
+                std::max(1e-9, 10.0 * tol) &&
             h <= cplus_size - 1) {
             half_integral = true;
             lifted = 0.5;
@@ -752,8 +753,7 @@ highs_lifted_binary_cover_cut_(const CanonicalKnapsack& kn,
     for (int pos = 0; pos < n; ++pos) {
         if (cover_flag[static_cast<std::size_t>(pos)] == -1) {
             canonical_coeffs[static_cast<std::size_t>(pos)] = 1.0;
-        } else if (cover_flag[static_cast<std::size_t>(pos)] == 1 ||
-                   kn.coeffs[pos] > tol) {
+        } else if (cover_flag[static_cast<std::size_t>(pos)] == 1 || kn.coeffs[pos] > tol) {
             canonical_coeffs[static_cast<std::size_t>(pos)] = lift_function(kn.coeffs[pos]);
         }
     }
@@ -1932,7 +1932,8 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
             // This reduces to standard GMI when tij < U (floor = 0).
             const auto gmi_g = [&](double t) -> double {
                 const double fj = fractional_part(t);
-                if (fj <= f0) return fj;
+                if (fj <= f0)
+                    return fj;
                 return (std::abs(1.0 - f0) > 1e-10) ? (f0 * (1.0 - fj)) / (1.0 - f0) : 0.0;
             };
 
@@ -1941,12 +1942,14 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
             // tij < 0: internal model complements upper-bounded variables, so |tij| is
             //          the entry for s_j = ub - x_j in [0, U]; U is the same range.
             const double lb = *mapped_index < static_cast<int>(problem.lower_bounds.size())
-                                  ? problem.lower_bounds(*mapped_index) : 0.0;
+                                  ? problem.lower_bounds(*mapped_index)
+                                  : 0.0;
             const double ub = *mapped_index < static_cast<int>(problem.upper_bounds.size())
                                   ? problem.upper_bounds(*mapped_index)
                                   : std::numeric_limits<double>::infinity();
-            const double U = (std::isfinite(lb) && std::isfinite(ub)) ? (ub - lb)
-                                                                        : std::numeric_limits<double>::infinity();
+            const double U = (std::isfinite(lb) && std::isfinite(ub))
+                                 ? (ub - lb)
+                                 : std::numeric_limits<double>::infinity();
             const double abs_tij = std::abs(tij);
             if (std::isfinite(U) && U >= 2.0 && abs_tij >= U - 1e-10) {
                 // CKS strengthening: floor(|tij|/U)*f0 + g(|tij| mod U, f0)
@@ -1966,7 +1969,6 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
                               ? tij
                               : ((std::abs(1.0 - f0) > 1e-10) ? (-(f0 * tij) / (1.0 - f0)) : 0.0);
         }
-
 
         if (std::abs(coefficient) > 1e-8) {
             cut.indices.push_back(*mapped_index);
@@ -2490,8 +2492,8 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
             i < static_cast<int>(row_norms_.size()) ? row_norms_[i] : cut_norm_(cuts_[i]);
         const double age_bonus =
             std::exp(-cut_selection_age_bonus_ * static_cast<double>(cuts_[i].age));
-        candidates.push_back(Candidate{i, violation, full_norm, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                                       0.0, cuts_[i].strength, age_bonus,
+        candidates.push_back(Candidate{i, violation, full_norm, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                       cuts_[i].strength, age_bonus,
                                        violation <= 2.5 * min_violation_});
     }
 
@@ -2562,13 +2564,13 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
 
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {
         const double lhs_score = 0.33 * lhs.active_efficacy + 0.19 * lhs.highs_active_score +
-                                 0.14 * lhs.efficacy +
-                                 0.14 * lhs.density_adjusted_efficacy + 0.10 * lhs.dynamism +
-                                 0.07 * lhs.fractional_focus + 0.08 * lhs.obj_parallelism;
+                                 0.14 * lhs.efficacy + 0.14 * lhs.density_adjusted_efficacy +
+                                 0.10 * lhs.dynamism + 0.07 * lhs.fractional_focus +
+                                 0.08 * lhs.obj_parallelism;
         const double rhs_score = 0.33 * rhs.active_efficacy + 0.19 * rhs.highs_active_score +
-                                 0.14 * rhs.efficacy +
-                                 0.14 * rhs.density_adjusted_efficacy + 0.10 * rhs.dynamism +
-                                 0.07 * rhs.fractional_focus + 0.08 * rhs.obj_parallelism;
+                                 0.14 * rhs.efficacy + 0.14 * rhs.density_adjusted_efficacy +
+                                 0.10 * rhs.dynamism + 0.07 * rhs.fractional_focus +
+                                 0.08 * rhs.obj_parallelism;
         return lhs_score > rhs_score;
     });
 
@@ -2606,12 +2608,10 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
                 continue;
 
             double score = 0.30 * candidate.active_efficacy + 0.17 * candidate.highs_active_score +
-                           0.11 * candidate.efficacy +
-                           0.18 * (1.0 - max_parallelism) + 0.11 * candidate.age_bonus +
-                           0.09 * candidate.density_adjusted_efficacy + 0.07 * candidate.strength +
-                           dynamism_weight_ * candidate.dynamism +
-                           0.05 * candidate.fractional_focus +
-                           0.10 * candidate.obj_parallelism;
+                           0.11 * candidate.efficacy + 0.18 * (1.0 - max_parallelism) +
+                           0.11 * candidate.age_bonus + 0.09 * candidate.density_adjusted_efficacy +
+                           0.07 * candidate.strength + dynamism_weight_ * candidate.dynamism +
+                           0.05 * candidate.fractional_focus + 0.10 * candidate.obj_parallelism;
             if (candidate.marginal) {
                 score +=
                     0.06 * candidate.density_adjusted_efficacy + 0.04 * candidate.fractional_focus;
@@ -3062,7 +3062,8 @@ std::vector<int> select_gmi_rows_(const Problem& problem, const RelaxationSoluti
             1.0 + 0.10 * std::min(1.0, static_cast<double>(fractional_support) / 8.0) +
             0.05 * std::min(1.0, static_cast<double>(integer_support) / 12.0);
         const double density_penalty = 1.0 + 0.08 * static_cast<double>(nnz);
-        const double score = frac * (1.0 - frac) * support_bonus / (std::max(1.0, norm_sq) * density_penalty);
+        const double score =
+            frac * (1.0 - frac) * support_bonus / (std::max(1.0, norm_sq) * density_penalty);
         std::sort(support_terms.begin(), support_terms.end(),
                   [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
         std::vector<int> support_indices;
@@ -3356,7 +3357,8 @@ std::optional<Cut> build_mir_cut_from_canonical_row_(const Problem& problem,
     // improving the chance that fractional_part(beta) is far from 0 and 1 (=> strong cut).
     if (std::isfinite(row.rhs) && std::abs(row.rhs) > away) {
         const double abs_rhs = std::abs(row.rhs);
-        constexpr std::array<double, 9> kTargetFracs = {0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85};
+        constexpr std::array<double, 9> kTargetFracs = {0.15, 0.2, 0.3, 0.4, 0.5,
+                                                        0.6,  0.7, 0.8, 0.85};
         const std::size_t base_size = delta_candidates.size();
         for (const double f_star : kTargetFracs) {
             for (int k = 1; k <= 4; ++k) {
@@ -3870,8 +3872,8 @@ std::optional<ModKIntegerRow> build_modk_integer_row_(const Problem& problem,
                                                       const Options& options,
                                                       const SparseLinearConstraint& source_row,
                                                       double row_sign) {
-    constexpr std::array<int, 12> kCandidateScales = {1, 2, 4, 8, 16, 32, 64, 128,
-                                                      256, 512, 1024, 2048};
+    constexpr std::array<int, 12> kCandidateScales = {1,  2,   4,   8,   16,   32,
+                                                      64, 128, 256, 512, 1024, 2048};
     const double coeff_tol = std::max(1e-8, 50.0 * options.integrality_tol);
     std::vector<std::pair<int, double>> dense_terms;
     dense_terms.reserve(source_row.indices.size());
@@ -3906,11 +3908,10 @@ std::optional<ModKIntegerRow> build_modk_integer_row_(const Problem& problem,
             merged_terms.emplace_back(index, value);
         }
     }
-    merged_terms.erase(std::remove_if(merged_terms.begin(), merged_terms.end(),
-                                      [](const auto& term) {
-                                          return std::abs(term.second) <= 1e-12;
-                                      }),
-                       merged_terms.end());
+    merged_terms.erase(
+        std::remove_if(merged_terms.begin(), merged_terms.end(),
+                       [](const auto& term) { return std::abs(term.second) <= 1e-12; }),
+        merged_terms.end());
     if (merged_terms.size() < 2)
         return std::nullopt;
 
@@ -3951,11 +3952,9 @@ std::optional<ModKIntegerRow> build_modk_integer_row_(const Problem& problem,
     return std::nullopt;
 }
 
-std::optional<Cut> build_modk_cg_cut_(const Problem& problem,
-                                      const RelaxationSolution& relaxation,
+std::optional<Cut> build_modk_cg_cut_(const Problem& problem, const RelaxationSolution& relaxation,
                                       const Options& options,
-                                      const std::vector<const ModKIntegerRow*>& rows,
-                                      int modulus) {
+                                      const std::vector<const ModKIntegerRow*>& rows, int modulus) {
     if (rows.empty() || modulus <= 1)
         return std::nullopt;
 
@@ -3965,8 +3964,8 @@ std::optional<Cut> build_modk_cg_cut_(const Problem& problem,
         if (row == nullptr)
             return std::nullopt;
         aggregate_rhs += row->rhs;
-        for (int k = 0; k < static_cast<int>(row->indices.size()) &&
-                        k < static_cast<int>(row->values.size());
+        for (int k = 0;
+             k < static_cast<int>(row->indices.size()) && k < static_cast<int>(row->values.size());
              ++k) {
             aggregate[row->indices[k]] += row->values[k];
         }
@@ -4001,9 +4000,9 @@ std::optional<Cut> build_modk_cg_cut_(const Problem& problem,
     const double violation = cut_violation(cut, relaxation.primal);
     if (violation <= options.min_cut_violation)
         return std::nullopt;
-    cut.strength = density_adjusted_efficacy_(
-        violation, cut_norm_(cut), static_cast<int>(cut.indices.size()),
-        fractional_focus_(cut, relaxation.primal), 1.0);
+    cut.strength =
+        density_adjusted_efficacy_(violation, cut_norm_(cut), static_cast<int>(cut.indices.size()),
+                                   fractional_focus_(cut, relaxation.primal), 1.0);
     return cut;
 }
 
@@ -4061,8 +4060,8 @@ std::vector<Cut> generate_zero_half_cuts(const Problem& problem,
 
             for (int j = i + 1; j < row_limit; ++j) {
                 const ModKIntegerRow* second = &rows[static_cast<std::size_t>(j)];
-                maybe_add(build_modk_cg_cut_(problem, relaxation, options, {first, second},
-                                             modulus));
+                maybe_add(
+                    build_modk_cg_cut_(problem, relaxation, options, {first, second}, modulus));
                 if (static_cast<int>(cuts.size()) >=
                     std::max(4, 2 * options.max_cuts_added_per_round))
                     return cuts;
