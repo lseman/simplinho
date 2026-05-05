@@ -186,6 +186,22 @@ void bind_bnb_bindings(py::module_& m) {
         .def_readwrite("use_node_presolve", &BranchAndBoundOptions::use_node_presolve)
         .def_readwrite("use_node_presolve_on_warm_basis",
                        &BranchAndBoundOptions::use_node_presolve_on_warm_basis)
+        .def_readwrite("use_adaptive_proof_phase",
+                       &BranchAndBoundOptions::use_adaptive_proof_phase)
+        .def_readwrite("proof_phase_min_nodes", &BranchAndBoundOptions::proof_phase_min_nodes)
+        .def_readwrite("proof_node_selection", &BranchAndBoundOptions::proof_node_selection)
+        .def_readwrite("proof_strong_branching_candidates",
+                       &BranchAndBoundOptions::proof_strong_branching_candidates)
+        .def_readwrite("proof_strong_branching_k",
+                       &BranchAndBoundOptions::proof_strong_branching_k)
+        .def_readwrite("proof_strong_branching_max_depth",
+                       &BranchAndBoundOptions::proof_strong_branching_max_depth)
+        .def_readwrite("proof_max_cut_rounds_per_node",
+                       &BranchAndBoundOptions::proof_max_cut_rounds_per_node)
+        .def_readwrite("proof_max_cuts_added_per_round",
+                       &BranchAndBoundOptions::proof_max_cuts_added_per_round)
+        .def_readwrite("proof_use_node_presolve_on_warm_basis",
+                       &BranchAndBoundOptions::proof_use_node_presolve_on_warm_basis)
         .def("__repr__", [](const BranchAndBoundOptions& self) {
             std::ostringstream oss;
             oss << "BranchAndBoundOptions(max_nodes=" << self.max_nodes

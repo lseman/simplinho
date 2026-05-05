@@ -3470,6 +3470,39 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             std_sol = solve_reformulated(SimplexMode::Auto);
             reformulated_retry_used = true;
         }
+        // When skip_quality_check assumed dual feasibility without verification, an Infeasible
+        // result is unreliable: if the cached basis was not truly dual-feasible, the dual simplex
+        // can terminate with a spurious Farkas certificate. A wrong Infeasible propagates through
+        // the BnB tree as a learned conflict, incorrectly pruning feasible nodes (false-positive
+        // optimal). Verify by clearing the inner cache and re-solving cold.
+        if (skip_quality_check && std_sol.status == LPSolution::Status::Infeasible) {
+            if (sparse_bound_only_cache_.reformulated_solver_cache) {
+                sparse_bound_only_cache_.reformulated_solver_cache->clear_basis_cache();
+            }
+            const LPSolution cold_sol = solve_reformulated(SimplexMode::Auto);
+            if (cold_sol.status != LPSolution::Status::Infeasible) {
+                std_sol = cold_sol;
+                reformulated_retry_used = true;
+            }
+        }
+        // Also verify a warm-started Optimal: check primal feasibility ||Ax - b||_inf.
+        // A wrong Optimal (too-low LP bound from a bad warm start) causes incorrect pruning
+        // in BnB, giving false-positive optimal results.
+        if (skip_quality_check && std_sol.status == LPSolution::Status::Optimal &&
+            std_sol.x.size() == n_total) {
+            const double verify_tol = opt_.tol * 1e4;
+            const Eigen::VectorXd residual = (*A_std_ptr) * std_sol.x - (*b_std_ptr);
+            if (residual.lpNorm<Eigen::Infinity>() > verify_tol) {
+                if (sparse_bound_only_cache_.reformulated_solver_cache) {
+                    sparse_bound_only_cache_.reformulated_solver_cache->clear_basis_cache();
+                }
+                const LPSolution cold_sol = solve_reformulated(SimplexMode::Auto);
+                if (cold_sol.status == LPSolution::Status::Optimal) {
+                    std_sol = cold_sol;
+                    reformulated_retry_used = true;
+                }
+            }
+        }
 
         Eigen::VectorXd x = Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
         if (std_sol.x.size() == n_total && std_sol.x.array().isFinite().all()) {

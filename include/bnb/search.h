@@ -396,6 +396,77 @@ inline double node_selection_score(const ActiveNode& node, NodeSelectionStrategy
 }
 
 // ============================================================================
+// GlobalDomain
+// ============================================================================
+// A globally-valid tightest-bound store, analogous to HighsDomain / SCIP_DOM.
+// Tracks the best known lower/upper bounds for each variable across the entire
+// BnB tree. Bounds here are VALID for every feasible integer solution, so they
+// can be applied to ANY node — including already-queued nodes — when tightened.
+//
+// Key operations:
+//   tighten(j, lb, ub) — thread-safe update (monotone: only tightens)
+//   apply(node_lb, node_ub) — intersect node bounds in-place
+//   snapshot() — cheap snapshot for read-only use outside the lock
+// ============================================================================
+class GlobalDomain {
+  public:
+    void reset(const Eigen::VectorXd& problem_lower, const Eigen::VectorXd& problem_upper) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        lower_ = problem_lower;
+        upper_ = problem_upper;
+        revision_ = 0;
+    }
+
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        lower_.resize(0);
+        upper_.resize(0);
+        revision_ = 0;
+    }
+
+    // Tighten variable j's global bounds. Returns true if anything changed.
+    bool tighten(int j, double lb, double ub) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (j < 0 || j >= static_cast<int>(lower_.size())) return false;
+        bool changed = false;
+        if (lb > lower_(j) + 1e-12) { lower_(j) = lb; changed = true; }
+        if (ub < upper_(j) - 1e-12) { upper_(j) = ub; changed = true; }
+        if (changed) ++revision_;
+        return changed;
+    }
+
+    // Intersect node bounds in-place. Returns number of variables tightened.
+    int apply(Eigen::VectorXd& node_lower, Eigen::VectorXd& node_upper) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (lower_.size() == 0) return 0;
+        const int n = std::min<int>(static_cast<int>(node_lower.size()),
+                                    static_cast<int>(lower_.size()));
+        int tightened = 0;
+        for (int j = 0; j < n; ++j) {
+            if (lower_(j) > node_lower(j) + 1e-12) { node_lower(j) = lower_(j); ++tightened; }
+            if (upper_(j) < node_upper(j) - 1e-12) { node_upper(j) = upper_(j); ++tightened; }
+        }
+        return tightened;
+    }
+
+    uint64_t revision() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return revision_;
+    }
+
+    bool initialized() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return lower_.size() > 0;
+    }
+
+  private:
+    mutable std::mutex mutex_;
+    Eigen::VectorXd lower_;
+    Eigen::VectorXd upper_;
+    uint64_t revision_ = 0;
+};
+
+// ============================================================================
 // Worker Local Queue
 // ============================================================================
 // A decentralized queue for worker-local node storage with support for

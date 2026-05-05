@@ -231,6 +231,17 @@ struct Options {
     bool use_quadratic_warm_start_repair = false;
     bool use_node_presolve = true;
     bool use_node_presolve_on_warm_basis = false;
+    // Adaptive proof phase: after an incumbent exists, switch effort from
+    // primal search toward proving the dual bound.
+    bool use_adaptive_proof_phase = false;
+    int proof_phase_min_nodes = 8;
+    NodeSelectionStrategy proof_node_selection = NodeSelectionStrategy::BestBound;
+    int proof_strong_branching_candidates = 8;
+    int proof_strong_branching_k = 4;
+    int proof_strong_branching_max_depth = 4;
+    int proof_max_cut_rounds_per_node = 2;
+    int proof_max_cuts_added_per_round = 8;
+    bool proof_use_node_presolve_on_warm_basis = false;
     // HiGHS-inspired separate tolerances
     double feasibility_tol = 1e-7; // Feasibility checks in relaxation (LP)
     double optimality_tol = 1e-7;  // LP optimality checks (reduced-cost dual feasibility)
@@ -238,7 +249,9 @@ struct Options {
     // Absolute MIP gap: stop once |best_bound - incumbent| <= mip_abs_gap.
     double mip_abs_gap = 1e-6;
     // Relative MIP gap: stop once |best_bound - incumbent| / max(1, |incumbent|) <= mip_rel_gap.
-    // HiGHS default is 1e-4.
+    // HiGHS default is 1e-4. The gap is used for early termination only
+    // (HiGHS-style optimality_limit); it never widens the per-node fathoming
+    // cutoff, which would risk losing the true optimum.
     double mip_rel_gap = 1e-4;
     // Cache control for parallel mode
     bool enable_parallel_cache = true; // Enable thread-local cache for reduced lock contention

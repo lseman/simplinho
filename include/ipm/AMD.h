@@ -1,16 +1,11 @@
-#include <execution>
-#include <stdexec/execution.hpp>
+#include <cstddef>
 #include <vector>
 
-#include <execution>
-
 // Helper function to wrap the bulk execution of a task
-template <typename Func>
-void bulk_parallel_for(size_t start, size_t end, Func &&func) {
-    exec::static_thread_pool            pool  = exec::static_thread_pool(std::thread::hardware_concurrency());
-    exec::static_thread_pool::scheduler sched = pool.get_scheduler();
-
-    stdexec::bulk(stdexec::schedule(sched), end - start, [=](size_t idx) { func(idx + start); });
+template <typename Func> void bulk_parallel_for(size_t start, size_t end, Func&& func) {
+    for (size_t idx = start; idx < end; ++idx) {
+        func(idx);
+    }
 }
 
 template <typename T>

@@ -11,8 +11,6 @@
 #include <experimental/simd>
 #include <limits>
 #include <set>
-#include <stdexec/execution.hpp>
-#include <thread>
 
 #include "AMD.h"
 template <typename T> using BVector = std::vector<T>;
@@ -75,9 +73,6 @@ class CustomSimplicialLDLT {
         : m_isInitialized(false), m_info(Success), m_epsilon(1e-9) {
         // compute(matrix);
     }
-
-    exec::static_thread_pool pool = exec::static_thread_pool(std::thread::hardware_concurrency());
-    exec::static_thread_pool::scheduler sched = pool.get_scheduler();
 
     CustomSimplicialLDLT& compute(const MatrixType& matrix) {
         analyzePattern(matrix);

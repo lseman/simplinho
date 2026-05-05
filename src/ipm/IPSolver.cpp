@@ -11,6 +11,21 @@
 
 #include "ipm/IPSolver.h"
 
+namespace {
+
+double bounded_static_regularization(double mu) {
+    if (!std::isfinite(mu) || mu <= 0.0) {
+        return 1e-8;
+    }
+
+    // HiPO applies a small static regularization to preserve quasi-definiteness.
+    // Scale it down as complementarity improves, but keep it in the paper's
+    // practical 1e-10 to 1e-12 neighbourhood near the solution.
+    return std::clamp(1e-2 * mu, 1e-12, 1e-8);
+}
+
+} // namespace
+
 /**
  * @brief Converts a dense vector to a sparse diagonal matrix.
  *
@@ -208,6 +223,26 @@ void IPSolver::solve_augmented_system(Eigen::VectorXd& dx, Eigen::VectorXd& dy, 
 
     // Solve augmented system
     Eigen::VectorXd d = ls.solve(xi);
+
+    // A direct factorization of IPM KKT matrices can still lose accuracy as the
+    // iterates become ill-conditioned. Reuse the same factorization for a small
+    // number of iterative refinement corrections, as suggested by HiPO.
+    constexpr int max_refinement_steps = 2;
+    const double rhs_norm = std::max(1.0, xi.lpNorm<Eigen::Infinity>());
+    const double refinement_tol = 1e-10 * rhs_norm;
+    for (int i = 0; i < max_refinement_steps; ++i) {
+        Eigen::VectorXd residual = xi - ls.S * d;
+        const double residual_norm = residual.lpNorm<Eigen::Infinity>();
+        if (!std::isfinite(residual_norm) || residual_norm <= refinement_tol) {
+            break;
+        }
+
+        Eigen::VectorXd correction = ls.solve(residual);
+        if (ls.info() != 0 || !correction.allFinite()) {
+            break;
+        }
+        d += correction;
+    }
 
     // Recover dx, dy in original order
     dx = d.head(xi_d.size()); // Gets the first n elements
@@ -457,9 +492,9 @@ void IPSolver::run_optimization(const OptimizationData& data, const double tol) 
     Eigen::VectorXd v = Eigen::VectorXd::Ones(ubv.size());
     Eigen::VectorXd w = Eigen::VectorXd::Ones(ubv.size());
     double tau = 1.0, kappa = 1.0;
-    Eigen::VectorXd regP = Eigen::VectorXd::Ones(n);
-    Eigen::VectorXd regD = Eigen::VectorXd::Ones(m);
-    double regG = 1.0;
+    Eigen::VectorXd regP = Eigen::VectorXd::Constant(n, 1e-8);
+    Eigen::VectorXd regD = Eigen::VectorXd::Constant(m, 1e-8);
+    double regG = 1e-8;
 
     ls.reset();
     start_linear_solver(ls, A);
@@ -477,7 +512,8 @@ void IPSolver::run_optimization(const OptimizationData& data, const double tol) 
     Eigen::VectorXd delta_z = Eigen::VectorXd::Zero(nu);
     Residuals res;
 
-    const double r_min = std::sqrt(std::numeric_limits<double>::epsilon());
+    constexpr double max_dynamic_regularization = 1e4;
+    double dynamic_regularization = 1.0;
     int ncor = 0;
     double _p, _d, _g, mu;
     double alpha, alpha_c, alpha_;
@@ -556,18 +592,28 @@ void IPSolver::run_optimization(const OptimizationData& data, const double tol) 
             theta_xs[ubi[i]] += theta_vw[i];
         }
 
-        // Update regularization dynamically (reuse regP/regD to avoid extra
-        // allocation)
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            regP = (regP / 10.0).cwiseMax(r_min);
-            regD = (regD / 10.0).cwiseMax(r_min);
-            regG = std::max(r_min, regG / 10.0);
-            if (update_linear_solver(ls, theta_xs, regP, regD) == 0)
+        // Static regularization preserves quasi-definiteness; dynamic
+        // regularization is increased only when the numeric factorization fails.
+        const double static_regularization = bounded_static_regularization(mu);
+        bool factorized = false;
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            const double regularization = static_regularization * dynamic_regularization;
+            regP.setConstant(regularization);
+            regD.setConstant(regularization);
+            regG = regularization;
+
+            if (update_linear_solver(ls, theta_xs, regP, regD) == 0) {
+                factorized = true;
                 break;
-            regP *= 100.0;
-            regD *= 100.0;
-            regG *= 100.0;
+            }
+
+            dynamic_regularization = std::min(dynamic_regularization * 100.0,
+                                              max_dynamic_regularization);
         }
+        if (!factorized) {
+            break;
+        }
+        dynamic_regularization = std::max(1.0, dynamic_regularization / 10.0);
 
         // Solve the augmented system
         solve_augsys(delta_x, delta_y, delta_z, ls, theta_vw, ubi, b, c, ubv);

@@ -558,6 +558,27 @@ class Solver {
         if (options_.max_cuts_per_type < 0) {
             throw std::invalid_argument("simplex::bnb: max_cuts_per_type must be >= 0");
         }
+        if (options_.proof_strong_branching_candidates < 0) {
+            throw std::invalid_argument(
+                "simplex::bnb: proof_strong_branching_candidates must be >= 0");
+        }
+        if (options_.proof_phase_min_nodes < 0) {
+            throw std::invalid_argument("simplex::bnb: proof_phase_min_nodes must be >= 0");
+        }
+        if (options_.proof_strong_branching_k < 0) {
+            throw std::invalid_argument("simplex::bnb: proof_strong_branching_k must be >= 0");
+        }
+        if (options_.proof_strong_branching_max_depth < 0) {
+            throw std::invalid_argument(
+                "simplex::bnb: proof_strong_branching_max_depth must be >= 0");
+        }
+        if (options_.proof_max_cut_rounds_per_node < 0) {
+            throw std::invalid_argument("simplex::bnb: proof_max_cut_rounds_per_node must be >= 0");
+        }
+        if (options_.proof_max_cuts_added_per_round < 0) {
+            throw std::invalid_argument(
+                "simplex::bnb: proof_max_cuts_added_per_round must be >= 0");
+        }
         if (options_.cut_max_parallelism < 0.0 || options_.cut_max_parallelism > 1.0) {
             throw std::invalid_argument("simplex::bnb: cut_max_parallelism must be in [0, 1]");
         }
@@ -657,6 +678,9 @@ class Solver {
             incumbent_primal_ = Eigen::VectorXd::Constant(problem_.lower_bounds.size(),
                                                           std::numeric_limits<double>::quiet_NaN());
             root_relaxation_objective.reset();
+            root_reduced_costs_.resize(0);
+            root_basis_statuses_.clear();
+            root_lp_objective_ = std::numeric_limits<double>::quiet_NaN();
         }
         {
             std::lock_guard<std::mutex> lock(progress_mutex_);
@@ -671,6 +695,7 @@ class Solver {
             std::lock_guard<std::mutex> lock(async_heuristic_completion_mutex_);
             async_heuristic_completions_.clear();
         }
+        global_domain_.reset(problem_.lower_bounds, problem_.upper_bounds);
     }
 
     detail::ActiveNode make_root_node_() {
@@ -691,9 +716,35 @@ class Solver {
                                  : (candidate < incumbent - options_.feasibility_tol);
     }
 
+    // Optimum-preserving fathoming cutoff (HiGHS HighsMipSolverData::upper_limit
+    // with mip_abs_gap = mip_rel_gap = 0). A node is pruned only when its LP
+    // bound is strictly worse than this cutoff, so any integer-feasible
+    // solution at least as good as the incumbent remains in the search tree.
+    // For minimization: cutoff = incumbent - feasibility_tol
+    // For maximization: cutoff = incumbent + feasibility_tol
+    double fathom_cutoff_(double incumbent) const {
+        return problem_.maximize ? (incumbent + options_.feasibility_tol)
+                                 : (incumbent - options_.feasibility_tol);
+    }
+
+    // Gap-aware "optimality limit" (HiGHS optimality_limit). Used only to
+    // decide when the requested optimality gap has been proved -- never for
+    // pruning individual nodes, since that would discard the true optimum
+    // whenever a better integer solution exists within the gap window.
+    double optimality_limit_(double incumbent) const {
+        const double scale = std::max(1.0, std::abs(incumbent));
+        const double slack = std::max(options_.mip_abs_gap, options_.mip_rel_gap * scale);
+        return problem_.maximize ? (incumbent + slack) : (incumbent - slack);
+    }
+
     bool bound_prunes_(double candidate, double incumbent) const {
-        return problem_.maximize ? (candidate <= incumbent + options_.feasibility_tol)
-                                 : (candidate >= incumbent - options_.feasibility_tol);
+        // Always use the optimum-preserving cutoff for fathoming. The
+        // use_gap_aware_cutoff toggle only controls the IncumbentCutoff LP cut
+        // and does NOT widen this fathoming criterion -- doing so would lose
+        // the optimum on instances where a better integer solution lies within
+        // the requested gap window.
+        const double cutoff = fathom_cutoff_(incumbent);
+        return problem_.maximize ? (candidate <= cutoff) : (candidate >= cutoff);
     }
 
     bool mip_gap_closed_(double bound) const {
@@ -709,6 +760,77 @@ class Solver {
         }
         const double scale = std::max(1.0, std::abs(incumbent.objective));
         return (raw_gap / scale) <= options_.mip_rel_gap;
+    }
+
+    bool adaptive_proof_phase_active_() const {
+        if (!options_.use_adaptive_proof_phase) {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            if (node_count_ < options_.proof_phase_min_nodes) {
+                return false;
+            }
+        }
+        const IncumbentSnapshot incumbent = incumbent_snapshot_();
+        if (!incumbent.has_incumbent || !std::isfinite(incumbent.objective)) {
+            return false;
+        }
+        if (search_coordinator_.empty()) {
+            return false;
+        }
+        const double best_bound =
+            search_coordinator_.compute_best_bound(incumbent.has_incumbent, incumbent.objective,
+                                                   problem_.maximize, root_relaxation_objective);
+        return !mip_gap_closed_(best_bound);
+    }
+
+    bool adaptive_proof_phase_active_for_bound_(double bound) const {
+        if (!options_.use_adaptive_proof_phase || !std::isfinite(bound)) {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            if (node_count_ < options_.proof_phase_min_nodes) {
+                return false;
+            }
+        }
+        const IncumbentSnapshot incumbent = incumbent_snapshot_();
+        if (!incumbent.has_incumbent || !std::isfinite(incumbent.objective)) {
+            return false;
+        }
+        return !mip_gap_closed_(bound);
+    }
+
+    Options proof_options_() const {
+        Options out = options_;
+        out.node_selection = options_.proof_node_selection;
+        // Pseudocost mode still performs strong-branching probes for unreliable
+        // candidates up to `strong_branching_max_depth`. The dedicated
+        // StrongBranching strategy is intentionally root-heavy, so proof mode
+        // uses the pseudocost path with larger probing budgets instead.
+        out.branching_strategy = BranchingStrategy::PseudoCost;
+        out.strong_branching_candidates = std::max(options_.strong_branching_candidates,
+                                                   options_.proof_strong_branching_candidates);
+        out.strong_branching_k =
+            std::max(options_.strong_branching_k, options_.proof_strong_branching_k);
+        out.strong_branching_max_depth = std::max(options_.strong_branching_max_depth,
+                                                  options_.proof_strong_branching_max_depth);
+        out.max_cut_rounds_per_node =
+            std::max(options_.max_cut_rounds_per_node, options_.proof_max_cut_rounds_per_node);
+        out.max_cuts_added_per_round =
+            std::max(options_.max_cuts_added_per_round, options_.proof_max_cuts_added_per_round);
+        out.use_node_presolve_on_warm_basis = options_.use_node_presolve_on_warm_basis ||
+                                              options_.proof_use_node_presolve_on_warm_basis;
+        return out;
+    }
+
+    Options effective_options_() const {
+        return adaptive_proof_phase_active_() ? proof_options_() : options_;
+    }
+
+    Options effective_options_for_bound_(double bound) const {
+        return adaptive_proof_phase_active_for_bound_(bound) ? proof_options_() : options_;
     }
 
     std::vector<Cut> current_relaxation_cuts_snapshot_() const {
@@ -734,8 +856,11 @@ class Solver {
         cutoff.cut_type = "IncumbentCutoff";
         cutoff.sense = problem_.maximize ? LinearConstraintSense::GreaterEqual
                                          : LinearConstraintSense::LessEqual;
-        cutoff.rhs = incumbent_objective - problem_.objective_constant +
-                     (problem_.maximize ? options_.integrality_tol : -options_.integrality_tol);
+        // Use the optimum-preserving fathoming cutoff so the LP-side cut and
+        // bound_prunes_ agree on the same threshold. Mirrors HiGHS, which
+        // applies its zero-gap upper_limit to the LP objective bound and never
+        // widens the cut by the user's gap tolerance.
+        cutoff.rhs = fathom_cutoff_(incumbent_objective) - problem_.objective_constant;
 
         for (int j = 0; j < problem_.objective_coefficients.size(); ++j) {
             const double coeff = problem_.objective_coefficients(j);
@@ -1725,39 +1850,41 @@ class Solver {
     }
 
     bool should_try_node_cuts_(const detail::ActiveNode& node, const RelaxationSolution& relaxation,
-                               const std::vector<detail::FractionalCandidate>& fractional) const {
-        if (!options_.use_cut_pool || node.depth <= 0 ||
+                               const std::vector<detail::FractionalCandidate>& fractional,
+                               const Options& effective) const {
+        if (!effective.use_cut_pool || node.depth <= 0 ||
             relaxation.status != RelaxationStatus::Optimal) {
             return false;
         }
-        if ((!options_.use_gomory_cuts && !options_.use_mir_cuts && !options_.use_cover_cuts &&
-             !options_.use_implied_bound_cuts && !options_.use_clique_cuts &&
-             !options_.use_odd_cycle_cuts && !options_.use_probing_implications &&
-             !options_.use_conflict_cuts && !options_.use_dual_proof_cuts) ||
+        if ((!effective.use_gomory_cuts && !effective.use_mir_cuts && !effective.use_cover_cuts &&
+             !effective.use_implied_bound_cuts && !effective.use_clique_cuts &&
+             !effective.use_odd_cycle_cuts && !effective.use_probing_implications &&
+             !effective.use_conflict_cuts && !effective.use_dual_proof_cuts) ||
             fractional.empty()) {
             return false;
         }
-        if (node.depth > std::max(2, options_.strong_branching_max_depth + 1)) {
+        if (node.depth > std::max(2, effective.strong_branching_max_depth + 1)) {
             return false;
         }
 
+        const bool proof = adaptive_proof_phase_active_for_bound_(relaxation.objective);
         const bool shallow = node.depth <= 2;
         const bool periodic =
-            options_.heuristic_frequency <= 1 ||
-            (options_.heuristic_frequency > 0 &&
-             (node.order % static_cast<std::uint64_t>(options_.heuristic_frequency) == 0));
-        if (!shallow && !periodic) {
+            effective.heuristic_frequency <= 1 ||
+            (effective.heuristic_frequency > 0 &&
+             (node.order % static_cast<std::uint64_t>(effective.heuristic_frequency) == 0));
+        if (!proof && !shallow && !periodic) {
             return false;
         }
-        if (fractional.size() > 24 && !shallow) {
+        if (fractional.size() > 24 && !shallow && !proof) {
             return false;
         }
 
         const double gap = relative_gap_from_bound_(relaxation.objective);
-        if (!shallow && gap <= 0.05) {
+        if (!proof && !shallow && gap <= 0.05) {
             return false;
         }
-        return !std::isfinite(gap) || gap > 0.01 || shallow;
+        return proof || !std::isfinite(gap) || gap > 0.01 || shallow;
     }
 
     HeuristicSchedule build_heuristic_schedule_(const detail::ActiveNode& node,
@@ -1977,8 +2104,10 @@ class Solver {
 
     std::optional<detail::ActiveNode> pop_next_active_node_() {
         reap_async_heuristics_();
-        return search_coordinator_.try_pop(options_.node_selection, problem_.maximize,
-                                           options_.hybrid_depth_bias, options_.plunging_bestfreq);
+        const Options effective = effective_options_();
+        return search_coordinator_.try_pop(effective.node_selection, problem_.maximize,
+                                           effective.hybrid_depth_bias,
+                                           effective.plunging_bestfreq);
     }
 
     std::uint64_t current_search_order_() const {
@@ -1997,6 +2126,22 @@ class Solver {
                                               options_.integrality_tol)) {
             return;
         }
+        // Verify linear constraint feasibility. Heuristics can produce solutions
+        // that satisfy integrality but violate constraints due to rounding or
+        // numerical tolerance. An infeasible incumbent causes incorrect pruning
+        // and false-positive "optimal" results.
+        const double ctol = options_.feasibility_tol * 100.0;
+        for (const auto& c : problem_.base_constraints) {
+            double lhs = 0.0;
+            for (int k = 0; k < static_cast<int>(c.indices.size()); ++k)
+                lhs += c.values[k] * primal[c.indices[k]];
+            if (c.sense == LinearConstraintSense::LessEqual && lhs > c.rhs + ctol)
+                return;
+            if (c.sense == LinearConstraintSense::GreaterEqual && lhs < c.rhs - ctol)
+                return;
+            if (c.sense == LinearConstraintSense::Equal && std::abs(lhs - c.rhs) > ctol)
+                return;
+        }
         bool updated = false;
         {
             std::lock_guard<std::mutex> lock(incumbent_mutex_);
@@ -2012,8 +2157,67 @@ class Solver {
             ++incumbent_updates_;
         }
         if (updated) {
+            propagate_root_redcosts_to_global_domain_(objective);
             maybe_log_progress_("incumbent", true);
             search_coordinator_.notify_all();
+        }
+    }
+
+    // SCIP/HiGHS-style global reduced-cost fixing (lurking bounds / addRootRedcost).
+    // When the incumbent improves to `new_cutoff`, variables whose root LP reduced
+    // cost satisfies |rc_j| > gap / range can have their global bounds tightened.
+    // The formula is the same as tighten_bounds_from_reduced_costs but uses the
+    // ROOT LP data (valid globally) instead of per-node data, so tightenings go
+    // into global_domain_ and benefit every node subsequently popped.
+    void propagate_root_redcosts_to_global_domain_(double new_incumbent_obj) {
+        Eigen::VectorXd root_rc;
+        std::vector<LPBasisStatus> root_status;
+        double root_obj = std::numeric_limits<double>::quiet_NaN();
+        {
+            std::lock_guard<std::mutex> lock(incumbent_mutex_);
+            if (root_reduced_costs_.size() == 0) return;
+            root_rc = root_reduced_costs_;
+            root_status = root_basis_statuses_;
+            root_obj = root_lp_objective_;
+        }
+        if (!std::isfinite(root_obj) || root_rc.size() == 0) return;
+
+        const double cutoff = fathom_cutoff_(new_incumbent_obj);
+        const double objective_sign = problem_.maximize ? -1.0 : 1.0;
+        const double gap = objective_sign * (cutoff - root_obj);
+        if (!(gap > 0.0)) return;
+
+        const double rc_tol = std::max(10.0 * options_.feasibility_tol,
+                                       std::numeric_limits<double>::epsilon() * gap);
+        const int n = std::min<int>(static_cast<int>(problem_.lower_bounds.size()),
+                                    static_cast<int>(root_rc.size()));
+
+        for (int j = 0; j < n; ++j) {
+            if (j >= static_cast<int>(problem_.variable_types.size()) ||
+                problem_.variable_types[j] == VariableType::Continuous)
+                continue;
+            if (j >= static_cast<int>(root_status.size())) continue;
+
+            const double rc = root_rc[j];
+            if (!std::isfinite(rc) || std::abs(rc) <= rc_tol) continue;
+
+            if (root_status[j] == LPBasisStatus::AtLower && rc > rc_tol) {
+                // x_j at lower bound, rc > 0: upper bound can be tightened.
+                const double new_ub_cont = problem_.lower_bounds(j) + gap / rc;
+                if (!std::isfinite(new_ub_cont)) continue;
+                const double new_ub = std::floor(new_ub_cont + 1e-12);
+                if (new_ub < problem_.upper_bounds(j) - 1e-12 &&
+                    new_ub >= problem_.lower_bounds(j))
+                    global_domain_.tighten(j, problem_.lower_bounds(j), new_ub);
+            } else if (root_status[j] == LPBasisStatus::AtUpper && rc < -rc_tol) {
+                // x_j at upper bound, rc < 0: lower bound can be tightened.
+                const double new_lb_cont = problem_.upper_bounds(j) + gap / rc;
+                if (!std::isfinite(new_lb_cont)) continue;
+                const double new_lb = std::ceil(new_lb_cont - 1e-12);
+                if (new_lb > problem_.lower_bounds(j) + 1e-12 &&
+                    new_lb <= problem_.upper_bounds(j))
+                    global_domain_.tighten(j, new_lb, problem_.upper_bounds(j));
+            }
         }
     }
 
@@ -2429,9 +2633,10 @@ class Solver {
         auto worker = [&](int worker_id) {
             while (true) {
                 reap_async_heuristics_();
+                const Options effective = effective_options_();
                 detail::PopResult pop_result = search_coordinator_.wait_pop(
-                    options_.node_selection, problem_.maximize, options_.hybrid_depth_bias,
-                    options_.plunging_bestfreq, worker_id);
+                    effective.node_selection, problem_.maximize, effective.hybrid_depth_bias,
+                    effective.plunging_bestfreq, worker_id);
                 if (pop_result.terminated) {
                     break;
                 }
@@ -2447,9 +2652,11 @@ class Solver {
                 // yielding back to wait_pop.  This avoids an extra lock-acquire-sleep-wake
                 // cycle and keeps the hot cache lines on the same core.
                 {
+                    const Options continuation_effective = effective_options_();
                     auto next = search_coordinator_.try_pop(
-                        options_.node_selection, problem_.maximize, options_.hybrid_depth_bias,
-                        options_.plunging_bestfreq, worker_id);
+                        continuation_effective.node_selection, problem_.maximize,
+                        continuation_effective.hybrid_depth_bias,
+                        continuation_effective.plunging_bestfreq, worker_id);
                     if (next.has_value()) {
                         process_node(std::move(*next), false, worker_id);
                     }
@@ -2514,9 +2721,9 @@ class Solver {
             flush_node_timing_record_(timing);
         };
 
-        auto should_run_node_presolve = [&](const LPBasis* basis) {
-            return options_.use_node_presolve &&
-                   (!basis || options_.use_node_presolve_on_warm_basis);
+        auto should_run_node_presolve = [&](const LPBasis* basis, const Options& effective) {
+            return effective.use_node_presolve &&
+                   (!basis || effective.use_node_presolve_on_warm_basis);
         };
 
         bool current_relaxation_allows_global_conflicts = true;
@@ -2533,8 +2740,11 @@ class Solver {
                 return;
             }
 
+            // Use the optimum-preserving fathoming cutoff (HiGHS upper_limit
+            // semantics) so the gap matches the value used by bound_prunes_.
+            const double cutoff = fathom_cutoff_(incumbent.objective);
             const double objective_sign = problem_.maximize ? -1.0 : 1.0;
-            const double gap = objective_sign * (incumbent.objective - out.objective);
+            const double gap = objective_sign * (cutoff - out.objective);
             if (!(gap > 0.0)) {
                 return;
             }
@@ -2546,6 +2756,10 @@ class Solver {
                               std::min<int>(static_cast<int>(reduced_costs.size()),
                                             static_cast<int>(status.size())));
             const double tol = 1e-12;
+            // Reduced-cost tolerance matching HiGHS HighsRedcostFixing::propagateRedCost:
+            // refuse to fix on tiny reduced costs that may be numerical noise.
+            const double rc_tolerance = std::max(10.0 * options_.feasibility_tol,
+                                                 std::numeric_limits<double>::epsilon() * gap);
 
             Eigen::VectorXd adjusted_reduced_costs = reduced_costs;
             if (out.lp_solution->has_internal_tableau &&
@@ -2630,13 +2844,18 @@ class Solver {
                 }
             }
 
+            const double feastol = options_.feasibility_tol;
             for (int j = 0; j < var_count; ++j) {
-                if (j >= static_cast<int>(problem_.variable_types.size()) ||
-                    problem_.variable_types[j] == VariableType::Continuous) {
+                if (j >= static_cast<int>(problem_.variable_types.size())) {
                     continue;
                 }
+                const bool is_integer = problem_.variable_types[j] != VariableType::Continuous;
                 const double rc = adjusted_reduced_costs[j];
-                if (!std::isfinite(rc) || std::abs(rc) <= tol) {
+                if (!std::isfinite(rc) || std::abs(rc) <= rc_tolerance) {
+                    continue;
+                }
+                // Skip fixed variables (HiGHS HighsRedcostFixing::propagateRedCost L97).
+                if (current_node.upper_bounds[j] - current_node.lower_bounds[j] <= tol) {
                     continue;
                 }
                 if (status[j] == LPBasisStatus::AtLower) {
@@ -2647,7 +2866,8 @@ class Solver {
                     if (!std::isfinite(bound)) {
                         continue;
                     }
-                    const double tightened_upper = std::floor(bound + 1e-12);
+                    const double tightened_upper =
+                        is_integer ? std::floor(bound + feastol) : (bound + feastol);
                     if (tightened_upper + tol < current_node.upper_bounds[j] &&
                         tightened_upper >= current_node.lower_bounds[j]) {
                         current_node.upper_bounds[j] =
@@ -2661,7 +2881,8 @@ class Solver {
                     if (!std::isfinite(bound)) {
                         continue;
                     }
-                    const double tightened_lower = std::ceil(bound - 1e-12);
+                    const double tightened_lower =
+                        is_integer ? std::ceil(bound - feastol) : (bound - feastol);
                     if (tightened_lower > current_node.lower_bounds[j] + tol &&
                         tightened_lower <= current_node.upper_bounds[j]) {
                         current_node.lower_bounds[j] =
@@ -2680,9 +2901,10 @@ class Solver {
                 !contains_incumbent_cutoff_(relaxation_cuts);
             current_relaxation_allows_global_conflicts = allow_global_conflict_learning;
             const LPBasis* warm_basis = current_node.basis ? &*current_node.basis : nullptr;
+            const Options effective = effective_options_();
             const auto presolve_start = SteadyClock::now();
             NodePresolveOutcome presolved;
-            if (should_run_node_presolve(warm_basis)) {
+            if (should_run_node_presolve(warm_basis, effective)) {
                 presolved =
                     presolve_node_bounds_(current_node.lower_bounds, current_node.upper_bounds,
                                           relaxation_cuts, current_node.reasons);
@@ -2695,7 +2917,23 @@ class Solver {
             current_node.lower_bounds = presolved.lower_bounds;
             current_node.upper_bounds = presolved.upper_bounds;
             current_node.reasons = presolved.reasons;
-            if (presolved.infeasible) {
+            // Apply global domain: intersect node bounds with globally-valid tightest bounds.
+            // This is the SCIP/HiGHS domain-application step — lurking bounds from root RC
+            // fixing and other globally-valid deductions become visible to every node here.
+            global_domain_.apply(current_node.lower_bounds, current_node.upper_bounds);
+            // Check for infeasibility introduced by global domain tightening.
+            bool global_domain_infeasible = false;
+            if (!presolved.infeasible) {
+                const int n = std::min<int>(current_node.lower_bounds.size(),
+                                            current_node.upper_bounds.size());
+                for (int j = 0; j < n; ++j) {
+                    if (current_node.lower_bounds(j) > current_node.upper_bounds(j) + options_.feasibility_tol) {
+                        global_domain_infeasible = true;
+                        break;
+                    }
+                }
+            }
+            if (presolved.infeasible || global_domain_infeasible) {
                 maybe_learn_conflict_from_bounds_(current_node.lower_bounds,
                                                   current_node.upper_bounds,
                                                   allow_global_conflict_learning);
@@ -2717,6 +2955,19 @@ class Solver {
                 maybe_learn_conflict_from_bounds_(current_node.lower_bounds,
                                                   current_node.upper_bounds,
                                                   allow_global_conflict_learning);
+                // HiGHS-style dual proof cut extraction: when the node LP is infeasible,
+                // extract a Farkas-certificate-based proof cut. Continuous variables are
+                // substituted at GLOBAL problem bounds, so the resulting cut is valid for
+                // the entire remaining tree (not just this subtree). Only cuts that are
+                // also violated at global bounds (i.e., globally infeasibility-proving) are
+                // kept; those pass through cut_pool_ and benefit subsequent nodes.
+                if (options_.use_dual_proof_cuts) {
+                    std::vector<Cut> proof_cuts = detail::generate_dual_proof_cuts(
+                        problem_, relaxation_cuts, out,
+                        problem_.lower_bounds, problem_.upper_bounds, options_);
+                    for (Cut& cut : proof_cuts)
+                        cut_pool_.add_cut(problem_, cut);
+                }
             } else {
                 tighten_bounds_from_reduced_costs(current_node, out);
             }
@@ -2781,6 +3032,16 @@ class Solver {
             if (!root_warm_start_basis_state_.has_value()) {
                 root_warm_start_basis_state_ = relaxation.basis;
             }
+            // Capture root LP reduced costs for global reduced-cost fixing (lurking bounds).
+            // These are valid globally: whenever the incumbent improves, any variable whose
+            // reduced cost exceeds gap/range can have its bound tightened for ALL nodes.
+            if (root_reduced_costs_.size() == 0 && relaxation.lp_solution.has_value() &&
+                relaxation.lp_solution->reduced_costs_internal.size() > 0 &&
+                !relaxation.lp_solution->basis_state.column_status.empty()) {
+                root_reduced_costs_ = relaxation.lp_solution->reduced_costs_internal;
+                root_basis_statuses_ = relaxation.lp_solution->basis_state.column_status;
+                root_lp_objective_ = relaxation.objective;
+            }
         }
 
         {
@@ -2810,10 +3071,14 @@ class Solver {
                 const std::vector<Cut> relaxation_cuts = current_relaxation_cuts_snapshot_();
                 const auto selection_start = SteadyClock::now();
                 std::vector<Cut> selected;
-                const std::array<detail::CutSeparatorPhase, 5> phase_order = {
+                // Note: CutSeparatorPhase::Proof is intentionally excluded here.
+                // DualProof cuts require an infeasible LP (Farkas certificate), but cut
+                // rounds only run when the LP is optimal. Proof cuts are extracted
+                // directly at infeasibility detection points in solve_relaxation_with_cuts
+                // and node_relaxation_solver instead (HiGHS-style).
+                const std::array<detail::CutSeparatorPhase, 4> phase_order = {
                     detail::CutSeparatorPhase::ImpliedBound, detail::CutSeparatorPhase::Clique,
                     detail::CutSeparatorPhase::OddCycle,     detail::CutSeparatorPhase::LP,
-                    detail::CutSeparatorPhase::Proof,
                 };
                 bool any_cuts_applied = false;
                 for (detail::CutSeparatorPhase phase : phase_order) {
@@ -2974,25 +3239,26 @@ class Solver {
 
         auto fractional = detail::collect_fractional_candidates(
             relaxation.primal, problem_.variable_types, options_.integrality_tol);
-        if (should_try_node_cuts_(node, relaxation, fractional)) {
+        const Options node_effective_options = effective_options_for_bound_(relaxation.objective);
+        if (should_try_node_cuts_(node, relaxation, fractional, node_effective_options)) {
             std::vector<Cut> local_cuts;
             std::unordered_set<detail::CutSignature, detail::CutSignatureHash> local_cut_signatures;
-            const int node_cut_rounds = options_.max_cut_rounds_per_node;
+            const int node_cut_rounds = node_effective_options.max_cut_rounds_per_node;
             for (int round = 0; round < node_cut_rounds; ++round) {
                 ++timing.node_cut_rounds;
                 std::vector<Cut> probing_relaxation_cuts = current_relaxation_cuts_snapshot_();
                 probing_relaxation_cuts.insert(probing_relaxation_cuts.end(), local_cuts.begin(),
                                                local_cuts.end());
-                const std::array<detail::CutSeparatorPhase, 5> phase_order = {
+                const std::array<detail::CutSeparatorPhase, 4> phase_order = {
                     detail::CutSeparatorPhase::ImpliedBound, detail::CutSeparatorPhase::Clique,
                     detail::CutSeparatorPhase::OddCycle,     detail::CutSeparatorPhase::LP,
-                    detail::CutSeparatorPhase::Proof,
                 };
                 bool any_cuts_applied = false;
                 for (detail::CutSeparatorPhase phase : phase_order) {
                     const auto phase_generation_start = SteadyClock::now();
-                    std::vector<Cut> phase_generated = detail::generate_cuts(
-                        problem_, relaxation, options_, phase, nullptr, &probing_relaxation_cuts);
+                    std::vector<Cut> phase_generated =
+                        detail::generate_cuts(problem_, relaxation, node_effective_options, phase,
+                                              nullptr, &probing_relaxation_cuts);
                     timing.node_cut_generation_wall_ns +=
                         elapsed_ns_(phase_generation_start, SteadyClock::now());
                     timing.node_cuts_generated += static_cast<int>(phase_generated.size());
@@ -3066,6 +3332,10 @@ class Solver {
                             }
                         }
                     }
+                    // All cuts from the loop phases go to the global pool.
+                    // DualProof (Proof-phase) cuts are NOT generated here: that phase is
+                    // excluded from phase_order above. They are extracted at LP infeasibility
+                    // detection points in solve_relaxation_with_cuts / node_relaxation_solver.
                     for (const Cut& cut : phase_generated) {
                         cut_pool_.add_cut(problem_, cut);
                     }
@@ -3073,8 +3343,8 @@ class Solver {
                     const auto selection_start = SteadyClock::now();
                     std::vector<Cut> selected = cut_pool_.select_violated_cuts(
                         relaxation.primal, node.lower_bounds, node.upper_bounds,
-                        options_.max_cuts_added_per_round, 1.6, &problem_.objective_coefficients,
-                        problem_.maximize);
+                        node_effective_options.max_cuts_added_per_round, 1.6,
+                        &problem_.objective_coefficients, problem_.maximize);
                     timing.node_cut_selection_wall_ns +=
                         elapsed_ns_(selection_start, SteadyClock::now());
                     timing.node_cuts_selected += static_cast<int>(selected.size());
@@ -3225,9 +3495,10 @@ class Solver {
             const std::vector<Cut> relaxation_cuts = current_relaxation_cuts_snapshot_();
             const bool allow_global_conflict_learning =
                 !contains_incumbent_cutoff_(relaxation_cuts);
+            const Options effective = effective_options_();
             const auto presolve_start = SteadyClock::now();
             NodePresolveOutcome presolved;
-            if (should_run_node_presolve(basis)) {
+            if (should_run_node_presolve(basis, effective)) {
                 presolved = presolve_node_bounds_(prepared.lower_bounds, prepared.upper_bounds,
                                                   relaxation_cuts, prepared.reasons);
             } else {
@@ -3256,6 +3527,13 @@ class Solver {
             if (out.status == RelaxationStatus::Infeasible) {
                 maybe_learn_conflict_from_bounds_(presolved.lower_bounds, presolved.upper_bounds,
                                                   allow_global_conflict_learning);
+                if (options_.use_dual_proof_cuts) {
+                    std::vector<Cut> proof_cuts = detail::generate_dual_proof_cuts(
+                        problem_, relaxation_cuts, out,
+                        problem_.lower_bounds, problem_.upper_bounds, options_);
+                    for (Cut& cut : proof_cuts)
+                        cut_pool_.add_cut(problem_, cut);
+                }
             }
             std::lock_guard<std::mutex> timing_lock(timing_mutex);
             accumulate_relaxation_timing_(&timing.child_relaxation, out,
@@ -3271,8 +3549,9 @@ class Solver {
             detail::materialize_child_state(&prepared);
             detail::prepare_child_state_for_relaxation(&prepared);
             const std::vector<Cut> relaxation_cuts = current_relaxation_cuts_snapshot_();
+            const Options effective = effective_options_();
             NodePresolveOutcome presolved;
-            if (should_run_node_presolve(basis)) {
+            if (should_run_node_presolve(basis, effective)) {
                 presolved = presolve_node_bounds_(prepared.lower_bounds, prepared.upper_bounds,
                                                   relaxation_cuts, prepared.reasons);
             } else {
@@ -3289,8 +3568,17 @@ class Solver {
                                                   : std::numeric_limits<double>::infinity();
                 return out;
             }
-            return relaxation_solver(presolved.lower_bounds, presolved.upper_bounds, basis,
-                                     relaxation_cuts);
+            RelaxationSolution out = relaxation_solver(presolved.lower_bounds,
+                                                       presolved.upper_bounds, basis,
+                                                       relaxation_cuts);
+            if (out.status == RelaxationStatus::Infeasible && options_.use_dual_proof_cuts) {
+                std::vector<Cut> proof_cuts = detail::generate_dual_proof_cuts(
+                    problem_, relaxation_cuts, out,
+                    problem_.lower_bounds, problem_.upper_bounds, options_);
+                for (Cut& cut : proof_cuts)
+                    cut_pool_.add_cut(problem_, cut);
+            }
+            return out;
         };
 
         const auto incumbent = incumbent_snapshot_();
@@ -3498,12 +3786,14 @@ class Solver {
         auto local_pseudocosts = pseudocost_before;
         const auto branching_start = SteadyClock::now();
         const bool branch_on_sos = sos_decision.variable >= 0;
+        const Options branching_effective_options =
+            effective_options_for_bound_(relaxation.objective);
         detail::BranchDecision decision =
             branch_on_sos
                 ? std::move(sos_decision)
                 : detail::choose_branching_variable(
-                      node, relaxation, fractional, options_, problem_.maximize, local_pseudocosts,
-                      parallel_task_dispatcher_.get(), node_relaxation_solver);
+                      node, relaxation, fractional, branching_effective_options, problem_.maximize,
+                      local_pseudocosts, parallel_task_dispatcher_.get(), node_relaxation_solver);
         if (branch_on_sos) {
             const LPBasis* basis = node.basis ? &*node.basis : nullptr;
             decision.down_child.relaxation =
@@ -3545,7 +3835,8 @@ class Solver {
         const LPBasis* parent_basis = node.basis ? &*node.basis : nullptr;
         auto first_child = decision.down_child;
         auto second_child = decision.up_child;
-        if (options_.node_selection == NodeSelectionStrategy::DepthFirst &&
+        const Options child_effective_options = effective_options_();
+        if (child_effective_options.node_selection == NodeSelectionStrategy::DepthFirst &&
             first_child.relaxation.has_value() && second_child.relaxation.has_value()) {
             const bool first_better = problem_.maximize
                                           ? (first_child.relaxation->objective >
@@ -3658,7 +3949,8 @@ class Solver {
             }
             active.reasons = child.state.reasons;
             finalize_child_timing();
-            search_coordinator_.push(std::move(active), options_.node_selection, problem_.maximize,
+            const Options effective = effective_options_for_bound_(inherited_bound);
+            search_coordinator_.push(std::move(active), effective.node_selection, problem_.maximize,
                                      worker_id);
             maybe_log_progress_("child");
             return;
@@ -3751,7 +4043,8 @@ class Solver {
             // the child relaxation solver did not record a basis.
             active.basis = *parent_basis;
         }
-        search_coordinator_.push(std::move(active), options_.node_selection, problem_.maximize,
+        const Options effective = effective_options_for_bound_(active.bound);
+        search_coordinator_.push(std::move(active), effective.node_selection, problem_.maximize,
                                  worker_id);
         maybe_log_progress_("bound");
         search_coordinator_.notify_all();
@@ -3927,6 +4220,13 @@ class Solver {
     Eigen::VectorXd incumbent_primal_;
     std::optional<LPBasis> root_warm_start_basis_state_;
     std::optional<double> root_relaxation_objective;
+    // Root LP data for global reduced-cost fixing (lurking bounds).
+    // Protected by incumbent_mutex_.
+    Eigen::VectorXd root_reduced_costs_;
+    std::vector<LPBasisStatus> root_basis_statuses_;
+    double root_lp_objective_ = std::numeric_limits<double>::quiet_NaN();
+    // Global domain: tightest bounds valid for the entire remaining tree.
+    detail::GlobalDomain global_domain_;
     bool progress_header_printed_ = false;
     int last_logged_node_count_ = 0;
     double last_logged_best_bound_ = std::numeric_limits<double>::quiet_NaN();
