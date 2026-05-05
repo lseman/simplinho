@@ -1124,29 +1124,35 @@ class Solver {
         if (!lower || !upper || !tightened_bounds)
             return true;
 
-        auto accumulate_activity = [&](bool use_upper_for_negative) {
-            double activity = 0.0;
-            bool finite = true;
-            for (int k = 0;
-                 k < static_cast<int>(indices.size()) && k < static_cast<int>(values.size()); ++k) {
-                const int index = indices[k];
-                const double coeff = values[k];
-                if (index < 0 || index >= lower->size() || std::abs(coeff) <= 1e-12)
-                    continue;
+        // O(n) activity-cache approach (HiGHS / SCIP style):
+        // Compute row_min = sum_j min(a_j * x_j) once.
+        // For each pivot j: other_min = row_min - contribution_j (O(1) per pivot).
+        // This avoids the O(n²) inner loop of the naive approach.
+        const int nnz = static_cast<int>(std::min(indices.size(), values.size()));
 
-                const double bound =
-                    coeff >= 0.0 ? (*lower)(index)
-                                 : (use_upper_for_negative ? (*upper)(index) : (*lower)(index));
-                if (!std::isfinite(bound)) {
-                    finite = false;
-                    break;
-                }
-                activity += coeff * bound;
+        double row_min = 0.0;
+        bool row_min_finite = true;
+        // contribution[k] = coeff_k * bound_k used in row_min
+        std::vector<double> contribution(nnz, 0.0);
+        for (int k = 0; k < nnz; ++k) {
+            const int index = indices[k];
+            const double coeff = values[k];
+            if (index < 0 || index >= lower->size() || std::abs(coeff) <= 1e-12) {
+                contribution[k] = 0.0;
+                continue;
             }
-            return std::pair<double, bool>{activity, finite};
-        };
+            const double bound = coeff >= 0.0 ? (*lower)(index) : (*upper)(index);
+            if (!std::isfinite(bound)) {
+                row_min_finite = false;
+                contribution[k] = 0.0;
+                // keep going to fill contributions (needed for individual pivots)
+            } else {
+                contribution[k] = coeff * bound;
+                if (row_min_finite)
+                    row_min += contribution[k];
+            }
+        }
 
-        const auto [row_min, row_min_finite] = accumulate_activity(true);
         if (row_min_finite && row_min > rhs + options_.integrality_tol) {
             if (conflict_literals != nullptr) {
                 *conflict_literals =
@@ -1155,37 +1161,25 @@ class Solver {
             return false;
         }
 
-        for (int pivot = 0;
-             pivot < static_cast<int>(indices.size()) && pivot < static_cast<int>(values.size());
-             ++pivot) {
+        for (int pivot = 0; pivot < nnz; ++pivot) {
             const int index = indices[pivot];
             const double coeff = values[pivot];
             if (index < 0 || index >= lower->size() || std::abs(coeff) <= 1e-12)
                 continue;
 
-            double other_min = 0.0;
-            bool other_min_finite = true;
-            for (int k = 0;
-                 k < static_cast<int>(indices.size()) && k < static_cast<int>(values.size()); ++k) {
-                if (k == pivot)
-                    continue;
-                const int other_index = indices[k];
-                const double other_coeff = values[k];
-                if (other_index < 0 || other_index >= lower->size() ||
-                    std::abs(other_coeff) <= 1e-12) {
-                    continue;
-                }
-
-                const double bound =
-                    other_coeff >= 0.0 ? (*lower)(other_index) : (*upper)(other_index);
-                if (!std::isfinite(bound)) {
-                    other_min_finite = false;
-                    break;
-                }
-                other_min += other_coeff * bound;
-            }
-            if (!other_min_finite)
+            // If row_min is infinite due to this pivot's own bound being infinite,
+            // we can't derive a tighter bound from this row for this variable.
+            const double pivot_bound = coeff >= 0.0 ? (*lower)(index) : (*upper)(index);
+            if (!std::isfinite(pivot_bound))
                 continue;
+
+            // If row_min is non-finite due to some OTHER variable, we also can't
+            // derive a bound for this pivot (other_min would be infinite).
+            if (!row_min_finite)
+                continue;
+
+            // other_min = row_min - contribution[pivot]  (O(1))
+            const double other_min = row_min - contribution[pivot];
 
             double new_lower = (*lower)(index);
             double new_upper = (*upper)(index);
@@ -1211,12 +1205,17 @@ class Solver {
                 return false;
             }
             if (new_lower > (*lower)(index) + options_.integrality_tol) {
+                // Update contribution cache so subsequent pivots use the tighter bound.
+                if (coeff >= 0.0) row_min += (new_lower - (*lower)(index)) * coeff;
+                contribution[pivot] += (new_lower - (*lower)(index)) * coeff;
                 (*lower)(index) = new_lower;
                 ++(*tightened_bounds);
                 if (changed_variables != nullptr)
                     changed_variables->push_back(index);
             }
-            if (new_upper < (*upper)(index)-options_.integrality_tol) {
+            if (new_upper < (*upper)(index) - options_.integrality_tol) {
+                if (coeff < 0.0) row_min += (new_upper - (*upper)(index)) * coeff;
+                contribution[pivot] += (new_upper - (*upper)(index)) * coeff;
                 (*upper)(index) = new_upper;
                 ++(*tightened_bounds);
                 if (changed_variables != nullptr)
@@ -2158,6 +2157,7 @@ class Solver {
         }
         if (updated) {
             propagate_root_redcosts_to_global_domain_(objective);
+            propagate_cutoff_to_global_domain_(objective);
             maybe_log_progress_("incumbent", true);
             search_coordinator_.notify_all();
         }
@@ -2217,6 +2217,52 @@ class Solver {
                 if (new_lb > problem_.lower_bounds(j) + 1e-12 &&
                     new_lb <= problem_.upper_bounds(j))
                     global_domain_.tighten(j, new_lb, problem_.upper_bounds(j));
+            }
+        }
+    }
+
+    // SCIP/HiGHS-style: when a new incumbent improves the cutoff, propagate the new
+    // objective bound as a constraint through the GLOBAL problem bounds.
+    // This is the `HighsDomain::propagate` / `SCIPpropagateCutoff` equivalent.
+    //
+    // The IncumbentCutoff constraint (c^T x <= cutoff or >= cutoff) is already propagated
+    // per-node through presolve_node_bounds_. But those per-node tightenings are discarded
+    // after each node. Here we propagate it once globally — with problem_.lower_bounds and
+    // problem_.upper_bounds as starting bounds — and feed any tightenings to GlobalDomain so
+    // every subsequent node benefits without re-discovering them via propagation.
+    void propagate_cutoff_to_global_domain_(double new_incumbent_obj) {
+        if (problem_.objective_coefficients.size() == 0) return;
+        const double cutoff = fathom_cutoff_(new_incumbent_obj);
+        if (!std::isfinite(cutoff)) return;
+
+        // Build the objective bound as a Cut in the same form as IncumbentCutoff.
+        Cut obj_cut;
+        obj_cut.cut_type = "IncumbentCutoff";
+        obj_cut.sense = problem_.maximize ? LinearConstraintSense::GreaterEqual
+                                          : LinearConstraintSense::LessEqual;
+        obj_cut.rhs = cutoff - problem_.objective_constant;
+        for (int j = 0; j < static_cast<int>(problem_.objective_coefficients.size()); ++j) {
+            const double coeff = problem_.objective_coefficients(j);
+            if (std::abs(coeff) <= 1e-12) continue;
+            obj_cut.indices.push_back(j);
+            obj_cut.values.push_back(coeff);
+        }
+        if (obj_cut.indices.empty()) return;
+
+        // Run one-pass constraint propagation from global bounds.
+        // presolve_node_bounds_ handles the full fixpoint including the graph implications.
+        // We call it with problem bounds (global) + just the cutoff cut.
+        // The result is globally valid: any tightening from propagating a globally-valid
+        // objective row through globally-valid bounds is itself globally valid.
+        const NodePresolveOutcome result =
+            presolve_node_bounds_(problem_.lower_bounds, problem_.upper_bounds, {obj_cut});
+        if (result.infeasible) return;  // Shouldn't happen; cutoff should be feasible at root.
+
+        const int n = std::min<int>(result.lower_bounds.size(), result.upper_bounds.size());
+        for (int j = 0; j < n; ++j) {
+            if (result.lower_bounds(j) > problem_.lower_bounds(j) + 1e-10 ||
+                result.upper_bounds(j) < problem_.upper_bounds(j) - 1e-10) {
+                global_domain_.tighten(j, result.lower_bounds(j), result.upper_bounds(j));
             }
         }
     }
