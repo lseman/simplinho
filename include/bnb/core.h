@@ -3033,7 +3033,7 @@ class Solver {
                 // the entire remaining tree (not just this subtree). Only cuts that are
                 // also violated at global bounds (i.e., globally infeasibility-proving) are
                 // kept; those pass through cut_pool_ and benefit subsequent nodes.
-                if (options_.use_dual_proof_cuts) {
+                if (options_.use_dual_proof_cuts && allow_global_conflict_learning) {
                     std::vector<Cut> proof_cuts = detail::generate_dual_proof_cuts(
                         problem_, relaxation_cuts, out, problem_.lower_bounds,
                         problem_.upper_bounds, options_);
@@ -3611,7 +3611,7 @@ class Solver {
             if (out.status == RelaxationStatus::Infeasible) {
                 maybe_learn_conflict_from_bounds_(presolved.lower_bounds, presolved.upper_bounds,
                                                   allow_global_conflict_learning);
-                if (options_.use_dual_proof_cuts) {
+                if (options_.use_dual_proof_cuts && allow_global_conflict_learning) {
                     std::vector<Cut> proof_cuts = detail::generate_dual_proof_cuts(
                         problem_, relaxation_cuts, out, problem_.lower_bounds,
                         problem_.upper_bounds, options_);
@@ -3633,6 +3633,8 @@ class Solver {
             detail::materialize_child_state(&prepared);
             detail::prepare_child_state_for_relaxation(&prepared);
             const std::vector<Cut> relaxation_cuts = current_relaxation_cuts_snapshot_();
+            const bool allow_global_conflict_learning =
+                !contains_incumbent_cutoff_(relaxation_cuts);
             const Options effective = effective_options_();
             NodePresolveOutcome presolved;
             if (should_run_node_presolve(basis, effective)) {
@@ -3662,7 +3664,8 @@ class Solver {
             }
             RelaxationSolution out = relaxation_solver(
                 presolved.lower_bounds, presolved.upper_bounds, basis, relaxation_cuts);
-            if (out.status == RelaxationStatus::Infeasible && options_.use_dual_proof_cuts) {
+            if (out.status == RelaxationStatus::Infeasible && options_.use_dual_proof_cuts &&
+                allow_global_conflict_learning) {
                 std::vector<Cut> proof_cuts = detail::generate_dual_proof_cuts(
                     problem_, relaxation_cuts, out, problem_.lower_bounds, problem_.upper_bounds,
                     options_);

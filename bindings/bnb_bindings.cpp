@@ -100,6 +100,8 @@ void bind_bnb_bindings(py::module_& m) {
             [](BranchAndBoundOptions& self, int value) { self.max_nodes = value; })
         .def_readwrite("parallel_workers", &BranchAndBoundOptions::parallel_workers)
         .def_readwrite("integrality_tol", &BranchAndBoundOptions::integrality_tol)
+        .def_readwrite("mip_abs_gap", &BranchAndBoundOptions::mip_abs_gap)
+        .def_readwrite("mip_rel_gap", &BranchAndBoundOptions::mip_rel_gap)
         .def_readwrite("verbose", &BranchAndBoundOptions::verbose)
         .def_readwrite("log_frequency", &BranchAndBoundOptions::log_frequency)
         .def_readwrite("node_timing_log_path", &BranchAndBoundOptions::node_timing_log_path)

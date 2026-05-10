@@ -781,6 +781,118 @@ highs_lifted_binary_cover_cut_(const CanonicalKnapsack& kn, const BinaryCoverPar
     return std::make_tuple(std::move(indices), std::move(values), cut_rhs);
 }
 
+bool validate_lifted_binary_cover_cut_(const CanonicalKnapsack& kn,
+                                       const std::vector<int>& indices,
+                                       const std::vector<double>& values, double rhs,
+                                       double tol = 1e-8) {
+    const int n = static_cast<int>(kn.variables.size());
+    if (!kn.valid || n < 2 || indices.size() != values.size() || !std::isfinite(kn.rhs) ||
+        kn.rhs < -tol || !std::isfinite(rhs)) {
+        return false;
+    }
+
+    std::unordered_map<int, int> position_of;
+    position_of.reserve(kn.variables.size());
+    for (int pos = 0; pos < n; ++pos) {
+        position_of.emplace(kn.variables[pos], pos);
+    }
+
+    double constant = 0.0;
+    std::vector<double> profits(static_cast<std::size_t>(n), 0.0);
+    for (int k = 0; k < static_cast<int>(indices.size()); ++k) {
+        const auto it = position_of.find(indices[k]);
+        if (it == position_of.end()) {
+            return false;
+        }
+        const int pos = it->second;
+        const double coeff = values[k];
+        if (!std::isfinite(coeff)) {
+            return false;
+        }
+        if (kn.complemented[pos]) {
+            constant += coeff;
+            profits[static_cast<std::size_t>(pos)] -= coeff;
+        } else {
+            profits[static_cast<std::size_t>(pos)] += coeff;
+        }
+    }
+
+    struct Item {
+        double weight = 0.0;
+        double profit = 0.0;
+    };
+    std::vector<Item> items;
+    items.reserve(static_cast<std::size_t>(n));
+    for (int pos = 0; pos < n; ++pos) {
+        const double profit = profits[static_cast<std::size_t>(pos)];
+        const double weight = kn.coeffs[static_cast<std::size_t>(pos)];
+        if (profit <= tol) {
+            continue;
+        }
+        if (!(weight > tol) || !std::isfinite(weight)) {
+            return false;
+        }
+        items.push_back(Item{weight, profit});
+    }
+    std::sort(items.begin(), items.end(), [](const Item& lhs, const Item& rhs_item) {
+        const double lhs_ratio = lhs.profit / lhs.weight;
+        const double rhs_ratio = rhs_item.profit / rhs_item.weight;
+        if (std::abs(lhs_ratio - rhs_ratio) > 1e-12) {
+            return lhs_ratio > rhs_ratio;
+        }
+        return lhs.profit > rhs_item.profit;
+    });
+
+    auto fractional_bound = [&](int start, double capacity, double value) {
+        double bound = value;
+        for (int i = start; i < static_cast<int>(items.size()) && capacity > tol; ++i) {
+            if (items[i].weight <= capacity + tol) {
+                capacity -= items[i].weight;
+                bound += items[i].profit;
+            } else {
+                bound += items[i].profit * (capacity / items[i].weight);
+                break;
+            }
+        }
+        return bound;
+    };
+
+    struct State {
+        int index = 0;
+        double capacity = 0.0;
+        double value = 0.0;
+    };
+    double best = 0.0;
+    std::vector<State> stack;
+    stack.push_back(State{0, std::max(0.0, kn.rhs), 0.0});
+    int visited = 0;
+    constexpr int kMaxValidationNodes = 200'000;
+    while (!stack.empty()) {
+        State state = stack.back();
+        stack.pop_back();
+        if (++visited > kMaxValidationNodes) {
+            return false;
+        }
+        if (fractional_bound(state.index, state.capacity, state.value) <= best + tol) {
+            continue;
+        }
+        if (state.index >= static_cast<int>(items.size())) {
+            best = std::max(best, state.value);
+            continue;
+        }
+        stack.push_back(State{state.index + 1, state.capacity, state.value});
+        const Item& item = items[static_cast<std::size_t>(state.index)];
+        if (item.weight <= state.capacity + tol) {
+            stack.push_back(
+                State{state.index + 1, state.capacity - item.weight, state.value + item.profit});
+        }
+    }
+
+    const double max_activity = constant + best;
+    const double scale = std::max({1.0, std::abs(max_activity), std::abs(rhs)});
+    return max_activity <= rhs + std::max(1e-7, 1e-8 * scale);
+}
+
 std::vector<int> minimize_binary_cover_positions_(std::vector<int> positions,
                                                   const CanonicalKnapsack& kn, double tol = 1e-9) {
     if (positions.size() < 2) {
@@ -4149,9 +4261,7 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
         CanonicalKnapsack kn = build_canonical_binary_knapsack_(problem, relaxation, row);
         if (kn.valid && kn.variables.size() >= 2 && !std::isfinite(kn.rhs) == false &&
             kn.rhs >= 0.0) {
-            const std::vector<CoverLiteralTerm> canonical_terms = canonical_binary_cover_terms_(kn);
             std::vector<std::vector<int>> candidate_literal_covers;
-            std::vector<BinaryCoverPartition> candidate_partitions;
             auto queue_literal_cover = [&](std::vector<int> cover_literals) {
                 if (cover_literals.size() < 2) {
                     return;
@@ -4167,6 +4277,37 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
                     candidate_literal_covers.push_back(std::move(cover_literals));
                 }
             };
+            auto maybe_add_validated_lifted_cover =
+                [&](const std::vector<int>& indices, const std::vector<double>& values, double rhs,
+                    const std::string& cut_type) {
+                    if (indices.size() != values.size() || indices.empty()) {
+                        return;
+                    }
+                    Cut cut;
+                    cut.sense = LinearConstraintSense::LessEqual;
+                    cut.rhs = rhs;
+                    cut.cut_type = cut_type;
+                    cut.indices = indices;
+                    cut.values = values;
+                    if (!postprocess_cover_cut_(problem, options, &cut) || cut.indices.empty()) {
+                        return;
+                    }
+                    if (!validate_lifted_binary_cover_cut_(kn, cut.indices, cut.values,
+                                                            cut.rhs)) {
+                        return;
+                    }
+                    const double violation = cut_violation(cut, relaxation.primal);
+                    if (violation <= options.min_cut_violation) {
+                        return;
+                    }
+                    cut.strength = violation;
+                    const CutSignature signature = cut_signature(cut);
+                    if (!signatures.insert(signature).second) {
+                        return;
+                    }
+                    cuts.push_back(std::move(cut));
+                };
+            std::vector<BinaryCoverPartition> candidate_partitions;
             auto queue_partition = [&](BinaryCoverPartition partition) {
                 std::vector<int> key = partition.cover_positions;
                 std::sort(key.begin(), key.end());
@@ -4183,17 +4324,16 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
 
             if (const std::optional<BinaryCoverPartition> partition =
                     find_lp_violated_minimal_cover_(kn)) {
-                queue_partition(*partition);
                 queue_literal_cover(
                     canonical_binary_cover_literals_(kn, partition->cover_positions));
+                queue_partition(*partition);
             }
 
             if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
                     lifted_cover = lifted_binary_cover_cut_(kn)) {
                 const auto& [lifted_indices, lifted_values, lifted_rhs] = *lifted_cover;
-                maybe_add_lifted_cover_cut_(problem, relaxation, options, lifted_indices,
-                                            lifted_values, lifted_rhs, "LiftedCover", &signatures,
-                                            &cuts);
+                maybe_add_validated_lifted_cover(lifted_indices, lifted_values, lifted_rhs,
+                                                 "LiftedCover");
             }
 
             for (BinaryCoverOrdering ordering :
@@ -4211,19 +4351,14 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
                 if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
                         lifted_cover = highs_lifted_binary_cover_cut_(kn, partition)) {
                     const auto& [lifted_indices, lifted_values, lifted_rhs] = *lifted_cover;
-                    maybe_add_lifted_cover_cut_(problem, relaxation, options, lifted_indices,
-                                                lifted_values, lifted_rhs, "LiftedCoverHighs",
-                                                &signatures, &cuts);
+                    maybe_add_validated_lifted_cover(lifted_indices, lifted_values, lifted_rhs,
+                                                     "LiftedCoverHighs");
                 }
             }
 
             for (const std::vector<int>& cover_literals : candidate_literal_covers) {
                 maybe_add_cover_cut_(problem, relaxation, options, cover_literals, "Cover",
                                      &signatures, &cuts);
-                const std::vector<int> lifted_cover_literals =
-                    extend_cover_literals_(canonical_terms, cover_literals, kn.rhs);
-                maybe_add_cover_cut_(problem, relaxation, options, lifted_cover_literals,
-                                     "LiftedCoverLite", &signatures, &cuts);
             }
             if (!candidate_literal_covers.empty()) {
                 return;
@@ -4252,24 +4387,6 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
                              &cuts);
         maybe_add_cover_cut_(problem, relaxation, options, ratio_cover, base_type, &signatures,
                              &cuts);
-        const std::vector<int> lifted_activity =
-            extend_cover_literals_(context.literals, activity_cover, context.rhs);
-        const std::vector<int> lifted_coeff =
-            extend_cover_literals_(context.literals, coeff_cover, context.rhs);
-        const std::vector<int> lifted_ratio =
-            extend_cover_literals_(context.literals, ratio_cover, context.rhs);
-        maybe_add_cover_cut_(problem, relaxation, options, lifted_activity,
-                             context.has_nonbinary_component ? "LiftedMixedBinaryCover"
-                                                             : "LiftedCoverLite",
-                             &signatures, &cuts);
-        maybe_add_cover_cut_(problem, relaxation, options, lifted_coeff,
-                             context.has_nonbinary_component ? "LiftedMixedBinaryCover"
-                                                             : "LiftedCoverLite",
-                             &signatures, &cuts);
-        maybe_add_cover_cut_(problem, relaxation, options, lifted_ratio,
-                             context.has_nonbinary_component ? "LiftedMixedBinaryCover"
-                                                             : "LiftedCoverLite",
-                             &signatures, &cuts);
     };
 
     if (!selected_rows.empty()) {
