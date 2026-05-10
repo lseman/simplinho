@@ -43,6 +43,7 @@
 #include "pricer.h"        // pricing + degeneracy helpers
 #include "simplex_lu.h"    // FTBasis implementation (solve_B, solve_BT, replace_column, refactor)
 #include "simplex_types.h" // public result/status/options types
+#include "sparse_presolver.h" // sparse-native LP presolve
 
 // Forward decls from degeneracy/pricer header (kept external)
 static inline std::unordered_map<std::string, std::string>
@@ -1030,7 +1031,8 @@ class RevisedSimplex {
                                                    it2, std::move(info), std::nullopt, std::nullopt,
                                                    primal_ray_internal, has_primal_ray),
                                     Ared, bred, cred, red_basis2, internal_column_labels,
-                                    internal_row_labels, opt_.tol),
+                                    internal_row_labels, opt_.tol, opt_.compute_tableau,
+                                    opt_.compute_reduced_costs),
                                 P, opt_.tol),
                             P, opt_.tol),
                         col_orig_map, sign, A_model.cols(), opt_.tol),
@@ -1246,7 +1248,8 @@ class RevisedSimplex {
                                                std::nullopt, std::nullopt, primal_ray_internal,
                                                has_primal_ray),
                                 Ared, bred, cred, red_basis_out, internal_column_labels,
-                                internal_row_labels, opt_.tol),
+                                internal_row_labels, opt_.tol, opt_.compute_tableau,
+                                opt_.compute_reduced_costs),
                             P, opt_.tol),
                         P, opt_.tol),
                     col_orig_map, sign, A_model.cols(), opt_.tol),
@@ -1264,7 +1267,8 @@ class RevisedSimplex {
                                                std::nullopt, std::nullopt, primal_ray_internal,
                                                has_primal_ray),
                                 Ared, bred, cred, red_basis_out, internal_column_labels,
-                                internal_row_labels, opt_.tol),
+                                internal_row_labels, opt_.tol, opt_.compute_tableau,
+                                opt_.compute_reduced_costs),
                             P, opt_.tol),
                         P, opt_.tol),
                     col_orig_map, sign, A_model.cols(), opt_.tol),
@@ -1280,7 +1284,8 @@ class RevisedSimplex {
                                            total_iters, std::move(merged_info), std::nullopt,
                                            std::nullopt, primal_ray_internal, has_primal_ray),
                             Ared, bred, cred, red_basis_out, internal_column_labels,
-                            internal_row_labels, opt_.tol),
+                            internal_row_labels, opt_.tol, opt_.compute_tableau,
+                            opt_.compute_reduced_costs),
                         P, opt_.tol),
                     P, opt_.tol),
                 col_orig_map, sign, A_model.cols(), opt_.tol));
@@ -1297,7 +1302,8 @@ class RevisedSimplex {
                                            std::move(merged_info), std::nullopt, std::nullopt,
                                            primal_ray_internal, has_primal_ray),
                             Ared, bred, cred, red_basis_out, internal_column_labels,
-                            internal_row_labels, opt_.tol),
+                            internal_row_labels, opt_.tol, opt_.compute_tableau,
+                            opt_.compute_reduced_costs),
                         P, opt_.tol),
                     P, opt_.tol),
                 col_orig_map, sign, A_model.cols(), opt_.tol),
@@ -2100,7 +2106,8 @@ class RevisedSimplex {
                                                std::vector<int> basis_internal,
                                                std::vector<std::string> internal_column_labels,
                                                std::vector<std::string> internal_row_labels,
-                                               double tol);
+                                               double tol, bool compute_tableau,
+                                               bool compute_reduced_costs);
 
     static LPSolution attach_internal_tableau_(LPSolution sol, const SparseMatrix& A_internal,
                                                const Eigen::VectorXd& b_internal,
@@ -2108,7 +2115,8 @@ class RevisedSimplex {
                                                std::vector<int> basis_internal,
                                                std::vector<std::string> internal_column_labels,
                                                std::vector<std::string> internal_row_labels,
-                                               double tol);
+                                               double tol, bool compute_tableau,
+                                               bool compute_reduced_costs);
 
     static LPSolution attach_basis_state_(LPSolution sol, const Eigen::VectorXd& l,
                                           const Eigen::VectorXd& u, double tol);
@@ -2215,6 +2223,8 @@ class RevisedSimplex {
         bopt.max_eta_count = opt_.basis_max_eta_count;
         bopt.column_residual_tol = opt_.basis_column_residual_tol;
         bopt.aggressive_refactor_on_suspicious_residual = opt_.basis_aggressive_residual_rebuild;
+        bopt.sparse_backend = opt_.basis_sparse_backend;
+        bopt.sparse_equilibration = opt_.basis_sparse_equilibration;
 
         std::string mode = opt_.basis_update;
         std::transform(mode.begin(), mode.end(), mode.begin(),
@@ -3177,6 +3187,88 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     const bool has_warm_basis_for_dual = opt_.mode == SimplexMode::Dual && basis_state_opt &&
                                          !basis_state_opt->column_status.empty();
 
+    auto dualization_requested = [&]() {
+        std::string mode = opt_.dualization;
+        std::transform(mode.begin(), mode.end(), mode.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (mode == "on" || mode == "true" || mode == "1")
+            return true;
+        if (mode != "auto")
+            return false;
+        if (n <= 0)
+            return false;
+        return static_cast<double>(m_in) / static_cast<double>(n) >=
+               opt_.dualization_min_row_col_ratio;
+    };
+
+    if (is_nonnegative_standard && !has_warm_basis_for_dual && !basis_opt && dualization_requested() &&
+        n <= opt_.dualization_max_recovery_cols) {
+        try {
+            std::vector<Eigen::Triplet<double>> dual_trips;
+            dual_trips.reserve(static_cast<std::size_t>(2 * A_in.nonZeros() + n));
+            for (int j = 0; j < A_in.outerSize(); ++j) {
+                for (SparseMatrix::InnerIterator it(A_in, j); it; ++it) {
+                    dual_trips.emplace_back(j, it.row(), it.value());
+                    dual_trips.emplace_back(j, m_in + it.row(), -it.value());
+                }
+            }
+            for (int j = 0; j < n; ++j)
+                dual_trips.emplace_back(j, 2 * m_in + j, 1.0);
+
+            SparseMatrix A_dual(n, 2 * m_in + n);
+            A_dual.setFromTriplets(dual_trips.begin(), dual_trips.end());
+            A_dual.makeCompressed();
+            Eigen::VectorXd b_dual = c_in;
+            Eigen::VectorXd c_dual = Eigen::VectorXd::Zero(2 * m_in + n);
+            for (int i = 0; i < m_in; ++i) {
+                c_dual(i) = -b_in(i);
+                c_dual(m_in + i) = b_in(i);
+            }
+            Eigen::VectorXd l_dual = Eigen::VectorXd::Zero(2 * m_in + n);
+            Eigen::VectorXd u_dual =
+                Eigen::VectorXd::Constant(2 * m_in + n, presolve::inf());
+
+            RevisedSimplexOptions dual_opt = opt_;
+            dual_opt.dualization = "off";
+            dual_opt.mode = SimplexMode::Dual;
+            dual_opt.compute_tableau = false;
+            dual_opt.compute_reduced_costs = false;
+            RevisedSimplex dual_solver(dual_opt);
+            LPSolution dual_sol = dual_solver.solve(A_dual, b_dual, c_dual, l_dual, u_dual);
+            if (dual_sol.status == LPSolution::Status::Optimal &&
+                dual_sol.x.size() == 2 * m_in + n) {
+                Eigen::VectorXd restricted_u = u_in;
+                int fixed_by_dual_slack = 0;
+                const double active_tol = std::max(1e-8, 100.0 * opt_.tol);
+                for (int j = 0; j < n; ++j) {
+                    const double slack = dual_sol.x(2 * m_in + j);
+                    if (std::isfinite(slack) && slack > active_tol) {
+                        restricted_u(j) = 0.0;
+                        ++fixed_by_dual_slack;
+                    }
+                }
+                if (fixed_by_dual_slack > 0) {
+                    RevisedSimplexOptions recovery_opt = opt_;
+                    recovery_opt.dualization = "off";
+                    recovery_opt.mode = SimplexMode::Dual;
+                    RevisedSimplex recovery_solver(recovery_opt);
+                    LPSolution recovered =
+                        recovery_solver.solve(A_in, b_in, c_in, l_in, restricted_u);
+                    if (recovered.status == LPSolution::Status::Optimal &&
+                        primal_feasible_(A_in, b_in, recovered.x, l_in, u_in, opt_.tol)) {
+                        recovered.info["dualization"] = "explicit_dual_recovery";
+                        recovered.info["dualization_fixed_by_slack"] =
+                            std::to_string(fixed_by_dual_slack);
+                        recovered.info["dualization_dual_iters"] = std::to_string(dual_sol.iters);
+                        return finalize_solution_(std::move(recovered));
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            trace_line_(std::string("[dualization] fallback after failure: ") + e.what());
+        }
+    }
+
     if (!is_nonnegative_standard) {
         const bool cache_reuse = sparse_bound_only_cache_.same_problem(A_in, b_in, c_in) &&
                                  sparse_bound_only_cache_.orientation_matches(l_use, u_use);
@@ -3614,11 +3706,42 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         }
     }
 
-    const SparseMatrix& Ared = A_model;
-    const Eigen::VectorXd& bred = b_model;
-    const Eigen::VectorXd& cred = c_model;
-    const Eigen::VectorXd& l_eff = l_model;
-    const Eigen::VectorXd& u_eff = u_model;
+    presolve::SparsePresolveResult sparse_pres;
+    if (opt_.disable_presolve) {
+        sparse_pres.reduced = {A_model, b_model, c_model, l_model, u_model};
+        sparse_pres.orig_col_index.resize(n);
+        sparse_pres.orig_row_index.resize(m_in);
+        std::iota(sparse_pres.orig_col_index.begin(), sparse_pres.orig_col_index.end(), 0);
+        std::iota(sparse_pres.orig_row_index.begin(), sparse_pres.orig_row_index.end(), 0);
+    } else {
+        presolve::SparsePresolver::Options spopt;
+        spopt.zero_tol = opt_.tol * 1e-3;
+        spopt.infeas_tol = opt_.tol;
+        spopt.min_delta = std::max(opt_.tol * 10.0, 1e-12);
+        spopt.max_passes = (basis_state_opt && !basis_state_opt->column_status.empty()) ? 2 : 4;
+        presolve::SparsePresolver sp(spopt);
+        sparse_pres = sp.run({A_model, b_model, c_model, l_model, u_model});
+    }
+    if (sparse_pres.proven_infeasible) {
+        return finalize_solution_(make_solution_(
+            LPSolution::Status::Infeasible, Eigen::VectorXd::Zero(n),
+            std::numeric_limits<double>::infinity(), {}, 0,
+            {{"sparse_presolve", "infeasible"},
+             {"sparse_presolve_bound_updates", std::to_string(sparse_pres.bound_updates)}}));
+    }
+    if (sparse_pres.proven_unbounded) {
+        Eigen::VectorXd xnan =
+            Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
+        return finalize_solution_(make_solution_(
+            LPSolution::Status::Unbounded, xnan, -std::numeric_limits<double>::infinity(), {}, 0,
+            {{"sparse_presolve", "unbounded"}}));
+    }
+
+    const SparseMatrix& Ared = sparse_pres.reduced.A;
+    const Eigen::VectorXd& bred = sparse_pres.reduced.b;
+    const Eigen::VectorXd& cred = sparse_pres.reduced.c;
+    const Eigen::VectorXd& l_eff = sparse_pres.reduced.l;
+    const Eigen::VectorXd& u_eff = sparse_pres.reduced.u;
     std::vector<int> col_orig_map(n);
     std::iota(col_orig_map.begin(), col_orig_map.end(), 0);
     std::vector<int> row_orig_map(m_in);
@@ -3688,6 +3811,12 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
 
     auto add_sparse_info = [&](std::unordered_map<std::string, std::string> info) {
         info["sparse_pipeline"] = "1";
+        info["sparse_presolve"] = opt_.disable_presolve ? "disabled" : "sparse";
+        info["sparse_presolve_passes"] = std::to_string(sparse_pres.passes);
+        info["sparse_presolve_bound_updates"] = std::to_string(sparse_pres.bound_updates);
+        info["sparse_presolve_singleton_rows"] = std::to_string(sparse_pres.singleton_rows);
+        info["sparse_presolve_zero_rows"] = std::to_string(sparse_pres.zero_rows);
+        info["sparse_presolve_zero_columns"] = std::to_string(sparse_pres.zero_columns);
         info["original_m"] = std::to_string(m_in);
         info["reduced_m"] = std::to_string(m_in);
         info["reduced_n"] = std::to_string(n);
@@ -3725,10 +3854,15 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         auto sol =
             make_solution_(status, x_full, obj, basis_full, iters, add_sparse_info(std::move(info)),
                            std::nullopt, std::nullopt, primal_ray_internal, has_primal_ray);
-        return finalize_solution_(attach_basis_state_(
-            attach_internal_tableau_(std::move(sol), Ared, bred, cred, red_basis,
-                                     internal_column_labels, internal_row_labels, opt_.tol),
-            l_in, u_in, opt_.tol));
+        sol = attach_internal_tableau_(std::move(sol), Ared, bred, cred, red_basis,
+                                       internal_column_labels, internal_row_labels, opt_.tol,
+                                       opt_.compute_tableau, opt_.compute_reduced_costs);
+        if (sol.dual_values_internal.size() == m_in) {
+            sol.dual_values = sol.dual_values_internal;
+            sol.shadow_prices = sol.dual_values;
+        }
+        return finalize_solution_(
+            attach_basis_state_(std::move(sol), l_in, u_in, opt_.tol));
     };
 
     auto run_phase2_p = [&](std::optional<std::vector<int>> b) {

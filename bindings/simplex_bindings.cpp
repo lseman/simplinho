@@ -276,12 +276,24 @@ void bind_simplex_bindings(py::module_& m) {
                        &RevisedSimplexOptions::basis_column_residual_tol)
         .def_readwrite("basis_aggressive_residual_rebuild",
                        &RevisedSimplexOptions::basis_aggressive_residual_rebuild)
+        .def_readwrite("basis_sparse_backend", &RevisedSimplexOptions::basis_sparse_backend)
+        .def_readwrite("basis_sparse_equilibration",
+                       &RevisedSimplexOptions::basis_sparse_equilibration)
         .def_readwrite("devex_reset", &RevisedSimplexOptions::devex_reset)
         .def_readwrite("pricing_rule", &RevisedSimplexOptions::pricing_rule)
         .def_readwrite("adaptive_reset_freq", &RevisedSimplexOptions::adaptive_reset_freq)
         .def_readwrite("partial_pricing", &RevisedSimplexOptions::partial_pricing)
         .def_readwrite("dual_pricing", &RevisedSimplexOptions::dual_pricing)
         .def_readwrite("row_pricing_threshold", &RevisedSimplexOptions::row_pricing_threshold)
+        .def_readwrite("parallel_pricing_workers",
+                       &RevisedSimplexOptions::parallel_pricing_workers)
+        .def_readwrite("parallel_pricing_min_cols",
+                       &RevisedSimplexOptions::parallel_pricing_min_cols)
+        .def_readwrite("dualization", &RevisedSimplexOptions::dualization)
+        .def_readwrite("dualization_min_row_col_ratio",
+                       &RevisedSimplexOptions::dualization_min_row_col_ratio)
+        .def_readwrite("dualization_max_recovery_cols",
+                       &RevisedSimplexOptions::dualization_max_recovery_cols)
         .def_readwrite("primal_edge_weight_strategy",
                        &RevisedSimplexOptions::primal_edge_weight_strategy)
         .def_readwrite("dual_edge_weight_strategy",
@@ -311,6 +323,9 @@ void bind_simplex_bindings(py::module_& m) {
         .def_readwrite("verbose_every", &RevisedSimplexOptions::verbose_every)
         .def_readwrite("verbose_include_basis", &RevisedSimplexOptions::verbose_include_basis)
         .def_readwrite("verbose_include_presolve", &RevisedSimplexOptions::verbose_include_presolve)
+        .def_readwrite("disable_presolve", &RevisedSimplexOptions::disable_presolve)
+        .def_readwrite("compute_tableau", &RevisedSimplexOptions::compute_tableau)
+        .def_readwrite("compute_reduced_costs", &RevisedSimplexOptions::compute_reduced_costs)
         .def_readwrite("mode", &RevisedSimplexOptions::mode);
 
     py::enum_<SimplexMode>(m, "SimplexMode")

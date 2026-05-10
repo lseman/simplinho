@@ -427,24 +427,39 @@ class GlobalDomain {
     // Tighten variable j's global bounds. Returns true if anything changed.
     bool tighten(int j, double lb, double ub) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (j < 0 || j >= static_cast<int>(lower_.size())) return false;
+        if (j < 0 || j >= static_cast<int>(lower_.size()))
+            return false;
         bool changed = false;
-        if (lb > lower_(j) + 1e-12) { lower_(j) = lb; changed = true; }
-        if (ub < upper_(j) - 1e-12) { upper_(j) = ub; changed = true; }
-        if (changed) ++revision_;
+        if (lb > lower_(j) + 1e-12) {
+            lower_(j) = lb;
+            changed = true;
+        }
+        if (ub < upper_(j) - 1e-12) {
+            upper_(j) = ub;
+            changed = true;
+        }
+        if (changed)
+            ++revision_;
         return changed;
     }
 
     // Intersect node bounds in-place. Returns number of variables tightened.
     int apply(Eigen::VectorXd& node_lower, Eigen::VectorXd& node_upper) const {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (lower_.size() == 0) return 0;
-        const int n = std::min<int>(static_cast<int>(node_lower.size()),
-                                    static_cast<int>(lower_.size()));
+        if (lower_.size() == 0)
+            return 0;
+        const int n =
+            std::min<int>(static_cast<int>(node_lower.size()), static_cast<int>(lower_.size()));
         int tightened = 0;
         for (int j = 0; j < n; ++j) {
-            if (lower_(j) > node_lower(j) + 1e-12) { node_lower(j) = lower_(j); ++tightened; }
-            if (upper_(j) < node_upper(j) - 1e-12) { node_upper(j) = upper_(j); ++tightened; }
+            if (lower_(j) > node_lower(j) + 1e-12) {
+                node_lower(j) = lower_(j);
+                ++tightened;
+            }
+            if (upper_(j) < node_upper(j) - 1e-12) {
+                node_upper(j) = upper_(j);
+                ++tightened;
+            }
         }
         return tightened;
     }

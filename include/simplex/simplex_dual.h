@@ -1,6 +1,7 @@
 #pragma once
 
 #include <type_traits>
+#include <future>
 
 class RevisedSimplexDualEngine {
   public:
@@ -266,6 +267,53 @@ class RevisedSimplexDualEngine {
                 rN(rel) -= yi * it.value();
             }
         }
+    }
+
+    static void compute_pricing_products_parallel(const RevisedSimplex::SparseMatrix& Ahat,
+                                                  const std::vector<int>& N, const HVector& w,
+                                                  const Eigen::VectorXd& ydual,
+                                                  const Eigen::VectorXd& chat, Eigen::VectorXd& pN,
+                                                  Eigen::VectorXd& rN, int workers,
+                                                  int min_cols) {
+        const int total = static_cast<int>(N.size());
+        workers = std::max(1, workers);
+        if (workers <= 1 || total < std::max(1, min_cols)) {
+            SparseRowMatrix Ahat_row(Ahat);
+            compute_pricing_products(Ahat, Ahat_row, N, w, ydual, chat, pN, rN);
+            return;
+        }
+
+        pN = Eigen::VectorXd::Zero(total);
+        rN.resize(total);
+        const int worker_count = std::min(workers, total);
+        const int chunk = (total + worker_count - 1) / worker_count;
+        std::vector<std::future<void>> tasks;
+        tasks.reserve(static_cast<std::size_t>(worker_count));
+        for (int worker = 0; worker < worker_count; ++worker) {
+            const int begin = worker * chunk;
+            const int end = std::min(total, begin + chunk);
+            if (begin >= end)
+                break;
+            tasks.push_back(std::async(std::launch::async, [&, begin, end]() {
+                for (int k = begin; k < end; ++k) {
+                    const int j = N[k];
+                    double p = 0.0;
+                    double r = chat(j);
+                    for (RevisedSimplex::SparseMatrix::InnerIterator it(Ahat, j); it; ++it) {
+                        const int row = it.row();
+                        const double a = it.value();
+                        if (row < w.size())
+                            p += a * w(row);
+                        if (row < ydual.size())
+                            r -= a * ydual(row);
+                    }
+                    pN(k) = p;
+                    rN(k) = r;
+                }
+            }));
+        }
+        for (auto& task : tasks)
+            task.get();
     }
 
     template <class MatrixType>
@@ -677,6 +725,25 @@ class RevisedSimplexDualEngine {
             return oss.str();
         };
 
+        // ── Incremental primal-solution (yB) cache ────────────────────────────
+        // Each outer iteration needs yB = B^{-1} rhs_eff. Recomputing it from
+        // scratch costs one full BTRAN. Instead we maintain it with the rank-1
+        // update formula after each standard pivot:
+        //   yB_new = yB_old − tau_r·s_enter + tau_r·e_{r_leave}
+        //   (tau_r = yB_old[r_leave] / s_enter[r_leave], derived via SMW)
+        // Falls back to a full BTRAN when rhs_eff changes (BFRT bound-flips),
+        // after explicit refactors / backtrack, or every refactor_every pivots.
+        Eigen::VectorXd yB_cache;
+        bool yB_cache_valid = false;
+        int yB_cache_age = 0;
+        const int yB_max_age = std::max(1, self.opt_.refactor_every);
+        auto refresh_yB_cache = [&]() {
+            yB_cache = read_basis().solve_B(rhs_eff).value;
+            yB_cache_valid = true;
+            yB_cache_age = 0;
+        };
+        refresh_yB_cache(); // prime the cache before the loop
+
         while (iters < self.opt_.max_iters) {
             ++iters;
             int flips_this_iter = 0;
@@ -693,13 +760,17 @@ class RevisedSimplexDualEngine {
 
             while (true) {
                 try {
-                    yB = read_basis().solve_B(rhs_eff);
+                    // Use cached yB when valid; otherwise solve from scratch and prime cache.
+                    if (!yB_cache_valid || yB_cache_age >= yB_max_age)
+                        refresh_yB_cache();
+                    yB = yB_cache;
                 } catch (...) {
                     if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
                         ++rebuild_attempts;
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after solve_B failure");
                         write_basis().refactor();
+                        yB_cache_valid = false;
                         if (auto failed = rebuild_dual_pool(
                                 "dual pricing rebuild failed after solve_B", iters)) {
                             return *failed;
@@ -734,6 +805,7 @@ class RevisedSimplexDualEngine {
 
                 if (!(warm_views_provided && iters == 1) && apply_views_to_nonbasics(ydual)) {
                     rhs_eff = b - transformed_rhs(A, view, l, u);
+                    yB_cache_valid = false; // rhs_eff recomputed from scratch
                     if (auto failed = rebuild_dual_pool(
                             "dual pricing rebuild failed after bound view update", iters)) {
                         return *failed;
@@ -817,6 +889,7 @@ class RevisedSimplexDualEngine {
                             self.trace_line_("[dual] cost-shift Phase 1 applied, refactoring");
                             try {
                                 write_basis().refactor();
+                                yB_cache_valid = false;
                             } catch (const std::exception&) {
                                 return {LPSolution::Status::NeedPhase1,
                                         Eigen::VectorXd::Zero(n),
@@ -840,7 +913,9 @@ class RevisedSimplexDualEngine {
 
                 w = leaving.dual_row;
                 if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
-                    compute_pricing_products(Ahat, *Ahat_row, N, w, ydual, chat, pN, rN);
+                    compute_pricing_products_parallel(Ahat, N, w, ydual, chat, pN, rN,
+                                                      self.opt_.parallel_pricing_workers,
+                                                      self.opt_.parallel_pricing_min_cols);
                 } else {
                     compute_pricing_products(Ahat, N, w, ydual, chat, pN, rN);
                 }
@@ -856,6 +931,7 @@ class RevisedSimplexDualEngine {
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after no eligible entering");
                         write_basis().refactor();
+                        yB_cache_valid = false;
                         if (auto failed = rebuild_dual_pool(
                                 "dual pricing rebuild failed after no eligible entering", iters)) {
                             return *failed;
@@ -912,6 +988,7 @@ class RevisedSimplexDualEngine {
                         ++flips_this_iter;
                         ++total_flips;
                     }
+                    yB_cache_valid = false; // rhs_eff changed due to bound flips
                     if (auto failed = rebuild_dual_pool(
                             "dual pricing rebuild failed after bound flips", iters)) {
                         return *failed;
@@ -958,6 +1035,7 @@ class RevisedSimplexDualEngine {
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after solve(B,a_e) failure");
                         write_basis().refactor();
+                        yB_cache_valid = false;
                         if (auto failed = rebuild_dual_pool(
                                 "dual pricing rebuild failed after solve(B,a_e)", iters)) {
                             return *failed;
@@ -1092,6 +1170,7 @@ class RevisedSimplexDualEngine {
                             N.push_back(j);
 
                     ydual_cached = false;
+                    yB_cache_valid = false; // basis and rhs_eff both changed
                     rhs_eff = b - transformed_rhs(A, view, l, u);
                     if (auto failed = rebuild_dual_pool(
                             "dual pricing rebuild failed after backtrack", iters)) {
@@ -1100,6 +1179,7 @@ class RevisedSimplexDualEngine {
                     backtracked_this_iter = true;
                 } else {
                     write_basis().refactor();
+                    yB_cache_valid = false;
                     if (auto failed = rebuild_dual_pool(
                             "dual pricing rebuild failed after replace_column", iters)) {
                         return *failed;
@@ -1109,6 +1189,24 @@ class RevisedSimplexDualEngine {
 
             if (backtracked_this_iter)
                 continue; // restored basis changes N/ydual state; restart from optimality check
+
+            // ── Incremental yB rank-1 update ─────────────────────────────────
+            // Formula (derived via Sherman-Morrison-Woodbury):
+            //   yB_new[i] = yB_old[i] - tau_r * s_enter[i]    (i != r_leave)
+            //   yB_new[r_leave] = tau_r
+            // where tau_r = yB_old[r_leave] / pivot, pivot = s_enter[r_leave].
+            // s_enter was B_old^{-1} a_e (computed before replace_column).
+            if (!backtracked_this_iter && yB_cache_valid) {
+                const double yb_pivot = s_enter(r_leave);
+                if (std::abs(yb_pivot) > 1e-14 && yB_cache_age < yB_max_age) {
+                    const double tau_r = yB_cache(r_leave) / yb_pivot;
+                    yB_cache.noalias() -= tau_r * s_enter.value;
+                    yB_cache(r_leave) = tau_r; // override (the -= above gives 0 here)
+                    ++yB_cache_age;
+                } else {
+                    yB_cache_valid = false; // pivot too small or cache aged out
+                }
+            }
 
             dual_pricer.update_after_dual_pivot(r_leave, eAbs, oldAbs, s_enter, s_enter(r_leave),
                                                 Ahat, N, w, true);

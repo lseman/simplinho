@@ -146,6 +146,8 @@ struct RevisedSimplexOptions {
     int basis_max_eta_count = 128;
     double basis_column_residual_tol = 1e-8;
     bool basis_aggressive_residual_rebuild = true;
+    std::string basis_sparse_backend = "auto"; // "auto" | "pf" | "ft" | "eigen"
+    bool basis_sparse_equilibration = true;
 
     // Pricing
     int devex_reset = 100;
@@ -163,6 +165,14 @@ struct RevisedSimplexOptions {
         1.3862943611198906; // log(4), equivalent to 25% acceptance
     double dual_steepest_edge_weight_log_error_threshold =
         1.3862943611198906; // log(4), equivalent to 25% acceptance
+    int parallel_pricing_workers = 1;
+    int parallel_pricing_min_cols = 2048;
+
+    // Opt-in explicit dualization for sparse nonnegative equality-form LPs.
+    // "off" keeps the current path; "on" always tries; "auto" uses the row/col ratio.
+    std::string dualization = "off";
+    double dualization_min_row_col_ratio = 4.0;
+    int dualization_max_recovery_cols = 8192;
 
     // Refinement safeguards
     double residual_abs_refactor_tol = 1e-10;
@@ -209,4 +219,9 @@ struct RevisedSimplexOptions {
     bool verbose_include_basis = true;
     bool verbose_include_presolve = true;
     bool disable_presolve = false;
+
+    // Heavy diagnostic expansion. Disabled by default so production solves
+    // return only primal/dual/basis/certificates on the hot path.
+    bool compute_tableau = false;
+    bool compute_reduced_costs = false;
 };

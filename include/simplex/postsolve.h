@@ -55,7 +55,8 @@ inline LPSolution RevisedSimplex::attach_internal_tableau_(
     const Eigen::VectorXd &b_internal, const Eigen::VectorXd &c_internal,
     std::vector<int> basis_internal,
     std::vector<std::string> internal_column_labels,
-    std::vector<std::string> internal_row_labels, double tol) {
+    std::vector<std::string> internal_row_labels, double tol,
+    bool compute_tableau, bool compute_reduced_costs) {
   sol.basis_internal = std::move(basis_internal);
   sol.internal_column_labels = std::move(internal_column_labels);
   sol.internal_row_labels = std::move(internal_row_labels);
@@ -65,12 +66,16 @@ inline LPSolution RevisedSimplex::attach_internal_tableau_(
   const int m = static_cast<int>(A_internal.rows());
   const int n = static_cast<int>(A_internal.cols());
   if (m == 0) {
-    sol.tableau = Eigen::MatrixXd::Zero(0, n);
-    sol.tableau_rhs = Eigen::VectorXd::Zero(0);
-    sol.reduced_costs_internal = clip_small_vec_(c_internal, tol);
     sol.dual_values_internal = Eigen::VectorXd::Zero(0);
     sol.shadow_prices_internal = Eigen::VectorXd::Zero(0);
-    sol.has_internal_tableau = true;
+    if (compute_tableau) {
+      sol.tableau = Eigen::MatrixXd::Zero(0, n);
+      sol.tableau_rhs = Eigen::VectorXd::Zero(0);
+      sol.has_internal_tableau = true;
+    }
+    if (compute_reduced_costs) {
+      sol.reduced_costs_internal = clip_small_vec_(c_internal, tol);
+    }
     return sol;
   }
   if (static_cast<int>(sol.basis_internal.size()) != m)
@@ -83,9 +88,6 @@ inline LPSolution RevisedSimplex::attach_internal_tableau_(
   if (!(lu.rank() == m && lu.isInvertible()))
     return sol;
 
-  sol.tableau = clip_small_mat_(lu.solve(A_internal), tol);
-  sol.tableau_rhs = clip_small_vec_(lu.solve(b_internal), tol);
-
   Eigen::VectorXd cB(m);
   for (int i = 0; i < m; ++i)
     cB(i) = c_internal(sol.basis_internal[i]);
@@ -94,11 +96,17 @@ inline LPSolution RevisedSimplex::attach_internal_tableau_(
     const Eigen::VectorXd y = lu_t.solve(cB);
     sol.dual_values_internal = clip_small_vec_(y, tol);
     sol.shadow_prices_internal = sol.dual_values_internal;
-    sol.reduced_costs_internal =
-        clip_small_vec_(c_internal - A_internal.transpose() * y, tol);
+    if (compute_reduced_costs) {
+      sol.reduced_costs_internal =
+          clip_small_vec_(c_internal - A_internal.transpose() * y, tol);
+    }
   }
 
-  sol.has_internal_tableau = true;
+  if (compute_tableau) {
+    sol.tableau = clip_small_mat_(lu.solve(A_internal), tol);
+    sol.tableau_rhs = clip_small_vec_(lu.solve(b_internal), tol);
+    sol.has_internal_tableau = true;
+  }
   return sol;
 }
 
@@ -107,7 +115,8 @@ inline LPSolution RevisedSimplex::attach_internal_tableau_(
     const Eigen::VectorXd &b_internal, const Eigen::VectorXd &c_internal,
     std::vector<int> basis_internal,
     std::vector<std::string> internal_column_labels,
-    std::vector<std::string> internal_row_labels, double tol) {
+    std::vector<std::string> internal_row_labels, double tol,
+    bool compute_tableau, bool compute_reduced_costs) {
   sol.basis_internal = std::move(basis_internal);
   sol.internal_column_labels = std::move(internal_column_labels);
   sol.internal_row_labels = std::move(internal_row_labels);
@@ -117,12 +126,16 @@ inline LPSolution RevisedSimplex::attach_internal_tableau_(
   const int m = static_cast<int>(A_internal.rows());
   const int n = static_cast<int>(A_internal.cols());
   if (m == 0) {
-    sol.tableau = Eigen::MatrixXd::Zero(0, n);
-    sol.tableau_rhs = Eigen::VectorXd::Zero(0);
-    sol.reduced_costs_internal = clip_small_vec_(c_internal, tol);
     sol.dual_values_internal = Eigen::VectorXd::Zero(0);
     sol.shadow_prices_internal = Eigen::VectorXd::Zero(0);
-    sol.has_internal_tableau = true;
+    if (compute_tableau) {
+      sol.tableau = Eigen::MatrixXd::Zero(0, n);
+      sol.tableau_rhs = Eigen::VectorXd::Zero(0);
+      sol.has_internal_tableau = true;
+    }
+    if (compute_reduced_costs) {
+      sol.reduced_costs_internal = clip_small_vec_(c_internal, tol);
+    }
     return sol;
   }
   if (static_cast<int>(sol.basis_internal.size()) != m)
@@ -135,23 +148,6 @@ inline LPSolution RevisedSimplex::attach_internal_tableau_(
   if (lu.info() != Eigen::Success)
     return sol;
 
-  sol.tableau = Eigen::MatrixXd::Zero(m, n);
-  for (int j = 0; j < n; ++j) {
-    Eigen::VectorXd rhs = Eigen::VectorXd::Zero(m);
-    for (SparseMatrix::InnerIterator it(A_internal, j); it; ++it) {
-      rhs(it.row()) = it.value();
-    }
-    Eigen::VectorXd col = lu.solve(rhs);
-    if (lu.info() != Eigen::Success)
-      return sol;
-    sol.tableau.col(j) = col;
-  }
-  sol.tableau = clip_small_mat_(std::move(sol.tableau), tol);
-
-  sol.tableau_rhs = clip_small_vec_(lu.solve(b_internal), tol);
-  if (lu.info() != Eigen::Success)
-    return sol;
-
   Eigen::VectorXd cB(m);
   for (int i = 0; i < m; ++i)
     cB(i) = c_internal(sol.basis_internal[i]);
@@ -160,11 +156,30 @@ inline LPSolution RevisedSimplex::attach_internal_tableau_(
   if (y.allFinite()) {
     sol.dual_values_internal = clip_small_vec_(y, tol);
     sol.shadow_prices_internal = sol.dual_values_internal;
-    sol.reduced_costs_internal =
-        clip_small_vec_(c_internal - A_internal.transpose() * y, tol);
+    if (compute_reduced_costs) {
+      sol.reduced_costs_internal =
+          clip_small_vec_(c_internal - A_internal.transpose() * y, tol);
+    }
   }
 
-  sol.has_internal_tableau = true;
+  if (compute_tableau) {
+    sol.tableau = Eigen::MatrixXd::Zero(m, n);
+    for (int j = 0; j < n; ++j) {
+      Eigen::VectorXd rhs = Eigen::VectorXd::Zero(m);
+      for (SparseMatrix::InnerIterator it(A_internal, j); it; ++it) {
+        rhs(it.row()) = it.value();
+      }
+      Eigen::VectorXd col = lu.solve(rhs);
+      if (lu.info() != Eigen::Success)
+        return sol;
+      sol.tableau.col(j) = col;
+    }
+    sol.tableau = clip_small_mat_(std::move(sol.tableau), tol);
+    sol.tableau_rhs = clip_small_vec_(lu.solve(b_internal), tol);
+    if (lu.info() != Eigen::Success)
+      return sol;
+    sol.has_internal_tableau = true;
+  }
   return sol;
 }
 

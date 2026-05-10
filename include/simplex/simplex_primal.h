@@ -261,18 +261,39 @@ class RevisedSimplexPrimalEngine {
 
         int rebuild_attempts = 0;
 
+        // ── Incremental xB (primal basic solution) cache ─────────────────────
+        // Avoids re-solving B·xB = b from scratch each iteration. After a
+        // pivot at leaving row r with FTRAN column dB = B^{-1}a_e and step θ:
+        //   xB_new[i] = xB_old[i] − θ·dB[i]    (i ≠ r)
+        //   xB_new[r] = θ
+        // Falls back to a full BTRAN after explicit refactors or every
+        // refactor_every pivots.
+        Eigen::VectorXd xB_cache;
+        bool xB_cache_valid = false;
+        int xB_cache_age = 0;
+        const int xB_max_age = std::max(1, self.opt_.refactor_every);
+        auto refresh_xB_cache = [&]() {
+            xB_cache = read_basis().solve_B(b).value;
+            xB_cache_valid = true;
+            xB_cache_age = 0;
+        };
+        refresh_xB_cache(); // prime before the loop
+
         while (iters < self.opt_.max_iters) {
             ++iters;
 
             Eigen::VectorXd xB;
             try {
-                xB = read_basis().solve_B(b);
+                if (!xB_cache_valid || xB_cache_age >= xB_max_age)
+                    refresh_xB_cache();
+                xB = xB_cache;
             } catch (...) {
                 if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
                     ++rebuild_attempts;
                     self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                      " refactor after solve_B failure");
                     write_basis().refactor();
+                    xB_cache_valid = false;
                     if (self.opt_.pricing_rule == "adaptive") {
                         self.measure_pricing_build_(false, [&]() {
                             self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
@@ -310,6 +331,7 @@ class RevisedSimplexPrimalEngine {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after solve_BT failure");
                 write_basis().refactor();
+                xB_cache_valid = false;
                 y = read_basis().solve_BT(cB);
                 if (self.opt_.pricing_rule == "adaptive") {
                     self.measure_pricing_build_(false, [&]() {
@@ -400,6 +422,7 @@ class RevisedSimplexPrimalEngine {
                 dB = read_basis().solve_B(A.col(e));
             } catch (...) {
                 write_basis().refactor();
+                xB_cache_valid = false;
                 dB = read_basis().solve_B(A.col(e));
                 if (self.opt_.pricing_rule == "adaptive") {
                     self.measure_pricing_build_(false, [&]() {
@@ -511,12 +534,27 @@ class RevisedSimplexPrimalEngine {
             basis[r] = eAbs;
             N[idxN] = oldAbs;
 
+            // ── Incremental xB update (rank-1) ─────────────────────────────
+            // xB_new = xB_old − step·dB;  xB_new[r] = step (override, non-flip only).
+            // For flip pivots dB was negated, so xB[r] is already correct after the
+            // noalias update; unconditionally overriding would corrupt it.
+            if (xB_cache_valid && xB_cache_age < xB_max_age) {
+                xB_cache.noalias() -= step * dB.value;
+                if (!flip_entering)
+                    xB_cache(r) = step;
+                xB_cache = xB_cache.cwiseMax(0.0);
+                ++xB_cache_age;
+            } else {
+                xB_cache_valid = false;
+            }
+
             try {
                 write_basis().replace_column(r, eAbs, A.col(e));
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
                 write_basis().refactor();
+                xB_cache_valid = false;
                 if (self.opt_.pricing_rule == "adaptive") {
                     self.measure_pricing_build_(false, [&]() {
                         self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
@@ -534,6 +572,8 @@ class RevisedSimplexPrimalEngine {
                 self.measure_pricing_build_(
                     false, [&]() { self.adaptive_pricer_.build_primal_pools(read_basis(), A, N); });
                 self.adaptive_pricer_.clear_rebuild_flag();
+                // Pricing rebuild signals accumulated numerical drift → refresh xB next iteration.
+                xB_cache_valid = false;
             }
         }
 

@@ -218,8 +218,13 @@ RevisedSimplexOptions tune_mip_lp_options(const RevisedSimplexOptions& base_opti
     tuned.partial_pricing = true;
     tuned.dual_pricing = "switch";
     tuned.row_pricing_threshold = std::max(tuned.row_pricing_threshold, 40);
+    tuned.parallel_pricing_workers =
+        std::max(tuned.parallel_pricing_workers, std::min(4, std::max(1, mip_options.parallel_workers)));
+    tuned.parallel_pricing_min_cols = std::min(tuned.parallel_pricing_min_cols, 1024);
 
     tuned.basis_update = "hybrid";
+    tuned.basis_sparse_backend = tuned.basis_sparse_backend.empty() ? "auto" : tuned.basis_sparse_backend;
+    tuned.basis_sparse_equilibration = true;
     tuned.primal_edge_weight_strategy = "dense_diagonal";
     tuned.dual_edge_weight_strategy = "dense_diagonal";
     tuned.basis_refinement_steps = std::max(tuned.basis_refinement_steps, 3);

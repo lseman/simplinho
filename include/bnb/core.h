@@ -1206,15 +1206,17 @@ class Solver {
             }
             if (new_lower > (*lower)(index) + options_.integrality_tol) {
                 // Update contribution cache so subsequent pivots use the tighter bound.
-                if (coeff >= 0.0) row_min += (new_lower - (*lower)(index)) * coeff;
+                if (coeff >= 0.0)
+                    row_min += (new_lower - (*lower)(index)) * coeff;
                 contribution[pivot] += (new_lower - (*lower)(index)) * coeff;
                 (*lower)(index) = new_lower;
                 ++(*tightened_bounds);
                 if (changed_variables != nullptr)
                     changed_variables->push_back(index);
             }
-            if (new_upper < (*upper)(index) - options_.integrality_tol) {
-                if (coeff < 0.0) row_min += (new_upper - (*upper)(index)) * coeff;
+            if (new_upper < (*upper)(index)-options_.integrality_tol) {
+                if (coeff < 0.0)
+                    row_min += (new_upper - (*upper)(index)) * coeff;
                 contribution[pivot] += (new_upper - (*upper)(index)) * coeff;
                 (*upper)(index) = new_upper;
                 ++(*tightened_bounds);
@@ -2175,20 +2177,23 @@ class Solver {
         double root_obj = std::numeric_limits<double>::quiet_NaN();
         {
             std::lock_guard<std::mutex> lock(incumbent_mutex_);
-            if (root_reduced_costs_.size() == 0) return;
+            if (root_reduced_costs_.size() == 0)
+                return;
             root_rc = root_reduced_costs_;
             root_status = root_basis_statuses_;
             root_obj = root_lp_objective_;
         }
-        if (!std::isfinite(root_obj) || root_rc.size() == 0) return;
+        if (!std::isfinite(root_obj) || root_rc.size() == 0)
+            return;
 
         const double cutoff = fathom_cutoff_(new_incumbent_obj);
         const double objective_sign = problem_.maximize ? -1.0 : 1.0;
         const double gap = objective_sign * (cutoff - root_obj);
-        if (!(gap > 0.0)) return;
+        if (!(gap > 0.0))
+            return;
 
-        const double rc_tol = std::max(10.0 * options_.feasibility_tol,
-                                       std::numeric_limits<double>::epsilon() * gap);
+        const double rc_tol =
+            std::max(10.0 * options_.feasibility_tol, std::numeric_limits<double>::epsilon() * gap);
         const int n = std::min<int>(static_cast<int>(problem_.lower_bounds.size()),
                                     static_cast<int>(root_rc.size()));
 
@@ -2196,26 +2201,28 @@ class Solver {
             if (j >= static_cast<int>(problem_.variable_types.size()) ||
                 problem_.variable_types[j] == VariableType::Continuous)
                 continue;
-            if (j >= static_cast<int>(root_status.size())) continue;
+            if (j >= static_cast<int>(root_status.size()))
+                continue;
 
             const double rc = root_rc[j];
-            if (!std::isfinite(rc) || std::abs(rc) <= rc_tol) continue;
+            if (!std::isfinite(rc) || std::abs(rc) <= rc_tol)
+                continue;
 
             if (root_status[j] == LPBasisStatus::AtLower && rc > rc_tol) {
                 // x_j at lower bound, rc > 0: upper bound can be tightened.
                 const double new_ub_cont = problem_.lower_bounds(j) + gap / rc;
-                if (!std::isfinite(new_ub_cont)) continue;
+                if (!std::isfinite(new_ub_cont))
+                    continue;
                 const double new_ub = std::floor(new_ub_cont + 1e-12);
-                if (new_ub < problem_.upper_bounds(j) - 1e-12 &&
-                    new_ub >= problem_.lower_bounds(j))
+                if (new_ub < problem_.upper_bounds(j) - 1e-12 && new_ub >= problem_.lower_bounds(j))
                     global_domain_.tighten(j, problem_.lower_bounds(j), new_ub);
             } else if (root_status[j] == LPBasisStatus::AtUpper && rc < -rc_tol) {
                 // x_j at upper bound, rc < 0: lower bound can be tightened.
                 const double new_lb_cont = problem_.upper_bounds(j) + gap / rc;
-                if (!std::isfinite(new_lb_cont)) continue;
+                if (!std::isfinite(new_lb_cont))
+                    continue;
                 const double new_lb = std::ceil(new_lb_cont - 1e-12);
-                if (new_lb > problem_.lower_bounds(j) + 1e-12 &&
-                    new_lb <= problem_.upper_bounds(j))
+                if (new_lb > problem_.lower_bounds(j) + 1e-12 && new_lb <= problem_.upper_bounds(j))
                     global_domain_.tighten(j, new_lb, problem_.upper_bounds(j));
             }
         }
@@ -2231,9 +2238,11 @@ class Solver {
     // problem_.upper_bounds as starting bounds — and feed any tightenings to GlobalDomain so
     // every subsequent node benefits without re-discovering them via propagation.
     void propagate_cutoff_to_global_domain_(double new_incumbent_obj) {
-        if (problem_.objective_coefficients.size() == 0) return;
+        if (problem_.objective_coefficients.size() == 0)
+            return;
         const double cutoff = fathom_cutoff_(new_incumbent_obj);
-        if (!std::isfinite(cutoff)) return;
+        if (!std::isfinite(cutoff))
+            return;
 
         // Build the objective bound as a Cut in the same form as IncumbentCutoff.
         Cut obj_cut;
@@ -2243,11 +2252,13 @@ class Solver {
         obj_cut.rhs = cutoff - problem_.objective_constant;
         for (int j = 0; j < static_cast<int>(problem_.objective_coefficients.size()); ++j) {
             const double coeff = problem_.objective_coefficients(j);
-            if (std::abs(coeff) <= 1e-12) continue;
+            if (std::abs(coeff) <= 1e-12)
+                continue;
             obj_cut.indices.push_back(j);
             obj_cut.values.push_back(coeff);
         }
-        if (obj_cut.indices.empty()) return;
+        if (obj_cut.indices.empty())
+            return;
 
         // Run one-pass constraint propagation from global bounds.
         // presolve_node_bounds_ handles the full fixpoint including the graph implications.
@@ -2256,7 +2267,8 @@ class Solver {
         // objective row through globally-valid bounds is itself globally valid.
         const NodePresolveOutcome result =
             presolve_node_bounds_(problem_.lower_bounds, problem_.upper_bounds, {obj_cut});
-        if (result.infeasible) return;  // Shouldn't happen; cutoff should be feasible at root.
+        if (result.infeasible)
+            return; // Shouldn't happen; cutoff should be feasible at root.
 
         const int n = std::min<int>(result.lower_bounds.size(), result.upper_bounds.size());
         for (int j = 0; j < n; ++j) {
@@ -2966,14 +2978,28 @@ class Solver {
             // Apply global domain: intersect node bounds with globally-valid tightest bounds.
             // This is the SCIP/HiGHS domain-application step — lurking bounds from root RC
             // fixing and other globally-valid deductions become visible to every node here.
-            global_domain_.apply(current_node.lower_bounds, current_node.upper_bounds);
+            const int gd_tightened =
+                global_domain_.apply(current_node.lower_bounds, current_node.upper_bounds);
+            // If global domain tightened any bounds and node presolve is enabled, re-run
+            // propagation on the tightened bounds to propagate their implications through the
+            // constraint graph (bound tightening, clique implications, etc.).
+            if (gd_tightened > 0 && !presolved.infeasible &&
+                should_run_node_presolve(warm_basis, effective)) {
+                presolved =
+                    presolve_node_bounds_(current_node.lower_bounds, current_node.upper_bounds,
+                                          relaxation_cuts, current_node.reasons);
+                current_node.lower_bounds = presolved.lower_bounds;
+                current_node.upper_bounds = presolved.upper_bounds;
+                current_node.reasons = presolved.reasons;
+            }
             // Check for infeasibility introduced by global domain tightening.
             bool global_domain_infeasible = false;
             if (!presolved.infeasible) {
                 const int n = std::min<int>(current_node.lower_bounds.size(),
                                             current_node.upper_bounds.size());
                 for (int j = 0; j < n; ++j) {
-                    if (current_node.lower_bounds(j) > current_node.upper_bounds(j) + options_.feasibility_tol) {
+                    if (current_node.lower_bounds(j) >
+                        current_node.upper_bounds(j) + options_.feasibility_tol) {
                         global_domain_infeasible = true;
                         break;
                     }
@@ -3009,8 +3035,8 @@ class Solver {
                 // kept; those pass through cut_pool_ and benefit subsequent nodes.
                 if (options_.use_dual_proof_cuts) {
                     std::vector<Cut> proof_cuts = detail::generate_dual_proof_cuts(
-                        problem_, relaxation_cuts, out,
-                        problem_.lower_bounds, problem_.upper_bounds, options_);
+                        problem_, relaxation_cuts, out, problem_.lower_bounds,
+                        problem_.upper_bounds, options_);
                     for (Cut& cut : proof_cuts)
                         cut_pool_.add_cut(problem_, cut);
                 }
@@ -3123,8 +3149,10 @@ class Solver {
                 // directly at infeasibility detection points in solve_relaxation_with_cuts
                 // and node_relaxation_solver instead (HiGHS-style).
                 const std::array<detail::CutSeparatorPhase, 4> phase_order = {
-                    detail::CutSeparatorPhase::ImpliedBound, detail::CutSeparatorPhase::Clique,
-                    detail::CutSeparatorPhase::OddCycle,     detail::CutSeparatorPhase::LP,
+                    detail::CutSeparatorPhase::ImpliedBound,
+                    detail::CutSeparatorPhase::Clique,
+                    detail::CutSeparatorPhase::OddCycle,
+                    detail::CutSeparatorPhase::LP,
                 };
                 bool any_cuts_applied = false;
                 for (detail::CutSeparatorPhase phase : phase_order) {
@@ -3296,8 +3324,10 @@ class Solver {
                 probing_relaxation_cuts.insert(probing_relaxation_cuts.end(), local_cuts.begin(),
                                                local_cuts.end());
                 const std::array<detail::CutSeparatorPhase, 4> phase_order = {
-                    detail::CutSeparatorPhase::ImpliedBound, detail::CutSeparatorPhase::Clique,
-                    detail::CutSeparatorPhase::OddCycle,     detail::CutSeparatorPhase::LP,
+                    detail::CutSeparatorPhase::ImpliedBound,
+                    detail::CutSeparatorPhase::Clique,
+                    detail::CutSeparatorPhase::OddCycle,
+                    detail::CutSeparatorPhase::LP,
                 };
                 bool any_cuts_applied = false;
                 for (detail::CutSeparatorPhase phase : phase_order) {
@@ -3553,6 +3583,14 @@ class Solver {
                 presolved.reasons = prepared.reasons;
             }
             const std::uint64_t presolve_wall_ns = elapsed_ns_(presolve_start, SteadyClock::now());
+            // Apply global domain and re-propagate if it tightened any bounds.
+            const int gd_tightened2 =
+                global_domain_.apply(prepared.lower_bounds, prepared.upper_bounds);
+            if (gd_tightened2 > 0 && !presolved.infeasible &&
+                should_run_node_presolve(basis, effective)) {
+                presolved = presolve_node_bounds_(prepared.lower_bounds, prepared.upper_bounds,
+                                                  relaxation_cuts, prepared.reasons);
+            }
             if (presolved.infeasible) {
                 maybe_learn_conflict_from_bounds_(presolved.lower_bounds, presolved.upper_bounds,
                                                   allow_global_conflict_learning);
@@ -3575,8 +3613,8 @@ class Solver {
                                                   allow_global_conflict_learning);
                 if (options_.use_dual_proof_cuts) {
                     std::vector<Cut> proof_cuts = detail::generate_dual_proof_cuts(
-                        problem_, relaxation_cuts, out,
-                        problem_.lower_bounds, problem_.upper_bounds, options_);
+                        problem_, relaxation_cuts, out, problem_.lower_bounds,
+                        problem_.upper_bounds, options_);
                     for (Cut& cut : proof_cuts)
                         cut_pool_.add_cut(problem_, cut);
                 }
@@ -3605,6 +3643,14 @@ class Solver {
                 presolved.upper_bounds = prepared.upper_bounds;
                 presolved.reasons = prepared.reasons;
             }
+            // Apply global domain and re-propagate if it tightened any bounds.
+            const int gd_tightened3 =
+                global_domain_.apply(prepared.lower_bounds, prepared.upper_bounds);
+            if (gd_tightened3 > 0 && !presolved.infeasible &&
+                should_run_node_presolve(basis, effective)) {
+                presolved = presolve_node_bounds_(prepared.lower_bounds, prepared.upper_bounds,
+                                                  relaxation_cuts, prepared.reasons);
+            }
             if (presolved.infeasible) {
                 RelaxationSolution out;
                 out.status = RelaxationStatus::Infeasible;
@@ -3614,13 +3660,12 @@ class Solver {
                                                   : std::numeric_limits<double>::infinity();
                 return out;
             }
-            RelaxationSolution out = relaxation_solver(presolved.lower_bounds,
-                                                       presolved.upper_bounds, basis,
-                                                       relaxation_cuts);
+            RelaxationSolution out = relaxation_solver(
+                presolved.lower_bounds, presolved.upper_bounds, basis, relaxation_cuts);
             if (out.status == RelaxationStatus::Infeasible && options_.use_dual_proof_cuts) {
                 std::vector<Cut> proof_cuts = detail::generate_dual_proof_cuts(
-                    problem_, relaxation_cuts, out,
-                    problem_.lower_bounds, problem_.upper_bounds, options_);
+                    problem_, relaxation_cuts, out, problem_.lower_bounds, problem_.upper_bounds,
+                    options_);
                 for (Cut& cut : proof_cuts)
                     cut_pool_.add_cut(problem_, cut);
             }

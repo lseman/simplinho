@@ -47,6 +47,8 @@ class FTBasis {
         double z_inf_guard = 1e6;
         bool sparse_amd = true;
         double sparse_drop_tol = 0.0;
+        std::string sparse_backend = "auto"; // "auto" | "pf" | "ft" | "eigen"
+        bool sparse_equilibration = true;
 
         enum class UpdateMode { EtaStack, ForrestTomlin, Hybrid };
         UpdateMode update_mode = UpdateMode::Hybrid;
@@ -655,10 +657,21 @@ class FTBasis {
     SparseForrestTomlinLU::Config make_sparse_lu_config_() const {
         SparseForrestTomlinLU::Config config;
         config.use_amd_ordering = opt_.sparse_amd;
+        config.diagonal_equilibration = opt_.sparse_equilibration;
         config.iterative_refinement = opt_.enable_iterative_refinement;
         config.iterative_refinement_steps = std::max(1, opt_.refinement_steps);
         config.iterative_refinement_tol = opt_.residual_refactor_tol;
         config.max_norm_growth_before_refactor = std::max(1e4, opt_.max_growth_tol * 100.0);
+        std::string backend = opt_.sparse_backend;
+        std::transform(backend.begin(), backend.end(), backend.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (backend == "eigen" || backend == "sparse_lu") {
+            config.force_eigen_sparse_lu = true;
+        } else if (backend == "ft" || backend == "forrest_tomlin") {
+            config.use_product_form_updates = false;
+        } else {
+            config.use_product_form_updates = true;
+        }
         return config;
     }
 

@@ -90,6 +90,7 @@ class SparseForrestTomlinLU {
         int max_parallel_update_size{64};
         bool enable_hyper_sparse_rhs{true};
         bool use_product_form_updates{true};
+        bool force_eigen_sparse_lu{false};
     };
 
     struct UpdateStats {
@@ -168,6 +169,12 @@ class SparseForrestTomlinLU {
         std::iota(col_map_.begin(), col_map_.end(), 0);
         std::iota(row_inv_.begin(), row_inv_.end(), 0);
         std::iota(col_inv_.begin(), col_inv_.end(), 0);
+
+        if (config_.force_eigen_sparse_lu) {
+            activate_sparse_lu_fallback_(base_matrix_original_);
+            clear_updates();
+            return;
+        }
 
         SparseMat factor_matrix = A;
         if (config_.diagonal_equilibration)
