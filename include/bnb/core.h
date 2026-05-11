@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include "../../extern/pdqsort/pdqsort.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1299,7 +1300,7 @@ class Solver {
             }
         }
 
-        std::sort(literals.begin(), literals.end(),
+        pdqsort(literals.begin(), literals.end(),
                   [](const ConflictLiteral& lhs, const ConflictLiteral& rhs) {
                       if (lhs.variable != rhs.variable)
                           return lhs.variable < rhs.variable;
@@ -1749,7 +1750,7 @@ class Solver {
                                                       detail::ConflictGraph::variable_of(literal));
                                        }),
                         candidates.end());
-                    std::sort(candidates.begin(), candidates.end(), [&](int lhs, int rhs) {
+                    pdqsort(candidates.begin(), candidates.end(), [&](int lhs, int rhs) {
                         const double lhs_weight =
                             detail::ConflictGraph::literal_weight(relaxation.primal, lhs);
                         const double rhs_weight =

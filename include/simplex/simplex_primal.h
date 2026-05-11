@@ -273,7 +273,7 @@ class RevisedSimplexPrimalEngine {
         int xB_cache_age = 0;
         const int xB_max_age = std::max(1, self.opt_.refactor_every);
         auto refresh_xB_cache = [&]() {
-            xB_cache = read_basis().solve_B(b).value;
+            xB_cache = read_basis().solve_B(b, FTBasis::TranKind::ColAq).value;
             xB_cache_valid = true;
             xB_cache_age = 0;
         };
@@ -326,13 +326,13 @@ class RevisedSimplexPrimalEngine {
 
             Eigen::VectorXd y;
             try {
-                y = read_basis().solve_BT(cB);
+                y = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after solve_BT failure");
                 write_basis().refactor();
                 xB_cache_valid = false;
-                y = read_basis().solve_BT(cB);
+                y = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
                 if (self.opt_.pricing_rule == "adaptive") {
                     self.measure_pricing_build_(false, [&]() {
                         self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
@@ -419,11 +419,11 @@ class RevisedSimplexPrimalEngine {
 
             HVector dB;
             try {
-                dB = read_basis().solve_B(A.col(e));
+                dB = read_basis().solve_B(A.col(e), FTBasis::TranKind::ColAq);
             } catch (...) {
                 write_basis().refactor();
                 xB_cache_valid = false;
-                dB = read_basis().solve_B(A.col(e));
+                dB = read_basis().solve_B(A.col(e), FTBasis::TranKind::ColAq);
                 if (self.opt_.pricing_rule == "adaptive") {
                     self.measure_pricing_build_(false, [&]() {
                         self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);

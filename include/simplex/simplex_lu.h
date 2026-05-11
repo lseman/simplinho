@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Eigen/Dense>
+#include "../../extern/pdqsort/pdqsort.h"
 #include <Eigen/SVD>
 #include <Eigen/Sparse>
 
@@ -49,6 +50,10 @@ class FTBasis {
         double sparse_drop_tol = 0.0;
         std::string sparse_backend = "auto"; // "auto" | "pf" | "ft" | "eigen"
         bool sparse_equilibration = true;
+        // HiGHS uses indexed vector loops well beyond the hyper-sparse regime.
+        // Keep sparse RHS solves active up to this density so FTRAN/BTRAN can
+        // preserve useful reach patterns for pricing.
+        double sparse_rhs_density_threshold = 0.40;
 
         enum class UpdateMode { EtaStack, ForrestTomlin, Hybrid };
         UpdateMode update_mode = UpdateMode::Hybrid;
@@ -135,6 +140,46 @@ class FTBasis {
         double last_refactor_sanity_residual{0.0};
     };
 
+    // HiGHS-style per-class FTRAN/BTRAN expected-density tracking.
+    // ColAq := FTRAN of an entering column A_q (solve_B(a_e)).
+    // RowEp := BTRAN of a unit row e_p or basic-cost vector cB (solve_BT).
+    // RowAp := dense reduced-cost row after BTRAN — currently unused but reserved for symmetry.
+    // The solver feeds `count/m_` back after each call; the kernel reads `expected(kind)` to
+    // pick hyper vs sparse vs dense per triangular stage. EWMA mirrors HEkk:
+    //   density = (1-mult)*density + mult*local, mult = 0.05.
+    enum class TranKind { Unknown, ColAq, RowEp, RowAp };
+
+    struct DensityTracker {
+        static constexpr double kRunningAverageMultiplier = 0.05;
+        double col_aq{0.0};
+        double row_ep{0.0};
+        double row_ap{0.0};
+
+        double expected(TranKind k) const noexcept {
+            switch (k) {
+                case TranKind::ColAq: return col_aq;
+                case TranKind::RowEp: return row_ep;
+                case TranKind::RowAp: return row_ap;
+                default: return 1.0; // unknown ⇒ assume dense (force sparse_solve path)
+            }
+        }
+
+        void update(TranKind k, int count, int m) noexcept {
+            if (m <= 0 || k == TranKind::Unknown) return;
+            const double local =
+                std::clamp(static_cast<double>(count) / static_cast<double>(m), 0.0, 1.0);
+            double* slot = nullptr;
+            switch (k) {
+                case TranKind::ColAq: slot = &col_aq; break;
+                case TranKind::RowEp: slot = &row_ep; break;
+                case TranKind::RowAp: slot = &row_ap; break;
+                default: return;
+            }
+            *slot = (1.0 - kRunningAverageMultiplier) * (*slot) +
+                    kRunningAverageMultiplier * local;
+        }
+    };
+
     FTBasis(const DenseMat& A, const std::vector<int>& basis) : FTBasis(A, basis, Options{}) {}
 
     FTBasis(const DenseMat& A, const std::vector<int>& basis, const Options& opt)
@@ -182,13 +227,14 @@ class FTBasis {
         return HVector(std::move(v));
     }
 
-    HVector solve_B(const Eigen::VectorXd& b) const {
+    HVector solve_B(const Eigen::VectorXd& b, TranKind kind = TranKind::Unknown) const {
         if (b.size() != m_)
             throw std::invalid_argument("FTBasis::solve_B size mismatch");
 
         auto* self = const_cast<FTBasis*>(this);
+        const double expected = density_tracker_.expected(kind);
         auto do_solve = [&]() {
-            Eigen::VectorXd x = self->solve_B_fast_(b);
+            Eigen::VectorXd x = self->solve_B_fast_(b, expected);
             if (self->opt_.enable_iterative_refinement && !self->A_is_sparse_)
                 x = self->refine_solve_B_(b, x);
             return x;
@@ -197,7 +243,9 @@ class FTBasis {
         try {
             Eigen::VectorXd x = do_solve();
             self->verify_solve_quality_B_(b, x, "FTBasis::solve_B");
-            return HVector(std::move(x));
+            HVector out = wrap_with_pattern_(std::move(x), A_is_sparse_);
+            self->update_density_tracker_(kind, out);
+            return out;
         } catch (const std::exception& err) {
             if (!opt_.refactor_on_solve_failure)
                 throw;
@@ -207,24 +255,29 @@ class FTBasis {
 
             Eigen::VectorXd x = do_solve();
             self->verify_solve_quality_B_(b, x, "FTBasis::solve_B after refactor");
-            return HVector(std::move(x));
+            HVector out = wrap_with_pattern_(std::move(x), A_is_sparse_);
+            self->update_density_tracker_(kind, out);
+            return out;
         }
     }
 
     template <typename Derived>
-    HVector solve_B(const Eigen::SparseMatrixBase<Derived>& b_sparse) const {
+    HVector solve_B(const Eigen::SparseMatrixBase<Derived>& b_sparse,
+                    TranKind kind = TranKind::Unknown) const {
         if (b_sparse.rows() != m_ || b_sparse.cols() != 1)
             throw std::invalid_argument("FTBasis::solve_B sparse size mismatch");
         auto* self = const_cast<FTBasis*>(this);
         auto [seed_idx, seed_val] = sparse_vector_to_seed_data_(b_sparse.derived());
         const double rhs_density =
             m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;
-        const bool use_sparse_rhs = A_is_sparse_ && rhs_density < kSparseSolveDensityThreshold_;
+        const bool use_sparse_rhs =
+            A_is_sparse_ && rhs_density < sparse_rhs_density_threshold_();
         Eigen::VectorXd b = sparse_vector_to_dense_(b_sparse.derived(), m_);
+        const double expected = density_tracker_.expected(kind);
         auto do_solve = [&]() {
             if (use_sparse_rhs)
-                return self->lu_sparse_.solve_sparse(seed_idx, seed_val);
-            Eigen::VectorXd x = self->solve_B_fast_(b);
+                return self->lu_sparse_.solve_sparse(seed_idx, seed_val, expected);
+            Eigen::VectorXd x = self->solve_B_fast_(b, expected);
             if (self->opt_.enable_iterative_refinement && !self->A_is_sparse_)
                 x = self->refine_solve_B_(b, x);
             return x;
@@ -233,7 +286,9 @@ class FTBasis {
         try {
             Eigen::VectorXd x = do_solve();
             self->verify_solve_quality_B_(b, x, "FTBasis::solve_B sparse");
-            return wrap_with_pattern_(std::move(x), use_sparse_rhs);
+            HVector out = wrap_with_pattern_(std::move(x), use_sparse_rhs);
+            self->update_density_tracker_(kind, out);
+            return out;
         } catch (const std::exception& err) {
             if (!opt_.refactor_on_solve_failure)
                 throw;
@@ -243,17 +298,20 @@ class FTBasis {
 
             Eigen::VectorXd x = do_solve();
             self->verify_solve_quality_B_(b, x, "FTBasis::solve_B sparse after refactor");
-            return wrap_with_pattern_(std::move(x), use_sparse_rhs);
+            HVector out = wrap_with_pattern_(std::move(x), use_sparse_rhs);
+            self->update_density_tracker_(kind, out);
+            return out;
         }
     }
 
-    HVector solve_BT(const Eigen::VectorXd& c) const {
+    HVector solve_BT(const Eigen::VectorXd& c, TranKind kind = TranKind::Unknown) const {
         if (c.size() != m_)
             throw std::invalid_argument("FTBasis::solve_BT size mismatch");
 
         auto* self = const_cast<FTBasis*>(this);
+        const double expected = density_tracker_.expected(kind);
         auto do_solve = [&]() {
-            Eigen::VectorXd y = self->solve_BT_fast_(c);
+            Eigen::VectorXd y = self->solve_BT_fast_(c, expected);
             if (self->opt_.enable_iterative_refinement && !self->A_is_sparse_)
                 y = self->refine_solve_BT_(c, y);
             return y;
@@ -262,7 +320,9 @@ class FTBasis {
         try {
             Eigen::VectorXd y = do_solve();
             self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT");
-            return HVector(std::move(y));
+            HVector out = wrap_with_pattern_(std::move(y), A_is_sparse_);
+            self->update_density_tracker_(kind, out);
+            return out;
         } catch (const std::exception& err) {
             if (!opt_.refactor_on_solve_failure)
                 throw;
@@ -272,73 +332,88 @@ class FTBasis {
 
             Eigen::VectorXd y = do_solve();
             self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT after refactor");
-            return HVector(std::move(y));
+            HVector out = wrap_with_pattern_(std::move(y), A_is_sparse_);
+            self->update_density_tracker_(kind, out);
+            return out;
         }
     }
 
     // Fast path for canonical unit-vector RHS (most common case: row picks in pricing).
     // Routes directly to the sparse triangular solve using a single-seed index, avoiding
     // the O(m) zero-scan in the dense solve path.
-    HVector solve_B_unit(int i) const {
+    HVector solve_B_unit(int i, TranKind kind = TranKind::Unknown) const {
         if (i < 0 || i >= m_)
             throw std::invalid_argument("FTBasis::solve_B_unit index out of range");
         if (!A_is_sparse_) {
             Eigen::VectorXd e = Eigen::VectorXd::Zero(m_);
             e(i) = 1.0;
-            return solve_B(e);
+            return solve_B(e, kind);
         }
         auto* self = const_cast<FTBasis*>(this);
         static const std::vector<double> one_val{1.0};
         std::vector<int> seed{i};
-        auto do_solve = [&]() { return self->lu_sparse_.solve_sparse(seed, one_val); };
+        const double expected = density_tracker_.expected(kind);
+        auto do_solve = [&]() { return self->lu_sparse_.solve_sparse(seed, one_val, expected); };
         try {
-            return wrap_with_pattern_(do_solve(), true);
+            HVector out = wrap_with_pattern_(do_solve(), true);
+            self->update_density_tracker_(kind, out);
+            return out;
         } catch (const std::exception& err) {
             if (!opt_.refactor_on_solve_failure)
                 throw;
             self->last_update_diagnostic_ = err.what();
             self->refactor();
-            return wrap_with_pattern_(do_solve(), true);
+            HVector out = wrap_with_pattern_(do_solve(), true);
+            self->update_density_tracker_(kind, out);
+            return out;
         }
     }
 
-    HVector solve_BT_unit(int i) const {
+    HVector solve_BT_unit(int i, TranKind kind = TranKind::Unknown) const {
         if (i < 0 || i >= m_)
             throw std::invalid_argument("FTBasis::solve_BT_unit index out of range");
         if (!A_is_sparse_) {
             Eigen::VectorXd e = Eigen::VectorXd::Zero(m_);
             e(i) = 1.0;
-            return solve_BT(e);
+            return solve_BT(e, kind);
         }
         auto* self = const_cast<FTBasis*>(this);
         static const std::vector<double> one_val{1.0};
         std::vector<int> seed{i};
-        auto do_solve = [&]() { return self->lu_sparse_.solveT_sparse(seed, one_val); };
+        const double expected = density_tracker_.expected(kind);
+        auto do_solve = [&]() { return self->lu_sparse_.solveT_sparse(seed, one_val, expected); };
         try {
-            return wrap_with_pattern_(do_solve(), true);
+            HVector out = wrap_with_pattern_(do_solve(), true);
+            self->update_density_tracker_(kind, out);
+            return out;
         } catch (const std::exception& err) {
             if (!opt_.refactor_on_solve_failure)
                 throw;
             self->last_update_diagnostic_ = err.what();
             self->refactor();
-            return wrap_with_pattern_(do_solve(), true);
+            HVector out = wrap_with_pattern_(do_solve(), true);
+            self->update_density_tracker_(kind, out);
+            return out;
         }
     }
 
     template <typename Derived>
-    HVector solve_BT(const Eigen::SparseMatrixBase<Derived>& c_sparse) const {
+    HVector solve_BT(const Eigen::SparseMatrixBase<Derived>& c_sparse,
+                     TranKind kind = TranKind::Unknown) const {
         if (c_sparse.rows() != m_ || c_sparse.cols() != 1)
             throw std::invalid_argument("FTBasis::solve_BT sparse size mismatch");
         auto* self = const_cast<FTBasis*>(this);
         auto [seed_idx, seed_val] = sparse_vector_to_seed_data_(c_sparse.derived());
         const double rhs_density =
             m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;
-        const bool use_sparse_rhs = A_is_sparse_ && rhs_density < kSparseSolveDensityThreshold_;
+        const bool use_sparse_rhs =
+            A_is_sparse_ && rhs_density < sparse_rhs_density_threshold_();
         Eigen::VectorXd c = sparse_vector_to_dense_(c_sparse.derived(), m_);
+        const double expected = density_tracker_.expected(kind);
         auto do_solve = [&]() {
             if (use_sparse_rhs)
-                return self->lu_sparse_.solveT_sparse(seed_idx, seed_val);
-            Eigen::VectorXd y = self->solve_BT_fast_(c);
+                return self->lu_sparse_.solveT_sparse(seed_idx, seed_val, expected);
+            Eigen::VectorXd y = self->solve_BT_fast_(c, expected);
             if (self->opt_.enable_iterative_refinement && !self->A_is_sparse_)
                 y = self->refine_solve_BT_(c, y);
             return y;
@@ -347,7 +422,9 @@ class FTBasis {
         try {
             Eigen::VectorXd y = do_solve();
             self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT sparse");
-            return wrap_with_pattern_(std::move(y), use_sparse_rhs);
+            HVector out = wrap_with_pattern_(std::move(y), use_sparse_rhs);
+            self->update_density_tracker_(kind, out);
+            return out;
         } catch (const std::exception& err) {
             if (!opt_.refactor_on_solve_failure)
                 throw;
@@ -357,9 +434,14 @@ class FTBasis {
 
             Eigen::VectorXd y = do_solve();
             self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT sparse after refactor");
-            return wrap_with_pattern_(std::move(y), use_sparse_rhs);
+            HVector out = wrap_with_pattern_(std::move(y), use_sparse_rhs);
+            self->update_density_tracker_(kind, out);
+            return out;
         }
     }
+
+    // Read-only access to the density tracker (debug + tests).
+    const DensityTracker& density_tracker() const noexcept { return density_tracker_; }
 
     void replace_column(int j, const Eigen::VectorXd& new_col_dense) {
         replace_column_impl_(j, std::nullopt, new_col_dense);
@@ -448,8 +530,6 @@ class FTBasis {
     }
 
   private:
-    static constexpr double kSparseSolveDensityThreshold_ = 0.05;
-
     static std::vector<int> permutation_to_vector_(const Permutation& perm) {
         std::vector<int> out(static_cast<size_t>(perm.indices().size()));
         for (int i = 0; i < perm.indices().size(); ++i)
@@ -497,7 +577,7 @@ class FTBasis {
         }
         for (int row = 0; row < B.rows(); ++row) {
             auto& cols = row_cols[static_cast<size_t>(row)];
-            std::sort(cols.begin(), cols.end());
+            pdqsort(cols.begin(), cols.end());
             cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
             csr.indptr[row + 1] = csr.indptr[row] + static_cast<int>(cols.size());
             csr.indices.insert(csr.indices.end(), cols.begin(), cols.end());
@@ -515,6 +595,12 @@ class FTBasis {
             seen[static_cast<size_t>(entry)] = 1;
         }
         return true;
+    }
+
+    double sparse_rhs_density_threshold_() const noexcept {
+        if (!std::isfinite(opt_.sparse_rhs_density_threshold))
+            return 0.40;
+        return std::clamp(opt_.sparse_rhs_density_threshold, 0.0, 1.0);
     }
 
     void compute_sparse_ordering_(const SparseMat& B) {
@@ -874,24 +960,33 @@ class FTBasis {
 
     // ----------------------------
     // Base solves / fast solves
+    //
+    // expected_density is the HiGHS-style EWMA of (count/m_) for this TRAN
+    // class. It propagates into the sparse LU's per-stage hyper/sparse gating.
+    // For dense LU it's ignored (Markowitz LU uses dense back-/forward-solves
+    // with no hyper-sparse path to gate).
     // ----------------------------
-    Eigen::VectorXd base_solve_B_(const Eigen::VectorXd& b) const {
-        return A_is_sparse_ ? lu_sparse_.solve(b) : lu_dense_.solve(b);
+    Eigen::VectorXd base_solve_B_(const Eigen::VectorXd& b,
+                                  double expected_density = 1.0) const {
+        return A_is_sparse_ ? lu_sparse_.solve(b, expected_density) : lu_dense_.solve(b);
     }
 
-    Eigen::VectorXd base_solve_BT_(const Eigen::VectorXd& c) const {
-        return A_is_sparse_ ? lu_sparse_.solveT(c) : lu_dense_.solveT(c);
+    Eigen::VectorXd base_solve_BT_(const Eigen::VectorXd& c,
+                                   double expected_density = 1.0) const {
+        return A_is_sparse_ ? lu_sparse_.solveT(c, expected_density) : lu_dense_.solveT(c);
     }
 
-    Eigen::VectorXd solve_B_fast_(const Eigen::VectorXd& b) const {
-        Eigen::VectorXd x = base_solve_B_(b);
+    Eigen::VectorXd solve_B_fast_(const Eigen::VectorXd& b,
+                                  double expected_density = 1.0) const {
+        Eigen::VectorXd x = base_solve_B_(b, expected_density);
         if (!A_is_sparse_ && !etas_.empty())
             x = apply_etas_solve_(x);
         return x;
     }
 
-    Eigen::VectorXd solve_BT_fast_(const Eigen::VectorXd& c) const {
-        Eigen::VectorXd y = base_solve_BT_(c);
+    Eigen::VectorXd solve_BT_fast_(const Eigen::VectorXd& c,
+                                   double expected_density = 1.0) const {
+        Eigen::VectorXd y = base_solve_BT_(c, expected_density);
         if (!A_is_sparse_ && !etas_.empty())
             y = apply_etas_solve_T_(y);
         return y;
@@ -1582,6 +1677,30 @@ class FTBasis {
         std::vector<SparseMat> Bcols_sparse;
     };
     std::optional<Snapshot> backtracking_snapshot_;
+
+    // HiGHS-style per-class FTRAN/BTRAN density EWMA. Survives refactor() —
+    // density is treated as a property of the LP, not the basis.
+    DensityTracker density_tracker_;
+
+    // Feed the result count back into the EWMA after a tagged solve.
+    // When the result has a known sparse pattern (HVector::has_pattern()),
+    // we use that count directly; otherwise scan the dense vector for
+    // entries above kSparsePatternTol_.
+    static constexpr double kDensityScanTol_ = 1e-14;
+    void update_density_tracker_(TranKind kind, const HVector& out) {
+        if (kind == TranKind::Unknown || m_ <= 0)
+            return;
+        int count;
+        if (out.has_pattern()) {
+            count = out.count;
+        } else {
+            count = 0;
+            for (Eigen::Index i = 0; i < out.value.size(); ++i)
+                if (std::abs(out.value(i)) > kDensityScanTol_)
+                    ++count;
+        }
+        density_tracker_.update(kind, count, m_);
+    }
 
     void put_backtracking_basis_() {
         Snapshot snap;

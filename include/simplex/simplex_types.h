@@ -148,6 +148,7 @@ struct RevisedSimplexOptions {
     bool basis_aggressive_residual_rebuild = true;
     std::string basis_sparse_backend = "auto"; // "auto" | "pf" | "ft" | "eigen"
     bool basis_sparse_equilibration = true;
+    double basis_sparse_rhs_density_threshold = 0.40;
 
     // Pricing
     int devex_reset = 100;

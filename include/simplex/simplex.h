@@ -2225,6 +2225,7 @@ class RevisedSimplex {
         bopt.aggressive_refactor_on_suspicious_residual = opt_.basis_aggressive_residual_rebuild;
         bopt.sparse_backend = opt_.basis_sparse_backend;
         bopt.sparse_equilibration = opt_.basis_sparse_equilibration;
+        bopt.sparse_rhs_density_threshold = opt_.basis_sparse_rhs_density_threshold;
 
         std::string mode = opt_.basis_update;
         std::transform(mode.begin(), mode.end(), mode.begin(),

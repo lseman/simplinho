@@ -781,40 +781,13 @@ highs_lifted_binary_cover_cut_(const CanonicalKnapsack& kn, const BinaryCoverPar
     return std::make_tuple(std::move(indices), std::move(values), cut_rhs);
 }
 
-bool validate_lifted_binary_cover_cut_(const CanonicalKnapsack& kn,
-                                       const std::vector<int>& indices,
-                                       const std::vector<double>& values, double rhs,
-                                       double tol = 1e-8) {
-    const int n = static_cast<int>(kn.variables.size());
-    if (!kn.valid || n < 2 || indices.size() != values.size() || !std::isfinite(kn.rhs) ||
-        kn.rhs < -tol || !std::isfinite(rhs)) {
+bool validate_binary_knapsack_cut_activity_(const std::vector<double>& weights,
+                                            const std::vector<double>& profits,
+                                            double knapsack_rhs, double constant,
+                                            double cut_rhs, double tol = 1e-8) {
+    if (weights.size() != profits.size() || weights.empty() || !std::isfinite(knapsack_rhs) ||
+        knapsack_rhs < -tol || !std::isfinite(constant) || !std::isfinite(cut_rhs)) {
         return false;
-    }
-
-    std::unordered_map<int, int> position_of;
-    position_of.reserve(kn.variables.size());
-    for (int pos = 0; pos < n; ++pos) {
-        position_of.emplace(kn.variables[pos], pos);
-    }
-
-    double constant = 0.0;
-    std::vector<double> profits(static_cast<std::size_t>(n), 0.0);
-    for (int k = 0; k < static_cast<int>(indices.size()); ++k) {
-        const auto it = position_of.find(indices[k]);
-        if (it == position_of.end()) {
-            return false;
-        }
-        const int pos = it->second;
-        const double coeff = values[k];
-        if (!std::isfinite(coeff)) {
-            return false;
-        }
-        if (kn.complemented[pos]) {
-            constant += coeff;
-            profits[static_cast<std::size_t>(pos)] -= coeff;
-        } else {
-            profits[static_cast<std::size_t>(pos)] += coeff;
-        }
     }
 
     struct Item {
@@ -822,10 +795,10 @@ bool validate_lifted_binary_cover_cut_(const CanonicalKnapsack& kn,
         double profit = 0.0;
     };
     std::vector<Item> items;
-    items.reserve(static_cast<std::size_t>(n));
-    for (int pos = 0; pos < n; ++pos) {
+    items.reserve(weights.size());
+    for (int pos = 0; pos < static_cast<int>(weights.size()); ++pos) {
         const double profit = profits[static_cast<std::size_t>(pos)];
-        const double weight = kn.coeffs[static_cast<std::size_t>(pos)];
+        const double weight = weights[static_cast<std::size_t>(pos)];
         if (profit <= tol) {
             continue;
         }
@@ -864,7 +837,7 @@ bool validate_lifted_binary_cover_cut_(const CanonicalKnapsack& kn,
     };
     double best = 0.0;
     std::vector<State> stack;
-    stack.push_back(State{0, std::max(0.0, kn.rhs), 0.0});
+    stack.push_back(State{0, std::max(0.0, knapsack_rhs), 0.0});
     int visited = 0;
     constexpr int kMaxValidationNodes = 200'000;
     while (!stack.empty()) {
@@ -889,8 +862,96 @@ bool validate_lifted_binary_cover_cut_(const CanonicalKnapsack& kn,
     }
 
     const double max_activity = constant + best;
-    const double scale = std::max({1.0, std::abs(max_activity), std::abs(rhs)});
-    return max_activity <= rhs + std::max(1e-7, 1e-8 * scale);
+    const double scale = std::max({1.0, std::abs(max_activity), std::abs(cut_rhs)});
+    return max_activity <= cut_rhs + std::max(1e-7, 1e-8 * scale);
+}
+
+bool validate_lifted_binary_cover_cut_(const CanonicalKnapsack& kn,
+                                       const std::vector<int>& indices,
+                                       const std::vector<double>& values, double rhs,
+                                       double tol = 1e-8) {
+    const int n = static_cast<int>(kn.variables.size());
+    if (!kn.valid || n < 2 || indices.size() != values.size() || !std::isfinite(kn.rhs) ||
+        kn.rhs < -tol || !std::isfinite(rhs)) {
+        return false;
+    }
+
+    std::unordered_map<int, int> position_of;
+    position_of.reserve(kn.variables.size());
+    for (int pos = 0; pos < n; ++pos) {
+        position_of.emplace(kn.variables[pos], pos);
+    }
+
+    double constant = 0.0;
+    std::vector<double> profits(static_cast<std::size_t>(n), 0.0);
+    for (int k = 0; k < static_cast<int>(indices.size()); ++k) {
+        const auto it = position_of.find(indices[k]);
+        if (it == position_of.end()) {
+            return false;
+        }
+        const int pos = it->second;
+        const double coeff = values[k];
+        if (!std::isfinite(coeff)) {
+            return false;
+        }
+        if (kn.complemented[pos]) {
+            constant += coeff;
+            profits[static_cast<std::size_t>(pos)] -= coeff;
+        } else {
+            profits[static_cast<std::size_t>(pos)] += coeff;
+        }
+    }
+
+    return validate_binary_knapsack_cut_activity_(kn.coeffs, profits, kn.rhs, constant, rhs, tol);
+}
+
+bool validate_literal_cover_cut_(const std::vector<CoverLiteralTerm>& terms,
+                                 const std::vector<int>& indices,
+                                 const std::vector<double>& values, double rhs,
+                                 double knapsack_rhs, double tol = 1e-8) {
+    if (terms.size() < 2 || indices.size() != values.size() || !std::isfinite(knapsack_rhs) ||
+        !std::isfinite(rhs)) {
+        return false;
+    }
+
+    std::unordered_map<int, int> position_of;
+    position_of.reserve(terms.size());
+    std::vector<double> weights;
+    weights.reserve(terms.size());
+    for (int pos = 0; pos < static_cast<int>(terms.size()); ++pos) {
+        const int variable = ConflictGraph::variable_of(terms[static_cast<std::size_t>(pos)].literal);
+        if (variable < 0 || position_of.contains(variable) ||
+            !(terms[static_cast<std::size_t>(pos)].coeff > tol)) {
+            return false;
+        }
+        position_of.emplace(variable, pos);
+        weights.push_back(terms[static_cast<std::size_t>(pos)].coeff);
+    }
+
+    double constant = 0.0;
+    std::vector<double> profits(terms.size(), 0.0);
+    for (int k = 0; k < static_cast<int>(indices.size()); ++k) {
+        const auto it = position_of.find(indices[k]);
+        if (it == position_of.end()) {
+            return false;
+        }
+        const int pos = it->second;
+        const double coeff = values[k];
+        if (!std::isfinite(coeff)) {
+            return false;
+        }
+        const bool literal_is_one =
+            ConflictGraph::value_of(terms[static_cast<std::size_t>(pos)].literal);
+        if (literal_is_one) {
+            profits[static_cast<std::size_t>(pos)] += coeff;
+        } else {
+            constant += coeff;
+            profits[static_cast<std::size_t>(pos)] -= coeff;
+        }
+    }
+
+    return validate_binary_knapsack_cut_activity_(weights, profits, knapsack_rhs, constant, rhs,
+                                                  tol);
 }
 
 std::vector<int> minimize_binary_cover_positions_(std::vector<int> positions,
@@ -4261,6 +4322,7 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
         CanonicalKnapsack kn = build_canonical_binary_knapsack_(problem, relaxation, row);
         if (kn.valid && kn.variables.size() >= 2 && !std::isfinite(kn.rhs) == false &&
             kn.rhs >= 0.0) {
+            const std::vector<CoverLiteralTerm> canonical_terms = canonical_binary_cover_terms_(kn);
             std::vector<std::vector<int>> candidate_literal_covers;
             auto queue_literal_cover = [&](std::vector<int> cover_literals) {
                 if (cover_literals.size() < 2) {
@@ -4294,6 +4356,48 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
                     }
                     if (!validate_lifted_binary_cover_cut_(kn, cut.indices, cut.values,
                                                             cut.rhs)) {
+                        return;
+                    }
+                    const double violation = cut_violation(cut, relaxation.primal);
+                    if (violation <= options.min_cut_violation) {
+                        return;
+                    }
+                    cut.strength = violation;
+                    const CutSignature signature = cut_signature(cut);
+                    if (!signatures.insert(signature).second) {
+                        return;
+                    }
+                    cuts.push_back(std::move(cut));
+                };
+            auto maybe_add_validated_literal_cover =
+                [&](const std::vector<CoverLiteralTerm>& terms, double rhs,
+                    const std::vector<int>& literals, const std::string& cut_type) {
+                    if (literals.size() < 2 || !std::isfinite(rhs)) {
+                        return;
+                    }
+                    Cut cut;
+                    cut.sense = LinearConstraintSense::LessEqual;
+                    cut.rhs = static_cast<double>(literals.size() - 1);
+                    cut.cut_type = cut_type;
+                    for (int literal : literals) {
+                        const int variable = ConflictGraph::variable_of(literal);
+                        if (variable < 0 ||
+                            variable >= static_cast<int>(problem.variable_types.size())) {
+                            continue;
+                        }
+                        cut.indices.push_back(variable);
+                        if (ConflictGraph::value_of(literal)) {
+                            cut.values.push_back(1.0);
+                        } else {
+                            cut.values.push_back(-1.0);
+                            cut.rhs -= 1.0;
+                        }
+                    }
+                    if (!postprocess_cover_cut_(problem, options, &cut) || cut.indices.empty()) {
+                        return;
+                    }
+                    if (!validate_literal_cover_cut_(terms, cut.indices, cut.values, cut.rhs,
+                                                     rhs)) {
                         return;
                     }
                     const double violation = cut_violation(cut, relaxation.primal);
@@ -4359,6 +4463,10 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
             for (const std::vector<int>& cover_literals : candidate_literal_covers) {
                 maybe_add_cover_cut_(problem, relaxation, options, cover_literals, "Cover",
                                      &signatures, &cuts);
+                const std::vector<int> lifted_cover_literals =
+                    extend_cover_literals_(canonical_terms, cover_literals, kn.rhs);
+                maybe_add_validated_literal_cover(canonical_terms, kn.rhs, lifted_cover_literals,
+                                                  "LiftedCoverLite");
             }
             if (!candidate_literal_covers.empty()) {
                 return;
@@ -4387,6 +4495,46 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
                              &cuts);
         maybe_add_cover_cut_(problem, relaxation, options, ratio_cover, base_type, &signatures,
                              &cuts);
+        auto maybe_add_validated_mixed_lift = [&](const std::vector<int>& literals) {
+            if (literals.size() < 2)
+                return;
+            Cut cut;
+            cut.sense = LinearConstraintSense::LessEqual;
+            cut.rhs = static_cast<double>(literals.size() - 1);
+            cut.cut_type =
+                context.has_nonbinary_component ? "LiftedMixedBinaryCover" : "LiftedCoverLite";
+            for (int literal : literals) {
+                const int variable = ConflictGraph::variable_of(literal);
+                if (variable < 0 || variable >= static_cast<int>(problem.variable_types.size()))
+                    continue;
+                cut.indices.push_back(variable);
+                if (ConflictGraph::value_of(literal)) {
+                    cut.values.push_back(1.0);
+                } else {
+                    cut.values.push_back(-1.0);
+                    cut.rhs -= 1.0;
+                }
+            }
+            if (!postprocess_cover_cut_(problem, options, &cut) || cut.indices.empty())
+                return;
+            if (!validate_literal_cover_cut_(context.literals, cut.indices, cut.values, cut.rhs,
+                                             context.rhs))
+                return;
+            const double violation = cut_violation(cut, relaxation.primal);
+            if (violation <= options.min_cut_violation)
+                return;
+            cut.strength = violation;
+            const CutSignature signature = cut_signature(cut);
+            if (!signatures.insert(signature).second)
+                return;
+            cuts.push_back(std::move(cut));
+        };
+        maybe_add_validated_mixed_lift(
+            extend_cover_literals_(context.literals, activity_cover, context.rhs));
+        maybe_add_validated_mixed_lift(
+            extend_cover_literals_(context.literals, coeff_cover, context.rhs));
+        maybe_add_validated_mixed_lift(
+            extend_cover_literals_(context.literals, ratio_cover, context.rhs));
     };
 
     if (!selected_rows.empty()) {

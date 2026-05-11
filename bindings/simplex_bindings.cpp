@@ -279,6 +279,8 @@ void bind_simplex_bindings(py::module_& m) {
         .def_readwrite("basis_sparse_backend", &RevisedSimplexOptions::basis_sparse_backend)
         .def_readwrite("basis_sparse_equilibration",
                        &RevisedSimplexOptions::basis_sparse_equilibration)
+        .def_readwrite("basis_sparse_rhs_density_threshold",
+                       &RevisedSimplexOptions::basis_sparse_rhs_density_threshold)
         .def_readwrite("devex_reset", &RevisedSimplexOptions::devex_reset)
         .def_readwrite("pricing_rule", &RevisedSimplexOptions::pricing_rule)
         .def_readwrite("adaptive_reset_freq", &RevisedSimplexOptions::adaptive_reset_freq)

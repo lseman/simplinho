@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include "../../extern/pdqsort/pdqsort.h"
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -132,7 +133,7 @@ inline void extract_binary_knapsack_cliques(const NormalizedCliqueRow& row,
 
     std::vector<int> order(row.literals.size(), 0);
     std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(), [&](int lhs, int rhs_idx) {
+    pdqsort(order.begin(), order.end(), [&](int lhs, int rhs_idx) {
         if (std::abs(row.coeffs[lhs] - row.coeffs[rhs_idx]) > 1e-12)
             return row.coeffs[lhs] < row.coeffs[rhs_idx];
         return row.literals[lhs] < row.literals[rhs_idx];
@@ -154,7 +155,7 @@ inline void extract_binary_knapsack_cliques(const NormalizedCliqueRow& row,
     auto push_clique = [&](std::vector<int> clique) {
         if (static_cast<int>(cliques->size()) >= max_cliques || clique.size() < 2)
             return;
-        std::sort(clique.begin(), clique.end());
+        pdqsort(clique.begin(), clique.end());
         clique.erase(std::unique(clique.begin(), clique.end()), clique.end());
         if (clique.size() >= 2)
             cliques->push_back(std::move(clique));
@@ -319,11 +320,11 @@ class ConflictGraph {
 
     void finalize() {
         for (auto& neighbors : adjacency_) {
-            std::sort(neighbors.begin(), neighbors.end());
+            pdqsort(neighbors.begin(), neighbors.end());
             neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
         }
         for (auto& refs : literal_clique_refs_) {
-            std::sort(refs.begin(), refs.end());
+            pdqsort(refs.begin(), refs.end());
             refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
         }
         rebuild_query_cache_();
@@ -340,7 +341,7 @@ class ConflictGraph {
                 out.insert(out.end(), clique.begin(), clique.end());
             }
             out.erase(std::remove(out.begin(), out.end(), literal), out.end());
-            std::sort(out.begin(), out.end());
+            pdqsort(out.begin(), out.end());
             out.erase(std::unique(out.begin(), out.end()), out.end());
             neighbor_degrees_[literal] = static_cast<int>(out.size());
         }
@@ -361,7 +362,7 @@ class ConflictGraph {
     }
 
     void add_clique(std::vector<int> clique) {
-        std::sort(clique.begin(), clique.end());
+        pdqsort(clique.begin(), clique.end());
         clique.erase(std::unique(clique.begin(), clique.end()), clique.end());
         if (clique.size() < 2)
             return;

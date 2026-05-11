@@ -1104,7 +1104,7 @@ inline std::vector<int> RevisedSimplex::rank_remaining_columns_(const Eigen::Mat
         if (!used_col[j])
             ranked.push_back(j);
     }
-    std::sort(ranked.begin(), ranked.end(), [&](int a, int b_idx) {
+    pdqsort(ranked.begin(), ranked.end(), [&](int a, int b_idx) {
         const double score_a = col_nnz[a] + cfg.cost_penalty * std::abs(c(a)) +
                                cfg.jitter * std::sin(static_cast<double>(a + 1)) +
                                seed_column_bonus_(a, seeded, cfg);
@@ -1138,7 +1138,7 @@ inline std::vector<int> RevisedSimplex::rank_remaining_columns_(const SparseMatr
         if (!used_col[j])
             ranked.push_back(j);
     }
-    std::sort(ranked.begin(), ranked.end(), [&](int a, int b_idx) {
+    pdqsort(ranked.begin(), ranked.end(), [&](int a, int b_idx) {
         const double score_a = col_nnz[a] + cfg.cost_penalty * std::abs(c(a)) +
                                cfg.jitter * std::sin(static_cast<double>(a + 1)) +
                                seed_column_bonus_(a, seeded, cfg);
@@ -1201,7 +1201,7 @@ RevisedSimplex::improve_basis_by_swaps_(const Eigen::MatrixXd& A, const Eigen::V
         for (int j = 0; j < n; ++j)
             if (!in_basis[j])
                 nonbasic.push_back(j);
-        std::sort(nonbasic.begin(), nonbasic.end(), [&](int a, int b_idx) {
+        pdqsort(nonbasic.begin(), nonbasic.end(), [&](int a, int b_idx) {
             const double score_a = col_nnz[a] + col_weight[a];
             const double score_b = col_nnz[b_idx] + col_weight[b_idx];
             if (std::abs(score_a - score_b) > 1e-12)
@@ -1221,7 +1221,7 @@ RevisedSimplex::improve_basis_by_swaps_(const Eigen::MatrixXd& A, const Eigen::V
                 score *= 0.75;
             position_priority.emplace_back(score, p);
         }
-        std::sort(position_priority.begin(), position_priority.end(), std::greater<>());
+        pdqsort(position_priority.begin(), position_priority.end(), std::greater<>());
         const int position_limit = std::min(m, cfg.max_swap_candidates);
         std::vector<int> positions;
         positions.reserve(position_limit);
@@ -1311,7 +1311,7 @@ RevisedSimplex::improve_basis_by_swaps_(const SparseMatrix& A, const Eigen::Vect
         for (int j = 0; j < n; ++j)
             if (!in_basis[j])
                 nonbasic.push_back(j);
-        std::sort(nonbasic.begin(), nonbasic.end(), [&](int a, int b_idx) {
+        pdqsort(nonbasic.begin(), nonbasic.end(), [&](int a, int b_idx) {
             const double score_a = col_nnz[a] + col_weight[a];
             const double score_b = col_nnz[b_idx] + col_weight[b_idx];
             if (std::abs(score_a - score_b) > 1e-12)
@@ -1331,7 +1331,7 @@ RevisedSimplex::improve_basis_by_swaps_(const SparseMatrix& A, const Eigen::Vect
                 score *= 0.75;
             position_priority.emplace_back(score, p);
         }
-        std::sort(position_priority.begin(), position_priority.end(), std::greater<>());
+        pdqsort(position_priority.begin(), position_priority.end(), std::greater<>());
         const int position_limit = std::min(m, cfg.max_swap_candidates);
         std::vector<int> positions;
         positions.reserve(position_limit);

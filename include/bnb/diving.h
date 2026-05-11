@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Eigen/Dense>
+#include "../../extern/pdqsort/pdqsort.h"
 
 #include <algorithm>
 #include <cmath>
@@ -70,7 +71,7 @@ inline void prepare_child_state_for_relaxation(ChildState* child) {
         child->reasons = std::make_shared<NodeReasonStore>(*child->reasons);
     }
     if (child->changed_variables_hint.size() > 1) {
-        std::sort(child->changed_variables_hint.begin(), child->changed_variables_hint.end());
+        pdqsort(child->changed_variables_hint.begin(), child->changed_variables_hint.end());
         child->changed_variables_hint.erase(
             std::unique(child->changed_variables_hint.begin(), child->changed_variables_hint.end()),
             child->changed_variables_hint.end());
@@ -108,9 +109,9 @@ inline std::vector<FractionalCandidate> collect_fractional_candidates(
     if (max_candidates < out.size()) {
         std::nth_element(out.begin(), out.begin() + max_candidates, out.end(), cmp);
         out.resize(max_candidates);
-        std::sort(out.begin(), out.end(), cmp);
+        pdqsort(out.begin(), out.end(), cmp);
     } else {
-        std::sort(out.begin(), out.end(), cmp);
+        pdqsort(out.begin(), out.end(), cmp);
     }
     return out;
 }

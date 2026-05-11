@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Eigen/Dense>
+#include "../../extern/pdqsort/pdqsort.h"
 #include <Eigen/LU> // for FullPivLU
 #include <algorithm>
 #include <cmath>
@@ -457,7 +458,7 @@ class MarkowitzLU {
             }
         }
 
-        std::sort(rows.begin(), rows.end(),
+        pdqsort(rows.begin(), rows.end(),
                   [&](int a, int b) { return row_deg_[a] < row_deg_[b]; });
 
         for (const int i : rows) {
@@ -542,7 +543,7 @@ class MarkowitzLU {
             return {-1, -1};
         }
 
-        std::sort(rows.begin(), rows.end(),
+        pdqsort(rows.begin(), rows.end(),
                   [&](int a, int b) { return row_deg_[a] < row_deg_[b]; });
 
         const int stride = std::max(1, static_cast<int>(rows.size()) / sample_rows);

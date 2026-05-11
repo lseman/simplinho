@@ -5,6 +5,7 @@
 // (Optional) parallel loops: add -fopenmp
 
 #include <algorithm>
+#include "../../extern/pdqsort/pdqsort.h"
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -104,7 +105,7 @@ struct CSR {
             }
             auto beg = U.indices.begin() + U.indptr[i];
             auto end = U.indices.begin() + wr[i];
-            std::sort(beg, end);
+            pdqsort(beg, end);
             end = std::unique(beg, end);
             wr[i] = (i32)std::distance(U.indices.begin(), end);
         }
@@ -450,7 +451,7 @@ class AMDReorderingArray {
             // Emit reps in supervariable group (sorted for determinism)
             auto& grp = sv_members_[piv];
             if (!grp.empty()) {
-                std::sort(grp.begin(), grp.end());
+                pdqsort(grp.begin(), grp.end());
                 for (i32 g : grp)
                     if (!in_order_[g]) {
                         order_.push_back(g);
@@ -487,7 +488,7 @@ class AMDReorderingArray {
         }
         elen_[e] = wr - pe;
         if (elen_[e] > 1)
-            std::sort(iw_.begin() + pe, iw_.begin() + pe + elen_[e]);
+            pdqsort(iw_.begin() + pe, iw_.begin() + pe + elen_[e]);
         return elen_[e];
     }
 
@@ -584,7 +585,7 @@ class AMDReorderingArray {
         // ensure sorted once
         for (i32 e : elems)
             if (elem_active_[e] && elen_[e] > 0)
-                std::sort(iw_.begin() + pe_[e], iw_.begin() + pe_[e] + elen_[e]);
+                pdqsort(iw_.begin() + pe_[e], iw_.begin() + pe_[e] + elen_[e]);
 
         for (i32 e : elems)
             if (elem_active_[e] && elen_[e] > 0)
@@ -636,7 +637,7 @@ class AMDReorderingArray {
                 if (a >= 0 && a < nsym_ && elen_[a] >= 0 && elem_active_[a])
                     tmp.push_back(a);
             }
-            std::sort(tmp.begin(), tmp.end());
+            pdqsort(tmp.begin(), tmp.end());
             dedup_sorted_inplace(tmp);
             uint64_t h = hash_sorted_ids_(tmp.data(), (i32)tmp.size());
             // cache set for later exact compares
@@ -744,7 +745,7 @@ class AMDReorderingArray {
             }
             elen_[e] = wr - s;
             if (elen_[e] > 1)
-                std::sort(iw_.begin() + s, iw_.begin() + s + elen_[e]);
+                pdqsort(iw_.begin() + s, iw_.begin() + s + elen_[e]);
         }
         len_[u] = 0;
     }
@@ -935,7 +936,7 @@ class AMDReorderingArray {
         return e;
     }
     void store_element_varlist_(i32 e, std::vector<i32> vlist) {
-        std::sort(vlist.begin(), vlist.end());
+        pdqsort(vlist.begin(), vlist.end());
         dedup_sorted_inplace(vlist);
         const i32 need = (i32)vlist.size();
         const i32 pos = reserve_space_(need);
@@ -1036,7 +1037,7 @@ class AMDReorderingArray {
             if (sort_cols) {
                 auto beg = B.indices.begin() + B.indptr[i];
                 auto end = B.indices.begin() + out;
-                std::sort(beg, end);
+                pdqsort(beg, end);
                 if (dedup) {
                     auto new_end = std::unique(beg, end);
                     (void)new_end; // second pass compacts
@@ -1111,7 +1112,7 @@ static CSR random_erdos_renyi(i32 n, double p, std::mt19937_64& rng) {
     CSR A(n);
     A.indptr[0] = 0;
     for (i32 i = 0; i < n; ++i) {
-        std::sort(rows[i].begin(), rows[i].end());
+        pdqsort(rows[i].begin(), rows[i].end());
         dedup_sorted_inplace(rows[i]);
         A.indptr[i + 1] = A.indptr[i] + (i32)rows[i].size();
     }

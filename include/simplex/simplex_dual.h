@@ -1,6 +1,7 @@
 #pragma once
 
 #include <type_traits>
+#include "../../extern/pdqsort/pdqsort.h"
 #include <future>
 
 class RevisedSimplexDualEngine {
@@ -440,7 +441,7 @@ class RevisedSimplexDualEngine {
             events.push_back({tau_k, k});
         }
 
-        std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) {
+        pdqsort(events.begin(), events.end(), [](const Event& a, const Event& b) {
             if (std::abs(a.tau - b.tau) > 1e-16)
                 return a.tau < b.tau;
             return a.rel < b.rel;
@@ -635,7 +636,7 @@ class RevisedSimplexDualEngine {
             Eigen::VectorXd cB(m);
             for (int i = 0; i < m; ++i)
                 cB(i) = chat(basis[i]);
-            Eigen::VectorXd ydual = read_basis().solve_BT(cB);
+            Eigen::VectorXd ydual = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
             apply_views_to_nonbasics(ydual);
         }
         if (!reused_warm_state) {
@@ -738,7 +739,7 @@ class RevisedSimplexDualEngine {
         int yB_cache_age = 0;
         const int yB_max_age = std::max(1, self.opt_.refactor_every);
         auto refresh_yB_cache = [&]() {
-            yB_cache = read_basis().solve_B(rhs_eff).value;
+            yB_cache = read_basis().solve_B(rhs_eff, FTBasis::TranKind::ColAq).value;
             yB_cache_valid = true;
             yB_cache_age = 0;
         };
@@ -788,7 +789,7 @@ class RevisedSimplexDualEngine {
                     cB(i) = chat(basis[i]);
                 if (!ydual_cached) {
                     try {
-                        ydual = read_basis().solve_BT(cB);
+                        ydual = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
                         ydual_cached = true;
                     } catch (...) {
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
@@ -798,7 +799,7 @@ class RevisedSimplexDualEngine {
                                 "dual pricing rebuild failed after solve_BT", iters)) {
                             return *failed;
                         }
-                        ydual = read_basis().solve_BT(cB);
+                        ydual = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
                         ydual_cached = true;
                     }
                 }
@@ -1028,7 +1029,7 @@ class RevisedSimplexDualEngine {
                     }
                 }
                 try {
-                    s_enter = read_basis().solve_B(Ahat.col(eAbs));
+                    s_enter = read_basis().solve_B(Ahat.col(eAbs), FTBasis::TranKind::ColAq);
                 } catch (...) {
                     if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
                         ++rebuild_attempts;
@@ -1133,7 +1134,7 @@ class RevisedSimplexDualEngine {
 
             Eigen::VectorXd unit = Eigen::VectorXd::Zero(m);
             unit(r_leave) = 1.0;
-            Eigen::VectorXd z = read_basis().solve_BT(unit);
+            Eigen::VectorXd z = read_basis().solve_BT(unit, FTBasis::TranKind::RowEp);
             const double pivot = s_enter(r_leave);
             const double alpha = rN(e_rel) / pivot;
             ydual.noalias() += alpha * z;
