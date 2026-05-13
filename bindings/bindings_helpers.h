@@ -207,6 +207,12 @@ inline SolveStats build_solve_stats(const LPSolution& sol) {
     stats.warm_start_cold_retry = sol.solve_stats.warm_start_cold_retry;
     stats.warm_factorization_reused = sol.solve_stats.warm_factorization_reused;
     stats.warm_dual_weights_reused = sol.solve_stats.warm_dual_weights_reused;
+    stats.dual_row_price_calls = sol.solve_stats.dual_row_price_calls;
+    stats.dual_col_price_calls = sol.solve_stats.dual_col_price_calls;
+    stats.dual_price_switches = sol.solve_stats.dual_price_switches;
+    stats.dual_row_ep_density = sol.solve_stats.dual_row_ep_density;
+    stats.dual_row_ap_density = sol.solve_stats.dual_row_ap_density;
+    stats.dual_col_aq_density = sol.solve_stats.dual_col_aq_density;
     stats.lu_build_ns = sol.solve_stats.lu_build_ns;
     stats.pricing_build_ns = sol.solve_stats.pricing_build_ns;
     stats.pivot_ns = sol.solve_stats.pivot_ns;

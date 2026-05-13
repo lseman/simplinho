@@ -115,6 +115,8 @@ void bind_bnb_bindings(py::module_& m) {
         .def_readwrite("strong_branching_k", &BranchAndBoundOptions::strong_branching_k)
         .def_readwrite("strong_branching_max_depth",
                        &BranchAndBoundOptions::strong_branching_max_depth)
+        .def_readwrite("strong_branching_lp_iter_limit",
+                       &BranchAndBoundOptions::strong_branching_lp_iter_limit)
         .def_readwrite("pseudocost_reliability", &BranchAndBoundOptions::pseudocost_reliability)
         .def_readwrite("max_dive_depth", &BranchAndBoundOptions::max_dive_depth)
         .def_readwrite("max_dive_lp_solves", &BranchAndBoundOptions::max_dive_lp_solves)

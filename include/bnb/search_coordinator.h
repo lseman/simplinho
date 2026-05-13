@@ -255,6 +255,17 @@ class SearchCoordinator {
         }
     }
 
+    QueueBoundPruneResult prune_by_bound(double incumbent_objective, bool maximize, double tol) {
+        QueueBoundPruneResult total;
+        for (auto& q : worker_queues_) {
+            QueueBoundPruneResult local = q.prune_by_bound(incumbent_objective, maximize, tol);
+            total.pruned_nodes += local.pruned_nodes;
+            total.pruned_node_ids.insert(total.pruned_node_ids.end(), local.pruned_node_ids.begin(),
+                                         local.pruned_node_ids.end());
+        }
+        return total;
+    }
+
     struct WorkStatistics {
         int total_steal_attempts = 0;
         int local_pops = 0;

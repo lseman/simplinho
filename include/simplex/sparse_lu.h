@@ -497,8 +497,10 @@ class SparseForrestTomlinLU {
                     for (int i = 0; i < n_; ++i)
                         last_solve_reach_original_[i] = i;
                 }
-                if (!updates_.empty())
+                if (!updates_.empty()) {
                     output_scratch_ = apply_updates_solve_(std::move(output_scratch_));
+                    mark_output_scratch_dense_();
+                }
                 if (!validate_sparse_rhs_solution_(b, output_scratch_))
                     throw std::runtime_error(
                         "SparseForrestTomlinLU: hyper-sparse RHS residual check failed");
@@ -601,8 +603,10 @@ class SparseForrestTomlinLU {
                     for (int i = 0; i < n_; ++i)
                         last_solve_reach_original_[i] = i;
                 }
-                if (!updates_.empty())
+                if (!updates_.empty()) {
                     output_scratch_ = apply_updates_solve_T_(std::move(output_scratch_));
+                    mark_output_scratch_dense_();
+                }
                 if (!validate_sparse_transpose_rhs_solution_(c, output_scratch_))
                     throw std::runtime_error(
                         "SparseForrestTomlinLU: hyper-sparse RHS transpose residual check failed");
@@ -700,8 +704,10 @@ class SparseForrestTomlinLU {
         }
         hyper_solve_reach_valid_ = pattern_via_reach;
         const bool pattern_preserved = pattern_via_reach && updates_.empty();
-        if (!updates_.empty())
+        if (!updates_.empty()) {
             output_scratch_ = apply_updates_solve_(std::move(output_scratch_));
+            mark_output_scratch_dense_();
+        }
         Eigen::VectorXd b = Eigen::VectorXd::Zero(n_);
         for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
             b(seed_idx[k]) = seed_val[k];
@@ -779,8 +785,10 @@ class SparseForrestTomlinLU {
         }
         hyper_solve_reach_valid_ = pattern_via_reach;
         const bool pattern_preserved = pattern_via_reach && updates_.empty();
-        if (!updates_.empty())
+        if (!updates_.empty()) {
             output_scratch_ = apply_updates_solve_T_(std::move(output_scratch_));
+            mark_output_scratch_dense_();
+        }
         Eigen::VectorXd c = Eigen::VectorXd::Zero(n_);
         for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
             c(seed_idx[k]) = seed_val[k];
@@ -1138,6 +1146,12 @@ class SparseForrestTomlinLU {
                                           const std::vector<int>& indices) noexcept {
         for (const int i : indices)
             x(i) = 0.0;
+    }
+
+    void mark_output_scratch_dense_() const {
+        last_solve_reach_original_.resize(n_);
+        for (int i = 0; i < n_; ++i)
+            last_solve_reach_original_[i] = i;
     }
 
     void ensure_sparse_scratch_size_(Eigen::VectorXd& x) const {

@@ -43,6 +43,12 @@ struct LPSolveStats {
     int warm_start_cold_retry = 0;      // 0/1: warm basis failed, fell back to cold start
     int warm_factorization_reused = 0;  // 0/1: reused cached LU/eta state
     int warm_dual_weights_reused = 0;   // 0/1: reused cached dual pricing weights
+    int dual_row_price_calls = 0;       // sparse row-wise dual PRICE calls
+    int dual_col_price_calls = 0;       // column-wise dual PRICE calls
+    int dual_price_switches = 0;        // runtime row/column pricing switches
+    double dual_row_ep_density = 0.0;   // running density of BTRAN pivotal rows
+    double dual_row_ap_density = 0.0;   // running density of priced tableau rows
+    double dual_col_aq_density = 0.0;   // running density of FTRAN pivotal columns
     std::uint64_t lu_build_ns = 0;      // cumulative time in refactor calls
     std::uint64_t pricing_build_ns = 0; // cumulative time in build_*_pool calls
     std::uint64_t pivot_ns = 0;         // cumulative time in basis update / pivot maintenance

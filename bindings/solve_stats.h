@@ -25,6 +25,12 @@ struct SolveStats {
     int warm_start_cold_retry = 0;
     int warm_factorization_reused = 0;
     int warm_dual_weights_reused = 0;
+    int dual_row_price_calls = 0;
+    int dual_col_price_calls = 0;
+    int dual_price_switches = 0;
+    double dual_row_ep_density = 0.0;
+    double dual_row_ap_density = 0.0;
+    double dual_col_aq_density = 0.0;
     std::uint64_t lu_build_ns = 0;
     std::uint64_t pricing_build_ns = 0;
     std::uint64_t pivot_ns = 0;
@@ -75,6 +81,12 @@ struct SolveStats {
         out["warm_start_cold_retry"] = warm_start_cold_retry;
         out["warm_factorization_reused"] = warm_factorization_reused;
         out["warm_dual_weights_reused"] = warm_dual_weights_reused;
+        out["dual_row_price_calls"] = dual_row_price_calls;
+        out["dual_col_price_calls"] = dual_col_price_calls;
+        out["dual_price_switches"] = dual_price_switches;
+        out["dual_row_ep_density"] = dual_row_ep_density;
+        out["dual_row_ap_density"] = dual_row_ap_density;
+        out["dual_col_aq_density"] = dual_col_aq_density;
         out["lu_build_ns"] = lu_build_ns;
         out["pricing_build_ns"] = pricing_build_ns;
         out["pivot_ns"] = pivot_ns;

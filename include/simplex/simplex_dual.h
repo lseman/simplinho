@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <type_traits>
 #include "../../extern/pdqsort/pdqsort.h"
 #include <future>
@@ -58,6 +59,39 @@ class RevisedSimplexDualEngine {
         std::optional<int> pivot_rel;
         double tau = std::numeric_limits<double>::infinity();
         std::vector<int> flip_rels;
+    };
+
+    struct DualPricingTelemetry {
+        double row_ep_density = 0.0;
+        double row_ap_density = 0.0;
+        double col_aq_density = 0.0;
+        int row_price_calls = 0;
+        int col_price_calls = 0;
+        int price_switches = 0;
+        bool last_used_column_price = false;
+        bool has_last_price_mode = false;
+
+        static void update_density(double local_density, double& density) {
+            constexpr double kRunningAverageMultiplier = 0.05;
+            if (!std::isfinite(local_density))
+                return;
+            local_density = std::clamp(local_density, 0.0, 1.0);
+            density = (1.0 - kRunningAverageMultiplier) * density +
+                      kRunningAverageMultiplier * local_density;
+        }
+
+        void record_price_mode(bool used_column_price) {
+            if (used_column_price) {
+                ++col_price_calls;
+            } else {
+                ++row_price_calls;
+            }
+            if (has_last_price_mode && last_used_column_price != used_column_price) {
+                ++price_switches;
+            }
+            last_used_column_price = used_column_price;
+            has_last_price_mode = true;
+        }
     };
 
     static BoundView default_bound_view(int j, const Eigen::VectorXd& l, const Eigen::VectorXd& u) {
@@ -270,6 +304,30 @@ class RevisedSimplexDualEngine {
         }
     }
 
+    static void compute_pricing_products_by_column(const RevisedSimplex::SparseMatrix& Ahat,
+                                                   const std::vector<int>& N, const HVector& w,
+                                                   const Eigen::VectorXd& ydual,
+                                                   const Eigen::VectorXd& chat, Eigen::VectorXd& pN,
+                                                   Eigen::VectorXd& rN) {
+        pN.resize(N.size());
+        rN.resize(N.size());
+        for (int k = 0; k < (int)N.size(); ++k) {
+            const int j = N[k];
+            double p = 0.0;
+            double r = chat(j);
+            for (RevisedSimplex::SparseMatrix::InnerIterator it(Ahat, j); it; ++it) {
+                const int row = it.row();
+                const double a = it.value();
+                if (row < w.size())
+                    p += a * w(row);
+                if (row < ydual.size())
+                    r -= a * ydual(row);
+            }
+            pN(k) = p;
+            rN(k) = r;
+        }
+    }
+
     static void compute_pricing_products_parallel(const RevisedSimplex::SparseMatrix& Ahat,
                                                   const std::vector<int>& N, const HVector& w,
                                                   const Eigen::VectorXd& ydual,
@@ -315,6 +373,39 @@ class RevisedSimplexDualEngine {
         }
         for (auto& task : tasks)
             task.get();
+    }
+
+    static int count_effective_nonzeros(const Eigen::VectorXd& v, double tol = 0.0) {
+        int count = 0;
+        for (int i = 0; i < v.size(); ++i) {
+            if (std::abs(v(i)) > tol)
+                ++count;
+        }
+        return count;
+    }
+
+    static int count_effective_nonzeros(const HVector& v, double tol = 0.0) {
+        if (!v.has_pattern())
+            return count_effective_nonzeros(v.value, tol);
+        int count = 0;
+        for (int k = 0; k < v.count; ++k) {
+            const int i = v.index[k];
+            if (i >= 0 && i < v.value.size() && std::abs(v.value(i)) > tol)
+                ++count;
+        }
+        return count;
+    }
+
+    static double vector_density(const Eigen::VectorXd& v, double tol = 0.0) {
+        return v.size() > 0 ? static_cast<double>(count_effective_nonzeros(v, tol)) /
+                                  static_cast<double>(v.size())
+                            : 0.0;
+    }
+
+    static double vector_density(const HVector& v, double tol = 0.0) {
+        return v.size() > 0 ? static_cast<double>(count_effective_nonzeros(v, tol)) /
+                                  static_cast<double>(v.size())
+                            : 0.0;
     }
 
     template <class MatrixType>
@@ -710,9 +801,34 @@ class RevisedSimplexDualEngine {
         int rebuild_attempts = 0;
         int backtrack_repairs = 0;
         int total_flips = 0;
+        DualPricingTelemetry pricing_telemetry;
         Eigen::VectorXd rhs_eff = b - transformed_rhs(A, view, l, u);
         bool ydual_cached = false;
         Eigen::VectorXd ydual;
+
+        auto attach_dual_pricing_info =
+            [&](std::unordered_map<std::string, std::string>& info_map) {
+                info_map["dual_pricing"] = dual_pricer.current_strategy_name();
+                info_map["dual_bfrt_flips"] = std::to_string(total_flips);
+                info_map["dual_row_price_calls"] =
+                    std::to_string(pricing_telemetry.row_price_calls);
+                info_map["dual_col_price_calls"] =
+                    std::to_string(pricing_telemetry.col_price_calls);
+                info_map["dual_price_switches"] =
+                    std::to_string(pricing_telemetry.price_switches);
+                info_map["dual_row_ep_density"] =
+                    std::to_string(pricing_telemetry.row_ep_density);
+                info_map["dual_row_ap_density"] =
+                    std::to_string(pricing_telemetry.row_ap_density);
+                info_map["dual_col_aq_density"] =
+                    std::to_string(pricing_telemetry.col_aq_density);
+                self.solve_stats_.dual_row_price_calls = pricing_telemetry.row_price_calls;
+                self.solve_stats_.dual_col_price_calls = pricing_telemetry.col_price_calls;
+                self.solve_stats_.dual_price_switches = pricing_telemetry.price_switches;
+                self.solve_stats_.dual_row_ep_density = pricing_telemetry.row_ep_density;
+                self.solve_stats_.dual_row_ap_density = pricing_telemetry.row_ap_density;
+                self.solve_stats_.dual_col_aq_density = pricing_telemetry.col_aq_density;
+            };
 
         auto serialize_vec = [](const Eigen::VectorXd& v) {
             std::ostringstream oss;
@@ -830,8 +946,7 @@ class RevisedSimplexDualEngine {
                         Eigen::VectorXd x =
                             assemble_transformed_primal(n, basis, yB.cwiseMax(0.0), l, u, view);
                         auto info_map = dm_stats_to_map(self.degen_.get_stats());
-                        info_map["dual_pricing"] = dual_pricer.current_strategy_name();
-                        info_map["dual_bfrt_flips"] = std::to_string(total_flips);
+                        attach_dual_pricing_info(info_map);
                         self.trace_line_("[dual] optimal iter=" + std::to_string(iters) +
                                          " basis=" + self.format_basis_(basis));
                         const auto dual_state = dual_pricer.export_state();
@@ -913,13 +1028,38 @@ class RevisedSimplexDualEngine {
                 }
 
                 w = leaving.dual_row;
+                const double local_row_ep_density = vector_density(w, self.opt_.tol);
+                DualPricingTelemetry::update_density(local_row_ep_density,
+                                                     pricing_telemetry.row_ep_density);
                 if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
-                    compute_pricing_products_parallel(Ahat, N, w, ydual, chat, pN, rN,
-                                                      self.opt_.parallel_pricing_workers,
-                                                      self.opt_.parallel_pricing_min_cols);
+                    const bool allow_runtime_switch =
+                        self.opt_.dual_pricing == "switch" || self.opt_.dual_pricing == "col";
+                    const bool use_column_price =
+                        self.opt_.dual_pricing == "col" ||
+                        (allow_runtime_switch &&
+                         (local_row_ep_density > 0.75 ||
+                          (pricing_telemetry.row_ap_density > 0.10 &&
+                           local_row_ep_density > 0.10)));
+                    pricing_telemetry.record_price_mode(use_column_price);
+                    if (use_column_price) {
+                        if (self.opt_.parallel_pricing_workers > 1 &&
+                            static_cast<int>(N.size()) >=
+                                std::max(1, self.opt_.parallel_pricing_min_cols)) {
+                            compute_pricing_products_parallel(Ahat, N, w, ydual, chat, pN, rN,
+                                                              self.opt_.parallel_pricing_workers,
+                                                              self.opt_.parallel_pricing_min_cols);
+                        } else {
+                            compute_pricing_products_by_column(Ahat, N, w, ydual, chat, pN, rN);
+                        }
+                    } else {
+                        compute_pricing_products(Ahat, *Ahat_row, N, w, ydual, chat, pN, rN);
+                    }
                 } else {
+                    pricing_telemetry.record_price_mode(true);
                     compute_pricing_products(Ahat, N, w, ydual, chat, pN, rN);
                 }
+                DualPricingTelemetry::update_density(vector_density(pN, self.opt_.tol),
+                                                     pricing_telemetry.row_ap_density);
 
                 const DualBFRTDecision bfrt =
                     dual_bfrt_decide(self, rN, pN, N, view, l, u,
@@ -1049,6 +1189,8 @@ class RevisedSimplexDualEngine {
                             iters,
                             {{"where", "dual: solve(Bhat,a_e) repair failed"}}};
                 }
+                DualPricingTelemetry::update_density(vector_density(s_enter, self.opt_.tol),
+                                                     pricing_telemetry.col_aq_density);
                 break;
             }
 
@@ -1059,8 +1201,7 @@ class RevisedSimplexDualEngine {
 
                 auto info_map = dm_stats_to_map(self.degen_.get_stats());
                 info_map["where"] = "dual: infinite step";
-                info_map["dual_pricing"] = dual_pricer.current_strategy_name();
-                info_map["dual_bfrt_flips"] = std::to_string(total_flips);
+                attach_dual_pricing_info(info_map);
                 info_map["certificate"] = "farkas";
                 info_map["farkas_has_cert"] = "1";
                 info_map["farkas_dim"] = std::to_string(m);
@@ -1132,12 +1273,10 @@ class RevisedSimplexDualEngine {
                 self.trace_line_(oss.str());
             }
 
-            Eigen::VectorXd unit = Eigen::VectorXd::Zero(m);
-            unit(r_leave) = 1.0;
-            Eigen::VectorXd z = read_basis().solve_BT(unit, FTBasis::TranKind::RowEp);
+            HVector z = read_basis().solve_BT_unit(r_leave, FTBasis::TranKind::RowEp);
             const double pivot = s_enter(r_leave);
             const double alpha = rN(e_rel) / pivot;
-            ydual.noalias() += alpha * z;
+            ydual.noalias() += alpha * z.value;
             for (int k = 0; k < static_cast<int>(N.size()); ++k) {
                 if (k == e_rel)
                     continue;
@@ -1235,8 +1374,7 @@ class RevisedSimplexDualEngine {
                 const double obj_check = c.dot(x_check);
                 if (obj_check > self.opt_.objective_bound_internal) {
                     auto info_map = dm_stats_to_map(self.degen_.get_stats());
-                    info_map["dual_pricing"] = dual_pricer.current_strategy_name();
-                    info_map["dual_bfrt_flips"] = std::to_string(total_flips);
+                    attach_dual_pricing_info(info_map);
                     info_map["objective_bound_bailout"] = "1";
                     info_map["objective_bound_bailout_obj"] = std::to_string(obj_check);
                     self.trace_line_(
@@ -1251,8 +1389,7 @@ class RevisedSimplexDualEngine {
         }
 
         auto info_map = dm_stats_to_map(self.degen_.get_stats());
-        info_map["dual_pricing"] = dual_pricer.current_strategy_name();
-        info_map["dual_bfrt_flips"] = std::to_string(total_flips);
+        attach_dual_pricing_info(info_map);
         self.trace_line_("[dual] iterlimit basis=" + self.format_basis_(basis));
         self.remember_warm_state_(basis, basis_factorization);
         return {LPSolution::Status::IterLimit, Eigen::VectorXd::Zero(n), basis, iters,

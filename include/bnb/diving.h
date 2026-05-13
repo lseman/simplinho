@@ -379,6 +379,34 @@ inline int diving_strategy_index(DivingStrategy strategy) {
     return -1;
 }
 
+struct RelaxationSolveContext {
+    bool strong_branching_probe = false;
+    int max_lp_iterations = 0;
+    bool isolate_lp_state = false;
+};
+
+inline thread_local const RelaxationSolveContext* current_relaxation_solve_context_ = nullptr;
+
+inline const RelaxationSolveContext* current_relaxation_solve_context() {
+    return current_relaxation_solve_context_;
+}
+
+class ScopedRelaxationSolveContext {
+  public:
+    explicit ScopedRelaxationSolveContext(const RelaxationSolveContext& context)
+        : previous_(current_relaxation_solve_context_) {
+        current_relaxation_solve_context_ = &context;
+    }
+
+    ~ScopedRelaxationSolveContext() { current_relaxation_solve_context_ = previous_; }
+
+    ScopedRelaxationSolveContext(const ScopedRelaxationSolveContext&) = delete;
+    ScopedRelaxationSolveContext& operator=(const ScopedRelaxationSolveContext&) = delete;
+
+  private:
+    const RelaxationSolveContext* previous_ = nullptr;
+};
+
 using RelaxationSolveCallback =
     std::function<RelaxationSolution(const ChildState&, const LPBasis*)>;
 

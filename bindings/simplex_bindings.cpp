@@ -51,6 +51,18 @@ void bind_solve_stats_type(py::module_& m) {
             [](const SolveStats& self) { return self.warm_factorization_reused; })
         .def_property_readonly("warm_dual_weights_reused",
                                [](const SolveStats& self) { return self.warm_dual_weights_reused; })
+        .def_property_readonly("dual_row_price_calls",
+                               [](const SolveStats& self) { return self.dual_row_price_calls; })
+        .def_property_readonly("dual_col_price_calls",
+                               [](const SolveStats& self) { return self.dual_col_price_calls; })
+        .def_property_readonly("dual_price_switches",
+                               [](const SolveStats& self) { return self.dual_price_switches; })
+        .def_property_readonly("dual_row_ep_density",
+                               [](const SolveStats& self) { return self.dual_row_ep_density; })
+        .def_property_readonly("dual_row_ap_density",
+                               [](const SolveStats& self) { return self.dual_row_ap_density; })
+        .def_property_readonly("dual_col_aq_density",
+                               [](const SolveStats& self) { return self.dual_col_aq_density; })
         .def_property_readonly("lu_build_ns",
                                [](const SolveStats& self) { return self.lu_build_ns; })
         .def_property_readonly("pricing_build_ns",

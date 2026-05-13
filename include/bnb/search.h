@@ -481,6 +481,11 @@ class GlobalDomain {
     uint64_t revision_ = 0;
 };
 
+struct QueueBoundPruneResult {
+    int pruned_nodes = 0;
+    std::vector<int> pruned_node_ids;
+};
+
 // ============================================================================
 // Worker Local Queue
 // ============================================================================
@@ -856,6 +861,37 @@ class WorkerLocalQueue {
             best = *root_relaxation_objective;
         }
         return best;
+    }
+
+    QueueBoundPruneResult prune_by_bound(double incumbent_objective, bool maximize, double tol) {
+        QueueBoundPruneResult result;
+        if (!std::isfinite(incumbent_objective)) {
+            return result;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (int handle = 0; handle < static_cast<int>(slots_.size()); ++handle) {
+            if (!slots_[handle].alive) {
+                continue;
+            }
+            const ActiveNode& node = slots_[handle].entry.node;
+            if (!std::isfinite(node.bound)) {
+                continue;
+            }
+            const bool prune = maximize ? (node.bound <= incumbent_objective + tol)
+                                        : (node.bound >= incumbent_objective - tol);
+            if (!prune) {
+                continue;
+            }
+
+            if (node.id >= 0) {
+                result.pruned_node_ids.push_back(node.id);
+            }
+            if (remove_slot_locked_(handle).has_value()) {
+                ++result.pruned_nodes;
+            }
+        }
+        return result;
     }
 
   private:

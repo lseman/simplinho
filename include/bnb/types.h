@@ -169,6 +169,7 @@ struct Options {
     int strong_branching_candidates = 4; // Max candidates for strong branching
     int strong_branching_k = 2; // Number of candidates for reduced strong branching (Highs-like)
     int strong_branching_max_depth = 1;
+    int strong_branching_lp_iter_limit = 24; // Per-probe LP iteration cap; <=0 means full solve
     int pseudocost_reliability = 2;
     int max_dive_depth = 15;     // Reduced from 25 for faster heuristics
     int max_dive_lp_solves = 32; // Reduced from 64 for faster heuristics

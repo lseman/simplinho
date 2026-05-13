@@ -2161,8 +2161,26 @@ class Solver {
         if (updated) {
             propagate_root_redcosts_to_global_domain_(objective);
             propagate_cutoff_to_global_domain_(objective);
+            prune_open_nodes_by_incumbent_bound_(objective);
             maybe_log_progress_("incumbent", true);
             search_coordinator_.notify_all();
+        }
+    }
+
+    void prune_open_nodes_by_incumbent_bound_(double incumbent_objective) {
+        const double tol = options_.feasibility_tol;
+        detail::QueueBoundPruneResult pruned =
+            search_coordinator_.prune_by_bound(incumbent_objective, problem_.maximize, tol);
+        if (pruned.pruned_node_ids.empty()) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(tree_mutex_);
+        for (const int node_id : pruned.pruned_node_ids) {
+            if (node_id >= 0 && node_id < static_cast<int>(tree_nodes_.size()) &&
+                tree_nodes_[node_id].status == TreeNodeStatus::Created) {
+                tree_nodes_[node_id].status = TreeNodeStatus::PrunedByBound;
+            }
         }
     }
 
@@ -3946,7 +3964,7 @@ class Solver {
         // in strong branching. Children inherit it so the parent's global bound
         // can later be tightened to min(child_lb, sibling_lb) in the cutoff logic.
         const auto sibling_bound_or_nan = [](const detail::ChildEvaluation& eval) {
-            return eval.relaxation.has_value() &&
+            return !eval.relaxation_is_probe_only && eval.relaxation.has_value() &&
                            eval.relaxation->status == RelaxationStatus::Optimal
                        ? eval.relaxation->objective
                        : std::numeric_limits<double>::quiet_NaN();
@@ -4017,7 +4035,7 @@ class Solver {
             }
         }
 
-        if (!child.relaxation.has_value()) {
+        if (!child.relaxation.has_value() || child.relaxation_is_probe_only) {
             update_tree_node_(child_id, [&](TreeNode& tree_node) {
                 tree_node.status = TreeNodeStatus::Created;
                 tree_node.bound = inherited_bound;

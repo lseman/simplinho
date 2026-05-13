@@ -1903,6 +1903,10 @@ class Model {
             solve_node(const Eigen::VectorXd& node_l, const Eigen::VectorXd& node_u,
                        const std::vector<simplex_bnb::Cut>& cuts, const LPBasis* parent_basis,
                        double objective_bound_internal = std::numeric_limits<double>::infinity()) {
+                const auto* relaxation_context =
+                    simplex_bnb::detail::current_relaxation_solve_context();
+                const bool strong_branching_probe =
+                    relaxation_context != nullptr && relaxation_context->strong_branching_probe;
                 const auto t0_assembly = std::chrono::steady_clock::now();
                 const NodeLPSolverView entry = get_node_lp_entry(cuts);
                 // HiGHS-style objective-bound bailout: tell every solver in the
@@ -2057,7 +2061,18 @@ class Model {
                             break;
                     }
                 };
-                if (effective_basis != nullptr) {
+                if (strong_branching_probe) {
+                    RevisedSimplexOptions probe_options = warm_options_;
+                    if (relaxation_context->max_lp_iterations > 0) {
+                        probe_options.max_iters =
+                            std::max(1, relaxation_context->max_lp_iterations);
+                    }
+                    RevisedSimplex probe_solver(probe_options);
+                    probe_solver.set_objective_bound_internal(objective_bound_internal);
+                    raw_opt = try_solver("strong_branch_probe", probe_solver, effective_basis);
+                    used_warm_start_result = effective_basis != nullptr && raw_opt.has_value() &&
+                                             !status_requires_warm_start_retry(raw_opt->status);
+                } else if (effective_basis != nullptr) {
                     std::optional<LPSolution> warm_opt =
                         try_solver("warm", *entry.warm_solver, solver_warm_basis);
                     const bool warm_failed = !warm_opt.has_value() ||
@@ -2122,7 +2137,11 @@ class Model {
                         raw_opt->status == LPSolution::Status::Unbounded;
                     const bool terminal_objective_bound =
                         raw_opt->status == LPSolution::Status::ObjectiveBound;
-                    out.status = raw_opt->status == LPSolution::Status::Optimal
+                    const bool terminal_probe_limited =
+                        strong_branching_probe &&
+                        raw_opt->status == LPSolution::Status::IterLimit && has_valid_primal &&
+                        std::isfinite(raw_opt->obj);
+                    out.status = (terminal_optimal || terminal_probe_limited)
                                      ? simplex_bnb::RelaxationStatus::Optimal
                                  : raw_opt->status == LPSolution::Status::Unbounded
                                      ? simplex_bnb::RelaxationStatus::Unbounded
@@ -2132,7 +2151,7 @@ class Model {
                             ? raw_opt->x
                             : Eigen::VectorXd::Constant(node_data.total_vars,
                                                         std::numeric_limits<double>::quiet_NaN());
-                    if (terminal_optimal || terminal_unbounded) {
+                    if (terminal_optimal || terminal_unbounded || terminal_probe_limited) {
                         out.objective =
                             node_data.objective_sign * raw_opt->obj + objective_constant_;
                     } else if (terminal_objective_bound && std::isfinite(raw_opt->obj)) {

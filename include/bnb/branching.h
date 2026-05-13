@@ -58,6 +58,7 @@ struct ChildEvaluation {
     std::optional<RelaxationSolution> relaxation;
     double score = -std::numeric_limits<double>::infinity();
     bool cutoff = false;
+    bool relaxation_is_probe_only = false;
 };
 
 struct BranchDecision {

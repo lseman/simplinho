@@ -261,6 +261,47 @@ class FTBasis {
         }
     }
 
+    HVector solve_B(const HVector& b, TranKind kind = TranKind::Unknown) const {
+        if (b.size() != m_)
+            throw std::invalid_argument("FTBasis::solve_B HVector size mismatch");
+        if (!b.has_pattern())
+            return solve_B(b.value, kind);
+
+        auto* self = const_cast<FTBasis*>(this);
+        auto [seed_idx, seed_val] = hvector_to_seed_data_(b);
+        const double rhs_density =
+            m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;
+        const bool use_sparse_rhs =
+            A_is_sparse_ && rhs_density < sparse_rhs_density_threshold_();
+        if (!use_sparse_rhs)
+            return solve_B(b.value, kind);
+
+        const double expected = density_tracker_.expected(kind);
+        auto do_solve = [&]() {
+            return self->lu_sparse_.solve_sparse(seed_idx, seed_val, expected);
+        };
+
+        try {
+            Eigen::VectorXd x = do_solve();
+            self->verify_solve_quality_B_(b.value, x, "FTBasis::solve_B HVector");
+            HVector out = wrap_with_pattern_(std::move(x), true);
+            self->update_density_tracker_(kind, out);
+            return out;
+        } catch (const std::exception& err) {
+            if (!opt_.refactor_on_solve_failure)
+                throw;
+
+            self->last_update_diagnostic_ = err.what();
+            self->refactor();
+
+            Eigen::VectorXd x = do_solve();
+            self->verify_solve_quality_B_(b.value, x, "FTBasis::solve_B HVector after refactor");
+            HVector out = wrap_with_pattern_(std::move(x), true);
+            self->update_density_tracker_(kind, out);
+            return out;
+        }
+    }
+
     template <typename Derived>
     HVector solve_B(const Eigen::SparseMatrixBase<Derived>& b_sparse,
                     TranKind kind = TranKind::Unknown) const {
@@ -333,6 +374,47 @@ class FTBasis {
             Eigen::VectorXd y = do_solve();
             self->verify_solve_quality_BT_(c, y, "FTBasis::solve_BT after refactor");
             HVector out = wrap_with_pattern_(std::move(y), A_is_sparse_);
+            self->update_density_tracker_(kind, out);
+            return out;
+        }
+    }
+
+    HVector solve_BT(const HVector& c, TranKind kind = TranKind::Unknown) const {
+        if (c.size() != m_)
+            throw std::invalid_argument("FTBasis::solve_BT HVector size mismatch");
+        if (!c.has_pattern())
+            return solve_BT(c.value, kind);
+
+        auto* self = const_cast<FTBasis*>(this);
+        auto [seed_idx, seed_val] = hvector_to_seed_data_(c);
+        const double rhs_density =
+            m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;
+        const bool use_sparse_rhs =
+            A_is_sparse_ && rhs_density < sparse_rhs_density_threshold_();
+        if (!use_sparse_rhs)
+            return solve_BT(c.value, kind);
+
+        const double expected = density_tracker_.expected(kind);
+        auto do_solve = [&]() {
+            return self->lu_sparse_.solveT_sparse(seed_idx, seed_val, expected);
+        };
+
+        try {
+            Eigen::VectorXd y = do_solve();
+            self->verify_solve_quality_BT_(c.value, y, "FTBasis::solve_BT HVector");
+            HVector out = wrap_with_pattern_(std::move(y), true);
+            self->update_density_tracker_(kind, out);
+            return out;
+        } catch (const std::exception& err) {
+            if (!opt_.refactor_on_solve_failure)
+                throw;
+
+            self->last_update_diagnostic_ = err.what();
+            self->refactor();
+
+            Eigen::VectorXd y = do_solve();
+            self->verify_solve_quality_BT_(c.value, y, "FTBasis::solve_BT HVector after refactor");
+            HVector out = wrap_with_pattern_(std::move(y), true);
             self->update_density_tracker_(kind, out);
             return out;
         }
@@ -562,6 +644,27 @@ class FTBasis {
             for (typename Derived::InnerIterator it(derived, k); it; ++it) {
                 seed_idx.push_back(it.row());
                 seed_val.push_back(it.value());
+            }
+        }
+        return {std::move(seed_idx), std::move(seed_val)};
+    }
+
+    static std::pair<std::vector<int>, std::vector<double>>
+    hvector_to_seed_data_(const HVector& v, double eps = 1e-14) {
+        std::vector<int> seed_idx;
+        std::vector<double> seed_val;
+        if (!v.has_pattern())
+            return {std::move(seed_idx), std::move(seed_val)};
+        seed_idx.reserve(static_cast<std::size_t>(std::max(0, v.count)));
+        seed_val.reserve(static_cast<std::size_t>(std::max(0, v.count)));
+        for (int k = 0; k < v.count; ++k) {
+            const int i = v.index[static_cast<std::size_t>(k)];
+            if (i < 0 || i >= v.value.size())
+                throw std::invalid_argument("FTBasis: HVector pattern index out of range");
+            const double value = v.value(i);
+            if (std::abs(value) > eps) {
+                seed_idx.push_back(i);
+                seed_val.push_back(value);
             }
         }
         return {std::move(seed_idx), std::move(seed_val)};
