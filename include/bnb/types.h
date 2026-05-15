@@ -201,11 +201,11 @@ struct Options {
     double feasibility_jump_objective_weight = 0.05;
     int heuristic_subproblem_max_nodes = 64;
     bool use_cut_pool = true;
-    int max_cut_rounds_per_node = 1;       // Reduced from 2 for faster solving
-    int max_root_cut_rounds = 2;           // Allow a dedicated root repeat pass
-    int max_cuts_added_per_round = 4;      // Reduced from 8 for faster cut selection
-    int max_root_cuts_added_per_round = 8; // Higher budget for root cut selection
-    int max_cut_pool_size = 128;           // Reduced from 256 for faster cut management
+    int max_cut_rounds_per_node = 1;
+    int max_root_cut_rounds = 4;
+    int max_cuts_added_per_round = 6;
+    int max_root_cuts_added_per_round = 16;
+    int max_cut_pool_size = 512;
     double min_cut_violation = 1e-4;
     int max_cut_age = 5;
     double cut_age_decay = 0.08;           // decay factor used when scoring and retaining cuts
@@ -213,7 +213,7 @@ struct Options {
     bool use_gomory_cuts = true;
     bool use_mir_cuts = true; // Enable MIR cuts (more powerful than Gomory cover)
     bool use_cover_cuts = true;
-    bool use_zero_half_cuts = false;
+    bool use_zero_half_cuts = true;
     bool use_implied_bound_cuts = true;
     bool use_clique_cuts = true;
     bool use_graph_clique_cuts = true; // enable the new graph-based clique separator
@@ -225,7 +225,7 @@ struct Options {
     // HiGHS-style conflict pool sizing.
     int max_conflict_pool_size = 512;
     int max_conflict_age = 10;
-    int max_cuts_per_type = 4;
+    int max_cuts_per_type = 8;
     double cut_max_parallelism = 0.98;
     bool use_dual_proof_cuts = true;
     bool use_lp_reoptimization_profile = true;
@@ -234,14 +234,14 @@ struct Options {
     bool use_node_presolve_on_warm_basis = false;
     // Adaptive proof phase: after an incumbent exists, switch effort from
     // primal search toward proving the dual bound.
-    bool use_adaptive_proof_phase = false;
-    int proof_phase_min_nodes = 8;
+    bool use_adaptive_proof_phase = true;
+    int proof_phase_min_nodes = 1;
     NodeSelectionStrategy proof_node_selection = NodeSelectionStrategy::BestBound;
     int proof_strong_branching_candidates = 8;
     int proof_strong_branching_k = 4;
     int proof_strong_branching_max_depth = 4;
-    int proof_max_cut_rounds_per_node = 2;
-    int proof_max_cuts_added_per_round = 8;
+    int proof_max_cut_rounds_per_node = 3;
+    int proof_max_cuts_added_per_round = 12;
     bool proof_use_node_presolve_on_warm_basis = false;
     // HiGHS-inspired separate tolerances
     double feasibility_tol = 1e-7; // Feasibility checks in relaxation (LP)

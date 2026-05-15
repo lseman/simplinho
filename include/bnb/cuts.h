@@ -125,6 +125,8 @@ class CutPool {
     // Thread-safe read access (for parallel workers)
     const std::vector<Cut>& active_cuts_read_only() const { return cuts_; }
 
+    std::vector<Cut> snapshot_cuts(int max_cuts = -1) const;
+
   private:
     void manage_pool_size_();
 

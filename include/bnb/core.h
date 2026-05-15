@@ -1,7 +1,7 @@
 #pragma once
 
-#include <algorithm>
 #include "../../extern/pdqsort/pdqsort.h"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -593,6 +593,7 @@ class Solver {
             std::lock_guard<std::mutex> lock(cuts_mutex_);
             cut_pool_.reset(options_);
             active_cuts_ = initial_cuts_;
+            protected_active_cut_count_ = active_cuts_.size();
             active_cut_signatures_.clear();
             for (const auto& cut : active_cuts_) {
                 active_cut_signatures_.insert(detail::cut_signature(cut));
@@ -748,6 +749,12 @@ class Solver {
         return problem_.maximize ? (candidate <= cutoff) : (candidate >= cutoff);
     }
 
+    double bound_tightening_improvement_(double before, double after) const {
+        if (!std::isfinite(before) || !std::isfinite(after))
+            return 0.0;
+        return problem_.maximize ? before - after : after - before;
+    }
+
     bool mip_gap_closed_(double bound) const {
         const IncumbentSnapshot incumbent = incumbent_snapshot_();
         if (!incumbent.has_incumbent || !std::isfinite(incumbent.objective) ||
@@ -874,6 +881,54 @@ class Solver {
             cuts.push_back(std::move(cutoff));
         }
         return cuts;
+    }
+
+    void age_active_cuts_(const Eigen::VectorXd& primal) {
+        if (primal.size() == 0)
+            return;
+
+        std::lock_guard<std::mutex> lock(cuts_mutex_);
+        if (active_cuts_.size() <= protected_active_cut_count_)
+            return;
+
+        bool removed = false;
+        std::vector<Cut> kept;
+        kept.reserve(active_cuts_.size());
+        for (std::size_t i = 0; i < active_cuts_.size(); ++i) {
+            Cut cut = std::move(active_cuts_[i]);
+            if (i < protected_active_cut_count_ || cut.cut_type == "IncumbentCutoff") {
+                kept.push_back(std::move(cut));
+                continue;
+            }
+
+            const double violation = detail::cut_violation(cut, primal);
+            if (violation > options_.min_cut_violation) {
+                cut.age = 0;
+                ++cut.times_used;
+                cut.strength = std::max(cut.strength, violation);
+                kept.push_back(std::move(cut));
+                continue;
+            }
+
+            ++cut.age;
+            cut.strength *= 0.97;
+            if (cut.age <= options_.max_cut_age || cut.times_used > 0 || cut.strength > 0.35) {
+                kept.push_back(std::move(cut));
+            } else {
+                removed = true;
+            }
+        }
+
+        if (!removed) {
+            active_cuts_ = std::move(kept);
+            return;
+        }
+
+        active_cuts_ = std::move(kept);
+        active_cut_signatures_.clear();
+        for (const Cut& cut : active_cuts_) {
+            active_cut_signatures_.insert(detail::cut_signature(cut));
+        }
     }
 
     bool contains_incumbent_cutoff_(const std::vector<Cut>& cuts) const {
@@ -1301,13 +1356,13 @@ class Solver {
         }
 
         pdqsort(literals.begin(), literals.end(),
-                  [](const ConflictLiteral& lhs, const ConflictLiteral& rhs) {
-                      if (lhs.variable != rhs.variable)
-                          return lhs.variable < rhs.variable;
-                      if (lhs.is_lower != rhs.is_lower)
-                          return lhs.is_lower < rhs.is_lower;
-                      return lhs.value < rhs.value;
-                  });
+                [](const ConflictLiteral& lhs, const ConflictLiteral& rhs) {
+                    if (lhs.variable != rhs.variable)
+                        return lhs.variable < rhs.variable;
+                    if (lhs.is_lower != rhs.is_lower)
+                        return lhs.is_lower < rhs.is_lower;
+                    return lhs.value < rhs.value;
+                });
         literals.erase(std::unique(literals.begin(), literals.end(),
                                    [&](const ConflictLiteral& lhs, const ConflictLiteral& rhs) {
                                        return lhs.variable == rhs.variable &&
@@ -2974,17 +3029,26 @@ class Solver {
             const auto solve_start = SteadyClock::now();
             std::vector<Cut> relaxation_cuts = current_relaxation_cuts_snapshot_();
             relaxation_cuts.insert(relaxation_cuts.end(), extra_cuts.begin(), extra_cuts.end());
+            const Options effective = effective_options_();
+            std::vector<Cut> propagation_cuts = relaxation_cuts;
+            if (options_.use_cut_pool) {
+                const int max_pool_propagation_cuts =
+                    std::max(64, 8 * std::max(1, effective.max_cuts_added_per_round));
+                std::vector<Cut> pool_cuts = cut_pool_.snapshot_cuts(max_pool_propagation_cuts);
+                propagation_cuts.insert(propagation_cuts.end(),
+                                        std::make_move_iterator(pool_cuts.begin()),
+                                        std::make_move_iterator(pool_cuts.end()));
+            }
             const bool allow_global_conflict_learning =
                 !contains_incumbent_cutoff_(relaxation_cuts);
             current_relaxation_allows_global_conflicts = allow_global_conflict_learning;
             const LPBasis* warm_basis = current_node.basis ? &*current_node.basis : nullptr;
-            const Options effective = effective_options_();
             const auto presolve_start = SteadyClock::now();
             NodePresolveOutcome presolved;
             if (should_run_node_presolve(warm_basis, effective)) {
                 presolved =
                     presolve_node_bounds_(current_node.lower_bounds, current_node.upper_bounds,
-                                          relaxation_cuts, current_node.reasons);
+                                          propagation_cuts, current_node.reasons);
             } else {
                 presolved.lower_bounds = current_node.lower_bounds;
                 presolved.upper_bounds = current_node.upper_bounds;
@@ -3006,7 +3070,7 @@ class Solver {
                 should_run_node_presolve(warm_basis, effective)) {
                 presolved =
                     presolve_node_bounds_(current_node.lower_bounds, current_node.upper_bounds,
-                                          relaxation_cuts, current_node.reasons);
+                                          propagation_cuts, current_node.reasons);
                 current_node.lower_bounds = presolved.lower_bounds;
                 current_node.upper_bounds = presolved.upper_bounds;
                 current_node.reasons = presolved.reasons;
@@ -3072,8 +3136,8 @@ class Solver {
             return solve_relaxation_with_cuts(current_node, {});
         };
 
-        auto tighten_bounds_from_implied_cuts = [&](const std::vector<Cut>& cuts,
-                                                    detail::ActiveNode& current_node) {
+        auto tighten_bounds_from_cuts = [&](const std::vector<Cut>& cuts,
+                                            detail::ActiveNode& current_node) {
             int tightened_bounds = 0;
             for (const Cut& cut : cuts) {
                 if (!propagate_row_bounds_(cut.indices, cut.values, cut.rhs, cut.sense,
@@ -3155,8 +3219,11 @@ class Solver {
             const int root_cuts_added_per_round = options_.max_root_cuts_added_per_round > 0
                                                       ? options_.max_root_cuts_added_per_round
                                                       : options_.max_cuts_added_per_round;
+            double previous_round_objective = relaxation.objective;
+            int stall_rounds = 0;
             for (int round = 0; round < root_cut_rounds; ++round) {
                 ++timing.root_cut_rounds;
+                const double round_start_objective = relaxation.objective;
                 const auto cut_fractional = detail::collect_fractional_candidates(
                     relaxation.primal, problem_.variable_types, options_.integrality_tol);
                 const std::vector<Cut> relaxation_cuts = current_relaxation_cuts_snapshot_();
@@ -3181,14 +3248,13 @@ class Solver {
                     timing.root_cut_generation_wall_ns +=
                         elapsed_ns_(phase_generation_start, SteadyClock::now());
                     timing.root_cuts_generated += static_cast<int>(phase_generated.size());
-                    if (phase == detail::CutSeparatorPhase::ImpliedBound) {
-                        const int tightened =
-                            tighten_bounds_from_implied_cuts(phase_generated, node);
+                    if (!phase_generated.empty()) {
+                        const int tightened = tighten_bounds_from_cuts(phase_generated, node);
                         if (tightened < 0) {
                             update_tree_node_(node.id, [&](TreeNode& tree_node) {
                                 tree_node.status = TreeNodeStatus::Infeasible;
                             });
-                            finalize_node_timing("root_bound_tighten", "infeasible");
+                            finalize_node_timing("root_cut_propagate", "infeasible");
                             return;
                         }
                         if (tightened > 0) {
@@ -3200,6 +3266,8 @@ class Solver {
                                 elapsed_ns_(resolve_start, SteadyClock::now());
                             timing.final_relaxation_objective = relaxation.objective;
                             node.basis = relaxation.basis;
+                            if (relaxation.status == RelaxationStatus::Optimal)
+                                age_active_cuts_(relaxation.primal);
                             note_lp_work_(relaxation);
                             const auto cut_estimate = detail::node_estimate(
                                 relaxation, problem_.variable_types, pseudocosts_snapshot_(),
@@ -3214,14 +3282,14 @@ class Solver {
                                 });
                                 mark_unbounded_();
                                 search_coordinator_.notify_all();
-                                finalize_node_timing("root_bound_tighten", "unbounded");
+                                finalize_node_timing("root_cut_propagate", "unbounded");
                                 return;
                             }
                             if (relaxation.status == RelaxationStatus::Infeasible) {
                                 update_tree_node_(node.id, [&](TreeNode& tree_node) {
                                     tree_node.status = TreeNodeStatus::Infeasible;
                                 });
-                                finalize_node_timing("root_bound_tighten", "infeasible");
+                                finalize_node_timing("root_cut_propagate", "infeasible");
                                 return;
                             }
                             const auto incumbent = incumbent_snapshot_();
@@ -3230,7 +3298,7 @@ class Solver {
                                 update_tree_node_(node.id, [&](TreeNode& tree_node) {
                                     tree_node.status = TreeNodeStatus::PrunedByBound;
                                 });
-                                finalize_node_timing("root_bound_tighten", "pruned_by_bound");
+                                finalize_node_timing("root_cut_propagate", "pruned_by_bound");
                                 return;
                             }
                         }
@@ -3277,6 +3345,8 @@ class Solver {
                             elapsed_ns_(resolve_start, SteadyClock::now());
                         timing.final_relaxation_objective = relaxation.objective;
                         node.basis = relaxation.basis;
+                        if (relaxation.status == RelaxationStatus::Optimal)
+                            age_active_cuts_(relaxation.primal);
                         note_lp_work_(relaxation);
                         const auto cut_estimate = detail::node_estimate(
                             relaxation, problem_.variable_types, pseudocosts_snapshot_(),
@@ -3315,6 +3385,22 @@ class Solver {
                 }
                 if (!any_cuts_applied)
                     break;
+
+                const double round_improvement =
+                    bound_tightening_improvement_(round_start_objective, relaxation.objective);
+                const double cumulative_improvement =
+                    bound_tightening_improvement_(previous_round_objective, relaxation.objective);
+                const double progress_tol =
+                    std::max(10.0 * options_.feasibility_tol,
+                             1e-5 * std::max(1.0, std::abs(round_start_objective)));
+                if (round_improvement <= progress_tol && cumulative_improvement <= progress_tol) {
+                    ++stall_rounds;
+                } else {
+                    stall_rounds = 0;
+                }
+                previous_round_objective = relaxation.objective;
+                if (round >= 1 && stall_rounds >= 1)
+                    break;
             }
 
             if (re_solved_with_cuts) {
@@ -3337,8 +3423,11 @@ class Solver {
             std::vector<Cut> local_cuts;
             std::unordered_set<detail::CutSignature, detail::CutSignatureHash> local_cut_signatures;
             const int node_cut_rounds = node_effective_options.max_cut_rounds_per_node;
+            double previous_node_cut_objective = relaxation.objective;
+            int node_cut_stall_rounds = 0;
             for (int round = 0; round < node_cut_rounds; ++round) {
                 ++timing.node_cut_rounds;
+                const double round_start_objective = relaxation.objective;
                 std::vector<Cut> probing_relaxation_cuts = current_relaxation_cuts_snapshot_();
                 probing_relaxation_cuts.insert(probing_relaxation_cuts.end(), local_cuts.begin(),
                                                local_cuts.end());
@@ -3357,14 +3446,13 @@ class Solver {
                     timing.node_cut_generation_wall_ns +=
                         elapsed_ns_(phase_generation_start, SteadyClock::now());
                     timing.node_cuts_generated += static_cast<int>(phase_generated.size());
-                    if (phase == detail::CutSeparatorPhase::ImpliedBound) {
-                        const int tightened =
-                            tighten_bounds_from_implied_cuts(phase_generated, node);
+                    if (!phase_generated.empty()) {
+                        const int tightened = tighten_bounds_from_cuts(phase_generated, node);
                         if (tightened < 0) {
                             update_tree_node_(node.id, [&](TreeNode& tree_node) {
                                 tree_node.status = TreeNodeStatus::Infeasible;
                             });
-                            finalize_node_timing("node_bound_tighten", "infeasible");
+                            finalize_node_timing("node_cut_propagate", "infeasible");
                             return;
                         }
                         if (tightened > 0) {
@@ -3389,14 +3477,14 @@ class Solver {
                                 });
                                 mark_unbounded_();
                                 search_coordinator_.notify_all();
-                                finalize_node_timing("node_bound_tighten", "unbounded");
+                                finalize_node_timing("node_cut_propagate", "unbounded");
                                 return;
                             }
                             if (relaxation.status == RelaxationStatus::Infeasible) {
                                 update_tree_node_(node.id, [&](TreeNode& tree_node) {
                                     tree_node.status = TreeNodeStatus::Infeasible;
                                 });
-                                finalize_node_timing("node_bound_tighten", "infeasible");
+                                finalize_node_timing("node_cut_propagate", "infeasible");
                                 return;
                             }
                             const auto incumbent = incumbent_snapshot_();
@@ -3405,7 +3493,7 @@ class Solver {
                                 update_tree_node_(node.id, [&](TreeNode& tree_node) {
                                     tree_node.status = TreeNodeStatus::PrunedByBound;
                                 });
-                                finalize_node_timing("node_bound_tighten", "pruned_by_bound");
+                                finalize_node_timing("node_cut_propagate", "pruned_by_bound");
                                 return;
                             }
                             fractional = detail::collect_fractional_candidates(
@@ -3422,7 +3510,7 @@ class Solver {
                                 });
                                 maybe_update_incumbent_(relaxation.primal, relaxation.objective);
                                 search_coordinator_.notify_all();
-                                finalize_node_timing("node_bound_tighten", "integral");
+                                finalize_node_timing("node_cut_propagate", "integral");
                                 return;
                             }
                         }
@@ -3524,6 +3612,22 @@ class Solver {
                     }
                 }
                 if (!any_cuts_applied)
+                    break;
+
+                const double round_improvement =
+                    bound_tightening_improvement_(round_start_objective, relaxation.objective);
+                const double cumulative_improvement = bound_tightening_improvement_(
+                    previous_node_cut_objective, relaxation.objective);
+                const double progress_tol =
+                    std::max(20.0 * options_.feasibility_tol,
+                             2e-5 * std::max(1.0, std::abs(round_start_objective)));
+                if (round_improvement <= progress_tol && cumulative_improvement <= progress_tol) {
+                    ++node_cut_stall_rounds;
+                } else {
+                    node_cut_stall_rounds = 0;
+                }
+                previous_node_cut_objective = relaxation.objective;
+                if (node_cut_stall_rounds >= 1)
                     break;
 
                 {
@@ -4261,6 +4365,7 @@ class Solver {
     detail::SearchCoordinator search_coordinator_;
     detail::CutPool cut_pool_{options_};
     std::vector<Cut> active_cuts_;
+    std::size_t protected_active_cut_count_ = 0;
     std::unordered_set<detail::CutSignature, detail::CutSignatureHash> active_cut_signatures_;
     std::vector<TreeNode> tree_nodes_;
     int node_count_ = 0;
