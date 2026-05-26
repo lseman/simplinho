@@ -126,6 +126,7 @@ class CutPool {
     const std::vector<Cut>& active_cuts_read_only() const { return cuts_; }
 
     std::vector<Cut> snapshot_cuts(int max_cuts = -1) const;
+    std::vector<Cut> snapshot_propagation_cuts(const Problem& problem, int max_cuts = -1) const;
 
   private:
     void manage_pool_size_();

@@ -13,339 +13,10 @@
 #include <variant>
 #include <vector>
 
+#include "presolve_types.h"
+
 namespace presolve {
 
-// ------------------------------
-// Problem container
-// ------------------------------
-enum class RowSense : int { LE = -1, EQ = 0, GE = 1 };
-
-struct LP {
-    Eigen::MatrixXd A;           // m x n
-    Eigen::VectorXd b;           // m
-    std::vector<RowSense> sense; // m
-    Eigen::VectorXd c;           // n
-    Eigen::VectorXd l;           // n  (can be -inf)
-    Eigen::VectorXd u;           // n  (can be +inf)
-    double c0 = 0.0;
-};
-
-struct BoundRelaxationSummary {
-    int relaxed_lower = 0;
-    int relaxed_upper = 0;
-};
-
-inline double inf() { return std::numeric_limits<double>::infinity(); }
-inline double ninf() { return -std::numeric_limits<double>::infinity(); }
-inline bool is_finite(double v) { return std::isfinite(v); }
-
-struct ActRowReduce {
-    Eigen::MatrixXd U;
-    Eigen::VectorXi keep;
-    int old_m = 0;
-};
-struct ActRemoveRow {
-    int i;
-    RowSense sense;
-    double rhs;
-    Eigen::VectorXd row;
-};
-struct ActRemoveCol {
-    int j;
-    double c_j;
-    double l_j, u_j;
-    Eigen::VectorXd col;
-};
-struct ActFixVar {
-    int j;
-    double x_fix;
-    double c_j;
-    Eigen::VectorXd col;
-};
-struct ActTightenBound {
-    int j;
-    double old_l, old_u;
-};
-struct ActScaleRow {
-    int i;
-    double scale;
-};
-struct ActScaleCol {
-    int j;
-    double scale;
-};
-struct ActSingletonRowElim {
-    int i;
-    int j;
-    RowSense sense;
-    double rhs;
-    double aij;
-    Eigen::VectorXd row;
-};
-struct ActSingletonColElim {
-    int j;
-    int i;
-    double aij;
-    Eigen::VectorXd col;
-};
-struct ActDualFix {
-    int j;
-    double old_l, old_u;
-    double x_fix;
-};
-
-// Doubleton equality row: x_elim = (b_i - a_keep * x_keep) / a_elim
-struct ActDoubletonEq {
-    int col_elim;                  // column that was eliminated (expressed via col_keep)
-    int col_keep;                  // column that remains in the reduced problem
-    double a_elim;                 // coefficient of col_elim in the doubleton row
-    double a_keep;                 // coefficient of col_keep in the doubleton row
-    double b_row;                  // RHS of the doubleton equality row
-    double old_l_elim, old_u_elim; // original bounds of col_elim
-    double c_elim;                 // original objective coefficient of col_elim
-};
-
-using Action =
-    std::variant<ActRowReduce, ActRemoveRow, ActRemoveCol, ActFixVar, ActTightenBound, ActScaleRow,
-                 ActScaleCol, ActSingletonRowElim, ActSingletonColElim, ActDualFix, ActDoubletonEq>;
-
-struct PresolveResult {
-    LP reduced;
-    std::vector<Action> stack;
-    std::vector<int> orig_col_index;
-    std::vector<int> orig_row_index;
-    int original_num_cols = 0;
-    int original_num_rows = 0;
-    double obj_shift = 0.0;
-    bool proven_infeasible = false;
-    bool proven_unbounded = false;
-    int implied_bound_updates = 0;
-    int relaxed_huge_lower_bounds = 0;
-    int relaxed_huge_upper_bounds = 0;
-};
-
-struct ActivityBounds {
-    double min_act = 0.0, max_act = 0.0;
-};
-
-struct ActivityRange {
-    double min_act = 0.0, max_act = 0.0;
-    bool min_finite = true, max_finite = true;
-};
-
-struct ImpliedInterval {
-    double lower = ninf(), upper = inf();
-    bool has_lower = false, has_upper = false;
-};
-
-struct ImpliedBoundsSummary {
-    Eigen::VectorXd impl_col_lower;
-    Eigen::VectorXd impl_col_upper;
-    std::vector<char> has_lower;
-    std::vector<char> has_upper;
-
-    explicit ImpliedBoundsSummary(int n = 0)
-        : impl_col_lower(Eigen::VectorXd::Constant(n, ninf())),
-          impl_col_upper(Eigen::VectorXd::Constant(n, inf())), has_lower(n, 0), has_upper(n, 0) {}
-};
-
-inline ActivityBounds row_activity_bounds(const Eigen::RowVectorXd& a, const Eigen::VectorXd& l,
-                                          const Eigen::VectorXd& u) {
-    ActivityBounds ab{0.0, 0.0};
-    const int n = (int)a.size();
-    for (int j = 0; j < n; ++j) {
-        const double coeff = a(j);
-        if (coeff >= 0.0) {
-            ab.min_act += coeff * (is_finite(l(j)) ? l(j) : (coeff == 0.0 ? 0.0 : -inf()));
-            ab.max_act += coeff * (is_finite(u(j)) ? u(j) : inf());
-        } else {
-            ab.min_act += coeff * (is_finite(u(j)) ? u(j) : inf());
-            ab.max_act += coeff * (is_finite(l(j)) ? l(j) : -inf());
-        }
-    }
-    return ab;
-}
-
-inline ActivityRange row_activity_range_excluding(const Eigen::RowVectorXd& a,
-                                                  const Eigen::VectorXd& l,
-                                                  const Eigen::VectorXd& u, int skip_j,
-                                                  double zero_tol) {
-    ActivityRange range;
-    const int n = (int)a.size();
-    for (int j = 0; j < n; ++j) {
-        if (j == skip_j)
-            continue;
-        const double coeff = a(j);
-        if (std::abs(coeff) <= zero_tol)
-            continue;
-
-        if (coeff >= 0.0) {
-            if (range.min_finite) {
-                if (is_finite(l(j)))
-                    range.min_act += coeff * l(j);
-                else
-                    range.min_finite = false;
-            }
-            if (range.max_finite) {
-                if (is_finite(u(j)))
-                    range.max_act += coeff * u(j);
-                else
-                    range.max_finite = false;
-            }
-        } else {
-            if (range.min_finite) {
-                if (is_finite(u(j)))
-                    range.min_act += coeff * u(j);
-                else
-                    range.min_finite = false;
-            }
-            if (range.max_finite) {
-                if (is_finite(l(j)))
-                    range.max_act += coeff * l(j);
-                else
-                    range.max_finite = false;
-            }
-        }
-    }
-    return range;
-}
-
-inline BoundRelaxationSummary canonicalize_inactive_huge_bounds(LP* problem, double zero_tol,
-                                                                double huge_bound_factor = 1e6,
-                                                                double relax_gap_factor = 1e6) {
-    BoundRelaxationSummary summary;
-    if (!problem || problem->A.rows() == 0 || problem->A.cols() == 0)
-        return summary;
-
-    double data_scale = 1.0;
-    if (problem->A.size() > 0)
-        data_scale = std::max(data_scale, problem->A.cwiseAbs().maxCoeff());
-    if (problem->b.size() > 0)
-        data_scale = std::max(data_scale, problem->b.cwiseAbs().maxCoeff());
-
-    const double huge_bound = huge_bound_factor * data_scale;
-
-    for (int j = 0; j < problem->A.cols(); ++j) {
-        const Eigen::VectorXd col = problem->A.col(j);
-        const double col_max = col.cwiseAbs().maxCoeff();
-
-        // Skip zero columns - they can't constrain anything
-        if (col_max <= zero_tol) {
-            if (is_finite(problem->u(j)) && problem->u(j) > huge_bound)
-                problem->u(j) = inf();
-            if (is_finite(problem->l(j)) && problem->l(j) < -huge_bound)
-                problem->l(j) = ninf();
-            continue;
-        }
-
-        bool needs_upper_check = is_finite(problem->u(j)) && problem->u(j) > huge_bound;
-        bool needs_lower_check = is_finite(problem->l(j)) && problem->l(j) < -huge_bound;
-
-        if (!needs_upper_check && !needs_lower_check)
-            continue;
-
-        double implied_u = inf();
-        double implied_l = ninf();
-        bool has_implied_u = false;
-        bool has_implied_l = false;
-
-        int row_count = (int)problem->A.rows();
-        for (int i = 0; i < row_count; ++i) {
-            const double aij = col(i);
-            if (std::abs(aij) <= zero_tol)
-                continue;
-
-            const auto other = row_activity_range_excluding(problem->A.row(i), problem->l,
-                                                            problem->u, j, zero_tol);
-            if (aij > 0.0) {
-                if (other.min_finite) {
-                    double val = (problem->b(i) - other.min_act) / aij;
-                    if (val < implied_u) {
-                        implied_u = val;
-                        has_implied_u = true;
-                    }
-                }
-                if (other.max_finite) {
-                    double val = (problem->b(i) - other.max_act) / aij;
-                    if (val > implied_l) {
-                        implied_l = val;
-                        has_implied_l = true;
-                    }
-                }
-            } else {
-                if (other.max_finite) {
-                    double val = (problem->b(i) - other.max_act) / aij;
-                    if (val < implied_u) {
-                        implied_u = val;
-                        has_implied_u = true;
-                    }
-                }
-                if (other.min_finite) {
-                    double val = (problem->b(i) - other.min_act) / aij;
-                    if (val > implied_l) {
-                        implied_l = val;
-                        has_implied_l = true;
-                    }
-                }
-            }
-
-            // Early termination: if we found finite bounds, we can stop
-            if (has_implied_u && has_implied_l && implied_u > implied_l) {
-                if (implied_u > -inf()) {
-                    const double ref = std::max({1.0, std::abs(implied_u), data_scale});
-                    if (problem->u(j) > implied_u + relax_gap_factor * ref) {
-                        problem->u(j) = inf();
-                        ++summary.relaxed_upper;
-                    }
-                }
-                if (implied_l < inf()) {
-                    const double ref = std::max({1.0, std::abs(implied_l), data_scale});
-                    if (problem->l(j) < implied_l - relax_gap_factor * ref) {
-                        problem->l(j) = ninf();
-                        ++summary.relaxed_lower;
-                    }
-                }
-                break;
-            }
-        }
-
-        // Final check if we didn't break early
-        if (has_implied_u && is_finite(implied_u)) {
-            const double ref = std::max({1.0, std::abs(implied_u), data_scale});
-            if (problem->u(j) > implied_u + relax_gap_factor * ref) {
-                problem->u(j) = inf();
-                ++summary.relaxed_upper;
-            }
-        }
-        if (has_implied_l && is_finite(implied_l)) {
-            const double ref = std::max({1.0, std::abs(implied_l), data_scale});
-            if (problem->l(j) < implied_l - relax_gap_factor * ref) {
-                problem->l(j) = ninf();
-                ++summary.relaxed_lower;
-            }
-        }
-    }
-
-    return summary;
-}
-
-inline bool nearly_zero(double v, double tol = 1e-12) { return std::abs(v) <= tol; }
-
-inline double nearest_power_of_two_magnitude(double value) {
-    if (!(std::isfinite(value)) || value <= 0.0)
-        return 1.0;
-    int exponent = 0;
-    const double fraction = std::frexp(value, &exponent);
-    if (fraction < std::sqrt(0.5))
-        --exponent;
-    return std::ldexp(1.0, exponent);
-}
-
-template <class Derived> inline double safe_abs_max(const Eigen::MatrixBase<Derived>& x) {
-    return x.size() ? x.cwiseAbs().maxCoeff() : 0.0;
-}
-
-enum class RowReduceMethod { RRQR, SVD, Auto };
 
 class Presolver {
   public:
@@ -391,6 +62,20 @@ class Presolver {
         // doubleton equation elimination: x_elim = (b - a_keep*x_keep) / a_elim
         // Only active when allow_structural_changes && !non_destructive
         bool enable_doubleton_elim = false;
+
+        // HiGHS-style reduced-cost lurking bound tightening:
+        // For a continuous column with one-sided reduced cost implied by its
+        // lock structure, we derive implied dual row bounds and use them to
+        // tighten primal bounds on other columns in those rows.
+        bool enable_reduced_cost_lurking = true;
+
+        // Row aggregation through continuous free variables:
+        // Pair rows containing a common continuous free variable and sum them
+        // with appropriate scaling to eliminate the variable, deriving a new
+        // aggregate constraint on the remaining variables.  New bounds
+        // propagated without filling in the matrix.
+        bool enable_row_aggregation = false; // off by default (may increase constraint count)
+        int  row_agg_max_pairs = 20;         // max (row_i, row_k) pairs per pass
     };
 
     Presolver() : opt_() { domprop_min_delta_ = 1e3 * opt_.infeas_tol; }
@@ -507,6 +192,17 @@ class Presolver {
 
             // Cheap reduced-cost-style fixing from objective sign and row locks.
             changed |= dual_fix_by_locks(P);
+            if (res_.proven_infeasible)
+                break;
+
+            // HiGHS-style reduced-cost lurking bounds: implied primal bounds
+            // from dual bounds derived via reduced-cost certificates.
+            changed |= reduced_cost_lurking_bounds(P);
+            if (res_.proven_infeasible)
+                break;
+
+            // Row aggregation through continuous free variables.
+            changed |= row_aggregation(P);
             if (res_.proven_infeasible)
                 break;
 
@@ -1761,6 +1457,263 @@ class Presolver {
         }
 
         return false;
+    }
+
+    // -----------------------------------------------------------------------
+    // reduced_cost_lurking_bounds (HiGHS-style)
+    // -----------------------------------------------------------------------
+    // For each continuous, non-fixed column j whose objective coefficient c_j
+    // is non-zero and whose every appearance is in a one-sided inequality
+    // (no EQ rows), we exploit the complementary-slackness / reduced-cost
+    // condition to infer that certain rows must be *tight* at any LP optimum,
+    // then propagate primal bounds from those tight rows.
+    //
+    // Key observation:
+    //   LE row i: dual y_i <= 0;  if c_j > 0 and a_ij > 0 => rc = c_j - a_ij*y_i > 0
+    //     => x_j pushed to lower bound (already handled by dual_fix_by_locks).
+    //   NEW case – mixed signs:
+    //     For a given row i, bounding y_i from rc >= 0 using worst-case y_k=0
+    //     for all other rows k gives:  y_i <= c_j / a_ij  (if a_ij > 0, LE row).
+    //     If c_j / a_ij < 0 (i.e. c_j < 0 and a_ij > 0), then y_i < 0, meaning
+    //     row i MUST be tight (dual > 0 in absolute value => active constraint).
+    //     We then treat row i as equality and tighten all columns in it.
+    // -----------------------------------------------------------------------
+    bool reduced_cost_lurking_bounds(LP& P) {
+        if (!opt_.enable_reduced_cost_lurking)
+            return false;
+        const int m = (int)P.A.rows(), n = (int)P.A.cols();
+        if (m == 0 || n == 0)
+            return false;
+
+        ImpliedBoundsSummary summary(n);
+
+        for (int j = 0; j < n; ++j) {
+            // Skip fixed variables
+            if (is_finite(P.l(j)) && is_finite(P.u(j)) &&
+                std::abs(P.u(j) - P.l(j)) <= opt_.zero_tol)
+                continue;
+
+            const double cj = P.c(j);
+            if (std::abs(cj) <= opt_.zero_tol)
+                continue;
+
+            const std::vector<int>& rows_j =
+                (j < (int)col_nz_.size()) ? col_nz_[j] : std::vector<int>{};
+            if (rows_j.empty())
+                continue;
+
+            // All rows must be one-sided inequalities for this to apply
+            bool all_one_sided = true;
+            for (int i : rows_j) {
+                if (P.sense[i] == RowSense::EQ) { all_one_sided = false; break; }
+            }
+            if (!all_one_sided)
+                continue;
+
+            // For each row i containing j, derive an implied dual bound and
+            // check if that forces the row to be tight.
+            for (int i : rows_j) {
+                const double aij = P.A(i, j);
+                if (std::abs(aij) <= opt_.zero_tol)
+                    continue;
+
+                // Dual sign: LE => y_i <= 0; GE => y_i >= 0
+                // From rc condition (worst case other duals = 0):
+                //   y_i <= c_j / a_ij   (if a_ij > 0)
+                //   y_i >= c_j / a_ij   (if a_ij < 0)
+                const double yi_bound = cj / aij;
+
+                bool row_forced_tight = false;
+                if (P.sense[i] == RowSense::LE) {
+                    // y_i <= 0 by complementarity
+                    // If yi_bound < 0 strictly: y_i is forced < 0 => row active
+                    if (aij > opt_.zero_tol && yi_bound < -opt_.dual_fix_tol)
+                        row_forced_tight = true;
+                } else { // GE
+                    // y_i >= 0 by complementarity
+                    // If yi_bound > 0 strictly: y_i is forced > 0 => row active
+                    if (aij < -opt_.zero_tol && yi_bound > opt_.dual_fix_tol)
+                        row_forced_tight = true;
+                }
+
+                if (!row_forced_tight)
+                    continue;
+
+                // Row i is forced tight at optimality: propagate EQ-style bounds.
+                const std::vector<int>* nz_row_ptr =
+                    (i < (int)row_nz_.size()) ? &row_nz_[i] : nullptr;
+
+                struct NzE { int k; double a; };
+                std::vector<NzE> entries;
+                double min_finite = 0.0, max_finite = 0.0;
+                int min_inf_cnt = 0, max_inf_cnt = 0;
+
+                auto process = [&](int k) {
+                    const double a = P.A(i, k);
+                    if (std::abs(a) <= opt_.zero_tol) return;
+                    entries.push_back({k, a});
+                    if (a > 0.0) {
+                        if (is_finite(P.l(k))) min_finite += a * P.l(k); else ++min_inf_cnt;
+                        if (is_finite(P.u(k))) max_finite += a * P.u(k); else ++max_inf_cnt;
+                    } else {
+                        if (is_finite(P.u(k))) min_finite += a * P.u(k); else ++min_inf_cnt;
+                        if (is_finite(P.l(k))) max_finite += a * P.l(k); else ++max_inf_cnt;
+                    }
+                };
+                if (nz_row_ptr) {
+                    entries.reserve(nz_row_ptr->size());
+                    for (int k : *nz_row_ptr) process(k);
+                } else {
+                    for (int k = 0; k < n; ++k) process(k);
+                }
+
+                const double rhs = P.b(i);
+                for (const auto& [k, a] : entries) {
+                    double omin = min_finite; int omin_inf = min_inf_cnt;
+                    double omax = max_finite; int omax_inf = max_inf_cnt;
+                    if (a > 0.0) {
+                        if (is_finite(P.l(k))) omin -= a * P.l(k); else --omin_inf;
+                        if (is_finite(P.u(k))) omax -= a * P.u(k); else --omax_inf;
+                    } else {
+                        if (is_finite(P.u(k))) omin -= a * P.u(k); else --omin_inf;
+                        if (is_finite(P.l(k))) omax -= a * P.l(k); else --omax_inf;
+                    }
+                    const bool omin_f = (omin_inf == 0), omax_f = (omax_inf == 0);
+                    ImpliedInterval impl;
+                    // EQ-style: both bounds
+                    if (a > 0.0) {
+                        if (omax_f) { impl.lower = (rhs - omax) / a; impl.has_lower = true; }
+                        if (omin_f) { impl.upper = (rhs - omin) / a; impl.has_upper = true; }
+                    } else {
+                        if (omin_f) { impl.lower = (rhs - omin) / a; impl.has_lower = true; }
+                        if (omax_f) { impl.upper = (rhs - omax) / a; impl.has_upper = true; }
+                    }
+                    if (impl.has_lower && impl.has_upper && impl.lower > impl.upper)
+                        std::swap(impl.lower, impl.upper);
+                    merge_implied_interval_(summary, k, impl);
+                }
+            }
+        }
+
+        return apply_implied_bounds_(P, summary, nullptr, false);
+    }
+
+    // -----------------------------------------------------------------------
+    // row_aggregation (Farkas/Chvátal aggregation through free continuous vars)
+    // -----------------------------------------------------------------------
+    // For a continuous free variable x_j (l_j = -inf, u_j = +inf) appearing in
+    // both a LE and a GE row, eliminate x_j by Farkas aggregation:
+    //   lambda * (LE row) + (GE row), lambda > 0 chosen to cancel x_j.
+    // The resulting constraint is valid and may tighten bounds on other columns.
+    // We propagate the new bounds immediately without modifying A.
+    // -----------------------------------------------------------------------
+    bool row_aggregation(LP& P) {
+        if (!opt_.enable_row_aggregation)
+            return false;
+        const int m = (int)P.A.rows(), n = (int)P.A.cols();
+        if (m == 0 || n == 0)
+            return false;
+
+        ImpliedBoundsSummary summary(n);
+        int pairs_processed = 0;
+
+        for (int j = 0; j < n && pairs_processed < opt_.row_agg_max_pairs; ++j) {
+            // Must be free (both bounds infinite)
+            if (is_finite(P.l(j)) || is_finite(P.u(j)))
+                continue;
+
+            const std::vector<int>& rows_j =
+                (j < (int)col_nz_.size()) ? col_nz_[j] : std::vector<int>{};
+            if (rows_j.size() < 2)
+                continue;
+
+            std::vector<int> le_rows, ge_rows;
+            for (int i : rows_j) {
+                if (P.sense[i] == RowSense::LE) le_rows.push_back(i);
+                else if (P.sense[i] == RowSense::GE) ge_rows.push_back(i);
+            }
+            if (le_rows.empty() || ge_rows.empty())
+                continue;
+
+            for (int ir : le_rows) {
+                for (int ig : ge_rows) {
+                    if (pairs_processed >= opt_.row_agg_max_pairs) goto done_agg;
+                    const double a_le = P.A(ir, j);
+                    const double a_ge = P.A(ig, j);
+                    if (std::abs(a_le) <= opt_.zero_tol || std::abs(a_ge) <= opt_.zero_tol)
+                        continue;
+
+                    // lambda = -a_ge / a_le must be > 0 for Farkas validity
+                    const double lambda = -a_ge / a_le;
+                    if (lambda <= opt_.zero_tol)
+                        continue;
+
+                    ++pairs_processed;
+
+                    // Compute aggregated row coefficients and activity range
+                    // Aggregate = lambda*(LE row) + (GE row)  -> new GE constraint
+                    // Collect columns in union of the two rows
+                    const auto& ri = (ir < (int)row_nz_.size()) ? row_nz_[ir] : std::vector<int>{};
+                    const auto& rg = (ig < (int)row_nz_.size()) ? row_nz_[ig] : std::vector<int>{};
+
+                    std::vector<int> cols_union;
+                    cols_union.reserve(ri.size() + rg.size());
+                    cols_union.insert(cols_union.end(), ri.begin(), ri.end());
+                    for (int k : rg) {
+                        if (std::find(ri.begin(), ri.end(), k) == ri.end())
+                            cols_union.push_back(k);
+                    }
+
+                    const double agg_rhs = lambda * P.b(ir) + P.b(ig);
+
+                    struct AggEntry { int k; double coeff; };
+                    std::vector<AggEntry> agg;
+                    agg.reserve(cols_union.size());
+                    double min_act = 0.0, max_act = 0.0;
+                    int min_inf = 0, max_inf = 0;
+
+                    for (int k : cols_union) {
+                        if (k == j) continue; // cancelled
+                        const double coeff = lambda * P.A(ir, k) + P.A(ig, k);
+                        if (std::abs(coeff) <= opt_.zero_tol) continue;
+                        agg.push_back({k, coeff});
+                        if (coeff > 0.0) {
+                            if (is_finite(P.l(k))) min_act += coeff * P.l(k); else ++min_inf;
+                            if (is_finite(P.u(k))) max_act += coeff * P.u(k); else ++max_inf;
+                        } else {
+                            if (is_finite(P.u(k))) min_act += coeff * P.u(k); else ++min_inf;
+                            if (is_finite(P.l(k))) max_act += coeff * P.l(k); else ++max_inf;
+                        }
+                    }
+                    if (agg.empty()) continue;
+
+                    // Infeasibility: max activity < rhs for GE
+                    if (max_inf == 0 && max_act < agg_rhs - opt_.infeas_tol) {
+                        res_.proven_infeasible = true;
+                        return true;
+                    }
+
+                    // Propagate GE bounds
+                    for (const auto& [k, coeff] : agg) {
+                        double other_max = max_act; int o_max_inf = max_inf;
+                        if (coeff > 0.0) {
+                            if (is_finite(P.u(k))) other_max -= coeff * P.u(k); else --o_max_inf;
+                        } else {
+                            if (is_finite(P.l(k))) other_max -= coeff * P.l(k); else --o_max_inf;
+                        }
+                        if (o_max_inf != 0) continue;
+                        const double implied = (agg_rhs - other_max) / coeff;
+                        ImpliedInterval impl;
+                        if (coeff > 0.0) { impl.lower = implied; impl.has_lower = true; }
+                        else             { impl.upper = implied; impl.has_upper = true; }
+                        merge_implied_interval_(summary, k, impl);
+                    }
+                }
+            }
+        }
+        done_agg:
+
+        return apply_implied_bounds_(P, summary, nullptr, false);
     }
 
     bool dual_fix_by_locks(LP& P) {

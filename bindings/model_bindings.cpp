@@ -11,9 +11,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -34,6 +36,7 @@
 #include "simplex/bnb.h"
 #include "simplex/simplex.h"
 #include "solve_stats.h"
+#include "verbose_log.h"
 
 #ifndef SIMPLEX_PROJECT_VERSION
 #    define SIMPLEX_PROJECT_VERSION "unknown"
@@ -55,69 +58,6 @@ namespace {
 constexpr double kCoeffTol = 1e-12;
 using namespace simplinho::bindings;
 
-bool log_colors_enabled_() {
-    static const bool enabled = []() {
-        if (std::getenv("NO_COLOR") != nullptr) {
-            return false;
-        }
-        const char* term = std::getenv("TERM");
-        if (term == nullptr || std::string_view(term) == "dumb") {
-            return false;
-        }
-#if defined(__unix__) || defined(__APPLE__)
-        return ::isatty(fileno(stdout)) != 0;
-#else
-        return false;
-#endif
-    }();
-    return enabled;
-}
-
-std::string colorize_(std::string_view text, std::string_view ansi_code) {
-    if (!log_colors_enabled_()) {
-        return std::string(text);
-    }
-    std::string out;
-    out.reserve(text.size() + ansi_code.size() + 10);
-    out += "\033[";
-    out += ansi_code;
-    out += "m";
-    out += text;
-    out += "\033[0m";
-    return out;
-}
-
-std::string accent_(std::string_view text) { return colorize_(text, "38;5;39"); }
-std::string bold_(std::string_view text) { return colorize_(text, "1"); }
-std::string dim_(std::string_view text) { return colorize_(text, "2"); }
-std::string good_(std::string_view text) { return colorize_(text, "38;5;40"); }
-std::string warn_(std::string_view text) { return colorize_(text, "38;5;214"); }
-std::string cyan_(std::string_view text) { return colorize_(text, "38;5;51"); }
-std::string green_(std::string_view text) { return colorize_(text, "38;5;82"); }
-std::string yellow_(std::string_view text) { return colorize_(text, "38;5;226"); }
-std::string magenta_(std::string_view text) { return colorize_(text, "38;5;213"); }
-
-// Width = 79 chars (Gurobi-standard terminal width)
-constexpr int kLogWidth = 79;
-std::string rule_(char ch = '=') { return std::string(kLogWidth, ch); }
-std::string thin_rule_() { return dim_(std::string(kLogWidth, '-')); }
-
-void print_verbose_solver_banner() {
-    std::cout << dim_(rule_()) << "\n";
-    // Center "Simplinho" with version and git info
-    std::ostringstream title;
-    title << "Simplinho " << SIMPLEX_PROJECT_VERSION;
-    const std::string title_str = title.str();
-    const int pad = std::max(0, (kLogWidth - static_cast<int>(title_str.size())) / 2);
-    std::cout << std::string(pad, ' ') << bold_(title_str) << "\n";
-    std::ostringstream git_line;
-    git_line << "git " << SIMPLEX_GIT_DESCRIBE << "  branch:" << SIMPLEX_GIT_BRANCH;
-    const std::string git_str = git_line.str();
-    const int git_pad = std::max(0, (kLogWidth - static_cast<int>(git_str.size())) / 2);
-    std::cout << dim_(std::string(git_pad, ' ') + git_str) << "\n";
-    std::cout << dim_(rule_()) << "\n\n";
-}
-
 enum class ConstraintSense { LessEqual, Equal, GreaterEqual };
 using VarType = simplex_bnb::VariableType;
 using MIPStatus = simplex_bnb::Status;
@@ -134,61 +74,6 @@ using simplex_bnb::presolve::cut_set_signature;
 using simplex_bnb::presolve::presolve_mip_node_bounds;
 using simplex_bnb::presolve::presolve_mip_root_problem;
 using simplex_bnb::presolve::simplify_cuts_for_bounds;
-
-std::string feature_token_(std::string_view name, bool enabled) {
-    return enabled ? good_(name) : dim_(name);
-}
-
-template <typename Features> std::string join_feature_tokens_(const Features& features) {
-    std::ostringstream oss;
-    bool first = true;
-    for (const auto& [name, enabled] : features) {
-        if (!first) {
-            oss << "  ";
-        }
-        first = false;
-        oss << feature_token_(name, enabled);
-    }
-    return oss.str();
-}
-
-void print_verbose_solver_configuration(const BranchAndBoundOptions& options) {
-    std::cout << accent_("Search") << " " << dim_("|") << " node "
-              << cyan_(simplex_bnb::to_string(options.node_selection)) << "  branch "
-              << cyan_(simplex_bnb::to_string(options.branching_strategy)) << "  dive "
-              << cyan_(simplex_bnb::to_string(options.diving_strategy)) << "  workers "
-              << cyan_(std::to_string(options.parallel_workers)) << "  async "
-              << feature_token_("heuristics", options.use_async_heuristics) << "\n";
-
-    const std::vector<std::pair<std::string_view, bool>> heuristics = {
-        {"rounding", options.use_rounding},
-        {"diving", options.use_diving && options.diving_strategy != DivingStrategy::Disabled},
-        {"feas-jump", options.use_feasibility_jump},
-        {"feas-pump", options.use_feasibility_pump},
-        {"RENS", options.use_rens},
-        {"RINS", options.use_rins},
-        {"local-search", options.use_local_search},
-        {"local-branch", options.use_local_branching},
-    };
-    std::cout << accent_("Heur") << "   " << dim_("|") << " " << join_feature_tokens_(heuristics)
-              << "\n";
-
-    const std::vector<std::pair<std::string_view, bool>> cuts = {
-        {"pool", options.use_cut_pool},
-        {"gomory", options.use_gomory_cuts},
-        {"mir", options.use_mir_cuts},
-        {"cover", options.use_cover_cuts},
-        {"zero-half", options.use_zero_half_cuts},
-        {"impl-bound", options.use_implied_bound_cuts},
-        {"clique", options.use_clique_cuts},
-        {"odd-cycle", options.use_odd_cycle_cuts},
-        {"probing", options.use_probing_implications},
-        {"conflict", options.use_conflict_cuts},
-        {"dual-proof", options.use_dual_proof_cuts},
-    };
-    std::cout << accent_("Cuts") << "   " << dim_("|") << " " << join_feature_tokens_(cuts) << "\n";
-    std::cout << "\n" << thin_rule_() << "\n";
-}
 
 const char* simplex_mode_name(SimplexMode mode) {
     switch (mode) {
@@ -2389,7 +2274,541 @@ class Model {
         return oss.str();
     }
 
+    // Export the model to an MPS file. Writes NAME, ROWS, COLUMNS (with
+    // INTORG/INTEND markers around integer columns), RHS, RANGES, BOUNDS, and an
+    // SOS section when SOS constraints are present.
+    void write_mps(const std::string& path, const std::string& problem_name = "SIMPLINHO") const {
+        std::ofstream out(path);
+        if (!out) {
+            throw std::runtime_error("simplex: cannot open MPS file for writing: " + path);
+        }
+        write_mps_stream_(out, problem_name);
+        if (!out) {
+            throw std::runtime_error("simplex: error while writing MPS file: " + path);
+        }
+    }
+
+    // Construct a Model by parsing an MPS file. Reads the same sections written
+    // by write_mps; objective sense defaults to minimize (use OBJSENSE to flip).
+    static Model read_mps(const std::string& path,
+                          const RevisedSimplexOptions& options = RevisedSimplexOptions()) {
+        std::ifstream in(path);
+        if (!in) {
+            throw std::runtime_error("simplex: cannot open MPS file for reading: " + path);
+        }
+        Model model(options);
+        model.read_mps_stream_(in);
+        return model;
+    }
+
   private:
+    static std::string format_mps_number_(double value) {
+        std::ostringstream oss;
+        oss << std::setprecision(15) << value;
+        return oss.str();
+    }
+
+    void write_mps_stream_(std::ostream& out, const std::string& problem_name) const {
+        const int n = static_cast<int>(state_->vars.size());
+
+        out << "NAME          " << problem_name << "\n";
+        if (state_->maximize) {
+            out << "OBJSENSE\n    MAX\n";
+        }
+
+        // ROWS: objective marker + one row per constraint.
+        const std::string obj_row = "COST";
+        out << "ROWS\n";
+        out << " N  " << obj_row << "\n";
+        for (int i = 0; i < static_cast<int>(state_->constraints.size()); ++i) {
+            const auto& c = state_->constraints[i];
+            char tag = c.sense == ConstraintSense::LessEqual      ? 'L'
+                       : c.sense == ConstraintSense::GreaterEqual ? 'G'
+                                                                  : 'E';
+            out << " " << tag << "  " << mps_row_name_(i) << "\n";
+        }
+
+        // COLUMNS: column-major, integer columns wrapped in INTORG/INTEND markers.
+        // Build per-column row->coeff entries (objective row included).
+        std::vector<std::map<int, double>> col_entries(n); // row index (-1 = objective)
+        for (const auto& [index, coeff] : state_->objective.coeffs) {
+            if (index >= 0 && index < n) {
+                col_entries[index][-1] = coeff;
+            }
+        }
+        for (int row = 0; row < static_cast<int>(state_->constraints.size()); ++row) {
+            for (const auto& [index, coeff] : state_->constraints[row].expr.coeffs) {
+                if (index >= 0 && index < n) {
+                    col_entries[index][row] = coeff;
+                }
+            }
+        }
+
+        out << "COLUMNS\n";
+        bool in_int_block = false;
+        int marker_id = 0;
+        for (int j = 0; j < n; ++j) {
+            const bool is_int = state_->vars[j].type != VarType::Continuous;
+            if (is_int && !in_int_block) {
+                out << "    MARKER" << std::setw(0) << "                 'MARKER'"
+                    << "                 'INTORG'\n";
+                in_int_block = true;
+                ++marker_id;
+            } else if (!is_int && in_int_block) {
+                out << "    MARKER                 'MARKER'                 'INTEND'\n";
+                in_int_block = false;
+                ++marker_id;
+            }
+            const std::string& cname = state_->vars[j].name;
+            for (const auto& [row, coeff] : col_entries[j]) {
+                const std::string rname = (row == -1) ? obj_row : mps_row_name_(row);
+                out << "    " << cname << "  " << rname << "  " << format_mps_number_(coeff) << "\n";
+            }
+        }
+        if (in_int_block) {
+            out << "    MARKER                 'MARKER'                 'INTEND'\n";
+        }
+
+        // RHS: constraint right-hand sides (rhs = -expr.constant). Objective
+        // constant emitted against the objective row (negated, MPS convention).
+        out << "RHS\n";
+        if (std::abs(state_->objective.constant) > kCoeffTol) {
+            out << "    RHS  " << obj_row << "  " << format_mps_number_(-state_->objective.constant)
+                << "\n";
+        }
+        for (int i = 0; i < static_cast<int>(state_->constraints.size()); ++i) {
+            const double rhs = -state_->constraints[i].expr.constant;
+            if (std::abs(rhs) > kCoeffTol) {
+                out << "    RHS  " << mps_row_name_(i) << "  " << format_mps_number_(rhs) << "\n";
+            }
+        }
+
+        // BOUNDS: emit non-default bounds. Default LP bound is [0, +inf).
+        out << "BOUNDS\n";
+        for (int j = 0; j < n; ++j) {
+            const auto& v = state_->vars[j];
+            const bool lb_finite = std::isfinite(v.lb);
+            const bool ub_finite = std::isfinite(v.ub);
+            const std::string& name = v.name;
+            if (v.type == VarType::Binary && v.lb == 0.0 && v.ub == 1.0) {
+                out << " BV BND  " << name << "\n";
+                continue;
+            }
+            if (lb_finite && ub_finite && v.lb == v.ub) {
+                out << " FX BND  " << name << "  " << format_mps_number_(v.lb) << "\n";
+                continue;
+            }
+            if (!lb_finite && !ub_finite) {
+                out << " FR BND  " << name << "\n";
+                continue;
+            }
+            if (v.lb != 0.0) {
+                if (lb_finite) {
+                    out << " LO BND  " << name << "  " << format_mps_number_(v.lb) << "\n";
+                } else {
+                    out << " MI BND  " << name << "\n";
+                }
+            }
+            if (ub_finite) {
+                out << " UP BND  " << name << "  " << format_mps_number_(v.ub) << "\n";
+            } else if (v.type == VarType::Integer && v.lb == 0.0) {
+                // Integer with no upper bound: PL keeps it [0, +inf).
+                out << " PL BND  " << name << "\n";
+            }
+        }
+
+        // SOS: one set per SOS constraint, using variable weights.
+        if (!state_->sos_constraints.empty()) {
+            out << "SOS\n";
+            int set_id = 1;
+            for (const SOSData& sos : state_->sos_constraints) {
+                const int type = sos.type == simplex_bnb::SOSType::SOS1 ? 1 : 2;
+                out << " S" << type << " SOS  set" << set_id++ << "\n";
+                for (std::size_t k = 0; k < sos.variables.size(); ++k) {
+                    const int vi = sos.variables[k];
+                    if (vi >= 0 && vi < n) {
+                        out << "    " << state_->vars[vi].name << "  "
+                            << format_mps_number_(sos.weights[k]) << "\n";
+                    }
+                }
+            }
+        }
+
+        out << "ENDATA\n";
+    }
+
+    std::string mps_row_name_(int constraint_index) const {
+        const std::string& name = state_->constraints[constraint_index].name;
+        if (!name.empty()) {
+            return name;
+        }
+        return "R" + std::to_string(constraint_index);
+    }
+
+    void read_mps_stream_(std::istream& in) {
+        enum class Section { None, Name, Rows, Columns, Rhs, Ranges, Bounds, Sos, ObjSense };
+        Section section = Section::None;
+
+        std::string objective_row;                       // N row name
+        std::unordered_map<std::string, char> row_sense;  // row name -> L/G/E/N
+        std::vector<std::string> row_order;               // constraint rows in file order
+        std::unordered_map<std::string, int> row_to_constraint; // row name -> constraint index
+
+        bool integer_block = false;
+        // Pending column coefficients: var name -> (row name -> coeff).
+        std::unordered_map<std::string, std::unordered_map<std::string, double>> col_coeffs;
+        std::unordered_map<std::string, char> col_type; // 'I' integer, 'C' continuous
+        std::vector<std::string> col_order;
+        std::unordered_set<std::string> col_seen;
+
+        double objective_constant = 0.0;
+        std::unordered_map<std::string, double> row_rhs;    // constraint row -> rhs
+        std::unordered_map<std::string, double> row_ranges; // constraint row -> range
+        // Bounds collected per variable; applied after columns are known.
+        struct BoundInfo {
+            std::optional<double> lb;
+            std::optional<double> ub;
+            bool is_integer = false;
+            bool free = false;
+        };
+        std::unordered_map<std::string, BoundInfo> bounds;
+
+        struct SosEntry {
+            int type = 1;
+            std::vector<std::string> vars;
+            std::vector<double> weights;
+        };
+        std::vector<SosEntry> sos_sets;
+
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            if (line.empty() || line[0] == '*') {
+                continue;
+            }
+
+            // Section headers start in column 1 (no leading whitespace).
+            if (!std::isspace(static_cast<unsigned char>(line[0]))) {
+                std::istringstream hs(line);
+                std::string header;
+                hs >> header;
+                std::string upper = header;
+                std::transform(upper.begin(), upper.end(), upper.begin(),
+                               [](unsigned char ch) { return std::toupper(ch); });
+                if (upper == "NAME") {
+                    section = Section::Name;
+                } else if (upper == "OBJSENSE") {
+                    section = Section::ObjSense;
+                } else if (upper == "ROWS") {
+                    section = Section::Rows;
+                } else if (upper == "COLUMNS") {
+                    section = Section::Columns;
+                } else if (upper == "RHS") {
+                    section = Section::Rhs;
+                } else if (upper == "RANGES") {
+                    section = Section::Ranges;
+                } else if (upper == "BOUNDS") {
+                    section = Section::Bounds;
+                } else if (upper == "SOS") {
+                    section = Section::Sos;
+                } else if (upper == "ENDATA") {
+                    break;
+                } else {
+                    section = Section::None;
+                }
+                continue;
+            }
+
+            std::istringstream ss(line);
+            std::vector<std::string> tok;
+            std::string t;
+            while (ss >> t) {
+                tok.push_back(t);
+            }
+            if (tok.empty()) {
+                continue;
+            }
+
+            switch (section) {
+                case Section::ObjSense: {
+                    std::string s = tok[0];
+                    std::transform(s.begin(), s.end(), s.begin(),
+                                   [](unsigned char ch) { return std::toupper(ch); });
+                    state_->maximize = (s == "MAX" || s == "MAXIMIZE");
+                    break;
+                }
+                case Section::Rows: {
+                    if (tok.size() < 2) {
+                        break;
+                    }
+                    char sense = static_cast<char>(std::toupper(static_cast<unsigned char>(tok[0][0])));
+                    const std::string& rname = tok[1];
+                    row_sense[rname] = sense;
+                    if (sense == 'N') {
+                        if (objective_row.empty()) {
+                            objective_row = rname; // first N row is the objective
+                        }
+                    } else {
+                        row_to_constraint[rname] = static_cast<int>(row_order.size());
+                        row_order.push_back(rname);
+                    }
+                    break;
+                }
+                case Section::Columns: {
+                    // INTORG/INTEND markers.
+                    if (tok.size() >= 3 && tok[1] == "'MARKER'") {
+                        const std::string& kind = tok[2];
+                        if (kind == "'INTORG'") {
+                            integer_block = true;
+                        } else if (kind == "'INTEND'") {
+                            integer_block = false;
+                        }
+                        break;
+                    }
+                    if (tok.size() < 3) {
+                        break;
+                    }
+                    const std::string& cname = tok[0];
+                    if (col_seen.insert(cname).second) {
+                        col_order.push_back(cname);
+                        col_type[cname] = integer_block ? 'I' : 'C';
+                    }
+                    // Pairs of (row, value), up to two per line.
+                    for (std::size_t k = 1; k + 1 < tok.size(); k += 2) {
+                        const std::string& rname = tok[k];
+                        const double val = std::stod(tok[k + 1]);
+                        if (rname == objective_row) {
+                            col_coeffs[cname][objective_row] += val;
+                        } else if (row_sense.count(rname)) {
+                            col_coeffs[cname][rname] += val;
+                        }
+                    }
+                    break;
+                }
+                case Section::Rhs: {
+                    // [rhsname] row val [row val]; rhsname is optional.
+                    std::size_t start = 0;
+                    // If odd token count, first token is the RHS set name.
+                    if (tok.size() % 2 == 1) {
+                        start = 1;
+                    }
+                    for (std::size_t k = start; k + 1 < tok.size(); k += 2) {
+                        const std::string& rname = tok[k];
+                        const double val = std::stod(tok[k + 1]);
+                        if (rname == objective_row) {
+                            objective_constant = -val; // stored constant = -rhs
+                        } else if (row_sense.count(rname)) {
+                            row_rhs[rname] = val;
+                        }
+                    }
+                    break;
+                }
+                case Section::Ranges: {
+                    std::size_t start = (tok.size() % 2 == 1) ? 1 : 0;
+                    for (std::size_t k = start; k + 1 < tok.size(); k += 2) {
+                        row_ranges[tok[k]] = std::stod(tok[k + 1]);
+                    }
+                    break;
+                }
+                case Section::Bounds: {
+                    if (tok.size() < 3) {
+                        break;
+                    }
+                    std::string btype = tok[0];
+                    std::transform(btype.begin(), btype.end(), btype.begin(),
+                                   [](unsigned char ch) { return std::toupper(ch); });
+                    // tok[1] = bound set name, tok[2] = variable, tok[3] = value.
+                    const std::string& vname = tok[2];
+                    BoundInfo& b = bounds[vname];
+                    const auto value = [&]() { return std::stod(tok.at(3)); };
+                    if (btype == "UP") {
+                        b.ub = value();
+                    } else if (btype == "LO") {
+                        b.lb = value();
+                    } else if (btype == "FX") {
+                        b.lb = value();
+                        b.ub = value();
+                    } else if (btype == "FR") {
+                        b.free = true;
+                    } else if (btype == "MI") {
+                        b.lb = -std::numeric_limits<double>::infinity();
+                    } else if (btype == "PL") {
+                        b.ub = std::numeric_limits<double>::infinity();
+                    } else if (btype == "BV") {
+                        b.lb = 0.0;
+                        b.ub = 1.0;
+                        b.is_integer = true;
+                    } else if (btype == "LI") {
+                        b.lb = value();
+                        b.is_integer = true;
+                    } else if (btype == "UI") {
+                        b.ub = value();
+                        b.is_integer = true;
+                    }
+                    break;
+                }
+                case Section::Sos: {
+                    // Header line: "S1 setname identifier" (type token starts with S).
+                    if ((tok[0] == "S1" || tok[0] == "S2") && tok.size() >= 2) {
+                        SosEntry e;
+                        e.type = (tok[0] == "S2") ? 2 : 1;
+                        sos_sets.push_back(std::move(e));
+                    } else if (!sos_sets.empty() && tok.size() >= 2) {
+                        // Member line: "varname weight".
+                        sos_sets.back().vars.push_back(tok[0]);
+                        sos_sets.back().weights.push_back(std::stod(tok[1]));
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+
+        // Materialize variables in column order.
+        std::unordered_map<std::string, int> var_index;
+        for (const std::string& cname : col_order) {
+            const bool is_int = col_type[cname] == 'I';
+            auto bit = bounds.find(cname);
+            double lb = 0.0;
+            double ub = std::numeric_limits<double>::infinity();
+            VarType vtype = is_int ? VarType::Integer : VarType::Continuous;
+            if (bit != bounds.end()) {
+                const BoundInfo& b = bit->second;
+                if (b.is_integer) {
+                    vtype = VarType::Integer;
+                }
+                if (b.free) {
+                    lb = -std::numeric_limits<double>::infinity();
+                    ub = std::numeric_limits<double>::infinity();
+                }
+                if (b.lb) {
+                    lb = *b.lb;
+                }
+                if (b.ub) {
+                    ub = *b.ub;
+                }
+                // MPS convention: an integer var with only an upper bound gets lb 0
+                // (already default); a continuous var with negative-only signals handled above.
+            } else if (is_int) {
+                // Integer columns without explicit bounds default to [0, 1] in
+                // strict MPS; we keep [0, +inf) to match common solver behavior.
+            }
+            Var v = add_var(cname, lb, ub, 0.0, vtype);
+            var_index[cname] = v.index();
+        }
+
+        // Objective coefficients.
+        LinearExprData obj;
+        obj.constant = objective_constant;
+        for (const std::string& cname : col_order) {
+            auto it = col_coeffs.find(cname);
+            if (it == col_coeffs.end()) {
+                continue;
+            }
+            auto oit = it->second.find(objective_row);
+            if (oit != it->second.end()) {
+                set_coeff_value(obj, var_index[cname], oit->second);
+            }
+        }
+        state_->objective = obj;
+
+        // Constraints: one per non-N row, with coefficients gathered from columns.
+        std::vector<LinearExprData> con_exprs(row_order.size());
+        for (const std::string& cname : col_order) {
+            auto it = col_coeffs.find(cname);
+            if (it == col_coeffs.end()) {
+                continue;
+            }
+            for (const auto& [rname, coeff] : it->second) {
+                auto rit = row_to_constraint.find(rname);
+                if (rit != row_to_constraint.end()) {
+                    set_coeff_value(con_exprs[rit->second], var_index[cname], coeff);
+                }
+            }
+        }
+
+        for (std::size_t i = 0; i < row_order.size(); ++i) {
+            const std::string& rname = row_order[i];
+            const char sense = row_sense[rname];
+            const double rhs = row_rhs.count(rname) ? row_rhs[rname] : 0.0;
+            ConstraintData data;
+            data.id = state_->next_constraint_id++;
+            data.name = rname;
+            data.expr = con_exprs[i];
+            data.expr.constant = -rhs;
+
+            auto range_it = row_ranges.find(rname);
+            if (range_it != row_ranges.end()) {
+                add_range_constraint_(rname, sense, rhs, range_it->second, con_exprs[i]);
+                continue;
+            }
+
+            data.sense = sense == 'L'   ? ConstraintSense::LessEqual
+                         : sense == 'G' ? ConstraintSense::GreaterEqual
+                                        : ConstraintSense::Equal;
+            state_->constraints.push_back(std::move(data));
+        }
+
+        // SOS constraints.
+        for (const SosEntry& e : sos_sets) {
+            SOSData sos;
+            sos.type = e.type == 2 ? simplex_bnb::SOSType::SOS2 : simplex_bnb::SOSType::SOS1;
+            for (std::size_t k = 0; k < e.vars.size(); ++k) {
+                auto vit = var_index.find(e.vars[k]);
+                if (vit != var_index.end()) {
+                    sos.variables.push_back(vit->second);
+                    sos.weights.push_back(e.weights[k]);
+                }
+            }
+            if (!sos.variables.empty()) {
+                state_->sos_constraints.push_back(std::move(sos));
+            }
+        }
+
+        touch_(true);
+    }
+
+    // A RANGES entry turns a single row into a two-sided constraint. We model the
+    // two implied bounds as a pair of inequality constraints sharing the row's
+    // coefficients (lo <= a.x <= hi).
+    void add_range_constraint_(const std::string& rname, char sense, double rhs, double range,
+                               const LinearExprData& coeffs) {
+        double lo, hi;
+        if (sense == 'L') {
+            hi = rhs;
+            lo = rhs - std::abs(range);
+        } else if (sense == 'G') {
+            lo = rhs;
+            hi = rhs + std::abs(range);
+        } else { // E row
+            if (range >= 0.0) {
+                lo = rhs;
+                hi = rhs + range;
+            } else {
+                lo = rhs + range;
+                hi = rhs;
+            }
+        }
+        ConstraintData ge;
+        ge.id = state_->next_constraint_id++;
+        ge.name = rname + "_lo";
+        ge.expr = coeffs;
+        ge.expr.constant = -lo;
+        ge.sense = ConstraintSense::GreaterEqual;
+        state_->constraints.push_back(std::move(ge));
+
+        ConstraintData le;
+        le.id = state_->next_constraint_id++;
+        le.name = rname + "_hi";
+        le.expr = coeffs;
+        le.expr.constant = -hi;
+        le.sense = ConstraintSense::LessEqual;
+        state_->constraints.push_back(std::move(le));
+    }
+
     void ensure_same_model_(const std::shared_ptr<ModelState>& other, const char* context) const {
         if (!other || other.get() != state_.get()) {
             throw std::invalid_argument(std::string("simplex: object does not belong to "
@@ -3292,5 +3711,11 @@ void bind_model_bindings(py::module_& m) {
             },
             py::arg("basis") = py::none())
         .def("solve_mip", &Model::solve_mip, py::arg("options") = BranchAndBoundOptions())
+        .def("write_mps", &Model::write_mps, py::arg("path"), py::arg("name") = "SIMPLINHO")
+        .def("writeMPS", &Model::write_mps, py::arg("path"), py::arg("name") = "SIMPLINHO")
+        .def_static("read_mps", &Model::read_mps, py::arg("path"),
+                    py::arg("options") = RevisedSimplexOptions())
+        .def_static("readMPS", &Model::read_mps, py::arg("path"),
+                    py::arg("options") = RevisedSimplexOptions())
         .def("__repr__", &Model::repr);
 }

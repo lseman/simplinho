@@ -96,6 +96,7 @@ struct PseudoCostAverages {
     double inference = 1.0;
     double conflict = 1.0;
     double cutoff = 1.0;
+    double cutoff_rate = 1e-12;
 };
 
 [[nodiscard]] double node_estimate(const RelaxationSolution& relaxation,

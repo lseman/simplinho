@@ -219,8 +219,12 @@ std::optional<Cut> build_mir_cut_from_canonical_row_(const Problem& problem,
                                                      const CanonicalMirRow& row);
 std::optional<MirRowData> aggregate_rows_for_mir_(const MirRowData& lhs, const MirRowData& rhs,
                                                   int pivot_index);
-std::optional<int> choose_mir_aggregation_pivot_(const MirRowData& lhs, const MirRowData& rhs,
+std::optional<int> choose_mir_aggregation_pivot_(const Problem& problem, const MirRowData& lhs,
+                                                 const MirRowData& rhs,
                                                  const Eigen::VectorXd& primal);
+std::vector<MirRowData> marchand_wolsey_aggregate_(const Problem& problem, const MirRowData& base,
+                                                   const std::vector<MirRowData>& pool,
+                                                   const Eigen::VectorXd& primal, int max_depth);
 void add_implication_conflicts_(ConflictGraph* graph, const Problem& problem,
                                 const ImplicationStore* learned_implications,
                                 const Options& options);
@@ -952,6 +956,330 @@ bool validate_literal_cover_cut_(const std::vector<CoverLiteralTerm>& terms,
                                                   tol);
 }
 
+// Exact max-profit knapsack solver over a subset of canonical items, used by
+// sequence-dependent lifting to compute the largest lifting coefficient that
+// keeps the cut valid.  Returns max sum of profits subject to sum of weights
+// <= capacity, considering only items whose `active` flag is set.  Mirrors the
+// branch-and-bound search in validate_binary_knapsack_cut_activity_ and shares
+// its node cap so a pathological instance bails out (caller treats a bail-out
+// as "lift failed" and skips the variable).
+struct KnapsackLiftResult {
+    double value = 0.0;
+    bool ok = false;
+};
+
+KnapsackLiftResult knapsack_max_profit_(const std::vector<double>& weights,
+                                        const std::vector<double>& profits,
+                                        const std::vector<char>& active, double capacity,
+                                        double tol = 1e-9) {
+    struct Item {
+        double weight = 0.0;
+        double profit = 0.0;
+    };
+    std::vector<Item> items;
+    items.reserve(weights.size());
+    for (std::size_t pos = 0; pos < weights.size(); ++pos) {
+        if (!active[pos])
+            continue;
+        const double profit = profits[pos];
+        const double weight = weights[pos];
+        if (profit <= tol)
+            continue;
+        if (!(weight > tol) || !std::isfinite(weight) || !std::isfinite(profit))
+            return {0.0, false};
+        items.push_back(Item{weight, profit});
+    }
+    if (capacity < -tol || !std::isfinite(capacity))
+        return {0.0, false};
+    std::sort(items.begin(), items.end(), [](const Item& lhs, const Item& rhs) {
+        const double lr = lhs.profit / lhs.weight;
+        const double rr = rhs.profit / rhs.weight;
+        if (std::abs(lr - rr) > 1e-12)
+            return lr > rr;
+        return lhs.profit > rhs.profit;
+    });
+    auto fractional_bound = [&](int start, double cap, double value) {
+        double bound = value;
+        for (int i = start; i < static_cast<int>(items.size()) && cap > tol; ++i) {
+            if (items[i].weight <= cap + tol) {
+                cap -= items[i].weight;
+                bound += items[i].profit;
+            } else {
+                bound += items[i].profit * (cap / items[i].weight);
+                break;
+            }
+        }
+        return bound;
+    };
+    struct State {
+        int index = 0;
+        double capacity = 0.0;
+        double value = 0.0;
+    };
+    double best = 0.0;
+    std::vector<State> stack;
+    stack.push_back(State{0, std::max(0.0, capacity), 0.0});
+    int visited = 0;
+    constexpr int kMaxLiftNodes = 200'000;
+    while (!stack.empty()) {
+        State state = stack.back();
+        stack.pop_back();
+        if (++visited > kMaxLiftNodes)
+            return {0.0, false};
+        if (fractional_bound(state.index, state.capacity, state.value) <= best + tol)
+            continue;
+        if (state.index >= static_cast<int>(items.size())) {
+            best = std::max(best, state.value);
+            continue;
+        }
+        stack.push_back(State{state.index + 1, state.capacity, state.value});
+        const Item& item = items[static_cast<std::size_t>(state.index)];
+        if (item.weight <= state.capacity + tol)
+            stack.push_back(
+                State{state.index + 1, state.capacity - item.weight, state.value + item.profit});
+    }
+    return {best, true};
+}
+
+// Sequence-dependent (exact) cover lifting.
+//
+// Unlike the sequence-independent superadditive lifting in
+// lifted_binary_cover_cut_, this lifts variables one at a time, recomputing the
+// exact residual-knapsack value after each lift.  For an up-lift of a remainder
+// variable j with weight a_j the maximal coefficient is
+//   alpha_j = (cover_size - 1) - max { sum_{k already in cut} alpha_k x_k :
+//                                       sum a_k x_k <= b - a_j }
+// which is exactly a knapsack over the items lifted so far.  This produces
+// coefficients at least as strong as sequence-independent lifting and often
+// strictly stronger.  The final cut is validated before being returned.
+std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
+sequence_dependent_lifted_cover_cut_(const CanonicalKnapsack& kn, double tol = 1e-9) {
+    const int n = static_cast<int>(kn.variables.size());
+    if (n < 2 || !kn.valid || !std::isfinite(kn.rhs) || kn.rhs < 0.0)
+        return std::nullopt;
+
+    const std::optional<BinaryCoverPartition> partition = find_lp_violated_minimal_cover_(kn, tol);
+    if (!partition.has_value())
+        return std::nullopt;
+
+    const std::vector<int>& cover = partition->cover_positions;
+    const int cover_size = static_cast<int>(cover.size());
+    if (cover_size < 2)
+        return std::nullopt;
+
+    // canonical-space coefficient per position; cover members start at 1.
+    std::vector<double> alpha(static_cast<std::size_t>(n), 0.0);
+    std::vector<char> lifted(static_cast<std::size_t>(n), 0);
+    for (int pos : cover) {
+        alpha[static_cast<std::size_t>(pos)] = 1.0;
+        lifted[static_cast<std::size_t>(pos)] = 1;
+    }
+    const double cut_rhs_canonical = static_cast<double>(cover_size - 1);
+
+    // Lift remainder variables in non-increasing weight order: heavier items
+    // constrain the residual knapsack most, so lifting them first tends to
+    // produce the strongest sequence.
+    std::vector<int> order = partition->remainder_positions;
+    std::sort(order.begin(), order.end(), [&](int lhs, int rhs) {
+        if (std::abs(kn.coeffs[lhs] - kn.coeffs[rhs]) > tol)
+            return kn.coeffs[lhs] > kn.coeffs[rhs];
+        return lhs < rhs;
+    });
+
+    for (const int pos : order) {
+        const double weight = kn.coeffs[pos];
+        if (!(weight > tol) || !std::isfinite(weight))
+            return std::nullopt;
+        const double residual = kn.rhs - weight;
+        if (residual < -tol) {
+            // Variable alone exceeds capacity: it can take the full rhs coeff.
+            alpha[static_cast<std::size_t>(pos)] = cut_rhs_canonical;
+            lifted[static_cast<std::size_t>(pos)] = 1;
+            continue;
+        }
+        const KnapsackLiftResult max_lifted =
+            knapsack_max_profit_(kn.coeffs, alpha, lifted, residual, tol);
+        if (!max_lifted.ok)
+            return std::nullopt;
+        double coeff = cut_rhs_canonical - max_lifted.value;
+        if (coeff < tol)
+            coeff = 0.0;
+        // Round tiny numerical noise toward the nearest integer; lifted cover
+        // coefficients are integral in canonical space.
+        const double rounded = std::round(coeff);
+        if (std::abs(coeff - rounded) <= 1e-6)
+            coeff = rounded;
+        alpha[static_cast<std::size_t>(pos)] = coeff;
+        lifted[static_cast<std::size_t>(pos)] = 1;
+    }
+
+    // Translate canonical coefficients back to original variable space,
+    // undoing complementation.
+    std::vector<int> indices;
+    std::vector<double> values;
+    indices.reserve(n);
+    values.reserve(n);
+    double cut_rhs = cut_rhs_canonical;
+    for (int pos = 0; pos < n; ++pos) {
+        double coeff = alpha[static_cast<std::size_t>(pos)];
+        if (std::abs(coeff) <= tol)
+            continue;
+        if (kn.complemented[pos]) {
+            cut_rhs -= coeff;
+            coeff = -coeff;
+        }
+        indices.push_back(kn.variables[pos]);
+        values.push_back(coeff);
+    }
+    if (indices.size() < 2)
+        return std::nullopt;
+
+    // Guard: discard the cut unless it is provably valid for the knapsack.
+    if (!validate_lifted_binary_cover_cut_(kn, indices, values, cut_rhs, 1e-7))
+        return std::nullopt;
+
+    return std::make_tuple(std::move(indices), std::move(values), cut_rhs);
+}
+
+// GUB (generalized upper bound) cover lifting for set-packing structure.
+//
+// When remainder variables fall into groups that are mutually exclusive
+// (sum x_j <= 1 over the group — a clique / GUB), they can be lifted *together*
+// as a group rather than independently.  Because at most one variable per group
+// can be 1, the group contributes a single coefficient to the residual
+// knapsack, giving a stronger lift than treating members separately.
+//
+// `gub_group_of[pos]` gives the GUB group id of canonical position `pos`, or -1
+// if it belongs to no group.  Groups are assumed to be set-packing cliques
+// supplied by the caller (derived from base constraints / the conflict graph).
+std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
+gub_lifted_cover_cut_(const CanonicalKnapsack& kn, const std::vector<int>& gub_group_of,
+                      double tol = 1e-9) {
+    const int n = static_cast<int>(kn.variables.size());
+    if (n < 2 || !kn.valid || !std::isfinite(kn.rhs) || kn.rhs < 0.0 ||
+        static_cast<int>(gub_group_of.size()) != n)
+        return std::nullopt;
+
+    const std::optional<BinaryCoverPartition> partition = find_lp_violated_minimal_cover_(kn, tol);
+    if (!partition.has_value())
+        return std::nullopt;
+
+    const std::vector<int>& cover = partition->cover_positions;
+    const int cover_size = static_cast<int>(cover.size());
+    if (cover_size < 2)
+        return std::nullopt;
+
+    std::vector<double> alpha(static_cast<std::size_t>(n), 0.0);
+    std::vector<char> lifted(static_cast<std::size_t>(n), 0);
+    for (int pos : cover) {
+        alpha[static_cast<std::size_t>(pos)] = 1.0;
+        lifted[static_cast<std::size_t>(pos)] = 1;
+    }
+    const double cut_rhs_canonical = static_cast<double>(cover_size - 1);
+
+    // Bucket remainder variables by GUB group; ungrouped (-1) variables are
+    // lifted individually (each its own singleton group).
+    std::unordered_map<int, std::vector<int>> groups;
+    std::vector<std::vector<int>> singletons;
+    for (const int pos : partition->remainder_positions) {
+        const int g = gub_group_of[static_cast<std::size_t>(pos)];
+        if (g < 0)
+            singletons.push_back({pos});
+        else
+            groups[g].push_back(pos);
+    }
+
+    // Process groups (and singletons) in non-increasing min-weight order so the
+    // heaviest constraints are lifted first, as in the sequence-dependent case.
+    std::vector<std::vector<int>> lift_units;
+    lift_units.reserve(groups.size() + singletons.size());
+    for (auto& [group_id, members] : groups) {
+        (void)group_id;
+        lift_units.push_back(std::move(members));
+    }
+    for (auto& s : singletons)
+        lift_units.push_back(std::move(s));
+    auto min_weight_of = [&](const std::vector<int>& unit) {
+        double w = std::numeric_limits<double>::infinity();
+        for (int pos : unit)
+            w = std::min(w, kn.coeffs[pos]);
+        return w;
+    };
+    std::sort(lift_units.begin(), lift_units.end(),
+              [&](const std::vector<int>& lhs, const std::vector<int>& rhs) {
+                  return min_weight_of(lhs) > min_weight_of(rhs);
+              });
+
+    for (const std::vector<int>& unit : lift_units) {
+        if (unit.empty())
+            continue;
+        // Lift the whole GUB group in one round.  Because the members are
+        // mutually exclusive, none of them reduces another's residual capacity,
+        // so every member's coefficient is computed against the SAME set of
+        // previously-lifted items (the `lifted` mask, frozen for this round).
+        // Each member j gets its OWN coefficient from its OWN residual b - a_j
+        // (Wolsey 1990 / Nemhauser-Vance GUB cover lifting):
+        //   alpha_j = (cover_size - 1)
+        //             - max{ sum_k alpha_k x_k : sum a_k x_k <= b - a_j }
+        std::vector<std::pair<int, double>> round_coeffs;
+        round_coeffs.reserve(unit.size());
+        for (int pos : unit) {
+            const double weight = kn.coeffs[pos];
+            if (!(weight > tol) || !std::isfinite(weight))
+                return std::nullopt;
+            const double residual = kn.rhs - weight;
+            double coeff = cut_rhs_canonical;
+            if (residual >= -tol) {
+                const KnapsackLiftResult max_lifted =
+                    knapsack_max_profit_(kn.coeffs, alpha, lifted, residual, tol);
+                if (!max_lifted.ok)
+                    return std::nullopt;
+                coeff = cut_rhs_canonical - max_lifted.value;
+            }
+            if (coeff < tol)
+                coeff = 0.0;
+            const double rounded = std::round(coeff);
+            if (std::abs(coeff - rounded) <= 1e-6)
+                coeff = rounded;
+            round_coeffs.emplace_back(pos, coeff);
+        }
+        // Commit the round: assign per-member coefficients and mark the group
+        // lifted only now, so members did not influence each other this round.
+        for (const auto& [pos, coeff] : round_coeffs) {
+            alpha[static_cast<std::size_t>(pos)] = coeff;
+            lifted[static_cast<std::size_t>(pos)] = 1;
+        }
+    }
+
+    std::vector<int> indices;
+    std::vector<double> values;
+    indices.reserve(n);
+    values.reserve(n);
+    double cut_rhs = cut_rhs_canonical;
+    for (int pos = 0; pos < n; ++pos) {
+        double coeff = alpha[static_cast<std::size_t>(pos)];
+        if (std::abs(coeff) <= tol)
+            continue;
+        if (kn.complemented[pos]) {
+            cut_rhs -= coeff;
+            coeff = -coeff;
+        }
+        indices.push_back(kn.variables[pos]);
+        values.push_back(coeff);
+    }
+    if (indices.size() < 2)
+        return std::nullopt;
+
+    // Guard: the GUB lift assumes group exclusivity that the plain knapsack
+    // validator does not know about, so this check is conservative — it only
+    // confirms validity against the knapsack alone.  A cut that passes is valid
+    // regardless of the GUB constraints; one that fails is discarded.
+    if (!validate_lifted_binary_cover_cut_(kn, indices, values, cut_rhs, 1e-7))
+        return std::nullopt;
+
+    return std::make_tuple(std::move(indices), std::move(values), cut_rhs);
+}
+
 std::vector<int> minimize_binary_cover_positions_(std::vector<int> positions,
                                                   const CanonicalKnapsack& kn, double tol = 1e-9) {
     if (positions.size() < 2) {
@@ -1388,6 +1716,55 @@ void maybe_add_validated_literal_cover_cut_(
     cuts->push_back(std::move(cut));
 }
 
+// Map each canonical knapsack position to a GUB (set-packing clique) group id,
+// or -1 if it belongs to none.  A base constraint is treated as a GUB when it
+// is a binary set-packing row sum x_j <= 1 (positive equal coefficients, rhs 1).
+// Only the first clique covering a variable is used (a variable joins at most
+// one group), which is what the round-based GUB lift assumes.
+std::vector<int> build_gub_groups_for_knapsack_(const Problem& problem,
+                                                const CanonicalKnapsack& kn) {
+    const int n = static_cast<int>(kn.variables.size());
+    std::vector<int> group_of(static_cast<std::size_t>(n), -1);
+
+    std::unordered_map<int, int> pos_of_variable;
+    pos_of_variable.reserve(static_cast<std::size_t>(n));
+    for (int pos = 0; pos < n; ++pos)
+        pos_of_variable.emplace(kn.variables[pos], pos);
+
+    int next_group = 0;
+    for (const SparseLinearConstraint& row : problem.base_constraints) {
+        if (row.sense != LinearConstraintSense::LessEqual)
+            continue;
+        if (!(row.rhs > 0.5 && row.rhs < 1.5)) // set-packing rhs == 1
+            continue;
+        // Verify positive coefficients on binary variables and collect the
+        // members that appear (uncovered) in this knapsack.
+        std::vector<int> members;
+        bool is_set_packing = true;
+        for (int k = 0;
+             k < static_cast<int>(row.indices.size()) && k < static_cast<int>(row.values.size());
+             ++k) {
+            const int var = row.indices[k];
+            const double coeff = row.values[k];
+            if (var < 0 || var >= static_cast<int>(problem.variable_types.size()) ||
+                problem.variable_types[var] != VariableType::Binary ||
+                !(coeff > 0.5 && coeff < 1.5)) {
+                is_set_packing = false;
+                break;
+            }
+            const auto it = pos_of_variable.find(var);
+            if (it != pos_of_variable.end() && group_of[static_cast<std::size_t>(it->second)] < 0)
+                members.push_back(it->second);
+        }
+        if (!is_set_packing || members.size() < 2)
+            continue;
+        for (int pos : members)
+            group_of[static_cast<std::size_t>(pos)] = next_group;
+        ++next_group;
+    }
+    return group_of;
+}
+
 void append_binary_knapsack_cover_family_(
     const Problem& problem, const RelaxationSolution& relaxation, const Options& options,
     const CanonicalKnapsack& kn, std::string_view type_prefix,
@@ -1429,6 +1806,8 @@ void append_binary_knapsack_cover_family_(
     const std::string lifted_type = std::string(type_prefix) + "LiftedCover";
     const std::string highs_type = std::string(type_prefix) + "LiftedCoverHighs";
     const std::string lite_type = std::string(type_prefix) + "LiftedCoverLite";
+    const std::string seqdep_type = std::string(type_prefix) + "LiftedCoverSeq";
+    const std::string gub_type = std::string(type_prefix) + "LiftedCoverGub";
 
     if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
             lifted_cover = lifted_binary_cover_cut_(kn)) {
@@ -1436,6 +1815,34 @@ void append_binary_knapsack_cover_family_(
         maybe_add_validated_lifted_binary_cover_cut_(problem, relaxation, options, kn,
                                                      lifted_indices, lifted_values, lifted_rhs,
                                                      lifted_type, signatures, cuts);
+    }
+
+    // Sequence-dependent (exact) lifting — generally at least as strong as the
+    // sequence-independent superadditive lift above.
+    if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>> seq_cover =
+            sequence_dependent_lifted_cover_cut_(kn)) {
+        const auto& [seq_indices, seq_values, seq_rhs] = *seq_cover;
+        maybe_add_validated_lifted_binary_cover_cut_(problem, relaxation, options, kn, seq_indices,
+                                                     seq_values, seq_rhs, seqdep_type, signatures,
+                                                     cuts);
+    }
+
+    // GUB cover lifting — exploits set-packing cliques among the variables for
+    // stronger per-group coefficients.  Only attempted when at least one GUB
+    // group actually covers two of this knapsack's variables.
+    {
+        const std::vector<int> gub_groups = build_gub_groups_for_knapsack_(problem, kn);
+        const bool has_gub =
+            std::any_of(gub_groups.begin(), gub_groups.end(), [](int g) { return g >= 0; });
+        if (has_gub) {
+            if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
+                    gub_cover = gub_lifted_cover_cut_(kn, gub_groups)) {
+                const auto& [gub_indices, gub_values, gub_rhs] = *gub_cover;
+                maybe_add_validated_lifted_binary_cover_cut_(problem, relaxation, options, kn,
+                                                             gub_indices, gub_values, gub_rhs,
+                                                             gub_type, signatures, cuts);
+            }
+        }
     }
 
     for (const BinaryCoverPartition& partition : candidate_partitions) {
@@ -2791,6 +3198,63 @@ std::vector<Cut> CutPool::snapshot_cuts(int max_cuts) const {
     return snapshot;
 }
 
+std::vector<Cut> CutPool::snapshot_propagation_cuts(const Problem& problem, int max_cuts) const {
+    const std::shared_lock<std::shared_mutex> lock(cuts_mutex_);
+    if (cuts_.empty() || max_cuts == 0)
+        return {};
+
+    int model_rows = 0;
+    int model_nnz = 0;
+    for (const SparseLinearConstraint& row : problem.base_constraints) {
+        const int nnz = std::min<int>(row.indices.size(), row.values.size());
+        if (nnz <= 0)
+            continue;
+        ++model_rows;
+        model_nnz += nnz;
+    }
+    const double avg_model_nnz =
+        model_rows > 0 ? static_cast<double>(model_nnz) / static_cast<double>(model_rows)
+                       : static_cast<double>(std::max<int>(1, problem.variable_types.size()));
+    const int normal_density_limit = std::max(8, static_cast<int>(std::ceil(2.0 * avg_model_nnz)));
+    const int conflict_density_limit =
+        std::max(normal_density_limit, static_cast<int>(std::ceil(3.0 * avg_model_nnz)));
+
+    std::vector<int> order;
+    order.reserve(cuts_.size());
+    for (int i = 0; i < static_cast<int>(cuts_.size()); ++i) {
+        const Cut& cut = cuts_[i];
+        const bool conflict_like =
+            cut.cut_type == "Conflict" || cut.cut_type == "Clique" || cut.cut_type == "OddCycle";
+        const int limit = conflict_like ? conflict_density_limit : normal_density_limit;
+        if (static_cast<int>(cut.indices.size()) <= limit) {
+            order.push_back(i);
+        }
+    }
+    if (order.empty())
+        return {};
+
+    std::sort(order.begin(), order.end(), [&](int lhs_index, int rhs_index) {
+        const Cut& lhs = cuts_[lhs_index];
+        const Cut& rhs = cuts_[rhs_index];
+        if (lhs.age != rhs.age)
+            return lhs.age < rhs.age;
+        if (std::abs(lhs.strength - rhs.strength) > 1e-12)
+            return lhs.strength > rhs.strength;
+        if (lhs.times_used != rhs.times_used)
+            return lhs.times_used > rhs.times_used;
+        return lhs.indices.size() < rhs.indices.size();
+    });
+    if (max_cuts > 0 && order.size() > static_cast<std::size_t>(max_cuts))
+        order.resize(static_cast<std::size_t>(max_cuts));
+
+    std::vector<Cut> snapshot;
+    snapshot.reserve(order.size());
+    for (int index : order) {
+        snapshot.push_back(cuts_[index]);
+    }
+    return snapshot;
+}
+
 std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
                                                const Eigen::VectorXd& lower_bounds,
                                                const Eigen::VectorXd& upper_bounds, int max_cuts,
@@ -3483,9 +3947,17 @@ std::vector<int> select_mir_rows_(const Problem& problem, const RelaxationSoluti
         if (row.indices.size() < 2)
             continue;
 
+        // The LP relaxation point satisfies every base constraint by definition, so the
+        // old primal-violation filter rejected nearly all rows and the caller silently fell
+        // back to iterating all rows.  A row is a useful MIR base instead when it carries
+        // integer variables sitting at fractional LP values: that fractionality is what the
+        // MIR/c-MIR rounding turns into a violated cut.  Score rows by that fractional
+        // integer mass (the cut driver) plus the row-activity fractionality, penalized by
+        // density so we prefer sparser, stronger candidates.
         double lhs = 0.0;
         int fractional_support = 0;
         int integer_support = 0;
+        double integer_frac_mass = 0.0; // sum over integer vars of distance-to-nearest-integer
         for (int k = 0;
              k < static_cast<int>(row.indices.size()) && k < static_cast<int>(row.values.size());
              ++k) {
@@ -3494,28 +3966,31 @@ std::vector<int> select_mir_rows_(const Problem& problem, const RelaxationSoluti
                 continue;
             const double value = relaxation.primal(col);
             lhs += row.values[k] * value;
-            if (value > options.integrality_tol && value < 1.0 - options.integrality_tol)
+            const double frac_dist = std::abs(value - std::round(value));
+            const bool is_fractional = frac_dist > options.integrality_tol;
+            if (is_fractional)
                 ++fractional_support;
-            if (problem.variable_types[col] != VariableType::Continuous)
+            if (problem.variable_types[col] != VariableType::Continuous) {
                 ++integer_support;
+                if (is_fractional)
+                    integer_frac_mass += std::min(0.5, frac_dist);
+            }
         }
 
-        double violation = 0.0;
-        if (row.sense == LinearConstraintSense::LessEqual) {
-            violation = lhs - row.rhs;
-        } else if (row.sense == LinearConstraintSense::GreaterEqual) {
-            violation = row.rhs - lhs;
-        } else {
-            violation = std::abs(lhs - row.rhs);
-        }
-        if (violation <= std::max(options.min_cut_violation, 1e-9))
+        // Without a fractional integer variable the canonical MIR row has no integer term
+        // to round, so it cannot yield a cut — skip those rows outright.
+        if (integer_frac_mass <= options.integrality_tol)
             continue;
+
+        // Fractionality of the row activity itself: a row whose slack is integer-aligned
+        // tends to produce a weak (near-zero violation) MIR cut.
+        const double activity_frac = std::abs(lhs - std::round(lhs));
 
         const double fractional_density =
             std::min(1.0, static_cast<double>(fractional_support) / 8.0);
         const double integer_density = std::min(1.0, static_cast<double>(integer_support) / 10.0);
         const double density_penalty = 1.0 + 0.08 * static_cast<double>(row.indices.size());
-        const double score = violation *
+        const double score = (integer_frac_mass + 0.5 * activity_frac) *
                              (1.0 + 0.08 * fractional_density + 0.05 * integer_density) /
                              density_penalty;
         candidates.push_back(Candidate{row_index, score});
@@ -3887,7 +4362,18 @@ std::optional<MirRowData> aggregate_rows_for_mir_(const MirRowData& lhs, const M
     return aggregated;
 }
 
-std::optional<int> choose_mir_aggregation_pivot_(const MirRowData& lhs, const MirRowData& rhs,
+// Pick the variable to cancel when aggregating two rows for c-MIR.
+//
+// Marchand-Wolsey aggregation (Math. Prog. 2001) eliminates *continuous*
+// structure: continuous terms only weaken the MIR rounding (they pass through
+// the 1/(delta*(1-f)) scaling without integer strengthening), so cancelling a
+// continuous variable that is currently away from its bound concentrates the
+// row's fractionality on the integer variables and yields a stronger cut.
+// We therefore give continuous pivots a large multiplicative bonus and rank the
+// distance of the continuous variable's LP value from its nearest bound (a var
+// sitting at a bound contributes nothing, so cancelling it is wasted work).
+std::optional<int> choose_mir_aggregation_pivot_(const Problem& problem, const MirRowData& lhs,
+                                                 const MirRowData& rhs,
                                                  const Eigen::VectorXd& primal) {
     std::unordered_map<int, double> rhs_coeffs;
     rhs_coeffs.reserve(rhs.indices.size());
@@ -3897,6 +4383,12 @@ std::optional<int> choose_mir_aggregation_pivot_(const MirRowData& lhs, const Mi
             continue;
         rhs_coeffs.emplace(rhs.indices[k], rhs.values[k]);
     }
+
+    const int n_vars = static_cast<int>(problem.variable_types.size());
+    auto is_continuous = [&](int index) {
+        return index >= 0 && index < n_vars &&
+               problem.variable_types[index] == VariableType::Continuous;
+    };
 
     int best_pivot = -1;
     double best_score = -1.0;
@@ -3917,7 +4409,23 @@ std::optional<int> choose_mir_aggregation_pivot_(const MirRowData& lhs, const Mi
         const double abs_rhs = std::abs(rhs_coeff);
         const double balance = std::min(abs_lhs, abs_rhs) / std::max(abs_lhs, abs_rhs);
         double score = std::abs(lhs_coeff * rhs_coeff) * (0.6 + 0.4 * balance);
-        if (index >= 0 && index < primal.size()) {
+
+        if (is_continuous(index)) {
+            // Marchand-Wolsey: strongly prefer cancelling continuous variables.
+            double bound_dist = 1.0;
+            if (index < problem.lower_bounds.size() && index < problem.upper_bounds.size() &&
+                index < primal.size()) {
+                const double value = primal(index);
+                const double dl = std::isfinite(problem.lower_bounds(index))
+                                      ? std::abs(value - problem.lower_bounds(index))
+                                      : 1.0;
+                const double du = std::isfinite(problem.upper_bounds(index))
+                                      ? std::abs(problem.upper_bounds(index) - value)
+                                      : 1.0;
+                bound_dist = std::min(dl, du);
+            }
+            score *= 4.0 * (0.25 + std::min(1.0, bound_dist));
+        } else if (index >= 0 && index < primal.size()) {
             const double value = primal(index);
             const double frac_dist = std::abs(value - std::round(value));
             score *= 1.0 + std::min(1.5, 2.0 * frac_dist);
@@ -3931,6 +4439,56 @@ std::optional<int> choose_mir_aggregation_pivot_(const MirRowData& lhs, const Mi
     if (best_pivot < 0)
         return std::nullopt;
     return best_pivot;
+}
+
+// Marchand-Wolsey greedy aggregation driver: starting from a base row, keep
+// aggregating the partner row that best cancels a (preferably continuous)
+// variable, up to max_depth additional rows.  This walks toward a row whose
+// fractionality is concentrated on integer variables, which is where MIR is
+// strong.  Returns the chain of aggregated rows produced along the way (each is
+// fed to the MIR builder by the caller).
+std::vector<MirRowData> marchand_wolsey_aggregate_(const Problem& problem, const MirRowData& base,
+                                                   const std::vector<MirRowData>& pool,
+                                                   const Eigen::VectorXd& primal, int max_depth) {
+    std::vector<MirRowData> chain;
+    MirRowData current = base;
+    std::vector<char> used(pool.size(), 0);
+    for (int depth = 0; depth < max_depth; ++depth) {
+        int best_j = -1;
+        int best_pivot = -1;
+        double best_pivot_score = -1.0;
+        for (int j = 0; j < static_cast<int>(pool.size()); ++j) {
+            if (used[static_cast<std::size_t>(j)])
+                continue;
+            const std::optional<int> pivot =
+                choose_mir_aggregation_pivot_(problem, current, pool[j], primal);
+            if (!pivot.has_value())
+                continue;
+            // Rank candidate partners by whether the pivot is continuous (MW goal)
+            // and by how sparse the partner is (keep the aggregate from blowing up).
+            const bool pivot_continuous =
+                *pivot >= 0 && *pivot < static_cast<int>(problem.variable_types.size()) &&
+                problem.variable_types[*pivot] == VariableType::Continuous;
+            const double sparsity =
+                1.0 / (1.0 + 0.05 * static_cast<double>(pool[j].indices.size()));
+            const double partner_score = (pivot_continuous ? 4.0 : 1.0) * sparsity;
+            if (partner_score > best_pivot_score) {
+                best_pivot_score = partner_score;
+                best_j = j;
+                best_pivot = *pivot;
+            }
+        }
+        if (best_j < 0 || best_pivot < 0)
+            break;
+        std::optional<MirRowData> aggregated =
+            aggregate_rows_for_mir_(current, pool[static_cast<std::size_t>(best_j)], best_pivot);
+        if (!aggregated.has_value())
+            break;
+        used[static_cast<std::size_t>(best_j)] = 1;
+        current = *aggregated;
+        chain.push_back(current);
+    }
+    return chain;
 }
 
 } // namespace
@@ -4104,46 +4662,27 @@ std::vector<Cut> generate_mir_cuts(const Problem& problem, const RelaxationSolut
         }
     }
 
-    const int max_pair_aggregations = std::max(4, 2 * options.max_cuts_added_per_round);
-    int pair_aggregations = 0;
-    std::vector<MirRowData> aggregated_rows;
-    aggregated_rows.reserve(max_pair_aggregations);
-    for (int i = 0; i < static_cast<int>(rows.size()) && pair_aggregations < max_pair_aggregations;
+    // Marchand-Wolsey greedy aggregation: from each promising base row, walk a
+    // short chain of aggregations that preferentially cancels continuous
+    // variables, emitting an MIR cut from each intermediate aggregate.  The
+    // chain depth covers the old pairwise (depth 1 => CMIR) and 3-row
+    // (depth 2 => CMIR-3) cases, but chooses partners by MW criteria instead of
+    // enumerating all pairs.
+    const int max_aggregation_bases = std::max(4, 2 * options.max_cuts_added_per_round);
+    const int max_chain_depth = 2;
+    int aggregation_emits = 0;
+    const int max_aggregation_emits = std::max(6, 3 * options.max_cuts_added_per_round);
+    for (int i = 0; i < static_cast<int>(rows.size()) &&
+                    aggregation_emits < max_aggregation_emits && i < max_aggregation_bases;
          ++i) {
-        for (int j = i + 1;
-             j < static_cast<int>(rows.size()) && pair_aggregations < max_pair_aggregations; ++j) {
-            const std::optional<int> best_pivot =
-                choose_mir_aggregation_pivot_(rows[i], rows[j], relaxation.primal);
-            if (!best_pivot.has_value())
-                continue;
-            std::optional<MirRowData> aggregated =
-                aggregate_rows_for_mir_(rows[i], rows[j], *best_pivot);
-            if (!aggregated.has_value())
-                continue;
-            try_row(aggregated->indices, aggregated->values, aggregated->rhs, "CMIR");
-            aggregated_rows.push_back(*aggregated);
-            ++pair_aggregations;
-        }
-    }
-
-    const int max_multi_aggregations = std::max(2, options.max_cuts_added_per_round);
-    int multi_aggregations = 0;
-    for (int i = 0; i < static_cast<int>(aggregated_rows.size()) &&
-                    multi_aggregations < max_multi_aggregations;
-         ++i) {
-        for (int j = 0;
-             j < static_cast<int>(rows.size()) && multi_aggregations < max_multi_aggregations;
-             ++j) {
-            const std::optional<int> best_pivot =
-                choose_mir_aggregation_pivot_(aggregated_rows[i], rows[j], relaxation.primal);
-            if (!best_pivot.has_value())
-                continue;
-            std::optional<MirRowData> aggregated =
-                aggregate_rows_for_mir_(aggregated_rows[i], rows[j], *best_pivot);
-            if (!aggregated.has_value())
-                continue;
-            try_row(aggregated->indices, aggregated->values, aggregated->rhs, "CMIR-3");
-            ++multi_aggregations;
+        const std::vector<MirRowData> chain =
+            marchand_wolsey_aggregate_(problem, rows[i], rows, relaxation.primal, max_chain_depth);
+        for (std::size_t d = 0; d < chain.size(); ++d) {
+            if (aggregation_emits >= max_aggregation_emits)
+                break;
+            const char* tag = (d == 0) ? "CMIR" : "CMIR-3";
+            try_row(chain[d].indices, chain[d].values, chain[d].rhs, tag);
+            ++aggregation_emits;
         }
     }
 
@@ -4158,7 +4697,7 @@ std::vector<Cut> generate_mir_cuts(const Problem& problem, const RelaxationSolut
                 if (tcmir_count >= max_tcmir)
                     break;
                 const std::optional<int> pivot =
-                    choose_mir_aggregation_pivot_(trow, brow, relaxation.primal);
+                    choose_mir_aggregation_pivot_(problem, trow, brow, relaxation.primal);
                 if (!pivot.has_value())
                     continue;
                 std::optional<MirRowData> agg = aggregate_rows_for_mir_(trow, brow, *pivot);

@@ -84,8 +84,13 @@ namespace {
 
 [[nodiscard]] double compute_cutoff_score(const PseudoCost& pseudocost, double cutoff_avg,
                                           double eps = 1e-12) {
-    return safe_max(pseudocost.signal.cutoff_up, eps) *
-           safe_max(pseudocost.signal.cutoff_down, eps) / safe_max(cutoff_avg * cutoff_avg, eps);
+    const double up_denom = std::max(1.0, pseudocost.signal.cutoff_up + pseudocost.cost.up_count);
+    const double down_denom =
+        std::max(1.0, pseudocost.signal.cutoff_down + pseudocost.cost.down_count);
+    const double cutoff_up_rate = pseudocost.signal.cutoff_up / up_denom;
+    const double cutoff_down_rate = pseudocost.signal.cutoff_down / down_denom;
+    return safe_max(cutoff_up_rate, eps) * safe_max(cutoff_down_rate, eps) /
+           safe_max(cutoff_avg * cutoff_avg, eps);
 }
 
 [[nodiscard]] double get_combined_pseudocost_score(const PseudoCost& pseudocost, double up_cost,
@@ -171,6 +176,8 @@ compute_pseudocost_averages(const std::vector<FractionalCandidate>& candidates,
     averages.inference = std::max(inference_sum / denom, 1e-12);
     averages.conflict = std::max(conflict_sum / denom, 1e-12);
     averages.cutoff = std::max(cutoff_sum / denom, 1e-12);
+    averages.cutoff_rate = std::max(
+        cutoff_sum / std::max(1.0, cutoff_sum + static_cast<double>(cost_observations)), 1e-12);
     return averages;
 }
 
@@ -185,7 +192,7 @@ compute_pseudocost_averages(const std::vector<FractionalCandidate>& candidates,
                            candidate.up_distance;
     const double rich_score =
         get_combined_pseudocost_score(pseudocost, up_cost, down_cost, averages.cost,
-                                      averages.inference, averages.conflict, averages.cutoff);
+                                      averages.inference, averages.conflict, averages.cutoff_rate);
     const double simple_score =
         pseudocost_candidate_score_simple(pseudocost, candidate, reliability, averages.cost);
     return rich_score + 1e-6 * simple_score;
@@ -344,14 +351,13 @@ choose_pseudocost_without_probing(const ActiveNode& node,
     return evaluation;
 }
 
-[[nodiscard]] BranchDecision
-choose_strong_branching(const ActiveNode& node, const RelaxationSolution& relaxation,
-                        const std::vector<FractionalCandidate>& candidates, int candidate_limit,
-                        int strong_branching_k, // NEW: reduced limit for Highs-like behavior
-                        int lp_iteration_limit, int parallel_workers, bool maximize,
-                        double feasibility_tol, double integrality_tol,
-                        std::vector<PseudoCost>& pseudocosts, ParallelDispatcher* parallel_dispatcher,
-                        const RelaxationSolveCallback& relaxation_solver) {
+[[nodiscard]] BranchDecision choose_strong_branching(
+    const ActiveNode& node, const RelaxationSolution& relaxation,
+    const std::vector<FractionalCandidate>& candidates, int candidate_limit,
+    int strong_branching_k, // NEW: reduced limit for Highs-like behavior
+    int lp_iteration_limit, int parallel_workers, bool maximize, double feasibility_tol,
+    double integrality_tol, std::vector<PseudoCost>& pseudocosts,
+    ParallelDispatcher* parallel_dispatcher, const RelaxationSolveCallback& relaxation_solver) {
     BranchDecision best;
     double best_score = -std::numeric_limits<double>::infinity();
     int probe_count = 0;
@@ -501,6 +507,9 @@ choose_strong_branching(const ActiveNode& node, const RelaxationSolution& relaxa
     if (strong_branching_max_depth >= 0 && node.depth > strong_branching_max_depth) {
         return build_decision_from_candidate(node, ranked.front().candidate);
     }
+    if (strong_branching_max_depth < -1) {
+        return choose_pseudocost_without_probing(node, candidates, pseudocosts, reliability);
+    }
 
     for (const auto& item : ranked) {
         if (item.candidate.variable >= 0 &&
@@ -527,11 +536,10 @@ choose_strong_branching(const ActiveNode& node, const RelaxationSolution& relaxa
         return choose_pseudocost_without_probing(node, candidates, pseudocosts, reliability);
     }
 
-    return choose_strong_branching(node, relaxation, evaluate_candidates,
-                                   static_cast<int>(evaluate_candidates.size()), strong_branching_k,
-                                   lp_iteration_limit, parallel_workers, maximize, feasibility_tol,
-                                   integrality_tol, pseudocosts, parallel_dispatcher,
-                                   relaxation_solver);
+    return choose_strong_branching(
+        node, relaxation, evaluate_candidates, static_cast<int>(evaluate_candidates.size()),
+        strong_branching_k, lp_iteration_limit, parallel_workers, maximize, feasibility_tol,
+        integrality_tol, pseudocosts, parallel_dispatcher, relaxation_solver);
 }
 
 } // namespace
@@ -632,9 +640,9 @@ void BranchSignalStats::record_inference(bool branch_up, double amount) {
 
 void BranchSignalStats::record_conflict(bool branch_up, double amount) {
     if (branch_up) {
-        conflict_score_up = 1.02 * conflict_score_up + amount;
+        conflict_score_up += amount;
     } else {
-        conflict_score_down = 1.02 * conflict_score_down + amount;
+        conflict_score_down += amount;
     }
 }
 
@@ -733,6 +741,10 @@ BranchDecision choose_branching_variable(const ActiveNode& node,
     if (options.branching_strategy == BranchingStrategy::MostFractional) {
         return build_decision_from_candidate(node, fractional.front());
     }
+    if (options.strong_branching_max_depth < -1) {
+        return choose_pseudocost_without_probing(node, fractional, pseudocosts,
+                                                 options.pseudocost_reliability);
+    }
 
     if (options.branching_strategy == BranchingStrategy::StrongBranching) {
         // HiGHS-like behavior: use strong branching mainly to seed pseudocosts
@@ -743,8 +755,8 @@ BranchDecision choose_branching_variable(const ActiveNode& node,
                 node, relaxation, fractional, options.strong_branching_candidates,
                 options.strong_branching_k, // Pass k for reduced strong branching
                 options.strong_branching_lp_iter_limit, effective_parallel_workers, maximize,
-                options.feasibility_tol,
-                options.integrality_tol, pseudocosts, parallel_dispatcher, relaxation_solver);
+                options.feasibility_tol, options.integrality_tol, pseudocosts, parallel_dispatcher,
+                relaxation_solver);
         }
 
         const int limited_candidates = options.strong_branching_candidates > 0
@@ -758,14 +770,13 @@ BranchDecision choose_branching_variable(const ActiveNode& node,
             relaxation_solver);
     }
 
-    return choose_pseudocost_branching(node, relaxation, fractional, options.pseudocost_reliability,
-                                       options.strong_branching_candidates,
-                                       options.strong_branching_k, // Pass k parameter
-                                       options.strong_branching_max_depth,
-                                       options.strong_branching_lp_iter_limit,
-                                       effective_parallel_workers, maximize,
-                                       options.feasibility_tol, options.integrality_tol,
-                                       pseudocosts, parallel_dispatcher, relaxation_solver);
+    return choose_pseudocost_branching(
+        node, relaxation, fractional, options.pseudocost_reliability,
+        options.strong_branching_candidates,
+        options.strong_branching_k, // Pass k parameter
+        options.strong_branching_max_depth, options.strong_branching_lp_iter_limit,
+        effective_parallel_workers, maximize, options.feasibility_tol, options.integrality_tol,
+        pseudocosts, parallel_dispatcher, relaxation_solver);
 }
 
 } // namespace simplex::bnb::detail

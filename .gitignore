@@ -43,3 +43,4 @@ highs-source/
 .opencode.json
 .code-review-graph/
 .openclaude/
+.codex-ariadne-mcp.toml
