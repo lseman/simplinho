@@ -16,6 +16,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -47,6 +48,7 @@ class Solver {
           initial_cuts_(std::move(initial_cuts)) {
         validate_inputs_();
         pseudocosts_.resize(problem_.variable_types.size());
+        detect_objective_integrality_();
     }
 
     std::optional<LPBasis> root_warm_start_basis_state() const {
@@ -166,6 +168,7 @@ class Solver {
             reap_async_heuristics_();
         };
 
+        bool gap_terminated = false;
         if (options_.parallel_workers > 1) {
             process_parallel_active_nodes_(process_node);
         } else {
@@ -185,6 +188,7 @@ class Solver {
                         inc.has_incumbent, inc.objective, problem_.maximize,
                         root_relaxation_objective);
                     if (mip_gap_closed_(best_bound)) {
+                        gap_terminated = true;
                         break;
                     }
                 }
@@ -198,6 +202,9 @@ class Solver {
             const IncumbentSnapshot incumbent = incumbent_snapshot_();
             if (search_coordinator_.found_unbounded()) {
                 final_status = Status::Unbounded;
+            } else if (incumbent.has_incumbent && gap_terminated &&
+                       !search_coordinator_.hit_node_limit()) {
+                final_status = Status::Optimal;
             } else if (incumbent.has_incumbent && search_coordinator_.empty() &&
                        !search_coordinator_.hit_node_limit()) {
                 final_status = Status::Optimal;
@@ -729,6 +736,65 @@ class Solver {
                                  : (incumbent - options_.feasibility_tol);
     }
 
+    // When the objective takes only values on the lattice {constant + k*step},
+    // a dual bound can be rounded toward the incumbent without losing the
+    // optimum: maximize -> floor to the lattice, minimize -> ceil. This is the
+    // standard integer-objective bound tightening (HiGHS/SCIP) and is the main
+    // lever for proving optimality on instances with an integral objective.
+    double round_objective_bound_(double bound) const {
+        if (!objective_integral_ || !std::isfinite(bound)) {
+            return bound;
+        }
+        const double step = objective_round_step_;
+        const double rel = bound - problem_.objective_constant;
+        // Pull in by a feasibility tolerance before rounding so a bound that is
+        // numerically a hair above an integer point is not rounded the wrong way.
+        const double tol = options_.feasibility_tol;
+        if (problem_.maximize) {
+            return problem_.objective_constant + std::floor(rel / step + tol) * step;
+        }
+        return problem_.objective_constant + std::ceil(rel / step - tol) * step;
+    }
+
+    // Detect whether the objective is integer-valued on every feasible integer
+    // point, and the granularity (GCD of integer coefficients) of its values.
+    void detect_objective_integrality_() {
+        objective_integral_ = false;
+        objective_round_step_ = 1.0;
+        const int n = static_cast<int>(problem_.objective_coefficients.size());
+        if (n == 0) {
+            return;
+        }
+        const double tol = 1e-9;
+        auto is_integral = [&](double v) { return std::abs(v - std::round(v)) <= tol; };
+        if (!is_integral(problem_.objective_constant)) {
+            return;
+        }
+        long long gcd = 0;
+        for (int j = 0; j < n; ++j) {
+            const double coeff = problem_.objective_coefficients(j);
+            if (std::abs(coeff) <= tol) {
+                continue;
+            }
+            // A variable that is free to take fractional values cannot give an
+            // integral objective unless its coefficient is zero.
+            if (j >= static_cast<int>(problem_.variable_types.size()) ||
+                problem_.variable_types[static_cast<std::size_t>(j)] == VariableType::Continuous) {
+                return;
+            }
+            if (!is_integral(coeff)) {
+                return;
+            }
+            const long long c = std::llabs(static_cast<long long>(std::llround(coeff)));
+            gcd = std::gcd(gcd, c);
+        }
+        if (gcd <= 0) {
+            return;
+        }
+        objective_integral_ = true;
+        objective_round_step_ = static_cast<double>(gcd);
+    }
+
     // Gap-aware "optimality limit" (HiGHS optimality_limit). Used only to
     // decide when the requested optimality gap has been proved -- never for
     // pruning individual nodes, since that would discard the true optimum
@@ -746,7 +812,8 @@ class Solver {
         // the optimum on instances where a better integer solution lies within
         // the requested gap window.
         const double cutoff = fathom_cutoff_(incumbent);
-        return problem_.maximize ? (candidate <= cutoff) : (candidate >= cutoff);
+        const double rounded = round_objective_bound_(candidate);
+        return problem_.maximize ? (rounded <= cutoff) : (rounded >= cutoff);
     }
 
     double bound_tightening_improvement_(double before, double after) const {
@@ -761,8 +828,9 @@ class Solver {
             !std::isfinite(bound)) {
             return false;
         }
-        const double raw_gap =
-            problem_.maximize ? (bound - incumbent.objective) : (incumbent.objective - bound);
+        const double rounded_bound = round_objective_bound_(bound);
+        const double raw_gap = problem_.maximize ? (rounded_bound - incumbent.objective)
+                                                 : (incumbent.objective - rounded_bound);
         if (raw_gap <= options_.mip_abs_gap) {
             return true;
         }
@@ -2000,11 +2068,17 @@ class Solver {
             fractional.empty()) {
             return false;
         }
+        // Cut-depth policy. Interior cut separation is expensive on this code
+        // path (each pass regenerates every cut family over the full variable
+        // set and re-solves the LP), so it must stay bounded: separating on
+        // many deep nodes makes per-node cost dominate. Keep the reach modest
+        // and, beyond the shallow band, only separate on the periodic node
+        // frequency. The dual bound deep in the tree is instead handled cheaply
+        // by objective-integrality rounding in round_objective_bound_.
+        const bool proof = adaptive_proof_phase_active_for_bound_(relaxation.objective);
         if (node.depth > std::max(2, effective.strong_branching_max_depth + 1)) {
             return false;
         }
-
-        const bool proof = adaptive_proof_phase_active_for_bound_(relaxation.objective);
         const bool shallow = node.depth <= 2;
         const bool periodic =
             effective.heuristic_frequency <= 1 ||
@@ -2146,9 +2220,6 @@ class Solver {
             relaxation_lp_lu_build_ns_ += lp_stats.lu_build_ns;
             relaxation_lp_pricing_build_ns_ += lp_stats.pricing_build_ns;
             relaxation_lp_pivot_ns_ += lp_stats.pivot_ns;
-        }
-        if (node_count_ >= options_.max_nodes) {
-            search_coordinator_.mark_node_limit_reached();
         }
     }
 
@@ -2857,7 +2928,8 @@ class Solver {
                 }
 
                 WorkerFinishedGuard guard{&search_coordinator_, true};
-                process_node(std::move(*pop_result.node), false, worker_id);
+                const bool allow_root_cuts = pop_result.node->depth == 0;
+                process_node(std::move(*pop_result.node), allow_root_cuts, worker_id);
 
                 // Direct continuation: after processing a node this worker may have just
                 // pushed children.  Try to pick up local work immediately (once) before
@@ -2870,7 +2942,8 @@ class Solver {
                         continuation_effective.hybrid_depth_bias,
                         continuation_effective.plunging_bestfreq, worker_id);
                     if (next.has_value()) {
-                        process_node(std::move(*next), false, worker_id);
+                        const bool next_allow_root_cuts = next->depth == 0;
+                        process_node(std::move(*next), next_allow_root_cuts, worker_id);
                     }
                 }
 
@@ -3476,16 +3549,21 @@ class Solver {
                     bound_tightening_improvement_(round_start_objective, relaxation.objective);
                 const double cumulative_improvement =
                     bound_tightening_improvement_(previous_round_objective, relaxation.objective);
+                // Root cutting is the highest-leverage place to tighten the global
+                // dual bound, so be far more patient here than at interior nodes:
+                // many cut families (cover/GMI/MIR) close the gap incrementally over
+                // a dozen-plus rounds. Use a small relative threshold and tolerate
+                // several consecutive low-yield rounds before giving up.
                 const double progress_tol =
                     std::max(10.0 * options_.feasibility_tol,
-                             1e-5 * std::max(1.0, std::abs(round_start_objective)));
+                             1e-6 * std::max(1.0, std::abs(round_start_objective)));
                 if (round_improvement <= progress_tol && cumulative_improvement <= progress_tol) {
                     ++stall_rounds;
                 } else {
                     stall_rounds = 0;
                 }
                 previous_round_objective = relaxation.objective;
-                if (round >= 1 && stall_rounds >= 1)
+                if (stall_rounds >= 3)
                     break;
             }
 
@@ -4204,6 +4282,9 @@ class Solver {
             tree_node.branch_var = branch_variable;
             tree_node.branch_value = branch_value;
             tree_node.sibling_bound = sibling_bound;
+            if (static_cast<int>(tree_nodes_.size()) >= options_.max_nodes) {
+                search_coordinator_.mark_node_limit_reached();
+            }
         }
 
         if (child.state.upper_bounds(branch_variable) + options_.integrality_tol <
@@ -4367,15 +4448,15 @@ class Solver {
                             ? incumbent_primal_
                             : Eigen::VectorXd::Constant(problem_.lower_bounds.size(),
                                                         std::numeric_limits<double>::quiet_NaN());
-        result.best_bound = search_coordinator_.compute_best_bound(
-            has_incumbent_, incumbent_objective_, problem_.maximize, root_relaxation_objective);
+        result.best_bound = round_objective_bound_(search_coordinator_.compute_best_bound(
+            has_incumbent_, incumbent_objective_, problem_.maximize, root_relaxation_objective));
         // When optimally solved (tree exhausted), best_bound must equal the incumbent objective.
         if (status == Status::Optimal && has_incumbent_) {
             result.best_bound = incumbent_objective_;
         }
         result.root_relaxation_objective =
             root_relaxation_objective.value_or(std::numeric_limits<double>::quiet_NaN());
-        result.node_count = node_count_;
+        result.node_count = static_cast<int>(tree_nodes_.size());
         result.relaxation_solve_count = relaxation_solve_count_;
         result.lp_iterations = lp_iterations_ + heuristic_lp_iterations_;
         result.incumbent_updates = incumbent_updates_;
@@ -4449,6 +4530,11 @@ class Solver {
 
     Problem problem_;
     Options options_;
+    // Objective lattice: when true, every feasible objective value lies on
+    // {objective_constant + k * objective_round_step_}, enabling dual-bound
+    // rounding in round_objective_bound_. Set once in the constructor.
+    bool objective_integral_ = false;
+    double objective_round_step_ = 1.0;
     std::vector<detail::PseudoCost> pseudocosts_;
     std::unique_ptr<detail::ParallelDispatcher> parallel_task_dispatcher_;
     detail::SearchCoordinator search_coordinator_;

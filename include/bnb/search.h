@@ -504,7 +504,9 @@ class WorkerLocalQueue {
         slots_ = std::move(other.slots_);
         free_handles_ = std::move(other.free_handles_);
         lifo_stack_ = std::move(other.lifo_stack_);
-        best_heap_ = std::move(other.best_heap_);
+        bound_heap_ = std::move(other.bound_heap_);
+        estimate_heap_ = std::move(other.estimate_heap_);
+        hybrid_heap_ = std::move(other.hybrid_heap_);
         stealing_heap_ = std::move(other.stealing_heap_);
         next_stamp_ = other.next_stamp_;
         active_count_ = other.active_count_;
@@ -527,7 +529,9 @@ class WorkerLocalQueue {
             slots_ = std::move(other.slots_);
             free_handles_ = std::move(other.free_handles_);
             lifo_stack_ = std::move(other.lifo_stack_);
-            best_heap_ = std::move(other.best_heap_);
+            bound_heap_ = std::move(other.bound_heap_);
+            estimate_heap_ = std::move(other.estimate_heap_);
+            hybrid_heap_ = std::move(other.hybrid_heap_);
             stealing_heap_ = std::move(other.stealing_heap_);
             next_stamp_ = other.next_stamp_;
             active_count_ = other.active_count_;
@@ -632,7 +636,9 @@ class WorkerLocalQueue {
     std::vector<Slot> slots_;
     std::vector<int> free_handles_;
     std::vector<HandleStamp> lifo_stack_;
-    std::priority_queue<BestKey, std::vector<BestKey>, BestKeyLess> best_heap_;
+    std::priority_queue<BestKey, std::vector<BestKey>, BestKeyLess> bound_heap_;
+    std::priority_queue<BestKey, std::vector<BestKey>, BestKeyLess> estimate_heap_;
+    std::priority_queue<BestKey, std::vector<BestKey>, BestKeyLess> hybrid_heap_;
     std::priority_queue<StealKey, std::vector<StealKey>, StealKeyLess> stealing_heap_;
     mutable std::mutex mutex_;
 
@@ -693,7 +699,7 @@ class WorkerLocalQueue {
 
         const ActiveNode& stored = slots_[handle].entry.node;
         lifo_stack_.push_back(HandleStamp{handle, stamp});
-        best_heap_.push(make_best_key_(handle, stamp, stored, strategy, maximize));
+        push_best_keys_locked_(handle, stamp, stored, maximize);
     }
 
     std::optional<ActiveNode> pop(NodeSelectionStrategy strategy, bool maximize,
@@ -715,10 +721,16 @@ class WorkerLocalQueue {
             if (auto node = extract_valid_lifo_node_locked_()) {
                 return node;
             }
-            return extract_valid_best_node_locked_();
+            return extract_valid_best_node_locked_(strategy);
         }
 
-        if (auto node = extract_valid_best_node_locked_()) {
+        NodeSelectionStrategy best_strategy = strategy;
+        if (strategy == NodeSelectionStrategy::InterleavedBestFirstBestEstimatePlunging &&
+            is_plunging_strategy(strategy) && !prefer_depth) {
+            best_strategy = NodeSelectionStrategy::BestBound;
+        }
+
+        if (auto node = extract_valid_best_node_locked_(best_strategy)) {
             return node;
         }
 
@@ -743,13 +755,10 @@ class WorkerLocalQueue {
             return std::nullopt;
         }
 
-        if (auto node = extract_valid_steal_node_locked_()) {
+        if (auto node = extract_valid_best_node_locked_(strategy)) {
             return node;
         }
-        if (auto node = extract_valid_best_node_locked_()) {
-            return node;
-        }
-        return extract_valid_lifo_node_locked_();
+        return extract_valid_steal_node_locked_();
     }
 
     void contribute_to_stealing_heap(ActiveNode node, NodeSelectionStrategy strategy,
@@ -786,6 +795,7 @@ class WorkerLocalQueue {
         ++active_count_;
 
         const ActiveNode& stored = slots_[handle].entry.node;
+        push_best_keys_locked_(handle, stamp, stored, maximize);
         stealing_heap_.push(make_steal_key_(handle, stamp, stored, strategy, maximize));
     }
 
@@ -800,8 +810,14 @@ class WorkerLocalQueue {
         slots_.clear();
         free_handles_.clear();
         lifo_stack_.clear();
-        while (!best_heap_.empty()) {
-            best_heap_.pop();
+        while (!bound_heap_.empty()) {
+            bound_heap_.pop();
+        }
+        while (!estimate_heap_.empty()) {
+            estimate_heap_.pop();
+        }
+        while (!hybrid_heap_.empty()) {
+            hybrid_heap_.pop();
         }
         while (!stealing_heap_.empty()) {
             stealing_heap_.pop();
@@ -839,7 +855,7 @@ class WorkerLocalQueue {
         double best =
             has_incumbent ? incumbent_objective : std::numeric_limits<double>::quiet_NaN();
 
-        if (const ActiveNode* best_local_node = peek_valid_best_node_locked_()) {
+        if (const ActiveNode* best_local_node = peek_valid_best_node_locked_(maximize)) {
             if (!std::isfinite(best)) {
                 best = best_local_node->bound;
             } else {
@@ -1187,6 +1203,16 @@ class WorkerLocalQueue {
         return key;
     }
 
+    void push_best_keys_locked_(int handle, std::uint64_t stamp, const ActiveNode& node,
+                                bool maximize) {
+        bound_heap_.push(make_best_key_(handle, stamp, node, NodeSelectionStrategy::BestBound,
+                                        maximize));
+        estimate_heap_.push(make_best_key_(handle, stamp, node, NodeSelectionStrategy::BestEstimate,
+                                           maximize));
+        hybrid_heap_.push(
+            make_best_key_(handle, stamp, node, NodeSelectionStrategy::Hybrid, maximize));
+    }
+
     bool is_valid_locked_(int handle, std::uint64_t stamp) const {
         return handle >= 0 && handle < static_cast<int>(slots_.size()) && slots_[handle].alive &&
                slots_[handle].entry.stamp == stamp;
@@ -1220,10 +1246,35 @@ class WorkerLocalQueue {
         return std::nullopt;
     }
 
-    std::optional<ActiveNode> extract_valid_best_node_locked_() {
-        while (!best_heap_.empty()) {
-            const BestKey key = best_heap_.top();
-            best_heap_.pop();
+    std::priority_queue<BestKey, std::vector<BestKey>, BestKeyLess>&
+    heap_for_strategy_locked_(NodeSelectionStrategy strategy) {
+        if (strategy == NodeSelectionStrategy::BestBound ||
+            strategy == NodeSelectionStrategy::BestFirstPlunging) {
+            return bound_heap_;
+        }
+        if (strategy == NodeSelectionStrategy::Hybrid) {
+            return hybrid_heap_;
+        }
+        return estimate_heap_;
+    }
+
+    const std::priority_queue<BestKey, std::vector<BestKey>, BestKeyLess>&
+    heap_for_strategy_locked_(NodeSelectionStrategy strategy) const {
+        if (strategy == NodeSelectionStrategy::BestBound ||
+            strategy == NodeSelectionStrategy::BestFirstPlunging) {
+            return bound_heap_;
+        }
+        if (strategy == NodeSelectionStrategy::Hybrid) {
+            return hybrid_heap_;
+        }
+        return estimate_heap_;
+    }
+
+    std::optional<ActiveNode> extract_valid_best_node_locked_(NodeSelectionStrategy strategy) {
+        auto& heap = heap_for_strategy_locked_(strategy);
+        while (!heap.empty()) {
+            const BestKey key = heap.top();
+            heap.pop();
             if (!is_valid_locked_(key.handle, key.stamp)) {
                 continue;
             }
@@ -1244,9 +1295,10 @@ class WorkerLocalQueue {
         return std::nullopt;
     }
 
-    const ActiveNode* peek_valid_best_node_locked_() const {
+    const ActiveNode* peek_valid_best_node_locked_(bool maximize = true) const {
+        (void)maximize;
         auto& heap = const_cast<std::priority_queue<BestKey, std::vector<BestKey>, BestKeyLess>&>(
-            best_heap_);
+            bound_heap_);
         while (!heap.empty()) {
             const BestKey& key = heap.top();
             if (!is_valid_locked_(key.handle, key.stamp)) {

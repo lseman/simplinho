@@ -122,10 +122,10 @@ cpmaddpackage(
     GITHUB_REPOSITORY NVIDIA/stdexec
     GIT_TAG main
     OPTIONS
-        "STDEXEC_BUILD_TESTS OFF"
-        "STDEXEC_BUILD_EXAMPLES OFF"
-        "STDEXEC_BUILD_BENCHMARKS OFF"
-        "STDEXEC_BUILD_DOCS OFF"
+    "STDEXEC_BUILD_TESTS OFF"
+    "STDEXEC_BUILD_EXAMPLES OFF"
+    "STDEXEC_BUILD_BENCHMARKS OFF"
+    "STDEXEC_BUILD_DOCS OFF"
 )
 
 cpmaddpackage(
@@ -216,6 +216,7 @@ target_compile_definitions(simplex_core INTERFACE
     SIMPLEX_GIT_DESCRIBE="${SIMPLEX_GIT_DESCRIBE}"
     SIMPLEX_GIT_BRANCH="${SIMPLEX_GIT_BRANCH}"
     _GLIBCXX_USE_TBB_PAR_BACKEND=0
+    SIMPLINHO_REUSE_DEBUG
 )
 
 target_link_libraries(simplex_core INTERFACE
@@ -256,7 +257,7 @@ target_link_libraries(simplinho PRIVATE
 
 if(SIMPLEX_ENABLE_UNITY_BUILD)
     set_target_properties(simplinho PROPERTIES
-        UNITY_BUILD ON
+        UNITY_BUILD OFF
         UNITY_BUILD_BATCH_SIZE 8
     )
 endif()

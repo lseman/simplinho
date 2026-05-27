@@ -1673,12 +1673,11 @@ class Model {
 
                 const std::size_t prior_size = extended.column_status.size();
                 extended.column_status.resize(static_cast<std::size_t>(total_vars),
-                                              LPBasisStatus::Basic);
+                                              LPBasisStatus::AtLower);
                 if (extended.column_status.size() > prior_size) {
                     extended.warm_state.reset();
-                    for (int col = static_cast<int>(prior_size); col < total_vars; ++col) {
-                        extended.basis_columns.push_back(col);
-                    }
+                    // Do not assume new vars are basic; preserve the old basis
+                    // structure and let solver reconstruction handle the new vars.
                 }
                 if (extended.column_status.size() > prior_size &&
                     basis_matches_dimensions(extended, total_vars, rows)) {
@@ -1855,9 +1854,7 @@ class Model {
 
                 const LPBasis* solver_warm_basis = nullptr;
                 if (effective_basis != nullptr) {
-                    if (!entry.warm_solver->has_cached_basis_state(node_data.A_sparse)) {
-                        solver_warm_basis = effective_basis;
-                    }
+                    solver_warm_basis = effective_basis;
                 }
 
                 simplex_bnb::RelaxationSolution out;
@@ -2017,7 +2014,14 @@ class Model {
                 if (raw_opt.has_value()) {
                     const bool has_valid_primal = raw_opt->x.size() == node_data.total_vars &&
                                                   raw_opt->x.array().isFinite().all();
-                    const bool terminal_optimal = raw_opt->status == LPSolution::Status::Optimal;
+                    // A relaxation with zero constraint rows is bound-only: the
+                    // optimum is each variable at its cost-favoring bound and the
+                    // (empty) basis factorization can report Singular spuriously.
+                    // Treat a finite-objective, valid-primal result as Optimal.
+                    const bool terminal_optimal =
+                        raw_opt->status == LPSolution::Status::Optimal ||
+                        (node_data.rows == 0 && has_valid_primal &&
+                         std::isfinite(raw_opt->obj));
                     const bool terminal_unbounded =
                         raw_opt->status == LPSolution::Status::Unbounded;
                     const bool terminal_objective_bound =
@@ -2115,7 +2119,7 @@ class Model {
                         [this](const ModelLPData& base, const std::vector<simplex_bnb::Cut>& cuts) {
                             return build_node_lp_data_from_base_(base, cuts);
                         },
-                        data, state_->objective.constant, state_->maximize, cold_lp_options,
+                        data, problem.objective_constant, state_->maximize, cold_lp_options,
                         warm_lp_options, mip_options.verbose);
                     context_owner = solve_token;
                 }
@@ -2224,7 +2228,7 @@ class Model {
                     if (inc.has_incumbent && std::isfinite(inc.objective)) {
                         const double sign_external = state_->maximize ? -1.0 : 1.0;
                         objective_bound_internal =
-                            sign_external * (inc.objective - state_->objective.constant);
+                            sign_external * (inc.objective - problem.objective_constant);
                     }
                 }
                 simplex_bnb::RelaxationSolution relaxation = thread_context.solve_node(

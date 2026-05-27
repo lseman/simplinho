@@ -274,7 +274,7 @@ choose_pseudocost_without_probing(const ActiveNode& node,
         }
 
         const auto& pseudocost = pseudocosts[candidate.variable];
-        const bool reliable = pseudocost.cost.up_count > 0 || pseudocost.cost.down_count > 0;
+        const bool reliable = pseudocost.cost.is_reliable(reliability);
         if (!reliable && saw_reliable) {
             continue;
         }
@@ -343,8 +343,10 @@ choose_pseudocost_without_probing(const ActiveNode& node,
     evaluation.relaxation =
         relaxation_solver(evaluation.state, node.basis ? &*node.basis : nullptr);
     evaluation.relaxation_is_probe_only =
-        evaluation.relaxation.has_value() && evaluation.relaxation->lp_solution.has_value() &&
-        evaluation.relaxation->lp_solution->status == LPSolution::Status::IterLimit;
+        evaluation.relaxation.has_value() &&
+        (evaluation.relaxation->status != RelaxationStatus::Optimal ||
+         (evaluation.relaxation->lp_solution.has_value() &&
+          evaluation.relaxation->lp_solution->status == LPSolution::Status::IterLimit));
     evaluation.cutoff = !evaluation.relaxation.has_value() ||
                         evaluation.relaxation->status == RelaxationStatus::Infeasible ||
                         evaluation.relaxation->status == RelaxationStatus::Unbounded;
@@ -747,9 +749,10 @@ BranchDecision choose_branching_variable(const ActiveNode& node,
     }
 
     if (options.branching_strategy == BranchingStrategy::StrongBranching) {
-        // HiGHS-like behavior: use strong branching mainly to seed pseudocosts
-        // at the root, then branch by pseudocost and probe only shallow,
-        // unreliable candidates afterwards.
+        // Use strong branching to seed and repair pseudocosts while the node is
+        // shallow. HiGHS keeps probing unreliable directions until the selected
+        // candidate is trustworthy; the shared pseudocost path below handles
+        // that budget instead of applying a separate non-root clamp here.
         if (node.depth == 0) {
             return choose_strong_branching(
                 node, relaxation, fractional, options.strong_branching_candidates,
@@ -758,16 +761,12 @@ BranchDecision choose_branching_variable(const ActiveNode& node,
                 options.feasibility_tol, options.integrality_tol, pseudocosts, parallel_dispatcher,
                 relaxation_solver);
         }
-
-        const int limited_candidates = options.strong_branching_candidates > 0
-                                           ? std::min(options.strong_branching_candidates, 2)
-                                           : 2;
         return choose_pseudocost_branching(
-            node, relaxation, fractional, options.pseudocost_reliability, limited_candidates,
-            options.strong_branching_k, std::min(options.strong_branching_max_depth, 1),
-            options.strong_branching_lp_iter_limit, effective_parallel_workers, maximize,
-            options.feasibility_tol, options.integrality_tol, pseudocosts, parallel_dispatcher,
-            relaxation_solver);
+            node, relaxation, fractional, options.pseudocost_reliability,
+            options.strong_branching_candidates, options.strong_branching_k,
+            options.strong_branching_max_depth, options.strong_branching_lp_iter_limit,
+            effective_parallel_workers, maximize, options.feasibility_tol, options.integrality_tol,
+            pseudocosts, parallel_dispatcher, relaxation_solver);
     }
 
     return choose_pseudocost_branching(

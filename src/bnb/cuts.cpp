@@ -1053,19 +1053,20 @@ KnapsackLiftResult knapsack_max_profit_(const std::vector<double>& weights,
 // coefficients at least as strong as sequence-independent lifting and often
 // strictly stronger.  The final cut is validated before being returned.
 std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
-sequence_dependent_lifted_cover_cut_(const CanonicalKnapsack& kn, double tol = 1e-9) {
+sequence_dependent_lifted_cover_cut_(const CanonicalKnapsack& kn,
+                                     const BinaryCoverPartition& partition, double tol = 1e-9) {
     const int n = static_cast<int>(kn.variables.size());
     if (n < 2 || !kn.valid || !std::isfinite(kn.rhs) || kn.rhs < 0.0)
         return std::nullopt;
 
-    const std::optional<BinaryCoverPartition> partition = find_lp_violated_minimal_cover_(kn, tol);
-    if (!partition.has_value())
-        return std::nullopt;
-
-    const std::vector<int>& cover = partition->cover_positions;
+    const std::vector<int>& cover = partition.cover_positions;
     const int cover_size = static_cast<int>(cover.size());
     if (cover_size < 2)
         return std::nullopt;
+    for (int pos : cover) {
+        if (pos < 0 || pos >= n)
+            return std::nullopt;
+    }
 
     // canonical-space coefficient per position; cover members start at 1.
     std::vector<double> alpha(static_cast<std::size_t>(n), 0.0);
@@ -1079,7 +1080,7 @@ sequence_dependent_lifted_cover_cut_(const CanonicalKnapsack& kn, double tol = 1
     // Lift remainder variables in non-increasing weight order: heavier items
     // constrain the residual knapsack most, so lifting them first tends to
     // produce the strongest sequence.
-    std::vector<int> order = partition->remainder_positions;
+    std::vector<int> order = partition.remainder_positions;
     std::sort(order.begin(), order.end(), [&](int lhs, int rhs) {
         if (std::abs(kn.coeffs[lhs] - kn.coeffs[rhs]) > tol)
             return kn.coeffs[lhs] > kn.coeffs[rhs];
@@ -1154,20 +1155,20 @@ sequence_dependent_lifted_cover_cut_(const CanonicalKnapsack& kn, double tol = 1
 // supplied by the caller (derived from base constraints / the conflict graph).
 std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
 gub_lifted_cover_cut_(const CanonicalKnapsack& kn, const std::vector<int>& gub_group_of,
-                      double tol = 1e-9) {
+                      const BinaryCoverPartition& partition, double tol = 1e-9) {
     const int n = static_cast<int>(kn.variables.size());
     if (n < 2 || !kn.valid || !std::isfinite(kn.rhs) || kn.rhs < 0.0 ||
         static_cast<int>(gub_group_of.size()) != n)
         return std::nullopt;
 
-    const std::optional<BinaryCoverPartition> partition = find_lp_violated_minimal_cover_(kn, tol);
-    if (!partition.has_value())
-        return std::nullopt;
-
-    const std::vector<int>& cover = partition->cover_positions;
+    const std::vector<int>& cover = partition.cover_positions;
     const int cover_size = static_cast<int>(cover.size());
     if (cover_size < 2)
         return std::nullopt;
+    for (int pos : cover) {
+        if (pos < 0 || pos >= n)
+            return std::nullopt;
+    }
 
     std::vector<double> alpha(static_cast<std::size_t>(n), 0.0);
     std::vector<char> lifted(static_cast<std::size_t>(n), 0);
@@ -1181,7 +1182,7 @@ gub_lifted_cover_cut_(const CanonicalKnapsack& kn, const std::vector<int>& gub_g
     // lifted individually (each its own singleton group).
     std::unordered_map<int, std::vector<int>> groups;
     std::vector<std::vector<int>> singletons;
-    for (const int pos : partition->remainder_positions) {
+    for (const int pos : partition.remainder_positions) {
         const int g = gub_group_of[static_cast<std::size_t>(pos)];
         if (g < 0)
             singletons.push_back({pos});
@@ -1817,45 +1818,47 @@ void append_binary_knapsack_cover_family_(
                                                      lifted_type, signatures, cuts);
     }
 
-    // Sequence-dependent (exact) lifting — generally at least as strong as the
-    // sequence-independent superadditive lift above.
-    if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>> seq_cover =
-            sequence_dependent_lifted_cover_cut_(kn)) {
-        const auto& [seq_indices, seq_values, seq_rhs] = *seq_cover;
-        maybe_add_validated_lifted_binary_cover_cut_(problem, relaxation, options, kn, seq_indices,
-                                                     seq_values, seq_rhs, seqdep_type, signatures,
-                                                     cuts);
-    }
-
     // GUB cover lifting — exploits set-packing cliques among the variables for
     // stronger per-group coefficients.  Only attempted when at least one GUB
     // group actually covers two of this knapsack's variables.
-    {
-        const std::vector<int> gub_groups = build_gub_groups_for_knapsack_(problem, kn);
-        const bool has_gub =
-            std::any_of(gub_groups.begin(), gub_groups.end(), [](int g) { return g >= 0; });
-        if (has_gub) {
-            if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
-                    gub_cover = gub_lifted_cover_cut_(kn, gub_groups)) {
-                const auto& [gub_indices, gub_values, gub_rhs] = *gub_cover;
-                maybe_add_validated_lifted_binary_cover_cut_(problem, relaxation, options, kn,
-                                                             gub_indices, gub_values, gub_rhs,
-                                                             gub_type, signatures, cuts);
-            }
-        }
-    }
+    const std::vector<int> gub_groups = build_gub_groups_for_knapsack_(problem, kn);
+    const bool has_gub =
+        std::any_of(gub_groups.begin(), gub_groups.end(), [](int g) { return g >= 0; });
 
     for (const BinaryCoverPartition& partition : candidate_partitions) {
         const std::vector<int> cover_literals =
             canonical_binary_cover_literals_(kn, partition.cover_positions);
-        maybe_add_cover_cut_(problem, relaxation, options, cover_literals, cover_type, signatures,
-                             cuts);
+        maybe_add_validated_literal_cover_cut_(problem, relaxation, options, canonical_terms,
+                                               kn.rhs, cover_literals, cover_type, signatures,
+                                               cuts);
 
         const std::vector<int> lifted_cover_literals =
             extend_cover_literals_(canonical_terms, cover_literals, kn.rhs);
         maybe_add_validated_literal_cover_cut_(problem, relaxation, options, canonical_terms,
                                                kn.rhs, lifted_cover_literals, lite_type, signatures,
                                                cuts);
+
+        // Sequence-dependent (exact) lifting — generally at least as strong as
+        // the sequence-independent superadditive lift above.  Apply it to each
+        // minimal cover candidate, matching the SCIP/Cgl pattern of lifting the
+        // selected cover rather than only the LP-ratio one.
+        if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
+                seq_cover = sequence_dependent_lifted_cover_cut_(kn, partition)) {
+            const auto& [seq_indices, seq_values, seq_rhs] = *seq_cover;
+            maybe_add_validated_lifted_binary_cover_cut_(problem, relaxation, options, kn,
+                                                         seq_indices, seq_values, seq_rhs,
+                                                         seqdep_type, signatures, cuts);
+        }
+
+        if (has_gub) {
+            if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
+                    gub_cover = gub_lifted_cover_cut_(kn, gub_groups, partition)) {
+                const auto& [gub_indices, gub_values, gub_rhs] = *gub_cover;
+                maybe_add_validated_lifted_binary_cover_cut_(problem, relaxation, options, kn,
+                                                             gub_indices, gub_values, gub_rhs,
+                                                             gub_type, signatures, cuts);
+            }
+        }
 
         if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
                 lifted_cover = highs_lifted_binary_cover_cut_(kn, partition)) {
@@ -5024,158 +5027,14 @@ std::vector<Cut> generate_cover_cuts(const Problem& problem, const RelaxationSol
         if (row.sense != LinearConstraintSense::LessEqual)
             return;
 
-        // Try canonical pure binary knapsack lifting first
+        // Try canonical pure binary knapsack lifting first. Keep base rows on
+        // the same path as aggregated knapsacks so exact/GUB lifting is active
+        // for plain knapsack instances too.
         CanonicalKnapsack kn = build_canonical_binary_knapsack_(problem, relaxation, row);
-        if (kn.valid && kn.variables.size() >= 2 && !std::isfinite(kn.rhs) == false &&
-            kn.rhs >= 0.0) {
-            const std::vector<CoverLiteralTerm> canonical_terms = canonical_binary_cover_terms_(kn);
-            std::vector<std::vector<int>> candidate_literal_covers;
-            auto queue_literal_cover = [&](std::vector<int> cover_literals) {
-                if (cover_literals.size() < 2) {
-                    return;
-                }
-                std::sort(cover_literals.begin(), cover_literals.end());
-                cover_literals.erase(std::unique(cover_literals.begin(), cover_literals.end()),
-                                     cover_literals.end());
-                if (cover_literals.size() < 2) {
-                    return;
-                }
-                if (std::find(candidate_literal_covers.begin(), candidate_literal_covers.end(),
-                              cover_literals) == candidate_literal_covers.end()) {
-                    candidate_literal_covers.push_back(std::move(cover_literals));
-                }
-            };
-            auto maybe_add_validated_lifted_cover = [&](const std::vector<int>& indices,
-                                                        const std::vector<double>& values,
-                                                        double rhs, const std::string& cut_type) {
-                if (indices.size() != values.size() || indices.empty()) {
-                    return;
-                }
-                Cut cut;
-                cut.sense = LinearConstraintSense::LessEqual;
-                cut.rhs = rhs;
-                cut.cut_type = cut_type;
-                cut.indices = indices;
-                cut.values = values;
-                if (!postprocess_cover_cut_(problem, options, &cut) || cut.indices.empty()) {
-                    return;
-                }
-                if (!validate_lifted_binary_cover_cut_(kn, cut.indices, cut.values, cut.rhs)) {
-                    return;
-                }
-                const double violation = cut_violation(cut, relaxation.primal);
-                if (violation <= options.min_cut_violation) {
-                    return;
-                }
-                cut.strength = violation;
-                const CutSignature signature = cut_signature(cut);
-                if (!signatures.insert(signature).second) {
-                    return;
-                }
-                cuts.push_back(std::move(cut));
-            };
-            auto maybe_add_validated_literal_cover = [&](const std::vector<CoverLiteralTerm>& terms,
-                                                         double rhs,
-                                                         const std::vector<int>& literals,
-                                                         const std::string& cut_type) {
-                if (literals.size() < 2 || !std::isfinite(rhs)) {
-                    return;
-                }
-                Cut cut;
-                cut.sense = LinearConstraintSense::LessEqual;
-                cut.rhs = static_cast<double>(literals.size() - 1);
-                cut.cut_type = cut_type;
-                for (int literal : literals) {
-                    const int variable = ConflictGraph::variable_of(literal);
-                    if (variable < 0 ||
-                        variable >= static_cast<int>(problem.variable_types.size())) {
-                        continue;
-                    }
-                    cut.indices.push_back(variable);
-                    if (ConflictGraph::value_of(literal)) {
-                        cut.values.push_back(1.0);
-                    } else {
-                        cut.values.push_back(-1.0);
-                        cut.rhs -= 1.0;
-                    }
-                }
-                if (!postprocess_cover_cut_(problem, options, &cut) || cut.indices.empty()) {
-                    return;
-                }
-                if (!validate_literal_cover_cut_(terms, cut.indices, cut.values, cut.rhs, rhs)) {
-                    return;
-                }
-                const double violation = cut_violation(cut, relaxation.primal);
-                if (violation <= options.min_cut_violation) {
-                    return;
-                }
-                cut.strength = violation;
-                const CutSignature signature = cut_signature(cut);
-                if (!signatures.insert(signature).second) {
-                    return;
-                }
-                cuts.push_back(std::move(cut));
-            };
-            std::vector<BinaryCoverPartition> candidate_partitions;
-            auto queue_partition = [&](BinaryCoverPartition partition) {
-                std::vector<int> key = partition.cover_positions;
-                std::sort(key.begin(), key.end());
-                if (key.size() < 2)
-                    return;
-                for (const BinaryCoverPartition& existing : candidate_partitions) {
-                    std::vector<int> existing_key = existing.cover_positions;
-                    std::sort(existing_key.begin(), existing_key.end());
-                    if (existing_key == key)
-                        return;
-                }
-                candidate_partitions.push_back(std::move(partition));
-            };
-
-            if (const std::optional<BinaryCoverPartition> partition =
-                    find_lp_violated_minimal_cover_(kn)) {
-                queue_literal_cover(
-                    canonical_binary_cover_literals_(kn, partition->cover_positions));
-                queue_partition(*partition);
-            }
-
-            if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
-                    lifted_cover = lifted_binary_cover_cut_(kn)) {
-                const auto& [lifted_indices, lifted_values, lifted_rhs] = *lifted_cover;
-                maybe_add_validated_lifted_cover(lifted_indices, lifted_values, lifted_rhs,
-                                                 "LiftedCover");
-            }
-
-            for (BinaryCoverOrdering ordering :
-                 {BinaryCoverOrdering::ActivityFirst, BinaryCoverOrdering::CoefficientFirst,
-                  BinaryCoverOrdering::RatioFirst}) {
-                if (const std::optional<BinaryCoverPartition> partition =
-                        find_greedy_violated_minimal_cover_(kn, ordering)) {
-                    queue_literal_cover(
-                        canonical_binary_cover_literals_(kn, partition->cover_positions));
-                    queue_partition(*partition);
-                }
-            }
-
-            for (const BinaryCoverPartition& partition : candidate_partitions) {
-                if (const std::optional<std::tuple<std::vector<int>, std::vector<double>, double>>
-                        lifted_cover = highs_lifted_binary_cover_cut_(kn, partition)) {
-                    const auto& [lifted_indices, lifted_values, lifted_rhs] = *lifted_cover;
-                    maybe_add_validated_lifted_cover(lifted_indices, lifted_values, lifted_rhs,
-                                                     "LiftedCoverHighs");
-                }
-            }
-
-            for (const std::vector<int>& cover_literals : candidate_literal_covers) {
-                maybe_add_cover_cut_(problem, relaxation, options, cover_literals, "Cover",
-                                     &signatures, &cuts);
-                const std::vector<int> lifted_cover_literals =
-                    extend_cover_literals_(canonical_terms, cover_literals, kn.rhs);
-                maybe_add_validated_literal_cover(canonical_terms, kn.rhs, lifted_cover_literals,
-                                                  "LiftedCoverLite");
-            }
-            if (!candidate_literal_covers.empty()) {
-                return;
-            }
+        if (kn.valid && kn.variables.size() >= 2 && std::isfinite(kn.rhs) && kn.rhs >= 0.0) {
+            append_binary_knapsack_cover_family_(problem, relaxation, options, kn, "", &signatures,
+                                                 &cuts);
+            return;
         }
 
         // Fallback: old literal-based cover for mixed or non-binary

@@ -1,9 +1,9 @@
 #pragma once
 
-#include <algorithm>
-#include <type_traits>
 #include "../../extern/pdqsort/pdqsort.h"
+#include <algorithm>
 #include <future>
+#include <type_traits>
 
 class RevisedSimplexDualEngine {
   public:
@@ -332,8 +332,7 @@ class RevisedSimplexDualEngine {
                                                   const std::vector<int>& N, const HVector& w,
                                                   const Eigen::VectorXd& ydual,
                                                   const Eigen::VectorXd& chat, Eigen::VectorXd& pN,
-                                                  Eigen::VectorXd& rN, int workers,
-                                                  int min_cols) {
+                                                  Eigen::VectorXd& rN, int workers, int min_cols) {
         const int total = static_cast<int>(N.size());
         workers = std::max(1, workers);
         if (workers <= 1 || total < std::max(1, min_cols)) {
@@ -814,14 +813,10 @@ class RevisedSimplexDualEngine {
                     std::to_string(pricing_telemetry.row_price_calls);
                 info_map["dual_col_price_calls"] =
                     std::to_string(pricing_telemetry.col_price_calls);
-                info_map["dual_price_switches"] =
-                    std::to_string(pricing_telemetry.price_switches);
-                info_map["dual_row_ep_density"] =
-                    std::to_string(pricing_telemetry.row_ep_density);
-                info_map["dual_row_ap_density"] =
-                    std::to_string(pricing_telemetry.row_ap_density);
-                info_map["dual_col_aq_density"] =
-                    std::to_string(pricing_telemetry.col_aq_density);
+                info_map["dual_price_switches"] = std::to_string(pricing_telemetry.price_switches);
+                info_map["dual_row_ep_density"] = std::to_string(pricing_telemetry.row_ep_density);
+                info_map["dual_row_ap_density"] = std::to_string(pricing_telemetry.row_ap_density);
+                info_map["dual_col_aq_density"] = std::to_string(pricing_telemetry.col_aq_density);
                 self.solve_stats_.dual_row_price_calls = pricing_telemetry.row_price_calls;
                 self.solve_stats_.dual_col_price_calls = pricing_telemetry.col_price_calls;
                 self.solve_stats_.dual_price_switches = pricing_telemetry.price_switches;
@@ -1037,9 +1032,8 @@ class RevisedSimplexDualEngine {
                     const bool use_column_price =
                         self.opt_.dual_pricing == "col" ||
                         (allow_runtime_switch &&
-                         (local_row_ep_density > 0.75 ||
-                          (pricing_telemetry.row_ap_density > 0.10 &&
-                           local_row_ep_density > 0.10)));
+                         (local_row_ep_density > 0.75 || (pricing_telemetry.row_ap_density > 0.10 &&
+                                                          local_row_ep_density > 0.10)));
                     pricing_telemetry.record_price_mode(use_column_price);
                     if (use_column_price) {
                         if (self.opt_.parallel_pricing_workers > 1 &&

@@ -161,16 +161,17 @@ struct Options {
     bool verbose = false;
     int log_frequency = 100;
     std::string node_timing_log_path;
-    NodeSelectionStrategy node_selection = NodeSelectionStrategy::DepthFirst;
+    NodeSelectionStrategy node_selection =
+        NodeSelectionStrategy::InterleavedBestFirstBestEstimatePlunging;
     int hybrid_depth_bias = 5;
     int plunging_bestfreq = 10;
-    BranchingStrategy branching_strategy = BranchingStrategy::PseudoCost;
+    BranchingStrategy branching_strategy = BranchingStrategy::StrongBranching;
     DivingStrategy diving_strategy = DivingStrategy::Disabled;
-    int strong_branching_candidates = 4; // Max candidates for strong branching
-    int strong_branching_k = 2; // Number of candidates for reduced strong branching (Highs-like)
-    int strong_branching_max_depth = 1;
-    int strong_branching_lp_iter_limit = 24; // Per-probe LP iteration cap; <=0 means full solve
-    int pseudocost_reliability = 2;
+    int strong_branching_candidates = 8; // Max candidates for strong branching
+    int strong_branching_k = 4; // Number of candidates for reduced strong branching (HiGHS-like)
+    int strong_branching_max_depth = 2;
+    int strong_branching_lp_iter_limit = 0; // Per-probe LP iteration cap; <=0 means full solve
+    int pseudocost_reliability = 4;
     int max_dive_depth = 15;     // Reduced from 25 for faster heuristics
     int max_dive_lp_solves = 32; // Reduced from 64 for faster heuristics
     int heuristic_frequency = 8;
@@ -202,9 +203,9 @@ struct Options {
     int heuristic_subproblem_max_nodes = 64;
     bool use_cut_pool = true;
     int max_cut_rounds_per_node = 1;
-    int max_root_cut_rounds = 4;
+    int max_root_cut_rounds = 8;
     int max_cuts_added_per_round = 6;
-    int max_root_cuts_added_per_round = 16;
+    int max_root_cuts_added_per_round = 32;
     int max_cut_pool_size = 512;
     double min_cut_violation = 1e-4;
     int max_cut_age = 5;
@@ -225,7 +226,7 @@ struct Options {
     // HiGHS-style conflict pool sizing.
     int max_conflict_pool_size = 512;
     int max_conflict_age = 10;
-    int max_cuts_per_type = 8;
+    int max_cuts_per_type = 12;
     double cut_max_parallelism = 0.98;
     bool use_dual_proof_cuts = true;
     bool use_lp_reoptimization_profile = true;
@@ -235,10 +236,10 @@ struct Options {
     // Adaptive proof phase: after an incumbent exists, switch effort from
     // primal search toward proving the dual bound.
     bool use_adaptive_proof_phase = true;
-    int proof_phase_min_nodes = 1;
+    int proof_phase_min_nodes = 0;
     NodeSelectionStrategy proof_node_selection = NodeSelectionStrategy::BestBound;
-    int proof_strong_branching_candidates = 8;
-    int proof_strong_branching_k = 4;
+    int proof_strong_branching_candidates = 12;
+    int proof_strong_branching_k = 6;
     int proof_strong_branching_max_depth = 4;
     int proof_max_cut_rounds_per_node = 3;
     int proof_max_cuts_added_per_round = 12;

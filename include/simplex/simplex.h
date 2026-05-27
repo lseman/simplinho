@@ -38,11 +38,15 @@
 #include <utility>
 #include <vector>
 
-#include "degeneracy.h"    // DegeneracyManager + perturbation helpers
-#include "presolver.h"     // presolve::LP, Presolver
-#include "pricer.h"        // pricing + degeneracy helpers
-#include "simplex_lu.h"    // FTBasis implementation (solve_B, solve_BT, replace_column, refactor)
-#include "simplex_types.h" // public result/status/options types
+#include "degeneracy.h" // DegeneracyManager + perturbation helpers
+#include "presolver.h"  // presolve::LP, Presolver
+#include "pricer.h"     // pricing + degeneracy helpers
+#include "simplex_lu.h" // FTBasis implementation (solve_B, solve_BT, replace_column, refactor)
+#ifdef SIMPLINHO_REUSE_DEBUG
+#    include <atomic>
+#    include <cstdio>
+#endif
+#include "simplex_types.h"    // public result/status/options types
 #include "sparse_presolver.h" // sparse-native LP presolve
 
 // Forward decls from degeneracy/pricer header (kept external)
@@ -294,12 +298,25 @@ class RevisedSimplex {
             basis_state_opt = &*rebased_basis_state_opt;
         }
 
+        // When a reusable factorization is in hand (same matrix, Dual mode), prefer
+        // its basis over any passed-in seed: starting the dual re-solve from exactly
+        // that basis lets try_reuse_factorization_ adopt the existing LU and FT-pivot
+        // instead of refactoring. Otherwise the passed-in basis_opt (a different
+        // basis) forces a cold factorization on every node solve.
+        if (auto factorized_seed = warm_factorization_basis_seed_()) {
+            basis_opt = std::move(factorized_seed);
+        }
+
         if ((!basis_opt || basis_opt->empty()) && basis_state_opt &&
             !basis_state_opt->column_status.empty()) {
             if ((int)basis_state_opt->column_status.size() != n) {
                 throw std::invalid_argument(
                     "simplex: warm-start basis column_status size mismatch");
             }
+        }
+
+        if ((!basis_opt || basis_opt->empty()) && basis_state_opt &&
+            !basis_state_opt->column_status.empty()) {
             basis_opt =
                 basis_columns_from_basis_state_(*basis_state_opt, static_cast<int>(A_in.rows()));
         }
@@ -2026,6 +2043,17 @@ class RevisedSimplex {
         current_matrix_is_sparse_ = matrix_is_sparse;
         solve_input_warm_state_ =
             basis_state_opt ? basis_state_opt->warm_state : std::shared_ptr<LPWarmStateData>{};
+        // The persistent reformulated solver used for BnB node LPs re-solves the
+        // same matrix repeatedly without an explicit basis_state (it relies on
+        // has_cached_basis_state and passes no basis). That internal cache holds
+        // the FTBasis warm_state, but it was dropped here -- so factorization
+        // reuse never fired. Recover it: when no warm state was passed in and the
+        // cached basis is for the current matrix, adopt its factorization.
+        if (!solve_input_warm_state_ && cached_basis_state_ && cached_basis_state_->warm_state &&
+            cached_matrix_signature_ == current_matrix_signature_ && cached_basis_rows_ == rows &&
+            cached_basis_cols_ == cols && cached_matrix_is_sparse_ == matrix_is_sparse) {
+            solve_input_warm_state_ = cached_basis_state_->warm_state;
+        }
         solve_output_warm_state_.reset();
         if (basis_state_opt && !basis_state_opt->column_status.empty()) {
             solve_stats_.warm_start_attempted = 1;
@@ -2040,9 +2068,10 @@ class RevisedSimplex {
         if (solve_input_warm_state_->matrix_signature != current_matrix_signature_ ||
             solve_input_warm_state_->rows != current_matrix_rows_ ||
             solve_input_warm_state_->cols != current_matrix_cols_ ||
-            solve_input_warm_state_->matrix_is_sparse != current_matrix_is_sparse_ ||
-            solve_input_warm_state_->basis_columns != basis_columns ||
-            solve_input_warm_state_->basis_factorization->basis() != basis_columns) {
+            solve_input_warm_state_->matrix_is_sparse != current_matrix_is_sparse_) {
+            return nullptr;
+        }
+        if (solve_input_warm_state_->basis_factorization->basis() != basis_columns) {
             return nullptr;
         }
         solve_stats_.warm_start_accepted = 1;
@@ -2050,6 +2079,30 @@ class RevisedSimplex {
         solve_stats_.eta_stack_depth_entry =
             solve_input_warm_state_->basis_factorization->stats().eta_count;
         return solve_input_warm_state_;
+    }
+
+    std::optional<std::vector<int>> warm_factorization_basis_seed_() const {
+        if (opt_.mode != SimplexMode::Dual || !solve_input_warm_state_ ||
+            !solve_input_warm_state_->basis_factorization) {
+            return std::nullopt;
+        }
+        if (solve_input_warm_state_->matrix_signature != current_matrix_signature_ ||
+            solve_input_warm_state_->rows != current_matrix_rows_ ||
+            solve_input_warm_state_->cols != current_matrix_cols_ ||
+            solve_input_warm_state_->matrix_is_sparse != current_matrix_is_sparse_) {
+            return std::nullopt;
+        }
+        const std::vector<int>& factorized_basis =
+            solve_input_warm_state_->basis_factorization->basis();
+        if (static_cast<int>(factorized_basis.size()) != current_matrix_rows_) {
+            return std::nullopt;
+        }
+        for (int col : factorized_basis) {
+            if (col < 0 || col >= current_matrix_cols_) {
+                return std::nullopt;
+            }
+        }
+        return factorized_basis;
     }
 
     void
@@ -2584,6 +2637,19 @@ class RevisedSimplex {
                                       true);
     }
 
+    bool has_cached_basis_factorization_state(const SparseMatrix& A) const noexcept {
+        const double* ptr = A.isCompressed() ? A.valuePtr() : nullptr;
+        const std::uint64_t sig = (ptr != nullptr && ptr == last_sparse_a_value_ptr_ &&
+                                   static_cast<int>(A.rows()) == last_sparse_a_rows_ &&
+                                   static_cast<int>(A.cols()) == last_sparse_a_cols_)
+                                      ? last_sparse_a_signature_
+                                      : matrix_signature_(A);
+        return has_cached_basis_state(static_cast<int>(A.rows()), static_cast<int>(A.cols()), sig,
+                                      true) &&
+               cached_basis_state_->warm_state &&
+               cached_basis_state_->warm_state->basis_factorization;
+    }
+
   private:
     bool has_cached_basis_state(int rows, int cols, std::uint64_t signature,
                                 bool matrix_is_sparse) const noexcept {
@@ -2926,11 +2992,25 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         basis_state_opt = &*rebased_basis_state_opt;
     }
 
+    // When a reusable factorization is in hand (same matrix, Dual mode), prefer
+    // its basis over any passed-in seed: starting the dual re-solve from exactly
+    // that basis lets try_reuse_factorization_ adopt the existing LU and FT-pivot
+    // instead of refactoring. Otherwise the passed-in basis_opt (a different
+    // basis) forces a cold factorization on every node solve.
+    const std::optional<std::vector<int>> factorized_basis_seed_opt =
+        warm_factorization_basis_seed_();
+    if (factorized_basis_seed_opt) {
+        basis_opt = *factorized_basis_seed_opt;
+    }
     if ((!basis_opt || basis_opt->empty()) && basis_state_opt &&
         !basis_state_opt->column_status.empty()) {
         if ((int)basis_state_opt->column_status.size() != n) {
             throw std::invalid_argument("simplex: warm-start basis column_status size mismatch");
         }
+    }
+
+    if ((!basis_opt || basis_opt->empty()) && basis_state_opt &&
+        !basis_state_opt->column_status.empty()) {
         basis_opt = basis_columns_from_basis_state_(*basis_state_opt, m_in);
     }
 
@@ -2961,8 +3041,8 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                opt_.dualization_min_row_col_ratio;
     };
 
-    if (is_nonnegative_standard && !has_warm_basis_for_dual && !basis_opt && dualization_requested() &&
-        n <= opt_.dualization_max_recovery_cols) {
+    if (is_nonnegative_standard && !has_warm_basis_for_dual && !basis_opt &&
+        dualization_requested() && n <= opt_.dualization_max_recovery_cols) {
         try {
             std::vector<Eigen::Triplet<double>> dual_trips;
             dual_trips.reserve(static_cast<std::size_t>(2 * A_in.nonZeros() + n));
@@ -2985,8 +3065,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 c_dual(m_in + i) = b_in(i);
             }
             Eigen::VectorXd l_dual = Eigen::VectorXd::Zero(2 * m_in + n);
-            Eigen::VectorXd u_dual =
-                Eigen::VectorXd::Constant(2 * m_in + n, presolve::inf());
+            Eigen::VectorXd u_dual = Eigen::VectorXd::Constant(2 * m_in + n, presolve::inf());
 
             RevisedSimplexOptions dual_opt = opt_;
             dual_opt.dualization = "off";
@@ -3415,6 +3494,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             make_solution_(std_sol.status, std::move(x), obj, std::move(basis_out), std_sol.iters,
                            std::move(info), std_sol.farkas_y, std_sol.farkas_has_cert,
                            std_sol.primal_ray, std_sol.primal_ray_has_cert);
+        sol.basis_state.warm_state = std_sol.basis_state.warm_state;
         sol.basis_internal = std_sol.basis_internal;
         sol.nonbasis_internal = std_sol.nonbasis_internal;
         sol.internal_column_labels = std_sol.internal_column_labels;
@@ -3492,9 +3572,9 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     if (sparse_pres.proven_unbounded) {
         Eigen::VectorXd xnan =
             Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
-        return finalize_solution_(make_solution_(
-            LPSolution::Status::Unbounded, xnan, -std::numeric_limits<double>::infinity(), {}, 0,
-            {{"sparse_presolve", "unbounded"}}));
+        return finalize_solution_(make_solution_(LPSolution::Status::Unbounded, xnan,
+                                                 -std::numeric_limits<double>::infinity(), {}, 0,
+                                                 {{"sparse_presolve", "unbounded"}}));
     }
 
     const SparseMatrix& Ared = sparse_pres.reduced.A;
@@ -3551,6 +3631,16 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     auto t0_crash = std::chrono::steady_clock::now();
     CrashSelection basis_choice =
         choose_initial_basis_(Ared, bred, cred, opt_, crash_seed_basis_opt, !seed_basis_from_state);
+    if (factorized_basis_seed_opt && crash_seed_basis_opt &&
+        static_cast<int>(crash_seed_basis_opt->size()) == m_in &&
+        basis_choice.basis != *crash_seed_basis_opt) {
+        basis_choice.basis = *crash_seed_basis_opt;
+        basis_choice.source = "warm_start";
+        basis_choice.style = "factorization_reuse";
+        basis_choice.quality.valid = true;
+        basis_choice.quality.dual_feasible = true;
+        basis_choice.quality.primal_feasible = false;
+    }
     auto t1_crash = std::chrono::steady_clock::now();
     current_timing_.crash_ns +=
         std::chrono::duration_cast<std::chrono::nanoseconds>(t1_crash - t0_crash).count();
@@ -3621,8 +3711,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             sol.dual_values = sol.dual_values_internal;
             sol.shadow_prices = sol.dual_values;
         }
-        return finalize_solution_(
-            attach_basis_state_(std::move(sol), l_in, u_in, opt_.tol));
+        return finalize_solution_(attach_basis_state_(std::move(sol), l_in, u_in, opt_.tol));
     };
 
     auto run_phase2_p = [&](std::optional<std::vector<int>> b) {

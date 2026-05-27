@@ -189,8 +189,9 @@ inline LPSolution RevisedSimplex::attach_basis_state_(LPSolution sol,
                                                       double tol) {
   if (sol.x.size() > 0 && sol.x.array().isFinite().all()) {
     auto t0_ser = std::chrono::steady_clock::now();
-    const LPBasis warm_basis =
-        compute_basis_state_(sol.basis, sol.x, l, u, tol);
+  LPBasis warm_basis =
+    compute_basis_state_(sol.basis, sol.x, l, u, tol);
+  warm_basis.warm_state = sol.basis_state.warm_state;
     sol.basis_state = warm_basis;
     sol.info["warm_start_basis_state"] =
         serialize_basis_state_from_primal_(sol.basis, sol.x, l, u, tol);
