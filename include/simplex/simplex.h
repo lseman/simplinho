@@ -42,10 +42,6 @@
 #include "presolver.h"  // presolve::LP, Presolver
 #include "pricer.h"     // pricing + degeneracy helpers
 #include "simplex_lu.h" // FTBasis implementation (solve_B, solve_BT, replace_column, refactor)
-#ifdef SIMPLINHO_REUSE_DEBUG
-#    include <atomic>
-#    include <cstdio>
-#endif
 #include "simplex_types.h"    // public result/status/options types
 #include "sparse_presolver.h" // sparse-native LP presolve
 
@@ -916,6 +912,9 @@ class RevisedSimplex {
         const bool allow_direct_from_guess = allow_direct_primal || allow_direct_dual;
 
         if (allow_direct_from_guess) {
+            if (basis_guess_from_warm_start) {
+                solve_stats_.warm_start_accepted = 1;
+            }
             LPSolution::Status st;
             Eigen::VectorXd v2;
             std::vector<int> red_basis2;
@@ -2644,8 +2643,11 @@ class RevisedSimplex {
                                    static_cast<int>(A.cols()) == last_sparse_a_cols_)
                                       ? last_sparse_a_signature_
                                       : matrix_signature_(A);
-        return has_cached_basis_state(static_cast<int>(A.rows()), static_cast<int>(A.cols()), sig,
-                                      true) &&
+        const int rows = static_cast<int>(A.rows());
+        const int cols = static_cast<int>(A.cols());
+        return cached_basis_state_ && cached_basis_rows_ == rows && cached_basis_cols_ == cols &&
+               cached_matrix_signature_ == sig && cached_matrix_is_sparse_ &&
+               basis_state_matches_problem_(*cached_basis_state_, rows, cols) &&
                cached_basis_state_->warm_state &&
                cached_basis_state_->warm_state->basis_factorization;
     }
@@ -2744,6 +2746,11 @@ class RevisedSimplex {
         // alive across BnB node solves (HiGHS/SCIP hot-restart pattern).
         // unique_ptr because RevisedSimplex is an incomplete type at this point in the header.
         mutable std::unique_ptr<RevisedSimplex> reformulated_solver_cache;
+        // Last optimal basis_state returned by the reformulated solver. Feeding
+        // it back into the next dual restart attempt preserves the FTBasis
+        // warm_state without forcing Primal/Auto fallback solves onto a stale,
+        // primal-infeasible basis.
+        mutable std::optional<LPBasis> last_reformulated_basis_state;
         int m_eq = 0;
         int nv = 0;
         int upper_rows = 0;
@@ -2838,6 +2845,7 @@ class RevisedSimplex {
             cached_data_scale = 0.0;
             b_std_scratch_valid = false;
             reformulated_solver_cache.reset();
+            last_reformulated_basis_state.reset();
             m_eq = nv = upper_rows = n_total = m_total = 0;
             valid = false;
         }
@@ -3378,10 +3386,19 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             }
             RevisedSimplex& reformulated_solver =
                 *sparse_bound_only_cache_.reformulated_solver_cache;
+            reformulated_solver.opt_ = solve_opt;
             const RevisedSimplex::SparseMatrix& A_std_sparse = A_std;
-            if (reformulated_solver.has_cached_basis_state(A_std_sparse)) {
+            // Hot path for the dual restart attempt: feed back the previous
+            // reformulated basis_state so its FTBasis warm_state can be adopted.
+            // Primal/Auto fallback solves intentionally stay cold here; otherwise
+            // they pay the known primal-infeasible warm-basis penalty.
+            auto& prev_state = sparse_bound_only_cache_.last_reformulated_basis_state;
+            if (mode == SimplexMode::Dual && prev_state &&
+                reformulated_solver.has_cached_basis_factorization_state(A_std_sparse) &&
+                static_cast<int>(prev_state->column_status.size()) == n_total) {
                 reformulated_inner_cache_used = true;
-                return reformulated_solver.solve(A_std_sparse, b_std, c_std, l_std, u_std);
+                return reformulated_solver.solve(A_std_sparse, b_std, c_std, l_std, u_std,
+                                                 *prev_state);
             }
             return basis_state_std ? reformulated_solver.solve(A_std_sparse, b_std, c_std, l_std,
                                                                u_std, *basis_state_std)
@@ -3433,6 +3450,18 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                     reformulated_retry_used = true;
                 }
             }
+        }
+
+        // Persist the reformulated optimal basis_state (incl. its FTBasis
+        // warm_state) so the next node's solve_reformulated can dual-restart from
+        // it. Only on a clean Optimal -- a bad/partial state would force singular
+        // warm restarts downstream.
+        if (std_sol.status == LPSolution::Status::Optimal &&
+            !std_sol.basis_state.column_status.empty() &&
+            static_cast<int>(std_sol.basis_state.column_status.size()) == n_total) {
+            sparse_bound_only_cache_.last_reformulated_basis_state = std_sol.basis_state;
+        } else {
+            sparse_bound_only_cache_.last_reformulated_basis_state.reset();
         }
 
         Eigen::VectorXd x = Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
@@ -3508,6 +3537,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         sol.shadow_prices_internal = std_sol.shadow_prices_internal;
         sol.farkas_y_internal = std_sol.farkas_y_internal;
         sol.primal_ray_internal = std_sol.primal_ray_internal;
+        const int outer_warm_start_attempted = solve_stats_.warm_start_attempted;
+        solve_stats_ = std_sol.solve_stats;
+        solve_stats_.warm_start_attempted =
+            std::max(solve_stats_.warm_start_attempted, outer_warm_start_attempted);
         return finalize_solution_(attach_basis_state_(std::move(sol), l_in, u_in, opt_.tol));
     }
 
@@ -3769,6 +3802,9 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     };
 
     if (allow_direct_primal || allow_direct_dual) {
+        if (basis_guess_from_warm_start) {
+            solve_stats_.warm_start_accepted = 1;
+        }
         LPSolution::Status st = LPSolution::Status::NeedPhase1;
         Eigen::VectorXd v2;
         std::vector<int> red_basis2;

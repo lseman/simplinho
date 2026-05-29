@@ -91,6 +91,9 @@ RevisedSimplexOptions tune_mip_lp_options(const RevisedSimplexOptions& base_opti
                                           const BranchAndBoundOptions& mip_options,
                                           bool warm_start_expected) {
     RevisedSimplexOptions tuned = base_options;
+    if (warm_start_expected) {
+        tuned.mode = SimplexMode::Dual;
+    }
     if (!mip_options.use_lp_reoptimization_profile) {
         return tuned;
     }
@@ -98,7 +101,6 @@ RevisedSimplexOptions tune_mip_lp_options(const RevisedSimplexOptions& base_opti
     // BnB node LPs are dominated by small bound changes and repeated resolves.
     // Push them toward a HiGHS/SCIP-style dual reoptimization profile while
     // preserving the existing fallback solvers for robustness.
-    tuned.mode = SimplexMode::Dual;
     tuned.pricing_rule = "adaptive";
     tuned.partial_pricing = true;
     tuned.dual_pricing = "switch";
@@ -1671,13 +1673,25 @@ class Model {
                     return std::nullopt;
                 }
 
+                const int old_basic_count = std::count(
+                    extended.column_status.begin(), extended.column_status.end(),
+                    LPBasisStatus::Basic);
                 const std::size_t prior_size = extended.column_status.size();
                 extended.column_status.resize(static_cast<std::size_t>(total_vars),
                                               LPBasisStatus::AtLower);
                 if (extended.column_status.size() > prior_size) {
                     extended.warm_state.reset();
-                    // Do not assume new vars are basic; preserve the old basis
-                    // structure and let solver reconstruction handle the new vars.
+                    int needed_basics = rows - old_basic_count;
+                    if (needed_basics > 0) {
+                        for (int col = static_cast<int>(prior_size);
+                             col < static_cast<int>(extended.column_status.size()) &&
+                             needed_basics > 0;
+                             ++col) {
+                            extended.column_status[col] = LPBasisStatus::Basic;
+                            extended.basis_columns.push_back(col);
+                            --needed_basics;
+                        }
+                    }
                 }
                 if (extended.column_status.size() > prior_size &&
                     basis_matches_dimensions(extended, total_vars, rows)) {

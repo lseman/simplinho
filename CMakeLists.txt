@@ -216,7 +216,6 @@ target_compile_definitions(simplex_core INTERFACE
     SIMPLEX_GIT_DESCRIBE="${SIMPLEX_GIT_DESCRIBE}"
     SIMPLEX_GIT_BRANCH="${SIMPLEX_GIT_BRANCH}"
     _GLIBCXX_USE_TBB_PAR_BACKEND=0
-    SIMPLINHO_REUSE_DEBUG
 )
 
 target_link_libraries(simplex_core INTERFACE
