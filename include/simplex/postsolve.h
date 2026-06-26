@@ -186,11 +186,12 @@ inline LPSolution RevisedSimplex::attach_internal_tableau_(
 inline LPSolution RevisedSimplex::attach_basis_state_(LPSolution sol,
                                                       const Eigen::VectorXd &l,
                                                       const Eigen::VectorXd &u,
-                                                      double tol) {
+                                                      double tol,
+                                                      int basic_target) {
   if (sol.x.size() > 0 && sol.x.array().isFinite().all()) {
     auto t0_ser = std::chrono::steady_clock::now();
   LPBasis warm_basis =
-    compute_basis_state_(sol.basis, sol.x, l, u, tol);
+    compute_basis_state_(sol.basis, sol.x, l, u, tol, basic_target);
   warm_basis.warm_state = sol.basis_state.warm_state;
     sol.basis_state = warm_basis;
     sol.info["warm_start_basis_state"] =

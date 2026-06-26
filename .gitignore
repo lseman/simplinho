@@ -46,3 +46,4 @@ highs-source/
 .codex-ariadne-mcp.toml
 ariadne.db
 examples/
+third_party/

@@ -365,7 +365,15 @@ class RevisedSimplex {
                                        {{"reason", "invalid_bounds"}}));
                 }
 
-                if (has_l) {
+                const bool fixed = has_l && has_u && std::abs(u_use(j) - l_use(j)) <= opt_.tol;
+                if (fixed) {
+                    map[j].uses_single_var = true;
+                    map[j].y = -1;
+                    single_y[j] = -1;
+                    map[j].shift = l_use(j);
+                    map[j].sign = 0;
+                    obj_shift += c_in(j) * l_use(j);
+                } else if (has_l) {
                     map[j].uses_single_var = true;
                     map[j].y = nv++;
                     single_y[j] = map[j].y;
@@ -406,7 +414,8 @@ class RevisedSimplex {
 
             for (int j = 0; j < n; ++j) {
                 if (map[j].uses_single_var) {
-                    c_std(map[j].y) += static_cast<double>(map[j].sign) * c_in(j);
+                    if (map[j].y >= 0)
+                        c_std(map[j].y) += static_cast<double>(map[j].sign) * c_in(j);
                 } else {
                     c_std(map[j].y_pos) += c_in(j);
                     c_std(map[j].y_neg) += -c_in(j);
@@ -422,7 +431,8 @@ class RevisedSimplex {
                         continue;
                     if (map[j].uses_single_var) {
                         rhs -= aij * map[j].shift;
-                        A_std(row, map[j].y) += static_cast<double>(map[j].sign) * aij;
+                        if (map[j].y >= 0)
+                            A_std(row, map[j].y) += static_cast<double>(map[j].sign) * aij;
                     } else {
                         A_std(row, map[j].y_pos) += aij;
                         A_std(row, map[j].y_neg) += -aij;
@@ -454,7 +464,8 @@ class RevisedSimplex {
                     if (jorig < 0 || jorig >= n)
                         continue;
                     if (map[jorig].uses_single_var) {
-                        cand.push_back(map[jorig].y);
+                        if (map[jorig].y >= 0)
+                            cand.push_back(map[jorig].y);
                     } else if (map[jorig].y_pos >= 0) {
                         cand.push_back(map[jorig].y_pos);
                     }
@@ -493,7 +504,7 @@ class RevisedSimplex {
                     for (int j = 0; j < n && chosen < 0; ++j) {
                         if (map[j].uses_single_var) {
                             const int col = map[j].y;
-                            if (!col_used[col] && std::abs(A_std(i, col)) > 1e-14) {
+                            if (col >= 0 && !col_used[col] && std::abs(A_std(i, col)) > 1e-14) {
                                 chosen = col;
                             }
                         } else if (map[j].y_pos >= 0) {
@@ -569,8 +580,9 @@ class RevisedSimplex {
             if (std_sol.x.size() == n_total && std_sol.x.array().isFinite().all()) {
                 for (int j = 0; j < n; ++j) {
                     if (map[j].uses_single_var) {
-                        x(j) =
-                            map[j].shift + static_cast<double>(map[j].sign) * std_sol.x(map[j].y);
+                        x(j) = map[j].y >= 0
+                                    ? map[j].shift + static_cast<double>(map[j].sign) * std_sol.x(map[j].y)
+                                    : map[j].shift; // fixed variable: x = l = u
                     } else {
                         const double yp = std_sol.x(map[j].y_pos);
                         const double yn = std_sol.x(map[j].y_neg);
@@ -2216,7 +2228,8 @@ class RevisedSimplex {
                                                bool compute_reduced_costs);
 
     static LPSolution attach_basis_state_(LPSolution sol, const Eigen::VectorXd& l,
-                                          const Eigen::VectorXd& u, double tol);
+                                          const Eigen::VectorXd& u, double tol,
+                                          int basic_target = -1);
 
     struct SanitizedBounds {
         Eigen::VectorXd l;
@@ -3365,7 +3378,8 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 if (jorig < 0 || jorig >= n)
                     continue;
                 if (map[jorig].uses_single_var) {
-                    cand.push_back(map[jorig].y);
+                    if (map[jorig].y >= 0)
+                        cand.push_back(map[jorig].y);
                 } else if (map[jorig].y_pos >= 0) {
                     cand.push_back(map[jorig].y_pos);
                 }
@@ -3633,8 +3647,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         sol.tableau = std_sol.tableau;
         sol.tableau_rhs = std_sol.tableau_rhs;
         sol.reduced_costs_internal = std_sol.reduced_costs_internal;
-        sol.dual_values = std_sol.dual_values;
-        sol.shadow_prices = std_sol.shadow_prices;
+        if (std_sol.dual_values.size() >= m_eq) {
+            sol.dual_values = std_sol.dual_values.head(m_eq);
+            sol.shadow_prices = sol.dual_values;
+        }
         sol.dual_values_internal = std_sol.dual_values_internal;
         sol.shadow_prices_internal = std_sol.shadow_prices_internal;
         sol.farkas_y_internal = std_sol.farkas_y_internal;
@@ -3643,7 +3659,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         solve_stats_ = std_sol.solve_stats;
         solve_stats_.warm_start_attempted =
             std::max(solve_stats_.warm_start_attempted, outer_warm_start_attempted);
-        return finalize_solution_(attach_basis_state_(std::move(sol), l_in, u_in, opt_.tol));
+        return finalize_solution_(attach_basis_state_(std::move(sol), l_in, u_in, opt_.tol, m_in));
     }
 
     SparseMatrix A_model = A_in;
