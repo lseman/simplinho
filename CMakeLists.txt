@@ -22,8 +22,8 @@ set(SIMPLEX_LOCAL_PYBIND11_DIR "" CACHE PATH "Optional local pybind11 checkout")
 
 option(SIMPLEX_ENABLE_PERF_FLAGS "Enable perf-friendly compile and link flags" ON)
 option(SIMPLEX_ENABLE_CCACHE "Enable ccache/sccache for faster builds" ON)
-option(SIMPLEX_ENABLE_UNITY_BUILD "Enable Unity (jumbo) builds for faster compilation" OFF)
-option(SIMPLEX_ENABLE_PCH "Enable precompiled headers" ON)
+option(SIMPLEX_ENABLE_UNITY_BUILD "Enable Unity (jumbo) builds for faster compilation" ON)
+option(SIMPLEX_ENABLE_PCH "Enable precompiled headers" OFF)
 option(BNB_PROFILE_TIMERS "Enable per-phase BnB timing counters" OFF)
 option(SIMPLEX_BNB_DEBUG_LOCKS "Enable BnB lock tracing" OFF)
 option(SIMPLEX_BNB_DEBUG_TIMING "Enable BnB phase timing debug output" OFF)
@@ -89,6 +89,14 @@ endfunction()
 function(simplinho_apply_module_link_flags target_name)
     if(NOT SIMPLEX_ENABLE_PERF_FLAGS OR NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         return()
+    endif()
+
+    # Use lld for faster linking
+    find_program(LLD_PROGRAM lld)
+    if(LLD_PROGRAM)
+        set_target_properties(${target_name} PROPERTIES
+            LINK_FLAGS "-fuse-ld=lld"
+        )
     endif()
 
     target_link_options(${target_name} PRIVATE
@@ -256,8 +264,8 @@ target_link_libraries(simplinho PRIVATE
 
 if(SIMPLEX_ENABLE_UNITY_BUILD)
     set_target_properties(simplinho PROPERTIES
-        UNITY_BUILD OFF
-        UNITY_BUILD_BATCH_SIZE 8
+        UNITY_BUILD ON
+        UNITY_BUILD_BATCH_SIZE 4
     )
 endif()
 

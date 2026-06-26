@@ -480,6 +480,43 @@ class RevisedSimplex {
                                                              split_pos, split_neg);
             }
 
+            // When no warm-start basis is available, construct a logical basis from the
+            // reformulation structure. Upper-bound slack columns are identity columns for their
+            // rows; original rows are covered by picking the first y/y_pos with a nonzero entry.
+            if (!basis_std && (!basis_state_std || basis_state_std->column_status.empty())) {
+                std::vector<int> cand;
+                cand.reserve(m_total);
+                std::vector<bool> col_used(n_total, false);
+                // Original rows: pick first available y/y_pos with nonzero in that row
+                for (int i = 0; i < m_eq; ++i) {
+                    int chosen = -1;
+                    for (int j = 0; j < n && chosen < 0; ++j) {
+                        if (map[j].uses_single_var) {
+                            const int col = map[j].y;
+                            if (!col_used[col] && std::abs(A_std(i, col)) > 1e-14) {
+                                chosen = col;
+                            }
+                        } else if (map[j].y_pos >= 0) {
+                            const int col = map[j].y_pos;
+                            if (!col_used[col] && std::abs(A_std(i, col)) > 1e-14) {
+                                chosen = col;
+                            }
+                        }
+                    }
+                    if (chosen < 0)
+                        break;
+                    col_used[chosen] = true;
+                    cand.push_back(chosen);
+                }
+                // Upper-bound rows: each has a dedicated slack that is an identity column
+                for (int j = 0; j < n; ++j) {
+                    if (map[j].upper_slack >= 0)
+                        cand.push_back(map[j].upper_slack);
+                }
+                if ((int)cand.size() == m_total)
+                    basis_std = std::move(cand);
+            }
+
             LPSolution std_sol;
             bool reformulated_retry_used = false;
             std::optional<std::vector<int>> reformulated_basis_guess = basis_std;
@@ -3351,6 +3388,40 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                                                     single_y, upper_slack, split_pos, split_neg)
                     : map_reformulated_basis_seed_state_(*basis_state_opt, n_total, single_y,
                                                          split_pos, split_neg);
+        }
+
+        // When no warm-start basis is available, construct a logical basis from the
+        // reformulation structure. Upper-bound slack columns are identity columns for their
+        // rows; original rows are covered by picking the first y/y_pos with a nonzero entry.
+        if (!basis_std && (!basis_state_std || basis_state_std->column_status.empty())) {
+            // Build a row->first_nonzero_col map from the sparse A_std for original rows.
+            std::vector<int> row_col(m_eq, -1);
+            std::vector<bool> col_used(n_total, false);
+            for (int j = 0; j < A_std.outerSize(); ++j) {
+                for (SparseMatrix::InnerIterator it(A_std, j); it; ++it) {
+                    const int row = static_cast<int>(it.row());
+                    if (row < m_eq && row_col[row] < 0 && !col_used[j] &&
+                        std::abs(it.value()) > 1e-14) {
+                        row_col[row] = j;
+                        col_used[j] = true;
+                    }
+                }
+            }
+            std::vector<int> cand;
+            cand.reserve(m_total);
+            bool ok = true;
+            for (int i = 0; i < m_eq; ++i) {
+                if (row_col[i] < 0) { ok = false; break; }
+                cand.push_back(row_col[i]);
+            }
+            if (ok) {
+                for (int j = 0; j < n; ++j) {
+                    if (map[j].upper_slack >= 0)
+                        cand.push_back(map[j].upper_slack);
+                }
+                if ((int)cand.size() == m_total)
+                    basis_std = std::move(cand);
+            }
         }
 
         LPSolution std_sol;

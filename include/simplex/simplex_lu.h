@@ -198,7 +198,19 @@ class FTBasis {
           basis_(basis), opt_(opt) {
         if (static_cast<int>(basis_.size()) != m_)
             throw std::invalid_argument("FTBasis: basis size must equal m");
-
+        // Validate basis columns: no duplicates, no out-of-range
+        {
+            std::vector<char> used(static_cast<size_t>(A.cols()), 0);
+            for (int j : basis_) {
+                if (j < 0 || j >= static_cast<int>(A.cols()))
+                    throw std::invalid_argument(
+                        "FTBasis: basis has out-of-range column index " + std::to_string(j));
+                if (used[static_cast<size_t>(j)])
+                    throw std::invalid_argument(
+                        "FTBasis: basis has duplicate column index " + std::to_string(j));
+                used[static_cast<size_t>(j)] = 1;
+            }
+        }
         Bcols_dense_.resize(m_);
         for (int i = 0; i < m_; ++i)
             Bcols_dense_[i] = A.col(basis_[i]);
@@ -213,7 +225,19 @@ class FTBasis {
           basis_(basis), opt_(opt) {
         if (static_cast<int>(basis_.size()) != m_)
             throw std::invalid_argument("FTBasis: basis size must equal m");
-
+        // Validate basis columns: no duplicates, no out-of-range
+        {
+            std::vector<char> used(static_cast<size_t>(A.cols()), 0);
+            for (int j : basis_) {
+                if (j < 0 || j >= static_cast<int>(A.cols()))
+                    throw std::invalid_argument(
+                        "FTBasis: basis has out-of-range column index " + std::to_string(j));
+                if (used[static_cast<size_t>(j)])
+                    throw std::invalid_argument(
+                        "FTBasis: basis has duplicate column index " + std::to_string(j));
+                used[static_cast<size_t>(j)] = 1;
+            }
+        }
         Bcols_sparse_.resize(m_);
         for (int i = 0; i < m_; ++i)
             Bcols_sparse_[i] = A.col(basis_[i]);
