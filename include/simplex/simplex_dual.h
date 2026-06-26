@@ -594,6 +594,32 @@ class RevisedSimplexDualEngine {
                     N.push_back(j);
         }
 
+        if (N.empty()) {
+            Eigen::MatrixXd B(m, m);
+            for (int i = 0; i < m; ++i)
+                B.col(i) = A.col(basis[i]);
+            Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(B);
+            qr.setThreshold(self.opt_.svd_tol);
+            if (qr.rank() < m) {
+                return {LPSolution::Status::Singular,
+                        Eigen::VectorXd::Zero(n),
+                        basis,
+                        iters,
+                        {{"where", "dual full-basis rank check failed"}}};
+            }
+            const Eigen::VectorXd xB = qr.solve(b);
+            Eigen::VectorXd x = self.assemble_primal_(n, basis, xB, l, u);
+            if (self.primal_feasible_(A, b, x, l, u, self.opt_.tol)) {
+                return {LPSolution::Status::Optimal, self.clip_small_(x), basis, iters,
+                        dm_stats_to_map(self.degen_.get_stats())};
+            }
+            return {LPSolution::Status::NeedPhase1,
+                    Eigen::VectorXd::Zero(n),
+                    basis,
+                    iters,
+                    {{"reason", "full_basis_primal_infeasible"}}};
+        }
+
         std::vector<BoundView> view(n, BoundView::Lower);
         for (int j = 0; j < n; ++j)
             view[j] = default_bound_view(j, l, u);
@@ -740,6 +766,7 @@ class RevisedSimplexDualEngine {
                         {{"where", "dual initial refactor failed"}, {"what", e.what()}}};
             }
         }
+
         auto rebuild_dual_pool = [&](const char* where,
                                      int iter) -> std::optional<RevisedSimplex::PhaseResult> {
             try {

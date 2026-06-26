@@ -488,7 +488,7 @@ class RevisedSimplex {
                         ? map_reformulated_basis_state_(*basis_state_opt, l_use, u_use, n_total,
                                                         single_y, upper_slack, split_pos, split_neg)
                         : map_reformulated_basis_seed_state_(*basis_state_opt, n_total, single_y,
-                                                             split_pos, split_neg);
+                                                             upper_slack, split_pos, split_neg);
             }
 
             // When no warm-start basis is available, construct a logical basis from the
@@ -541,14 +541,13 @@ class RevisedSimplex {
                 reformulated_warm_basis_quality = evaluate_basis_quality_(
                     A_std, b_std, c_std, *reformulated_basis_guess, opt_.tol);
             }
-            const bool use_dual_first = opt_.mode == SimplexMode::Dual &&
+            const bool use_dual_first = opt_.mode != SimplexMode::Primal &&
                                         reformulated_warm_basis_quality &&
                                         reformulated_warm_basis_quality->valid &&
                                         reformulated_warm_basis_quality->dual_feasible;
             const char* reformulated_initial_mode =
-                (opt_.mode == SimplexMode::Dual)
-                    ? (use_dual_first ? "dual" : "auto")
-                    : (opt_.mode == SimplexMode::Primal ? "primal" : "auto");
+                use_dual_first ? "dual"
+                : (opt_.mode == SimplexMode::Primal ? "primal" : "auto");
             auto solve_reformulated = [&](SimplexMode mode) {
                 RevisedSimplexOptions solve_opt = opt_;
                 solve_opt.mode = (mode == SimplexMode::Auto ? SimplexMode::Primal : mode);
@@ -1693,11 +1692,12 @@ class RevisedSimplex {
                         mapped.column_status[y] = LPBasisStatus::AtLower;
                         mapped.column_status[slack] = LPBasisStatus::Basic;
                     } else if (status == LPBasisStatus::Basic) {
-                        // If the original variable was basic, keep that variable basic
-                        // and leave the extra upper-slack nonbasic. The slack is only
-                        // basic when the original variable is nonbasic at a bound.
+                        // Original variable is basic: y covers an original row, but
+                        // the upper-bound row (y + s = u-l) still needs a basic
+                        // variable. Since y is basic at some interior value, s must
+                        // also be basic (at u-l-y_val > 0). Both rows are covered.
                         mapped.column_status[y] = LPBasisStatus::Basic;
-                        mapped.column_status[slack] = LPBasisStatus::AtLower;
+                        mapped.column_status[slack] = LPBasisStatus::Basic;
                     } else if (status == LPBasisStatus::AtUpper) {
                         // In the reformulated model the single variable y is
                         // nonnegative with no finite upper bound, and the
@@ -1754,6 +1754,7 @@ class RevisedSimplex {
 
     static LPBasis map_reformulated_basis_seed_state_(const LPBasis& original_basis_state,
                                                       int n_total, const std::vector<int>& single_y,
+                                                      const std::vector<int>& upper_slack,
                                                       const std::vector<int>& split_pos,
                                                       const std::vector<int>& split_neg) {
         LPBasis mapped;
@@ -1764,6 +1765,10 @@ class RevisedSimplex {
                 const int y = single_y[j];
                 if (status == LPBasisStatus::Basic || status == LPBasisStatus::AtUpper) {
                     mapped.column_status[y] = LPBasisStatus::Basic;
+                    // Upper-bound row (y + s = u-l) needs a basic variable too.
+                    // Mark the slack Basic so the mapped basis covers all rows.
+                    if (j < (int)upper_slack.size() && upper_slack[j] >= 0)
+                        mapped.column_status[upper_slack[j]] = LPBasisStatus::Basic;
                 }
                 continue;
             }
@@ -3401,7 +3406,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                     ? map_reformulated_basis_state_(*basis_state_opt, l_use, u_use, n_total,
                                                     single_y, upper_slack, split_pos, split_neg)
                     : map_reformulated_basis_seed_state_(*basis_state_opt, n_total, single_y,
-                                                         split_pos, split_neg);
+                                                         upper_slack, split_pos, split_neg);
         }
 
         // When no warm-start basis is available, construct a logical basis from the
@@ -3463,14 +3468,16 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             reformulated_warm_basis_quality =
                 evaluate_basis_quality_(A_std, b_std, c_std, *reformulated_basis_guess, opt_.tol);
         }
-        const bool use_dual_first = opt_.mode == SimplexMode::Dual &&
+        // Prefer dual when the mapped warm basis is dual-feasible, regardless of opt_.mode.
+        // A dual-feasible warm basis makes dual simplex O(pivots) to optimality; primal
+        // from the same basis often hits numerical issues on the reformulated matrix.
+        const bool use_dual_first = opt_.mode != SimplexMode::Primal &&
                                     reformulated_warm_basis_quality &&
                                     reformulated_warm_basis_quality->valid &&
                                     reformulated_warm_basis_quality->dual_feasible;
         const char* reformulated_initial_mode =
-            (opt_.mode == SimplexMode::Dual)
-                ? (use_dual_first ? "dual" : "auto")
-                : (opt_.mode == SimplexMode::Primal ? "primal" : "auto");
+            use_dual_first ? "dual"
+            : (opt_.mode == SimplexMode::Primal ? "primal" : "auto");
         bool reformulated_inner_cache_used = false;
         auto solve_reformulated = [&](SimplexMode mode) {
             RevisedSimplexOptions solve_opt = opt_;
