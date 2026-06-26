@@ -1,7 +1,7 @@
 #pragma once
 
-#include <Eigen/Dense>
 #include "../../extern/pdqsort/pdqsort.h"
+#include <Eigen/Dense>
 #include <Eigen/SVD>
 #include <Eigen/Sparse>
 
@@ -157,26 +157,37 @@ class FTBasis {
 
         double expected(TranKind k) const noexcept {
             switch (k) {
-                case TranKind::ColAq: return col_aq;
-                case TranKind::RowEp: return row_ep;
-                case TranKind::RowAp: return row_ap;
-                default: return 1.0; // unknown ⇒ assume dense (force sparse_solve path)
+                case TranKind::ColAq:
+                    return col_aq;
+                case TranKind::RowEp:
+                    return row_ep;
+                case TranKind::RowAp:
+                    return row_ap;
+                default:
+                    return 1.0; // unknown ⇒ assume dense (force sparse_solve path)
             }
         }
 
         void update(TranKind k, int count, int m) noexcept {
-            if (m <= 0 || k == TranKind::Unknown) return;
+            if (m <= 0 || k == TranKind::Unknown)
+                return;
             const double local =
                 std::clamp(static_cast<double>(count) / static_cast<double>(m), 0.0, 1.0);
             double* slot = nullptr;
             switch (k) {
-                case TranKind::ColAq: slot = &col_aq; break;
-                case TranKind::RowEp: slot = &row_ep; break;
-                case TranKind::RowAp: slot = &row_ap; break;
-                default: return;
+                case TranKind::ColAq:
+                    slot = &col_aq;
+                    break;
+                case TranKind::RowEp:
+                    slot = &row_ep;
+                    break;
+                case TranKind::RowAp:
+                    slot = &row_ap;
+                    break;
+                default:
+                    return;
             }
-            *slot = (1.0 - kRunningAverageMultiplier) * (*slot) +
-                    kRunningAverageMultiplier * local;
+            *slot = (1.0 - kRunningAverageMultiplier) * (*slot) + kRunningAverageMultiplier * local;
         }
     };
 
@@ -216,6 +227,9 @@ class FTBasis {
     int update_count() const noexcept { return update_count_; }
     Stats stats() const noexcept { return stats_; }
     const std::string& last_update_diagnostic() const noexcept { return last_update_diagnostic_; }
+    // Compute a hash of the B matrix for warm-reuse verification
+    std::uint64_t basis_matrix_signature_() const;
+    std::uint64_t basis_matrix_signature() const { return basis_matrix_signature_(); }
 
     // Attach the sparse pattern captured by the last sparse-path solve in
     // lu_sparse_, when that path was used and the pattern wasn't invalidated
@@ -271,8 +285,7 @@ class FTBasis {
         auto [seed_idx, seed_val] = hvector_to_seed_data_(b);
         const double rhs_density =
             m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;
-        const bool use_sparse_rhs =
-            A_is_sparse_ && rhs_density < sparse_rhs_density_threshold_();
+        const bool use_sparse_rhs = A_is_sparse_ && rhs_density < sparse_rhs_density_threshold_();
         if (!use_sparse_rhs)
             return solve_B(b.value, kind);
 
@@ -311,8 +324,7 @@ class FTBasis {
         auto [seed_idx, seed_val] = sparse_vector_to_seed_data_(b_sparse.derived());
         const double rhs_density =
             m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;
-        const bool use_sparse_rhs =
-            A_is_sparse_ && rhs_density < sparse_rhs_density_threshold_();
+        const bool use_sparse_rhs = A_is_sparse_ && rhs_density < sparse_rhs_density_threshold_();
         Eigen::VectorXd b = sparse_vector_to_dense_(b_sparse.derived(), m_);
         const double expected = density_tracker_.expected(kind);
         auto do_solve = [&]() {
@@ -389,8 +401,7 @@ class FTBasis {
         auto [seed_idx, seed_val] = hvector_to_seed_data_(c);
         const double rhs_density =
             m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;
-        const bool use_sparse_rhs =
-            A_is_sparse_ && rhs_density < sparse_rhs_density_threshold_();
+        const bool use_sparse_rhs = A_is_sparse_ && rhs_density < sparse_rhs_density_threshold_();
         if (!use_sparse_rhs)
             return solve_BT(c.value, kind);
 
@@ -488,8 +499,7 @@ class FTBasis {
         auto [seed_idx, seed_val] = sparse_vector_to_seed_data_(c_sparse.derived());
         const double rhs_density =
             m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;
-        const bool use_sparse_rhs =
-            A_is_sparse_ && rhs_density < sparse_rhs_density_threshold_();
+        const bool use_sparse_rhs = A_is_sparse_ && rhs_density < sparse_rhs_density_threshold_();
         Eigen::VectorXd c = sparse_vector_to_dense_(c_sparse.derived(), m_);
         const double expected = density_tracker_.expected(kind);
         auto do_solve = [&]() {
@@ -537,8 +547,7 @@ class FTBasis {
     void replace_column(int j, const Eigen::SparseMatrixBase<Derived>& new_col_sparse) {
         const auto& sparse = new_col_sparse.derived();
         const SparseMat sparse_copy = sparse;
-        replace_column_impl_(j, std::nullopt,
-                             sparse_vector_to_dense_(sparse, m_), &sparse_copy);
+        replace_column_impl_(j, std::nullopt, sparse_vector_to_dense_(sparse, m_), &sparse_copy);
     }
 
     template <typename Derived>
@@ -546,8 +555,7 @@ class FTBasis {
                         const Eigen::SparseMatrixBase<Derived>& new_col_sparse) {
         const auto& sparse = new_col_sparse.derived();
         const SparseMat sparse_copy = sparse;
-        replace_column_impl_(j, entering_col,
-                             sparse_vector_to_dense_(sparse, m_), &sparse_copy);
+        replace_column_impl_(j, entering_col, sparse_vector_to_dense_(sparse, m_), &sparse_copy);
     }
 
     void refactor() {
@@ -599,9 +607,7 @@ class FTBasis {
         return true;
     }
 
-    bool has_backtracking_snapshot() const noexcept {
-        return backtracking_snapshot_.has_value();
-    }
+    bool has_backtracking_snapshot() const noexcept { return backtracking_snapshot_.has_value(); }
 
     Eigen::MatrixXd explicit_B_dense() const {
         if (A_is_sparse_) {
@@ -1050,8 +1056,7 @@ class FTBasis {
         put_backtracking_basis_();
     }
 
-    void report_refactor_telemetry_(
-        const std::chrono::steady_clock::time_point& t0) noexcept {
+    void report_refactor_telemetry_(const std::chrono::steady_clock::time_point& t0) noexcept {
         if (opt_.ext_refactor_counter)
             ++(*opt_.ext_refactor_counter);
         if (opt_.ext_refactor_ns) {
@@ -1069,26 +1074,22 @@ class FTBasis {
     // For dense LU it's ignored (Markowitz LU uses dense back-/forward-solves
     // with no hyper-sparse path to gate).
     // ----------------------------
-    Eigen::VectorXd base_solve_B_(const Eigen::VectorXd& b,
-                                  double expected_density = 1.0) const {
+    Eigen::VectorXd base_solve_B_(const Eigen::VectorXd& b, double expected_density = 1.0) const {
         return A_is_sparse_ ? lu_sparse_.solve(b, expected_density) : lu_dense_.solve(b);
     }
 
-    Eigen::VectorXd base_solve_BT_(const Eigen::VectorXd& c,
-                                   double expected_density = 1.0) const {
+    Eigen::VectorXd base_solve_BT_(const Eigen::VectorXd& c, double expected_density = 1.0) const {
         return A_is_sparse_ ? lu_sparse_.solveT(c, expected_density) : lu_dense_.solveT(c);
     }
 
-    Eigen::VectorXd solve_B_fast_(const Eigen::VectorXd& b,
-                                  double expected_density = 1.0) const {
+    Eigen::VectorXd solve_B_fast_(const Eigen::VectorXd& b, double expected_density = 1.0) const {
         Eigen::VectorXd x = base_solve_B_(b, expected_density);
         if (!A_is_sparse_ && !etas_.empty())
             x = apply_etas_solve_(x);
         return x;
     }
 
-    Eigen::VectorXd solve_BT_fast_(const Eigen::VectorXd& c,
-                                   double expected_density = 1.0) const {
+    Eigen::VectorXd solve_BT_fast_(const Eigen::VectorXd& c, double expected_density = 1.0) const {
         Eigen::VectorXd y = base_solve_BT_(c, expected_density);
         if (!A_is_sparse_ && !etas_.empty())
             y = apply_etas_solve_T_(y);
@@ -1135,7 +1136,8 @@ class FTBasis {
         int stall_steps = 0;
 
         for (int it = 0; it < max_steps; ++it) {
-            const Eigen::VectorXd r = rhs - multiply_B_(x);
+            const Eigen::VectorXd Bx = multiply_B_(x);
+            const Eigen::VectorXd r = rhs - Bx;
             final_abs_residual = r.lpNorm<Eigen::Infinity>();
             const double denom = std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
             const double berr = final_abs_residual / denom;
@@ -1535,10 +1537,10 @@ class FTBasis {
         const auto t0 = std::chrono::steady_clock::now();
         auto report_pivot_telemetry = [&]() noexcept {
             if (opt_.ext_pivot_ns) {
-                *opt_.ext_pivot_ns += static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - t0)
-                        .count());
+                *opt_.ext_pivot_ns +=
+                    static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - t0)
+                                                   .count());
             }
         };
         if (j < 0 || j >= m_)
@@ -1606,7 +1608,7 @@ class FTBasis {
             }
 
             if (!lu_sparse_.append_forrest_tomlin_update(j, u, z, w, alpha,
-                                                           std::max(opt_.abs_floor, 1e-14))) {
+                                                         std::max(opt_.abs_floor, 1e-14))) {
                 last_update_diagnostic_ = make_update_diagnostic_(
                     lu_sparse_.last_update_failure_reason_message(), alpha, &z, &w);
                 if (new_col_sparse)
@@ -1755,7 +1757,8 @@ class FTBasis {
     Options opt_;
     std::vector<Eta> etas_;
     int update_count_{0};
-    int current_refactor_every_{32}; // mirrors opt_.refactor_every; halved on backtrack, restored on clean refactor
+    int current_refactor_every_{
+        32}; // mirrors opt_.refactor_every; halved on backtrack, restored on clean refactor
     double max_element_{0.0};
     double refactor_baseline_max_element_{0.0};
     double initial_refactor_max_element_{0.0};
@@ -1815,3 +1818,38 @@ class FTBasis {
         backtracking_snapshot_ = std::move(snap);
     }
 };
+
+// Compute a hash of the B matrix for warm-reuse verification
+inline std::uint64_t FTBasis::basis_matrix_signature_() const {
+    std::uint64_t sig = 0xcbf29ce484222325ULL;
+    sig ^= (static_cast<std::uint64_t>(m_) + 0xc6b1a7c3d5e9f0a2ULL);
+    sig = (sig << 31) | (sig >> 33);
+    if (A_is_sparse_) {
+        ensure_current_B_sparse_();
+        const auto& B = current_B_sparse_;
+        sig ^= static_cast<std::uint64_t>(B.nonZeros());
+        sig = (sig << 31) | (sig >> 33);
+        const int* outer = B.outerIndexPtr();
+        const int* inner = B.innerIndexPtr();
+        const double* value = B.valuePtr();
+        for (int j = 0; j < m_; ++j) {
+            sig ^= static_cast<std::uint64_t>(outer[j]);
+            sig = (sig << 31) | (sig >> 33);
+            for (int k = outer[j]; k < (j < m_ - 1 ? outer[j + 1] : B.nonZeros()); ++k) {
+                sig ^= static_cast<std::uint64_t>(inner[k]);
+                sig = (sig << 31) | (sig >> 33);
+                std::uint64_t hv = std::bit_cast<std::uint64_t>(value[k]);
+                sig ^= hv;
+                sig = (sig << 31) | (sig >> 33);
+            }
+        }
+    } else {
+        for (int i = 0; i < m_; ++i)
+            for (int j = 0; j < m_; ++j) {
+                std::uint64_t hv = std::bit_cast<std::uint64_t>(current_B_dense_(i, j));
+                sig ^= hv;
+                sig = (sig << 31) | (sig >> 33);
+            }
+    }
+    return sig;
+}

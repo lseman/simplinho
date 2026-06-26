@@ -45,3 +45,4 @@ highs-source/
 .openclaude/
 .codex-ariadne-mcp.toml
 ariadne.db
+examples/

@@ -105,12 +105,13 @@ RevisedSimplexOptions tune_mip_lp_options(const RevisedSimplexOptions& base_opti
     tuned.partial_pricing = true;
     tuned.dual_pricing = "switch";
     tuned.row_pricing_threshold = std::max(tuned.row_pricing_threshold, 40);
-    tuned.parallel_pricing_workers =
-        std::max(tuned.parallel_pricing_workers, std::min(4, std::max(1, mip_options.parallel_workers)));
+    tuned.parallel_pricing_workers = std::max(
+        tuned.parallel_pricing_workers, std::min(4, std::max(1, mip_options.parallel_workers)));
     tuned.parallel_pricing_min_cols = std::min(tuned.parallel_pricing_min_cols, 1024);
 
     tuned.basis_update = "hybrid";
-    tuned.basis_sparse_backend = tuned.basis_sparse_backend.empty() ? "auto" : tuned.basis_sparse_backend;
+    tuned.basis_sparse_backend =
+        tuned.basis_sparse_backend.empty() ? "auto" : tuned.basis_sparse_backend;
     tuned.basis_sparse_equilibration = true;
     tuned.primal_edge_weight_strategy = "dense_diagonal";
     tuned.dual_edge_weight_strategy = "dense_diagonal";
@@ -1455,6 +1456,10 @@ class Model {
         RevisedSimplexOptions cold_lp_options = state_->options;
         RevisedSimplexOptions warm_lp_options =
             tune_mip_lp_options(state_->options, mip_options, true);
+        cold_lp_options.compute_tableau = true;
+        cold_lp_options.compute_reduced_costs = true;
+        warm_lp_options.compute_tableau = true;
+        warm_lp_options.compute_reduced_costs = true;
         state_->last_constraint_pi.clear();
         state_->solved_revision = std::numeric_limits<std::uint64_t>::max();
         state_->last_basis.reset();
@@ -1486,7 +1491,10 @@ class Model {
             print_verbose_solver_configuration(mip_options);
         }
 
-        const RootProblemPresolveResult root_presolve = presolve_mip_root_problem(problem);
+        const RootProblemPresolveResult root_presolve =
+            mip_options.use_node_presolve
+                ? presolve_mip_root_problem(problem)
+                : RootProblemPresolveResult{problem};
         if (root_presolve.infeasible) {
             simplex_bnb::SolveResult infeasible_result;
             infeasible_result.status = simplex_bnb::Status::Infeasible;
@@ -1673,9 +1681,9 @@ class Model {
                     return std::nullopt;
                 }
 
-                const int old_basic_count = std::count(
-                    extended.column_status.begin(), extended.column_status.end(),
-                    LPBasisStatus::Basic);
+                const int old_basic_count =
+                    std::count(extended.column_status.begin(), extended.column_status.end(),
+                               LPBasisStatus::Basic);
                 const std::size_t prior_size = extended.column_status.size();
                 extended.column_status.resize(static_cast<std::size_t>(total_vars),
                                               LPBasisStatus::AtLower);
@@ -1715,15 +1723,20 @@ class Model {
 
             NodeLPSolverView get_node_lp_entry(const std::vector<simplex_bnb::Cut>& cuts) {
                 if (cuts.empty()) {
-                    return NodeLPSolverView{&base_data, &cold_solver, &warm_solver,
-                                            &fallback_solver, &root_warm_start_fallback,
+                    return NodeLPSolverView{&base_data,
+                                            &cold_solver,
+                                            &warm_solver,
+                                            &fallback_solver,
+                                            &root_warm_start_fallback,
                                             &base_slack_basis_guess};
                 }
                 const std::string cache_key = cut_set_signature(cuts);
                 auto it = node_lp_cache.find(cache_key);
                 if (it != node_lp_cache.end()) {
-                    return NodeLPSolverView{&it->second.lp_data, &it->second.cold_solver,
-                                            &it->second.warm_solver, &it->second.fallback_solver,
+                    return NodeLPSolverView{&it->second.lp_data,
+                                            &it->second.cold_solver,
+                                            &it->second.warm_solver,
+                                            &it->second.fallback_solver,
                                             &it->second.root_warm_start_fallback,
                                             &it->second.slack_basis_guess};
                 }
@@ -1732,8 +1745,11 @@ class Model {
                     cache_key, NodeLPCacheEntry(std::move(lp_data), cold_options_, warm_options_));
                 auto& entry = inserted.first->second;
                 entry.slack_basis_guess = build_slack_basis_guess(entry.lp_data);
-                return NodeLPSolverView{&entry.lp_data, &entry.cold_solver, &entry.warm_solver,
-                                        &entry.fallback_solver, &entry.root_warm_start_fallback,
+                return NodeLPSolverView{&entry.lp_data,
+                                        &entry.cold_solver,
+                                        &entry.warm_solver,
+                                        &entry.fallback_solver,
+                                        &entry.root_warm_start_fallback,
                                         &entry.slack_basis_guess};
             }
 
@@ -1912,8 +1928,7 @@ class Model {
                     // }
                     return attempt;
                 };
-                const std::optional<std::vector<int>>& slack_basis_guess =
-                    *entry.slack_basis_guess;
+                const std::optional<std::vector<int>>& slack_basis_guess = *entry.slack_basis_guess;
                 // Debugging helper: slack_basis_guess may be used for fallback solves.
                 auto try_solver_with_basis_guess =
                     [&](RevisedSimplex& solver,
@@ -2034,8 +2049,7 @@ class Model {
                     // Treat a finite-objective, valid-primal result as Optimal.
                     const bool terminal_optimal =
                         raw_opt->status == LPSolution::Status::Optimal ||
-                        (node_data.rows == 0 && has_valid_primal &&
-                         std::isfinite(raw_opt->obj));
+                        (node_data.rows == 0 && has_valid_primal && std::isfinite(raw_opt->obj));
                     const bool terminal_unbounded =
                         raw_opt->status == LPSolution::Status::Unbounded;
                     const bool terminal_objective_bound =
@@ -2380,7 +2394,8 @@ class Model {
             const std::string& cname = state_->vars[j].name;
             for (const auto& [row, coeff] : col_entries[j]) {
                 const std::string rname = (row == -1) ? obj_row : mps_row_name_(row);
-                out << "    " << cname << "  " << rname << "  " << format_mps_number_(coeff) << "\n";
+                out << "    " << cname << "  " << rname << "  " << format_mps_number_(coeff)
+                    << "\n";
             }
         }
         if (in_int_block) {
@@ -2467,9 +2482,9 @@ class Model {
         enum class Section { None, Name, Rows, Columns, Rhs, Ranges, Bounds, Sos, ObjSense };
         Section section = Section::None;
 
-        std::string objective_row;                       // N row name
-        std::unordered_map<std::string, char> row_sense;  // row name -> L/G/E/N
-        std::vector<std::string> row_order;               // constraint rows in file order
+        std::string objective_row;                              // N row name
+        std::unordered_map<std::string, char> row_sense;        // row name -> L/G/E/N
+        std::vector<std::string> row_order;                     // constraint rows in file order
         std::unordered_map<std::string, int> row_to_constraint; // row name -> constraint index
 
         bool integer_block = false;
@@ -2561,7 +2576,8 @@ class Model {
                     if (tok.size() < 2) {
                         break;
                     }
-                    char sense = static_cast<char>(std::toupper(static_cast<unsigned char>(tok[0][0])));
+                    char sense =
+                        static_cast<char>(std::toupper(static_cast<unsigned char>(tok[0][0])));
                     const std::string& rname = tok[1];
                     row_sense[rname] = sense;
                     if (sense == 'N') {

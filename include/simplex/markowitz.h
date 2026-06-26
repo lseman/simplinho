@@ -1,11 +1,12 @@
 #pragma once
 
-#include <Eigen/Dense>
 #include "../../extern/pdqsort/pdqsort.h"
+#include <Eigen/Dense>
 #include <Eigen/LU> // for FullPivLU
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <ranges>
@@ -245,12 +246,13 @@ class MarkowitzLU {
 
             // Solve correction in the original coordinate system but through
             // the current factorization coordinates.
+            // Need: L*U*corr = P_r * residual
             if (!is_transpose) {
-                apply_perm_inplace_(residual_buf_, Pr_, corr_buf_);
+                apply_inv_perm_inplace_(residual_buf_, Pr_, corr_buf_);
                 triangular_solve_(L_, TriangularSolveMode::UnitLower, corr_buf_);
                 triangular_solve_(U_, TriangularSolveMode::Upper, corr_buf_);
             } else {
-                apply_perm_inplace_(residual_buf_, Pc_, corr_buf_);
+                apply_inv_perm_inplace_(residual_buf_, Pc_, corr_buf_);
                 triangular_solve_(U_, TriangularSolveMode::TransposeUpper, corr_buf_);
                 triangular_solve_(L_, TriangularSolveMode::TransposeUnitLower, corr_buf_);
             }
@@ -458,8 +460,7 @@ class MarkowitzLU {
             }
         }
 
-        pdqsort(rows.begin(), rows.end(),
-                  [&](int a, int b) { return row_deg_[a] < row_deg_[b]; });
+        pdqsort(rows.begin(), rows.end(), [&](int a, int b) { return row_deg_[a] < row_deg_[b]; });
 
         for (const int i : rows) {
             const int rd = row_deg_[i];
@@ -543,8 +544,7 @@ class MarkowitzLU {
             return {-1, -1};
         }
 
-        pdqsort(rows.begin(), rows.end(),
-                  [&](int a, int b) { return row_deg_[a] < row_deg_[b]; });
+        pdqsort(rows.begin(), rows.end(), [&](int a, int b) { return row_deg_[a] < row_deg_[b]; });
 
         const int stride = std::max(1, static_cast<int>(rows.size()) / sample_rows);
 

@@ -166,9 +166,9 @@ if(NOT TARGET Eigen3::Eigen)
 endif()
 
 set(PYBIND11_FINDPYTHON ON)
-set(PYBIND11_PYTHON_VERSION 3.13 CACHE STRING "Python version to use when building pybind11 modules" FORCE)
+set(PYBIND11_PYTHON_VERSION 3.14 CACHE STRING "Python version to use when building pybind11 modules" FORCE)
 
-find_package(Python 3.13 REQUIRED COMPONENTS Interpreter Development)
+find_package(Python 3.14 REQUIRED COMPONENTS Interpreter Development)
 find_package(Threads REQUIRED)
 
 # ==============================================================================

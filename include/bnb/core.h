@@ -2068,18 +2068,14 @@ class Solver {
             fractional.empty()) {
             return false;
         }
-        // Cut-depth policy. Interior cut separation is expensive on this code
-        // path (each pass regenerates every cut family over the full variable
-        // set and re-solves the LP), so it must stay bounded: separating on
-        // many deep nodes makes per-node cost dominate. Keep the reach modest
-        // and, beyond the shallow band, only separate on the periodic node
-        // frequency. The dual bound deep in the tree is instead handled cheaply
-        // by objective-integrality rounding in round_objective_bound_.
+        // Cut-depth policy. Extend cut reach deeper into the tree: GMI/MIR/cover
+        // cuts are most effective at pruning subtrees early. Allow cuts up to
+        // depth 4 (was 3) and widen the "shallow" band to depth 3 (was 2).
         const bool proof = adaptive_proof_phase_active_for_bound_(relaxation.objective);
-        if (node.depth > std::max(2, effective.strong_branching_max_depth + 1)) {
+        if (node.depth > std::max(3, effective.strong_branching_max_depth + 1)) {
             return false;
         }
-        const bool shallow = node.depth <= 2;
+        const bool shallow = node.depth <= 3;
         const bool periodic =
             effective.heuristic_frequency <= 1 ||
             (effective.heuristic_frequency > 0 &&
@@ -2087,7 +2083,8 @@ class Solver {
         if (!proof && !shallow && !periodic) {
             return false;
         }
-        if (fractional.size() > 24 && !shallow && !proof) {
+        // More fractional variables still benefit from cut separation.
+        if (fractional.size() > 48 && !shallow && !proof) {
             return false;
         }
 
@@ -3542,6 +3539,13 @@ class Solver {
                         return;
                     }
                 }
+                if (std::getenv("SIMPLINHO_TRACE_CUTS")) {
+                    std::fprintf(stderr,
+                                 "[rootcut] round=%d start_obj=%.4f end_obj=%.4f delta=%.4f "
+                                 "active_cuts=%zu\n",
+                                 round, round_start_objective, relaxation.objective,
+                                 round_start_objective - relaxation.objective, active_cuts_.size());
+                }
                 if (!any_cuts_applied)
                     break;
 
@@ -3563,7 +3567,7 @@ class Solver {
                     stall_rounds = 0;
                 }
                 previous_round_objective = relaxation.objective;
-                if (stall_rounds >= 3)
+                if (stall_rounds >= 5)
                     break;
             }
 
@@ -3794,7 +3798,7 @@ class Solver {
                     node_cut_stall_rounds = 0;
                 }
                 previous_node_cut_objective = relaxation.objective;
-                if (node_cut_stall_rounds >= 1)
+                if (node_cut_stall_rounds >= 2)
                     break;
 
                 {

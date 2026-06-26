@@ -38,12 +38,15 @@
 #include <utility>
 #include <vector>
 
-#include "degeneracy.h" // DegeneracyManager + perturbation helpers
-#include "presolver.h"  // presolve::LP, Presolver
-#include "pricer.h"     // pricing + degeneracy helpers
-#include "simplex_lu.h" // FTBasis implementation (solve_B, solve_BT, replace_column, refactor)
-#include "simplex_types.h"    // public result/status/options types
+#include "degeneracy.h"    // DegeneracyManager + perturbation helpers
+#include "presolver.h"     // presolve::LP, Presolver
+#include "pricer.h"        // pricing + degeneracy helpers
+#include "simplex_lu.h"    // FTBasis implementation (solve_B, solve_BT, replace_column, refactor)
+#include "simplex_types.h" // public result/status/options types
 #include "sparse_presolver.h" // sparse-native LP presolve
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 
 // Forward decls from degeneracy/pricer header (kept external)
 static inline std::unordered_map<std::string, std::string>
@@ -70,6 +73,7 @@ struct LPDualPricingWarmState {
 
 struct LPWarmStateData {
     std::uint64_t matrix_signature = 0;
+    std::uint64_t basis_matrix_signature = 0;
     int rows = -1;
     int cols = -1;
     bool matrix_is_sparse = false;
@@ -841,9 +845,12 @@ class RevisedSimplex {
                 crash_seed_basis_opt = std::move(partial_seed);
             }
         }
+        const bool allow_direct_warm_start =
+            !seed_basis_from_state ||
+            (crash_seed_basis_opt && static_cast<int>(crash_seed_basis_opt->size()) == m_eff);
         auto t0_crash = std::chrono::steady_clock::now();
         CrashSelection basis_choice = choose_initial_basis_(
-            Ared, bred, cred, opt_, crash_seed_basis_opt, !seed_basis_from_state);
+            Ared, bred, cred, opt_, crash_seed_basis_opt, allow_direct_warm_start);
         auto t1_crash = std::chrono::steady_clock::now();
         current_timing_.crash_ns +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1_crash - t0_crash).count();
@@ -2114,6 +2121,7 @@ class RevisedSimplex {
         }
         auto warm_state = std::make_shared<LPWarmStateData>();
         warm_state->matrix_signature = current_matrix_signature_;
+        warm_state->basis_matrix_signature = basis_factorization->basis_matrix_signature();
         warm_state->rows = current_matrix_rows_;
         warm_state->cols = current_matrix_cols_;
         warm_state->matrix_is_sparse = current_matrix_is_sparse_;
@@ -2643,11 +2651,8 @@ class RevisedSimplex {
                                    static_cast<int>(A.cols()) == last_sparse_a_cols_)
                                       ? last_sparse_a_signature_
                                       : matrix_signature_(A);
-        const int rows = static_cast<int>(A.rows());
-        const int cols = static_cast<int>(A.cols());
-        return cached_basis_state_ && cached_basis_rows_ == rows && cached_basis_cols_ == cols &&
-               cached_matrix_signature_ == sig && cached_matrix_is_sparse_ &&
-               basis_state_matches_problem_(*cached_basis_state_, rows, cols) &&
+        return has_cached_basis_state(static_cast<int>(A.rows()), static_cast<int>(A.cols()), sig,
+                                      true) &&
                cached_basis_state_->warm_state &&
                cached_basis_state_->warm_state->basis_factorization;
     }
@@ -2655,8 +2660,11 @@ class RevisedSimplex {
   private:
     bool has_cached_basis_state(int rows, int cols, std::uint64_t signature,
                                 bool matrix_is_sparse) const noexcept {
-        return opt_.mode == SimplexMode::Dual && cached_basis_state_ &&
-               cached_basis_rows_ == rows && cached_basis_cols_ == cols &&
+        // Allow cached basis reuse in Auto as well as Dual so warm-started
+        // re-solves can benefit from the stored basis state. The solver still
+        // preserves its normal mode fallback logic (Auto may fall back from
+        // primal to dual if needed).
+        return cached_basis_state_ && cached_basis_rows_ == rows && cached_basis_cols_ == cols &&
                cached_matrix_signature_ == signature &&
                cached_matrix_is_sparse_ == matrix_is_sparse &&
                basis_state_matches_problem_(*cached_basis_state_, rows, cols);
@@ -2747,9 +2755,10 @@ class RevisedSimplex {
         // unique_ptr because RevisedSimplex is an incomplete type at this point in the header.
         mutable std::unique_ptr<RevisedSimplex> reformulated_solver_cache;
         // Last optimal basis_state returned by the reformulated solver. Feeding
-        // it back into the next dual restart attempt preserves the FTBasis
-        // warm_state without forcing Primal/Auto fallback solves onto a stale,
-        // primal-infeasible basis.
+        // it back into the next solve (rather than relying on the solver's
+        // internal no-basis cache path, which loses the nonbasic bound views and
+        // goes singular) is what lets the FTBasis factorization actually be
+        // reused -- a dual warm restart in a few pivots instead of a cold refactor.
         mutable std::optional<LPBasis> last_reformulated_basis_state;
         int m_eq = 0;
         int nv = 0;
@@ -3119,6 +3128,13 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     if (!is_nonnegative_standard) {
         const bool cache_reuse = sparse_bound_only_cache_.same_problem(A_in, b_in, c_in) &&
                                  sparse_bound_only_cache_.orientation_matches(l_use, u_use);
+        if (std::getenv("SIMPLINHO_TRACE_REFORM")) {
+            static std::atomic<long> reuse_y{0}, reuse_n{0};
+            (cache_reuse ? reuse_y : reuse_n)++;
+            if (((reuse_y + reuse_n) % 200) == 0)
+                std::fprintf(stderr, "[reform] cache_reuse yes=%ld no=%ld\n", reuse_y.load(),
+                             reuse_n.load());
+        }
         // Reuse pre-allocated map_scratch to avoid heap allocation on every BnB node solve.
         // ReformVar is defined at class scope so SparseBoundOnlyCache can own this buffer.
         auto& map = sparse_bound_only_cache_.map_scratch;
@@ -3187,7 +3203,6 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             for (int j = 0; j < n; ++j) {
                 const bool has_l = std::isfinite(l_use(j));
                 const bool has_u = std::isfinite(u_use(j));
-                const bool fixed = has_l && has_u && std::abs(u_use(j) - l_use(j)) <= opt_.tol;
                 if (has_l && has_u && u_use(j) < l_use(j) - opt_.tol) {
                     Eigen::VectorXd xnan =
                         Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
@@ -3196,6 +3211,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                                        std::numeric_limits<double>::infinity(), {}, 0,
                                        {{"reason", "invalid_bounds"}}));
                 }
+                const bool fixed = has_l && has_u && std::abs(u_use(j) - l_use(j)) <= opt_.tol;
                 if (fixed) {
                     map[j].uses_single_var = true;
                     map[j].y = -1;
@@ -3388,12 +3404,27 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 *sparse_bound_only_cache_.reformulated_solver_cache;
             reformulated_solver.opt_ = solve_opt;
             const RevisedSimplex::SparseMatrix& A_std_sparse = A_std;
-            // Hot path for the dual restart attempt: feed back the previous
-            // reformulated basis_state so its FTBasis warm_state can be adopted.
-            // Primal/Auto fallback solves intentionally stay cold here; otherwise
-            // they pay the known primal-infeasible warm-basis penalty.
+            // Hot path: feed back the previous solve's optimal basis_state. Unlike
+            // the no-basis internal-cache route (which loses the nonbasic bound
+            // views and returns Singular), passing the full basis_state -- which
+            // carries the FTBasis warm_state -- lets the solver adopt the existing
+            // factorization and dual-pivot to the new optimum in a few iterations.
             auto& prev_state = sparse_bound_only_cache_.last_reformulated_basis_state;
-            if (mode == SimplexMode::Dual && prev_state &&
+            if (std::getenv("SIMPLINHO_TRACE_REFORM")) {
+                static std::atomic<long> hit{0}, no_prev{0}, no_fact{0}, sz{0};
+                if (!prev_state)
+                    ++no_prev;
+                else if (!reformulated_solver.has_cached_basis_factorization_state(A_std_sparse))
+                    ++no_fact;
+                else if (static_cast<int>(prev_state->column_status.size()) != n_total)
+                    ++sz;
+                else
+                    ++hit;
+                if (((hit + no_prev + no_fact + sz) % 200) == 0)
+                    std::fprintf(stderr, "[reformpath] hit=%ld no_prev=%ld no_fact=%ld sz=%ld\n",
+                                 hit.load(), no_prev.load(), no_fact.load(), sz.load());
+            }
+            if (prev_state &&
                 reformulated_solver.has_cached_basis_factorization_state(A_std_sparse) &&
                 static_cast<int>(prev_state->column_status.size()) == n_total) {
                 reformulated_inner_cache_used = true;
@@ -3661,9 +3692,12 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
 
     const bool seed_basis_from_state = (!basis_opt || basis_opt->empty()) && red_basis_state_opt &&
                                        !red_basis_state_opt->column_status.empty();
+    const bool allow_direct_warm_start =
+        !seed_basis_from_state ||
+        (crash_seed_basis_opt && static_cast<int>(crash_seed_basis_opt->size()) == m_in);
     auto t0_crash = std::chrono::steady_clock::now();
-    CrashSelection basis_choice =
-        choose_initial_basis_(Ared, bred, cred, opt_, crash_seed_basis_opt, !seed_basis_from_state);
+    CrashSelection basis_choice = choose_initial_basis_(
+        Ared, bred, cred, opt_, crash_seed_basis_opt, allow_direct_warm_start);
     if (factorized_basis_seed_opt && crash_seed_basis_opt &&
         static_cast<int>(crash_seed_basis_opt->size()) == m_in &&
         basis_choice.basis != *crash_seed_basis_opt) {
@@ -3691,6 +3725,19 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         basis_valid &&
         (basis_choice.quality.dual_feasible ||
          (opt_.mode == SimplexMode::Dual && basis_guess_from_warm_start && warm_has_column_status));
+    if (std::getenv("SIMPLINHO_TRACE_REFORM") && opt_.mode == SimplexMode::Dual &&
+        !allow_direct_dual) {
+        std::fprintf(stderr,
+                     "[reformdispatch] dual-warm-gate fail source=%s valid=%d dual_feasible=%d "
+                     "primal_feasible=%d basis_guess_from_warm_start=%d warm_has_column_status=%d "
+                     "basis_size=%d m_in=%d factorized_basis_seed_opt=%d\n",
+                     basis_choice.source.c_str(), static_cast<int>(basis_choice.quality.valid),
+                     static_cast<int>(basis_choice.quality.dual_feasible),
+                     static_cast<int>(basis_choice.quality.primal_feasible),
+                     static_cast<int>(basis_guess_from_warm_start),
+                     static_cast<int>(warm_has_column_status), static_cast<int>(basis_guess.size()),
+                     m_in, static_cast<int>(factorized_basis_seed_opt.has_value()));
+    }
 
     auto add_sparse_info = [&](std::unordered_map<std::string, std::string> info) {
         info["sparse_pipeline"] = "1";
@@ -3805,6 +3852,23 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         if (basis_guess_from_warm_start) {
             solve_stats_.warm_start_accepted = 1;
         }
+        if (std::getenv("SIMPLINHO_TRACE_REFORM")) {
+            static std::atomic<long> trace_reform_dispatch{0};
+            static std::atomic<long> trace_reform_primal{0};
+            static std::atomic<long> trace_reform_dual{0};
+            static std::atomic<long> trace_reform_auto_dual{0};
+            const long count = ++trace_reform_dispatch;
+            if ((count % 200) == 0) {
+                std::fprintf(stderr,
+                             "[reformdispatch] count=%ld mode=%d allow_primal=%d allow_dual=%d "
+                             "basis_guess_from_warm_start=%d allow_direct_dual=%d\n",
+                             count, static_cast<int>(opt_.mode),
+                             static_cast<int>(allow_direct_primal),
+                             static_cast<int>(allow_direct_dual),
+                             static_cast<int>(basis_guess_from_warm_start),
+                             static_cast<int>(allow_direct_dual));
+            }
+        }
         LPSolution::Status st = LPSolution::Status::NeedPhase1;
         Eigen::VectorXd v2;
         std::vector<int> red_basis2;
@@ -3813,7 +3877,23 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
 
         if (opt_.mode == SimplexMode::Dual) {
             if (allow_direct_dual) {
+                if (std::getenv("SIMPLINHO_TRACE_REFORM")) {
+                    static std::atomic<long> dual_branch_count{0};
+                    const long c = ++dual_branch_count;
+                    if ((c % 100) == 0)
+                        std::fprintf(stderr,
+                                     "[reformdispatch] dual-branch direct run_phase2_d count=%ld\n",
+                                     c);
+                }
                 std::tie(st, v2, red_basis2, it2, info2) = run_phase2_d(basis_guess);
+            } else if (std::getenv("SIMPLINHO_TRACE_REFORM")) {
+                static std::atomic<long> dual_branch_skipped{0};
+                const long c = ++dual_branch_skipped;
+                if ((c % 100) == 0)
+                    std::fprintf(
+                        stderr,
+                        "[reformdispatch] dual-branch skipped allow_direct_dual=false count=%ld\n",
+                        c);
             }
         } else if (opt_.mode == SimplexMode::Primal) {
             if (allow_direct_primal) {
@@ -3825,6 +3905,14 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             }
             if (allow_direct_dual && st == LPSolution::Status::NeedPhase1 &&
                 info2.count("reason") && info2.at("reason") == std::string("negative_basic_vars")) {
+                if (std::getenv("SIMPLINHO_TRACE_REFORM")) {
+                    static std::atomic<long> auto_dual_branch_count{0};
+                    const long c = ++auto_dual_branch_count;
+                    if ((c % 100) == 0)
+                        std::fprintf(stderr,
+                                     "[reformdispatch] auto fallback dual run_phase2_d count=%ld\n",
+                                     c);
+                }
                 std::tie(st, v2, red_basis2, it2, info2) = run_phase2_d(basis_guess);
             }
         }

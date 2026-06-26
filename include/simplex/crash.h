@@ -1657,6 +1657,19 @@ RevisedSimplex::choose_initial_basis_(const SparseMatrix& A, const Eigen::Vector
             sel.style = "mapped";
         }
         sel.attempt = attempt;
+        if (std::getenv("SIMPLINHO_TRACE_REFORM") &&
+            (sel.source == "warm_start" || sel.source == "repaired_warm_start" ||
+             sel.source == "logical")) {
+            std::fprintf(stderr,
+                         "[basisquality] source=%s style=%s valid=%d primal=%d dual=%d "
+                         "rank=%d residual=%g rows=%d cols=%d\n",
+                         sel.source.c_str(), sel.style.c_str(),
+                         static_cast<int>(sel.quality.valid),
+                         static_cast<int>(sel.quality.primal_feasible),
+                         static_cast<int>(sel.quality.dual_feasible),
+                         static_cast<int>(sel.quality.rank), sel.quality.solve_residual,
+                         static_cast<int>(A.rows()), static_cast<int>(A.cols()));
+        }
         if (better_basis_quality_(sel, best, opt.mode))
             best = std::move(sel);
     };
@@ -1680,6 +1693,19 @@ RevisedSimplex::choose_initial_basis_(const SparseMatrix& A, const Eigen::Vector
     };
 
     if (seed_basis && !seed_basis->empty()) {
+        if (std::getenv("SIMPLINHO_TRACE_REFORM")) {
+            static std::atomic<long> seed_basis_trace_count{0};
+            const long trace_count = ++seed_basis_trace_count;
+            if ((trace_count % 200) == 0) {
+                std::fprintf(stderr,
+                             "[crashseed] sparse seed_basis size=%d allow_direct_warm_start=%d "
+                             "A.rows=%d opt.mode=%d repair_mapped_basis=%d\n",
+                             static_cast<int>(seed_basis->size()),
+                             static_cast<int>(allow_direct_warm_start),
+                             static_cast<int>(A.rows()), static_cast<int>(opt.mode),
+                             static_cast<int>(opt.repair_mapped_basis));
+            }
+        }
         if (allow_direct_warm_start && (int)seed_basis->size() == A.rows()) {
             consider(*seed_basis, "warm_start", -1);
             if (can_accept_early(best.quality)) {

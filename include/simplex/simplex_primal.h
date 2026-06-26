@@ -166,6 +166,33 @@ class RevisedSimplexPrimalEngine {
         }
 
         std::shared_ptr<FTBasis> basis_factorization;
+        // Verify warm factorization's B matrix matches current B matrix
+        if (self.solve_input_warm_state_ && self.solve_input_warm_state_->basis_matrix_signature) {
+            std::uint64_t sig = 0xcbf29ce484222325ULL;
+            sig ^= (static_cast<std::uint64_t>(m) + 0xc6b1a7c3d5e9f0a2ULL);
+            sig = (sig << 31) | (sig >> 33);
+            Eigen::MatrixXd B_dense(m, m);
+            B_dense.setZero();
+            if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
+                for (int j = 0; j < m; ++j) {
+                    const int col = basis[j];
+                    for (typename MatrixType::InnerIterator it(A, col); it; ++it)
+                        B_dense(it.row(), j) = it.value();
+                }
+            } else {
+                for (int j = 0; j < m; ++j)
+                    B_dense.col(j) = A.col(basis[j]);
+            }
+            for (int i = 0; i < m; ++i)
+                for (int j = 0; j < m; ++j) {
+                    std::uint64_t hv = std::bit_cast<std::uint64_t>(B_dense(i, j));
+                    sig ^= hv;
+                    sig = (sig << 31) | (sig >> 33);
+                }
+            if (sig != self.solve_input_warm_state_->basis_matrix_signature) {
+                self.solve_input_warm_state_ = nullptr;
+            }
+        }
         if (const auto warm_state = self.try_reuse_factorization_(basis)) {
             basis_factorization = warm_state->basis_factorization;
         } else {

@@ -3370,14 +3370,17 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
     }
 
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {
-        const double lhs_score = 0.33 * lhs.active_efficacy + 0.19 * lhs.highs_active_score +
-                                 0.14 * lhs.efficacy + 0.14 * lhs.density_adjusted_efficacy +
-                                 0.10 * lhs.dynamism + 0.07 * lhs.fractional_focus +
-                                 0.08 * lhs.obj_parallelism;
-        const double rhs_score = 0.33 * rhs.active_efficacy + 0.19 * rhs.highs_active_score +
-                                 0.14 * rhs.efficacy + 0.14 * rhs.density_adjusted_efficacy +
-                                 0.10 * rhs.dynamism + 0.07 * rhs.fractional_focus +
-                                 0.08 * rhs.obj_parallelism;
+        // Rebalanced: boost bound-tightening potential (obj_parallelism) and active_efficacy,
+        // reduce highs_active_score (proxy for LP-solve speed) in favor of cuts that tighten
+        // the objective bound most directly.
+        const double lhs_score = 0.25 * lhs.active_efficacy + 0.12 * lhs.highs_active_score +
+                                 0.10 * lhs.efficacy + 0.10 * lhs.density_adjusted_efficacy +
+                                 0.08 * lhs.dynamism + 0.05 * lhs.fractional_focus +
+                                 0.20 * lhs.obj_parallelism;
+        const double rhs_score = 0.25 * rhs.active_efficacy + 0.12 * rhs.highs_active_score +
+                                 0.10 * rhs.efficacy + 0.10 * rhs.density_adjusted_efficacy +
+                                 0.08 * rhs.dynamism + 0.05 * rhs.fractional_focus +
+                                 0.20 * rhs.obj_parallelism;
         return lhs_score > rhs_score;
     });
 
@@ -3388,7 +3391,7 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
     selected.reserve(static_cast<std::size_t>(std::max(0, max_cuts)));
     selected_indices.reserve(static_cast<std::size_t>(std::max(0, max_cuts)));
 
-    double selection_parallelism_limit = std::min(max_parallelism_, 0.10);
+    double selection_parallelism_limit = std::min(max_parallelism_, 0.35);
     while (selected.size() < static_cast<std::size_t>(max_cuts)) {
         double best_score = -std::numeric_limits<double>::infinity();
         int best_pos = -1;
@@ -3414,11 +3417,11 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
             if (max_parallelism > selection_parallelism_limit)
                 continue;
 
-            double score = 0.30 * candidate.active_efficacy + 0.17 * candidate.highs_active_score +
-                           0.11 * candidate.efficacy + 0.18 * (1.0 - max_parallelism) +
-                           0.11 * candidate.age_bonus + 0.09 * candidate.density_adjusted_efficacy +
-                           0.07 * candidate.strength + dynamism_weight_ * candidate.dynamism +
-                           0.05 * candidate.fractional_focus + 0.10 * candidate.obj_parallelism;
+            double score = 0.25 * candidate.active_efficacy + 0.12 * candidate.highs_active_score +
+                           0.10 * candidate.efficacy + 0.18 * (1.0 - max_parallelism) +
+                           0.10 * candidate.age_bonus + 0.08 * candidate.density_adjusted_efficacy +
+                           0.08 * candidate.strength + dynamism_weight_ * candidate.dynamism +
+                           0.04 * candidate.fractional_focus + 0.15 * candidate.obj_parallelism;
             if (candidate.marginal) {
                 score +=
                     0.06 * candidate.density_adjusted_efficacy + 0.04 * candidate.fractional_focus;
@@ -3604,7 +3607,9 @@ Cut eliminate_base_row_slacks_from_cut_(const Problem& problem, Cut cut) {
 }
 
 double gmi_candidate_away_(const Options& options) {
-    return std::max({10.0 * options.integrality_tol, 5.0 * options.min_cut_violation, 5e-4});
+    // Lower floor: accept moderately fractional rows that CBC would use.
+    // This captures more cut candidates, letting the scoring filter the weak ones.
+    return std::max({10.0 * options.integrality_tol, 5.0 * options.min_cut_violation, 2e-4});
 }
 
 double gmi_cut_quality_score_(const Cut& cut, const Eigen::VectorXd& primal, double violation) {
@@ -3868,7 +3873,8 @@ std::vector<int> select_gmi_rows_(const Problem& problem, const RelaxationSoluti
         const double support_bonus =
             1.0 + 0.10 * std::min(1.0, static_cast<double>(fractional_support) / 8.0) +
             0.05 * std::min(1.0, static_cast<double>(integer_support) / 12.0);
-        const double density_penalty = 1.0 + 0.08 * static_cast<double>(nnz);
+        // Reduce density penalty: denser rows can still yield strong GMI cuts.
+        const double density_penalty = 1.0 + 0.04 * static_cast<double>(nnz);
         const double score =
             frac * (1.0 - frac) * support_bonus / (std::max(1.0, norm_sq) * density_penalty);
         std::sort(support_terms.begin(), support_terms.end(),
