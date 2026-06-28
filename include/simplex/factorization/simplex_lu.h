@@ -886,10 +886,12 @@ class FTBasis {
                        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
         if (backend == "eigen" || backend == "sparse_lu") {
             config.force_eigen_sparse_lu = true;
-        } else if (backend == "ft" || backend == "forrest_tomlin") {
-            config.use_product_form_updates = false;
-        } else {
+        } else if (backend == "pf" || backend == "product_form") {
             config.use_product_form_updates = true;
+        } else {
+            // HiGHS' HFactor defaults to Forrest-Tomlin updates. Product form
+            // remains available through basis_sparse_backend="pf".
+            config.use_product_form_updates = false;
         }
         return config;
     }

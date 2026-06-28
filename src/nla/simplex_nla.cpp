@@ -12,8 +12,15 @@ namespace simplex::nla {
 void SimplexNLA::update_framework_stats(double new_weight, double old_weight) {
     if (!config_.allow_framework_switch_ || old_weight <= 0)
         return;
-    framework_stats_.total_framework_updates_++;
     double log_err = std::abs(std::log(new_weight / old_weight));
+    record_framework_error(log_err);
+}
+
+void SimplexNLA::record_framework_error(double log_error) noexcept {
+    if (!config_.allow_framework_switch_ || !std::isfinite(log_error))
+        return;
+    framework_stats_.total_framework_updates_++;
+    double log_err = std::abs(log_error);
     framework_stats_.avg_log_error_ = 0.99 * framework_stats_.avg_log_error_ + 0.01 * log_err;
     if (framework_stats_.avg_log_error_ > config_.framework_switch_threshold_)
         ++framework_stats_.consecutive_errors_;

@@ -15,108 +15,6 @@
 namespace simplex::nla {
 
 // ============================================================================
-// ProductFormUpdate — HiGHS-style outer product-form chain
-//       Stores B^{-1} * a_q vectors for fast ftran/btran.
-//       Hard limit of 50 updates, pre-allocated at setup.
-//       Lives on NLA, not on factorizer.
-// ============================================================================
-struct ProductFormUpdate {
-    bool valid_{false};
-    int num_rows_{0};
-    int update_count_{0};
-    int max_updates_{50}; // kPFMaxUpdates
-    double expected_density_{0.1};
-    std::vector<int> pivot_index_;
-    std::vector<double> pivot_value_;
-    std::vector<int> start_;
-    std::vector<int> index_;
-    std::vector<double> value_;
-
-    void clear() {
-        valid_ = false;
-        num_rows_ = 0;
-        update_count_ = 0;
-        pivot_index_.clear();
-        pivot_value_.clear();
-        start_.clear();
-        index_.clear();
-        value_.clear();
-    }
-
-    void setup(int num_rows, double expected_density) {
-        valid_ = true;
-        num_rows_ = num_rows;
-        update_count_ = 0;
-        expected_density_ = expected_density;
-        start_.push_back(0);
-        int reserve = 1000 + max_updates_ * num_rows * expected_density;
-        index_.reserve(reserve);
-        value_.reserve(reserve);
-    }
-
-    // Record an eta vector (B^{-1} * a_q) for this pivot.
-    // Returns true if recorded, false if max reached.
-    bool update(int pivot_row, const Eigen::VectorXd& aq) {
-        if (update_count_ >= max_updates_)
-            return false;
-        double pivot = aq(pivot_row);
-        if (std::abs(pivot) < 1e-8)
-            return false;
-        pivot_index_.push_back(pivot_row);
-        pivot_value_.push_back(pivot);
-        for (int i = 0; i < aq.size(); ++i) {
-            if (i != pivot_row && std::abs(aq(i)) > 1e-14) {
-                index_.push_back(i);
-                value_.push_back(aq(i));
-            }
-        }
-        start_.push_back(static_cast<int>(index_.size()));
-        ++update_count_;
-        return true;
-    }
-
-    // FTRAN: apply PF updates forward (x = PF * x)
-    // Uses cwork[] as a visited set (HiGHS pattern).
-    void ftran(Eigen::VectorXd& x, std::vector<char>& cwork) const {
-        if (!valid_ || update_count_ == 0)
-            return;
-        for (int ix = 0; ix < update_count_; ++ix) {
-            int pi = pivot_index_[ix];
-            double pv = x(pi);
-            if (std::abs(pv) <= 1e-14) {
-                x(pi) = 0;
-                continue;
-            }
-            assert(cwork[pi]);
-            pv /= pivot_value_[ix];
-            x(pi) = pv;
-            for (int k = start_[ix]; k < start_[ix + 1]; ++k) {
-                int row = index_[k];
-                x(row) -= pv * value_[k];
-                if (!cwork[row])
-                    cwork[row] = 1;
-            }
-        }
-        for (int ix = 0; ix < update_count_; ++ix)
-            cwork[pivot_index_[ix]] = 0;
-    }
-
-    // BTRAN: apply PF updates backward (x = PF^{-T} * x)
-    void btran(Eigen::VectorXd& x) const {
-        if (!valid_ || update_count_ == 0)
-            return;
-        for (int ix = update_count_ - 1; ix >= 0; --ix) {
-            int pi = pivot_index_[ix];
-            double pv = x(pi);
-            for (int k = start_[ix]; k < start_[ix + 1]; ++k)
-                pv -= value_[k] * x(index_[k]);
-            pv /= pivot_value_[ix];
-            x(pi) = std::abs(pv) < 1e-100 ? 1e-100 : pv;
-        }
-    }
-};
-
-// ============================================================================
 // SimplexIterate — complete factorization snapshot for fast backtrack
 //       Matches HiGHS SimplexIterate{basis_, InvertibleRepresentation}.
 //       putInvert() copies current state into snapshot for restore on backtrack.
@@ -220,15 +118,17 @@ struct NLAStats {
 // ============================================================================
 // SimplexNLA — HiGHS HSimplexNla equivalent
 //       The glue layer between simplex engines and factorizer.
-//       Owns: PF updates, iterate snapshots, framework switching,
-//       price strategy, density tracking.
+//       Owns the factorizer and NLA metadata. Update storage itself belongs to
+//       FTBasis/SparseForrestTomlinLU, matching HiGHS' HFactor ownership model:
+//       update() chooses FT/PF/MPF/APF internally and ftran/btran apply that same
+//       representation.
 //
 //       Usage:
-//       1. nla.setup(rows, pf_density, config)
-//       2. After each pivot: nla.update(pivot_row, eta_vector)
-//       3. Apply PF: nla.pf().ftran(x, cwork) / nla.pf().btran(x)
-//       4. Framework: nla.update_framework_stats(new_w, old_w)
-//       5. Snapshot: nla.putInvert() / nla.getInvert()
+//       1. nla.setup(rows, expected_density, config)
+//       2. nla.setup_factor(A, basis, options)
+//       3. FTRAN/BTRAN through nla.ftran()/nla.btran()
+//       4. After each pivot: nla.update_basis(row, entering_col, entering_vector)
+//       5. Framework: nla.record_framework_error(log_error)
 // ============================================================================
 class SimplexNLA {
   public:
@@ -238,16 +138,18 @@ class SimplexNLA {
 
     // Setup NLA — called once at simplex start
     void setup(int num_rows, double expected_pf_density, const NLAConfig& config) {
+        (void)expected_pf_density;
         config_ = config;
-        pf_.setup(num_rows, expected_pf_density);
+        num_rows_ = num_rows;
         config_.ema_reach_ratio_ = 1.0;
         config_.factorization_count_ = 0;
         config_.build_synthetic_tick_ = 0.0;
+        stats_ = NLAStats{};
     }
 
-    // Clear all PF + iterate data
+    // Clear all factorization metadata and iterate data.
     void clear() {
-        pf_.clear();
+        factor_.reset();
         simplex_iterate_.clear();
         framework_stats_.avg_log_error_ = 0.0;
         framework_stats_.consecutive_errors_ = 0;
@@ -255,26 +157,8 @@ class SimplexNLA {
         config_.starting_row_pricing_ = false;
     }
 
-    // =========================================================================
-    // PF update chain — called after each pivot
-    // =========================================================================
-
-    // Record an eta vector (B^{-1} * a_q) for this pivot.
-    // Returns true if recorded, false if max reached.
-    bool update(int pivot_row, const Eigen::VectorXd& aq) { return pf_.update(pivot_row, aq); }
-
-    // Update count — how many PF updates stored
-    int update_count() const noexcept { return pf_.update_count_; }
-
-    // =========================================================================
-    // PF access — apply PF updates directly
-    //       Use after FTBasis::solve_B/solve_BT for full ftran/btran chain.
-    //       Example: basis->solve_B(x, kind); pf_.ftran(x, cwork);
-    // =========================================================================
-
-    // Get PF for ftran (called after FTBasis::solve_B)
-    ProductFormUpdate& pf() noexcept { return pf_; }
-    const ProductFormUpdate& pf() const noexcept { return pf_; }
+    // Update count — number of active factorizer updates since the last refactor.
+    int update_count() const noexcept { return factor_ ? factor_->stats().eta_count : 0; }
 
     // =========================================================================
     // SimplexIterate — snapshot/restore for fast backtrack
@@ -314,6 +198,8 @@ class SimplexNLA {
     void setup_factor(const MatrixType& A, const std::vector<int>& basis,
                       const FTBasis::Options& opts) {
         factor_ = std::make_unique<FTBasis>(A, basis, opts);
+        ++stats_.factorizations_;
+        sync_update_stats_();
     }
 
     bool has_factor() const noexcept { return factor_ != nullptr; }
@@ -350,10 +236,15 @@ class SimplexNLA {
     // Basis update: FT/eta update after pivot
     template <class ColT> void update_basis(int j, int entering_col, ColT&& new_col) {
         factor().replace_column(j, entering_col, std::forward<ColT>(new_col));
+        sync_update_stats_();
     }
 
     // Full refactor
-    void invert() { factor().refactor(); }
+    void invert() {
+        factor().refactor();
+        ++stats_.factorizations_;
+        sync_update_stats_();
+    }
 
     // Backtrack to last good snapshot (returns true if successful)
     bool try_backtrack(std::vector<int>& engine_basis) {
@@ -377,6 +268,7 @@ class SimplexNLA {
 
     // Call after each pivot to update framework stats
     void update_framework_stats(double new_weight, double old_weight);
+    void record_framework_error(double log_error) noexcept;
 
     // Check if framework needs rebuilding
     bool needs_framework_rebuild() const noexcept;
@@ -423,9 +315,15 @@ class SimplexNLA {
     const NLAStats& stats() const noexcept { return stats_; }
 
   private:
+    void sync_update_stats_() noexcept {
+        if (!factor_)
+            return;
+        stats_.pf_updates_ = factor_->stats().eta_count;
+    }
+
     std::unique_ptr<FTBasis> factor_;
-    ProductFormUpdate pf_;
     SimplexIterate simplex_iterate_;
+    int num_rows_{0};
     NLAConfig config_;
     DevexFrameworkStats framework_stats_;
     NLAStats stats_;

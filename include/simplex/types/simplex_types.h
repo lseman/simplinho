@@ -152,7 +152,7 @@ struct RevisedSimplexOptions {
     int basis_max_eta_count = 128;
     double basis_column_residual_tol = 1e-8;
     bool basis_aggressive_residual_rebuild = true;
-    std::string basis_sparse_backend = "auto"; // "auto" | "pf" | "ft" | "eigen"
+    std::string basis_sparse_backend = "auto"; // "auto"/"ft" | "pf" | "eigen"
     bool basis_sparse_equilibration = true;
     double basis_sparse_rhs_density_threshold = 0.40;
 

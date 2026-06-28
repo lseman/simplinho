@@ -271,6 +271,18 @@ class RevisedSimplexPrimalEngine {
                         B_dense.col(i) = A.col(basis[i]);
                     std::vector<int> dense_basis(m);
                     std::iota(dense_basis.begin(), dense_basis.end(), 0);
+                    simplex::nla::NLAConfig nla_cfg;
+                    nla_cfg.framework_switch_threshold_ = self.opt_.framework_switch_threshold;
+                    nla_cfg.framework_switch_consecutive_ = self.opt_.framework_switch_consecutive;
+                    nla_cfg.allow_framework_switch_ = self.opt_.allow_framework_switch;
+                    if (self.opt_.price_strategy == "row_switch_col_switch")
+                        nla_cfg.price_strategy_ =
+                            simplex::nla::NLAConfig::PriceStrategy::RowSwitchColSwitch;
+                    else if (self.opt_.price_strategy == "row_switch")
+                        nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::RowSwitch;
+                    else
+                        nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::ColOnly;
+                    fresh->setup(A.rows(), 0.1, nla_cfg);
                     fresh->setup_factor(B_dense, dense_basis, self.make_basis_options_());
                     return fresh;
                 }
@@ -305,11 +317,18 @@ class RevisedSimplexPrimalEngine {
             return fresh;
         };
         auto read_basis = [&]() -> FTBasis& { return nla->factor(); };
-        auto write_basis = [&]() -> FTBasis& {
+        auto refactor_basis = [&]() -> FTBasis& {
             if (!nla.unique()) {
                 nla = rebuild_nla();
+            } else {
+                nla->invert();
             }
             return nla->factor();
+        };
+        auto update_basis = [&](int row, int entering_col, const auto& entering_vector) {
+            if (!nla.unique())
+                nla = rebuild_nla();
+            nla->update_basis(row, entering_col, entering_vector);
         };
         self.degen_.start_basis_history(basis);
         self.trace_line_("[primal] start basis=" + self.format_basis_(basis));
@@ -388,7 +407,7 @@ class RevisedSimplexPrimalEngine {
                     ++rebuild_attempts;
                     self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                      " refactor after solve_B failure");
-                    write_basis().refactor();
+                    refactor_basis();
                     xB_cache_valid = false;
                     if (self.opt_.pricing_rule == "adaptive") {
                         self.measure_pricing_build_(false, [&]() {
@@ -427,7 +446,7 @@ class RevisedSimplexPrimalEngine {
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after solve_BT failure");
-                write_basis().refactor();
+                refactor_basis();
                 xB_cache_valid = false;
                 y_hvec = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
                 nla->update_ema_reach(y_hvec.count, m);
@@ -521,7 +540,7 @@ class RevisedSimplexPrimalEngine {
                 dB = read_basis().solve_B(A.col(e), FTBasis::TranKind::ColAq);
                 nla->update_ema_reach(dB.count, m);
             } catch (...) {
-                write_basis().refactor();
+                refactor_basis();
                 xB_cache_valid = false;
                 dB = read_basis().solve_B(A.col(e), FTBasis::TranKind::ColAq);
                 nla->update_ema_reach(dB.count, m);
@@ -655,7 +674,7 @@ class RevisedSimplexPrimalEngine {
             if (nla->needs_framework_rebuild()) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " framework rebuild triggered");
-                write_basis().refactor();
+                refactor_basis();
                 nla->clear_framework_rebuild();
                 xB_cache_valid = false;
                 if (self.opt_.pricing_rule == "adaptive") {
@@ -682,11 +701,11 @@ class RevisedSimplexPrimalEngine {
             }
 
             try {
-                write_basis().replace_column(r, eAbs, A.col(e));
+                update_basis(r, eAbs, A.col(e));
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
-                write_basis().refactor();
+                refactor_basis();
                 xB_cache_valid = false;
                 if (self.opt_.pricing_rule == "adaptive") {
                     self.measure_pricing_build_(false, [&]() {
@@ -702,14 +721,10 @@ class RevisedSimplexPrimalEngine {
             }
 
             if (self.opt_.pricing_rule == "adaptive") {
-                // NLA: record PF eta vector after successful replace_column
-                nla->update(r, dB.value);
-                nla->stats().pf_updates_++;
-
                 // NLA Devex framework switch — pass weight error from pricer
                 if (self.adaptive_pricer_.needs_rebuild()) {
                     double w_err = self.adaptive_pricer_.average_log_weight_error();
-                    nla->update_framework_stats(w_err, w_err);
+                    nla->record_framework_error(w_err);
                 }
             }
             if (self.opt_.pricing_rule == "adaptive" && self.adaptive_pricer_.needs_rebuild()) {

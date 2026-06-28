@@ -731,6 +731,19 @@ class RevisedSimplexDualEngine {
             }
             return nla->factor();
         };
+        auto refactor_basis = [&]() -> FTBasis& {
+            if (!nla.unique()) {
+                nla = rebuild_nla();
+            } else {
+                nla->invert();
+            }
+            return nla->factor();
+        };
+        auto update_basis = [&](int row, int entering_col, const auto& entering_vector) {
+            if (!nla.unique())
+                nla = rebuild_nla();
+            nla->update_basis(row, entering_col, entering_vector);
+        };
         self.degen_.start_basis_history(basis);
 
         auto apply_views_to_nonbasics = [&](const Eigen::VectorXd& ydual) {
@@ -936,7 +949,7 @@ class RevisedSimplexDualEngine {
                         ++rebuild_attempts;
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after solve_B failure");
-                        write_basis().refactor();
+                        refactor_basis();
                         yB_cache_valid = false;
                         if (auto failed = rebuild_dual_pool(
                                 "dual pricing rebuild failed after solve_B", iters)) {
@@ -965,7 +978,7 @@ class RevisedSimplexDualEngine {
                     } catch (...) {
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after solve_BT failure");
-                        write_basis().refactor();
+                        refactor_basis();
                         if (auto failed = rebuild_dual_pool(
                                 "dual pricing rebuild failed after solve_BT", iters)) {
                             return *failed;
@@ -1062,7 +1075,7 @@ class RevisedSimplexDualEngine {
                                 chat(basis[i]) = c_work(basis[i]);
                             self.trace_line_("[dual] cost-shift Phase 1 applied, refactoring");
                             try {
-                                write_basis().refactor();
+                                refactor_basis();
                                 yB_cache_valid = false;
                             } catch (const std::exception&) {
                                 return {LPSolution::Status::NeedPhase1,
@@ -1128,7 +1141,7 @@ class RevisedSimplexDualEngine {
                         ++rebuild_attempts;
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after no eligible entering");
-                        write_basis().refactor();
+                        refactor_basis();
                         yB_cache_valid = false;
                         if (auto failed = rebuild_dual_pool(
                                 "dual pricing rebuild failed after no eligible entering", iters)) {
@@ -1235,7 +1248,7 @@ class RevisedSimplexDualEngine {
                         ++rebuild_attempts;
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after solve(B,a_e) failure");
-                        write_basis().refactor();
+                        refactor_basis();
                         yB_cache_valid = false;
                         if (auto failed = rebuild_dual_pool(
                                 "dual pricing rebuild failed after solve(B,a_e)", iters)) {
@@ -1350,7 +1363,7 @@ class RevisedSimplexDualEngine {
             if (nla->needs_framework_rebuild()) {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                  " framework rebuild triggered");
-                write_basis().refactor();
+                refactor_basis();
                 nla->clear_framework_rebuild();
                 yB_cache_valid = false;
                 if (auto failed = rebuild_dual_pool(
@@ -1362,7 +1375,7 @@ class RevisedSimplexDualEngine {
 
             bool backtracked_this_iter = false;
             try {
-                write_basis().replace_column(r_leave, eAbs, Ahat.col(eAbs));
+                update_basis(r_leave, eAbs, Ahat.col(eAbs));
             } catch (...) {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
@@ -1392,7 +1405,7 @@ class RevisedSimplexDualEngine {
                     }
                     backtracked_this_iter = true;
                 } else {
-                    write_basis().refactor();
+                    refactor_basis();
                     yB_cache_valid = false;
                     if (auto failed = rebuild_dual_pool(
                             "dual pricing rebuild failed after replace_column", iters)) {
@@ -1422,18 +1435,12 @@ class RevisedSimplexDualEngine {
                 }
             }
 
-            // NLA: record PF eta vector after successful replace_column
-            if (!backtracked_this_iter) {
-                nla->update(r_leave, s_enter.value);
-                nla->stats().pf_updates_++;
-            }
-
             dual_pricer.update_after_dual_pivot(r_leave, eAbs, oldAbs, s_enter, s_enter(r_leave),
                                                 Ahat, N, w, true);
             // NLA Devex framework switch — pass weight error from pricer
             if (dual_pricer.needs_rebuild() && nla->allow_framework_switch()) {
                 double w_err = dual_pricer.average_log_weight_error();
-                nla->update_framework_stats(w_err, w_err);
+                nla->record_framework_error(w_err);
             }
             if (dual_pricer.needs_rebuild()) {
                 if (auto failed = rebuild_dual_pool(
@@ -1528,16 +1535,12 @@ class RevisedSimplexDualEngine {
                 ydual_cached = false;
 
                 try {
-                    write_basis().replace_column(sub_r, sub_eAbs, Ahat.col(sub_eAbs));
+                    update_basis(sub_r, sub_eAbs, Ahat.col(sub_eAbs));
                 } catch (...) {
-                    write_basis().refactor();
+                    refactor_basis();
                     yB_cache_valid = false;
                     break; // stop PAMI sub-iters on numerical failure
                 }
-
-                // NLA: record PF eta vector for PAMI sub-pivot
-                nla->update(sub_r, sub_s.value);
-                nla->stats().pf_updates_++;
 
                 // Update yB cache with rank-1 formula
                 if (yB_cache_valid) {
