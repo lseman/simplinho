@@ -126,6 +126,9 @@ class RevisedSimplexPrimalEngine {
         int iters = 0;
         Eigen::VectorXd c_work = c;
         bool costs_perturbed = false;
+        Eigen::VectorXd l_work = l;
+        Eigen::VectorXd u_work = u;
+        bool bounds_perturbed = false;
 
         std::vector<int> basis;
         if (basis_opt) {
@@ -400,7 +403,7 @@ class RevisedSimplexPrimalEngine {
             for (int k = 0; k < (int)N.size(); ++k) {
                 const int j = N[k];
                 rN(k) = c_work(j) - aTy(j);
-                rN_select(k) = self.can_increase_from_lower_(j, l, u, self.opt_.tol) ? rN(k) : 0.0;
+                rN_select(k) = self.can_increase_from_lower_(j, l_work, u_work, self.opt_.tol) ? rN(k) : 0.0;
             }
 
             std::optional<int> e_rel;
@@ -413,7 +416,7 @@ class RevisedSimplexPrimalEngine {
                         break;
                     }
                 if (idx < 0) {
-                    Eigen::VectorXd x = self.assemble_primal_(n, basis, xB, l, u);
+                    Eigen::VectorXd x = self.assemble_primal_(n, basis, xB, l_work, u_work);
                     self.trace_line_("[primal] optimal iter=" + std::to_string(iters) +
                                      " basis=" + self.format_basis_(basis));
                     self.remember_warm_state_(basis, basis_factorization);
@@ -436,8 +439,8 @@ class RevisedSimplexPrimalEngine {
                         for (int j = 0; j < n; ++j) {
                             if (inB[j])
                                 continue;
-                            if (j < l.size() && std::isfinite(l(j))) {
-                                current_obj += c_work(j) * l(j);
+                            if (j < l_work.size() && std::isfinite(l_work(j))) {
+                                current_obj += c_work(j) * l_work(j);
                             }
                         }
                     }
@@ -459,7 +462,7 @@ class RevisedSimplexPrimalEngine {
                 }
 
                 if (!e_rel) {
-                    Eigen::VectorXd x = self.assemble_primal_(n, basis, xB, l, u);
+                    Eigen::VectorXd x = self.assemble_primal_(n, basis, xB, l_work, u_work);
                     self.trace_line_("[primal] optimal iter=" + std::to_string(iters) +
                                      " basis=" + self.format_basis_(basis));
                     self.remember_warm_state_(basis, basis_factorization);
@@ -490,8 +493,8 @@ class RevisedSimplexPrimalEngine {
 
             const int idxN = *e_rel;
             const double rc_e = rN(idxN);
-            const double l_e = (e >= 0 && e < l.size()) ? l(e) : 0.0;
-            const double u_e = (e >= 0 && e < u.size()) ? u(e) : presolve::inf();
+            const double l_e = (e >= 0 && e < l_work.size()) ? l_work(e) : 0.0;
+            const double u_e = (e >= 0 && e < u_work.size()) ? u_work(e) : presolve::inf();
             const double x_e = std::isfinite(l_e) ? l_e : 0.0;
             const BFRTStep bfrt = entering_bound_step(x_e, l_e, u_e, rc_e, self.opt_.tol);
 
@@ -559,10 +562,27 @@ class RevisedSimplexPrimalEngine {
                     degeneracy_helpers::perturbCostsAbsolute(c_work, self.rng_, abs_multiplier);
                     costs_perturbed = true;
                 }
+                // Bound perturbation (HiGHS-style): shift bounds that are
+                // violated by the current basic solution outward so the iterate
+                // stays feasible without returning to Phase 1.
+                if (self.opt_.primal_simplex_bound_perturbation && !bounds_perturbed) {
+                    bounds_perturbed = degeneracy_helpers::perturbBounds(
+                        xB, basis, l_work, u_work, self.rng_,
+                        self.opt_.tol,
+                        self.opt_.primal_simplex_bound_perturbation_multiplier);
+                    if (bounds_perturbed)
+                        xB_cache_valid = false; // bounds changed, xB may shift
+                }
             } else {
                 if (costs_perturbed) {
                     c_work = c;
                     costs_perturbed = false;
+                }
+                if (bounds_perturbed) {
+                    l_work = l;
+                    u_work = u;
+                    bounds_perturbed = false;
+                    xB_cache_valid = false;
                 }
                 (void)self.degen_.reset_perturbation();
             }
@@ -573,7 +593,7 @@ class RevisedSimplexPrimalEngine {
             }
 
             if (self.should_trace_iter_(iters)) {
-                const Eigen::VectorXd xcur = self.assemble_primal_(n, basis, xB, l, u);
+                const Eigen::VectorXd xcur = self.assemble_primal_(n, basis, xB, l_work, u_work);
                 std::ostringstream oss;
                 oss << "[primal] iter=" << iters << " obj=" << c.dot(xcur) << " enter=" << eAbs
                     << " leave_row=" << r << " leave_var=" << oldAbs << " step=" << step

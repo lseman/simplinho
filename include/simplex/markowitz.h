@@ -109,8 +109,8 @@ class MarkowitzLU {
         // Optional iterative refinement in factorized coordinates
         iterative_refine_(perm_buf1_, b, /*is_transpose=*/false);
 
-        // x = P_c * w
-        apply_perm_inplace_(perm_buf1_, Pc_, perm_buf2_);
+        // x = P_c * w. Pc_[j] is the original column represented by factor column j.
+        apply_inv_perm_inplace_(perm_buf1_, Pc_, perm_buf2_);
         return perm_buf2_;
     }
 
@@ -230,7 +230,7 @@ class MarkowitzLU {
         for (int it = 0; it < kMaxRefine_; ++it) {
             Eigen::VectorXd x_full;
             if (!is_transpose) {
-                apply_perm_inplace_(x, Pc_, perm_buf2_);
+                apply_inv_perm_inplace_(x, Pc_, perm_buf2_);
                 x_full = perm_buf2_;
                 residual_buf_.noalias() = rhs_orig - A_orig_ * x_full;
             } else {
@@ -246,13 +246,14 @@ class MarkowitzLU {
 
             // Solve correction in the original coordinate system but through
             // the current factorization coordinates.
-            // Need: L*U*corr = P_r * residual
             if (!is_transpose) {
-                apply_inv_perm_inplace_(residual_buf_, Pr_, corr_buf_);
+                // Need: L*U*corr = P_r^T * residual.
+                apply_perm_inplace_(residual_buf_, Pr_, corr_buf_);
                 triangular_solve_(L_, TriangularSolveMode::UnitLower, corr_buf_);
                 triangular_solve_(U_, TriangularSolveMode::Upper, corr_buf_);
             } else {
-                apply_inv_perm_inplace_(residual_buf_, Pc_, corr_buf_);
+                // Need: U^T*L^T*corr = P_c^T * residual.
+                apply_perm_inplace_(residual_buf_, Pc_, corr_buf_);
                 triangular_solve_(U_, TriangularSolveMode::TransposeUpper, corr_buf_);
                 triangular_solve_(L_, TriangularSolveMode::TransposeUnitLower, corr_buf_);
             }

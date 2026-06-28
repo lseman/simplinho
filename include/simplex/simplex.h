@@ -573,6 +573,19 @@ class RevisedSimplex {
                 std_sol = solve_reformulated(SimplexMode::Auto);
                 reformulated_retry_used = true;
             }
+            if (opt_.mode == SimplexMode::Dual && !use_dual_first &&
+                (std_sol.status == LPSolution::Status::NeedPhase1 ||
+                 std_sol.status == LPSolution::Status::Singular)) {
+                std_sol = solve_reformulated(SimplexMode::Auto);
+                reformulated_retry_used = true;
+            }
+            if (std_sol.status == LPSolution::Status::Singular &&
+                (basis_std.has_value() || basis_state_std.has_value())) {
+                basis_std.reset();
+                basis_state_std.reset();
+                std_sol = solve_reformulated(SimplexMode::Auto);
+                reformulated_retry_used = true;
+            }
 
             Eigen::VectorXd x =
                 Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
@@ -3541,6 +3554,23 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             std_sol = solve_reformulated(SimplexMode::Auto);
             reformulated_retry_used = true;
         }
+        if (opt_.mode == SimplexMode::Dual && !use_dual_first &&
+            (std_sol.status == LPSolution::Status::NeedPhase1 ||
+             std_sol.status == LPSolution::Status::Singular)) {
+            std_sol = solve_reformulated(SimplexMode::Auto);
+            reformulated_retry_used = true;
+        }
+        if (std_sol.status == LPSolution::Status::Singular &&
+            (basis_std.has_value() || basis_state_std.has_value())) {
+            basis_std.reset();
+            basis_state_std.reset();
+            sparse_bound_only_cache_.last_reformulated_basis_state.reset();
+            if (sparse_bound_only_cache_.reformulated_solver_cache) {
+                sparse_bound_only_cache_.reformulated_solver_cache->clear_basis_cache();
+            }
+            std_sol = solve_reformulated(SimplexMode::Auto);
+            reformulated_retry_used = true;
+        }
         // When skip_quality_check assumed dual feasibility without verification, an Infeasible
         // result is unreliable: if the cached basis was not truly dual-feasible, the dual simplex
         // can terminate with a spurious Farkas certificate. A wrong Infeasible propagates through
@@ -3575,29 +3605,49 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             }
         }
 
+        auto reconstruct_original_x = [&]() {
+            Eigen::VectorXd out =
+                Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
+            if (std_sol.x.size() != n_total || !std_sol.x.array().isFinite().all()) {
+                return out;
+            }
+            for (int j = 0; j < n; ++j) {
+                if (map[j].uses_single_var) {
+                    out(j) = map[j].y >= 0 ? map[j].shift + static_cast<double>(map[j].sign) *
+                                                                 std_sol.x(map[j].y)
+                                            : map[j].shift;
+                } else {
+                    out(j) = std_sol.x(map[j].y_pos) - std_sol.x(map[j].y_neg);
+                }
+            }
+            return out;
+        };
+
+        Eigen::VectorXd x = reconstruct_original_x();
+        if (std_sol.status == LPSolution::Status::Optimal &&
+            !primal_feasible_(A_in, b_in, x, l_in, u_in, opt_.tol)) {
+            sparse_bound_only_cache_.last_reformulated_basis_state.reset();
+            if (sparse_bound_only_cache_.reformulated_solver_cache) {
+                sparse_bound_only_cache_.reformulated_solver_cache->clear_basis_cache();
+            }
+            basis_std.reset();
+            basis_state_std.reset();
+            std_sol = solve_reformulated(SimplexMode::Primal);
+            reformulated_retry_used = true;
+            x = reconstruct_original_x();
+        }
+
         // Persist the reformulated optimal basis_state (incl. its FTBasis
         // warm_state) so the next node's solve_reformulated can dual-restart from
         // it. Only on a clean Optimal -- a bad/partial state would force singular
         // warm restarts downstream.
         if (std_sol.status == LPSolution::Status::Optimal &&
+            primal_feasible_(A_in, b_in, x, l_in, u_in, opt_.tol) &&
             !std_sol.basis_state.column_status.empty() &&
             static_cast<int>(std_sol.basis_state.column_status.size()) == n_total) {
             sparse_bound_only_cache_.last_reformulated_basis_state = std_sol.basis_state;
         } else {
             sparse_bound_only_cache_.last_reformulated_basis_state.reset();
-        }
-
-        Eigen::VectorXd x = Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
-        if (std_sol.x.size() == n_total && std_sol.x.array().isFinite().all()) {
-            for (int j = 0; j < n; ++j) {
-                if (map[j].uses_single_var) {
-                    x(j) = map[j].y >= 0 ? map[j].shift + static_cast<double>(map[j].sign) *
-                                                              std_sol.x(map[j].y)
-                                         : map[j].shift;
-                } else {
-                    x(j) = std_sol.x(map[j].y_pos) - std_sol.x(map[j].y_neg);
-                }
-            }
         }
 
         std::vector<int> basis_out;

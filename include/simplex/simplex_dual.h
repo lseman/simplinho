@@ -1383,6 +1383,119 @@ class RevisedSimplexDualEngine {
                                  " basis_after=" + self.format_basis_(basis));
             }
 
+            // ── PAMI sub-iterations ───────────────────────────────────────────
+            // After committing the first pivot of this outer iteration, attempt
+            // up to (dual_pami_rows - 1) additional pivots using the updated
+            // yB cache. Each sub-pivot is fully sequential (basis updates cannot
+            // be parallelized); the throughput gain comes from amortizing the
+            // per-outer-iteration overhead (pricing pool setup, cache priming)
+            // across multiple pivots.
+            for (int pami_k = 1;
+                 pami_k < self.opt_.dual_pami_rows && iters < self.opt_.max_iters;
+                 ++pami_k) {
+                // Need a fresh primal solution to identify most-infeasible row.
+                if (!yB_cache_valid || yB_cache_age >= yB_max_age)
+                    refresh_yB_cache();
+                const Eigen::VectorXd& yB_sub = yB_cache;
+
+                const auto sub_leaving =
+                    dual_pricer.choose_dual_leaving(read_basis(), yB_sub, self.opt_.tol);
+                if (sub_leaving.row < 0)
+                    break; // optimal — let the outer loop detect it cleanly
+
+                const int sub_r = sub_leaving.row;
+                HVector sub_w = sub_leaving.dual_row;
+
+                // PRICE: compute pN_sub / rN_sub for the sub-leaving row
+                Eigen::VectorXd sub_pN, sub_rN;
+                if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
+                    const double sub_density = vector_density(sub_w, self.opt_.tol);
+                    const bool use_col_price =
+                        self.opt_.dual_pricing == "col" ||
+                        (self.opt_.dual_pricing == "switch" && sub_density > 0.75);
+                    if (use_col_price)
+                        compute_pricing_products_by_column(Ahat, N, sub_w, ydual, chat,
+                                                           sub_pN, sub_rN);
+                    else
+                        compute_pricing_products(Ahat, *Ahat_row, N, sub_w, ydual, chat,
+                                                 sub_pN, sub_rN);
+                } else {
+                    compute_pricing_products(Ahat, N, sub_w, ydual, chat, sub_pN, sub_rN);
+                }
+
+                const DualBFRTDecision sub_bfrt =
+                    dual_bfrt_decide(self, sub_rN, sub_pN, N, view, l, u,
+                                     self.opt_.dual_allow_bound_flip
+                                         ? self.opt_.dual_flip_max_per_iter
+                                         : 0);
+                if (!sub_bfrt.pivot_rel || !sub_bfrt.flip_rels.empty())
+                    break; // bound flip or no pivot: fall back to outer loop
+
+                const int sub_e_rel = *sub_bfrt.pivot_rel;
+                const int sub_eAbs  = N[sub_e_rel];
+                const double sub_tau = sub_bfrt.tau;
+                if (!std::isfinite(sub_tau))
+                    break; // infeasibility detected — outer loop handles it
+
+                HVector sub_s;
+                try {
+                    sub_s = read_basis().solve_B(Ahat.col(sub_eAbs), FTBasis::TranKind::ColAq);
+                } catch (...) {
+                    break; // numerical issue; let outer loop deal with it
+                }
+
+                ++iters;
+                const int sub_oldAbs = basis[sub_r];
+
+                // Apply the sub-pivot dual update
+                {
+                    HVector sub_z = read_basis().solve_BT_unit(sub_r, FTBasis::TranKind::RowEp);
+                    const double sub_pivot = sub_s(sub_r);
+                    const double sub_alpha = sub_rN(sub_e_rel) / sub_pivot;
+                    ydual.noalias() += sub_alpha * sub_z.value;
+                    for (int k = 0; k < static_cast<int>(N.size()); ++k) {
+                        if (k == sub_e_rel) continue;
+                        sub_rN(k) -= sub_alpha * column_dot(Ahat, N[k], sub_z);
+                    }
+                }
+
+                basis[sub_r] = sub_eAbs;
+                N[sub_e_rel]  = sub_oldAbs;
+                ydual_cached  = false;
+
+                try {
+                    write_basis().replace_column(sub_r, sub_eAbs, Ahat.col(sub_eAbs));
+                } catch (...) {
+                    write_basis().refactor();
+                    yB_cache_valid = false;
+                    break; // stop PAMI sub-iters on numerical failure
+                }
+
+                // Update yB cache with rank-1 formula
+                if (yB_cache_valid) {
+                    const double yb_piv = sub_s(sub_r);
+                    if (std::abs(yb_piv) > 1e-14 && yB_cache_age < yB_max_age) {
+                        const double tau_r = yB_cache(sub_r) / yb_piv;
+                        yB_cache.noalias() -= tau_r * sub_s.value;
+                        yB_cache(sub_r) = tau_r;
+                        ++yB_cache_age;
+                    } else {
+                        yB_cache_valid = false;
+                    }
+                }
+
+                dual_pricer.update_after_dual_pivot(sub_r, sub_eAbs, sub_oldAbs, sub_s,
+                                                    sub_s(sub_r), Ahat, N, sub_w, true);
+                if (dual_pricer.needs_rebuild()) {
+                    if (auto failed = rebuild_dual_pool(
+                            "dual pricing rebuild failed after PAMI pivot", iters)) {
+                        return *failed;
+                    }
+                    dual_pricer.clear_rebuild_flag();
+                    break; // pricing state changed; restart from outer loop
+                }
+            }
+
             // HiGHS-style objective-bound bailout: dual phase 2 obj is monotone
             // non-decreasing for a min problem. Check periodically; if we have
             // already crossed the bound the node can be pruned without solving

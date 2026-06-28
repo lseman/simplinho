@@ -47,3 +47,4 @@ highs-source/
 ariadne.db
 examples/
 third_party/
+build-simplex-only/

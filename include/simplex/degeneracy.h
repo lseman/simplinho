@@ -45,6 +45,51 @@ inline void perturbCostsAbsolute(Eigen::VectorXd& c, std::mt19937& rng,
     }
 }
 
+// HiGHS-style bound perturbation for the primal simplex.
+// When a basic variable value exceeds its bound (primal infeasibility), shift
+// that bound outward by (infeasibility + small_feasibility_slack) so the
+// iterate becomes feasible without a basis change. This avoids degenerate
+// pivots caused by accumulated numerical errors near tight bounds.
+//
+// l_work / u_work are the working (perturbed) bounds — original bounds must
+// be saved separately so they can be restored after perturbation is removed.
+// random_value is drawn from [0,1) and adds a non-uniform slack so different
+// variables get slightly different shifts (avoids re-creating degeneracy).
+// Returns true if any bound was shifted.
+inline bool perturbBounds(const Eigen::VectorXd& xB,
+                          const std::vector<int>& basis,
+                          Eigen::VectorXd& l_work,
+                          Eigen::VectorXd& u_work,
+                          std::mt19937& rng,
+                          double feasibility_tol = 1e-7,
+                          double perturbation_multiplier = 1.0) {
+    std::uniform_real_distribution<double> rand01(0.0, 1.0);
+    bool any_shifted = false;
+    const int m = static_cast<int>(basis.size());
+    for (int i = 0; i < m; ++i) {
+        const int col = basis[i];
+        if (col < 0 || col >= static_cast<int>(l_work.size())) continue;
+        const double val = xB(i);
+        const double lo = l_work(col);
+        const double hi = u_work(col);
+        // Shift lower bound down if value is below it
+        if (std::isfinite(lo) && val < lo - feasibility_tol) {
+            const double infeas = lo - val;
+            const double slack = (1.0 + rand01(rng)) * feasibility_tol * perturbation_multiplier;
+            l_work(col) = lo - (infeas + slack);
+            any_shifted = true;
+        }
+        // Shift upper bound up if value is above it
+        if (std::isfinite(hi) && val > hi + feasibility_tol) {
+            const double infeas = val - hi;
+            const double slack = (1.0 + rand01(rng)) * feasibility_tol * perturbation_multiplier;
+            u_work(col) = hi + (infeas + slack);
+            any_shifted = true;
+        }
+    }
+    return any_shifted;
+}
+
 }  // namespace degeneracy_helpers
 
 // ============================================================================

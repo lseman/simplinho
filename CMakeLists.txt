@@ -24,6 +24,8 @@ option(SIMPLEX_ENABLE_PERF_FLAGS "Enable perf-friendly compile and link flags" O
 option(SIMPLEX_ENABLE_CCACHE "Enable ccache/sccache for faster builds" ON)
 option(SIMPLEX_ENABLE_UNITY_BUILD "Enable Unity (jumbo) builds for faster compilation" ON)
 option(SIMPLEX_ENABLE_PCH "Enable precompiled headers" OFF)
+option(SIMPLEX_ENABLE_BNB "Build the branch-and-bound MIP solver" OFF)
+option(SIMPLEX_ENABLE_IPM "Build the interior-point solver" OFF)
 option(BNB_PROFILE_TIMERS "Enable per-phase BnB timing counters" OFF)
 option(SIMPLEX_BNB_DEBUG_LOCKS "Enable BnB lock tracing" OFF)
 option(SIMPLEX_BNB_DEBUG_TIMING "Enable BnB phase timing debug output" OFF)
@@ -149,7 +151,7 @@ if(NOT TARGET pybind11::module)
         FetchContent_Declare(
             pybind11
             GIT_REPOSITORY https://github.com/pybind/pybind11.git
-            GIT_TAG v2.12.0
+            GIT_TAG v3.0.4
         )
         FetchContent_MakeAvailable(pybind11)
     endif()
@@ -183,28 +185,32 @@ find_package(Threads REQUIRED)
 # Sources
 # ==============================================================================
 
-set(SIMPLINHO_BNB_SOURCES
-    src/bnb/async_heuristic_manager.cpp
-    src/bnb/branching.cpp
-    src/bnb/conflict_engine.cpp
-    src/bnb/core.cpp
-    src/bnb/cuts.cpp
-    src/bnb/diving.cpp
-    src/bnb/heuristic.cpp
-    src/bnb/mip_presolve.cpp
-)
-
-set(SIMPLINHO_IPM_SOURCES
-    src/ipm/IPSolver.cpp
-)
-
 set(SIMPLINHO_BINDING_SOURCES
-    bindings/bnb_bindings.cpp
-    bindings/ipm_bindings.cpp
     bindings/model_bindings.cpp
     bindings/module.cpp
     bindings/simplex_bindings.cpp
 )
+
+set(SIMPLINHO_EXTRA_SOURCES "")
+
+if(SIMPLEX_ENABLE_BNB)
+    list(APPEND SIMPLINHO_EXTRA_SOURCES
+        src/bnb/async_heuristic_manager.cpp
+        src/bnb/branching.cpp
+        src/bnb/conflict_engine.cpp
+        src/bnb/core.cpp
+        src/bnb/cuts.cpp
+        src/bnb/diving.cpp
+        src/bnb/heuristic.cpp
+        src/bnb/mip_presolve.cpp
+    )
+    list(APPEND SIMPLINHO_BINDING_SOURCES bindings/bnb_bindings.cpp)
+endif()
+
+if(SIMPLEX_ENABLE_IPM)
+    list(APPEND SIMPLINHO_EXTRA_SOURCES src/ipm/IPSolver.cpp)
+    list(APPEND SIMPLINHO_BINDING_SOURCES bindings/ipm_bindings.cpp)
+endif()
 
 # ==============================================================================
 # Core interface target
@@ -224,6 +230,8 @@ target_compile_definitions(simplex_core INTERFACE
     SIMPLEX_GIT_DESCRIBE="${SIMPLEX_GIT_DESCRIBE}"
     SIMPLEX_GIT_BRANCH="${SIMPLEX_GIT_BRANCH}"
     _GLIBCXX_USE_TBB_PAR_BACKEND=0
+    $<$<BOOL:${SIMPLEX_ENABLE_BNB}>:SIMPLEX_ENABLE_BNB>
+    $<$<BOOL:${SIMPLEX_ENABLE_IPM}>:SIMPLEX_ENABLE_IPM>
 )
 
 target_link_libraries(simplex_core INTERFACE
@@ -250,8 +258,7 @@ endif()
 
 pybind11_add_module(simplinho
     ${SIMPLINHO_BINDING_SOURCES}
-    ${SIMPLINHO_BNB_SOURCES}
-    ${SIMPLINHO_IPM_SOURCES}
+    ${SIMPLINHO_EXTRA_SOURCES}
 )
 
 target_compile_features(simplinho PRIVATE cxx_std_23)
@@ -272,4 +279,5 @@ endif()
 simplinho_apply_module_link_flags(simplinho)
 
 message(STATUS "simplinho build configured with ccache=${SIMPLEX_ENABLE_CCACHE}, "
-    "PCH=${SIMPLEX_ENABLE_PCH}, unity=${SIMPLEX_ENABLE_UNITY_BUILD}")
+    "PCH=${SIMPLEX_ENABLE_PCH}, unity=${SIMPLEX_ENABLE_UNITY_BUILD}, "
+    "BnB=${SIMPLEX_ENABLE_BNB}, IPM=${SIMPLEX_ENABLE_IPM}")
