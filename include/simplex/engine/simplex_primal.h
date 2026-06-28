@@ -1,6 +1,7 @@
 #pragma once
 
-#include "hvector.h"
+#include "simplex/core/hvector.h"
+#include "simplex/nla/simplex_nla.h"
 
 class RevisedSimplexPrimalEngine {
   public:
@@ -194,7 +195,7 @@ class RevisedSimplexPrimalEngine {
                     {{"reason", "full_basis_primal_infeasible"}}};
         }
 
-        std::shared_ptr<FTBasis> basis_factorization;
+        std::shared_ptr<simplex::nla::SimplexNLA> nla;
         // Verify warm factorization's B matrix matches current B matrix
         if (self.solve_input_warm_state_ && self.solve_input_warm_state_->basis_matrix_signature) {
             std::uint64_t sig = 0xcbf29ce484222325ULL;
@@ -223,9 +224,22 @@ class RevisedSimplexPrimalEngine {
             }
         }
         if (const auto warm_state = self.try_reuse_factorization_(basis)) {
-            basis_factorization = warm_state->basis_factorization;
+            nla = warm_state->nla;
         } else {
+            nla = std::make_shared<simplex::nla::SimplexNLA>();
             try {
+                simplex::nla::NLAConfig nla_cfg;
+                nla_cfg.framework_switch_threshold_ = self.opt_.framework_switch_threshold;
+                nla_cfg.framework_switch_consecutive_ = self.opt_.framework_switch_consecutive;
+                nla_cfg.allow_framework_switch_ = self.opt_.allow_framework_switch;
+                if (self.opt_.price_strategy == "row_switch_col_switch")
+                    nla_cfg.price_strategy_ =
+                        simplex::nla::NLAConfig::PriceStrategy::RowSwitchColSwitch;
+                else if (self.opt_.price_strategy == "row_switch")
+                    nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::RowSwitch;
+                else
+                    nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::ColOnly;
+                nla->setup(A.rows(), 0.1, nla_cfg);
                 if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
                     if (m <= 16) {
                         Eigen::MatrixXd B_dense(m, m);
@@ -233,15 +247,12 @@ class RevisedSimplexPrimalEngine {
                             B_dense.col(i) = A.col(basis[i]);
                         std::vector<int> dense_basis(m);
                         std::iota(dense_basis.begin(), dense_basis.end(), 0);
-                        basis_factorization = std::make_shared<FTBasis>(B_dense, dense_basis,
-                                                                        self.make_basis_options_());
+                        nla->setup_factor(B_dense, dense_basis, self.make_basis_options_());
                     } else {
-                        basis_factorization =
-                            std::make_shared<FTBasis>(A, basis, self.make_basis_options_());
+                        nla->setup_factor(A, basis, self.make_basis_options_());
                     }
                 } else {
-                    basis_factorization =
-                        std::make_shared<FTBasis>(A, basis, self.make_basis_options_());
+                    nla->setup_factor(A, basis, self.make_basis_options_());
                 }
             } catch (const std::exception& e) {
                 return {LPSolution::Status::Singular,
@@ -251,7 +262,8 @@ class RevisedSimplexPrimalEngine {
                         {{"where", "initial basis factorization failed"}, {"what", e.what()}}};
             }
         }
-        auto rebuild_basis_factorization = [&]() -> std::shared_ptr<FTBasis> {
+        auto rebuild_nla = [&]() -> std::shared_ptr<simplex::nla::SimplexNLA> {
+            auto fresh = std::make_shared<simplex::nla::SimplexNLA>();
             if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
                 if (m <= 16) {
                     Eigen::MatrixXd B_dense(m, m);
@@ -259,19 +271,45 @@ class RevisedSimplexPrimalEngine {
                         B_dense.col(i) = A.col(basis[i]);
                     std::vector<int> dense_basis(m);
                     std::iota(dense_basis.begin(), dense_basis.end(), 0);
-                    return std::make_shared<FTBasis>(B_dense, dense_basis,
-                                                     self.make_basis_options_());
+                    fresh->setup_factor(B_dense, dense_basis, self.make_basis_options_());
+                    return fresh;
                 }
-                return std::make_shared<FTBasis>(A, basis, self.make_basis_options_());
+                simplex::nla::NLAConfig nla_cfg;
+                nla_cfg.framework_switch_threshold_ = self.opt_.framework_switch_threshold;
+                nla_cfg.framework_switch_consecutive_ = self.opt_.framework_switch_consecutive;
+                nla_cfg.allow_framework_switch_ = self.opt_.allow_framework_switch;
+                if (self.opt_.price_strategy == "row_switch_col_switch")
+                    nla_cfg.price_strategy_ =
+                        simplex::nla::NLAConfig::PriceStrategy::RowSwitchColSwitch;
+                else if (self.opt_.price_strategy == "row_switch")
+                    nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::RowSwitch;
+                else
+                    nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::ColOnly;
+                fresh->setup(A.rows(), 0.1, nla_cfg);
+                fresh->setup_factor(A, basis, self.make_basis_options_());
+                return fresh;
             }
-            return std::make_shared<FTBasis>(A, basis, self.make_basis_options_());
+            simplex::nla::NLAConfig nla_cfg;
+            nla_cfg.framework_switch_threshold_ = self.opt_.framework_switch_threshold;
+            nla_cfg.framework_switch_consecutive_ = self.opt_.framework_switch_consecutive;
+            nla_cfg.allow_framework_switch_ = self.opt_.allow_framework_switch;
+            if (self.opt_.price_strategy == "row_switch_col_switch")
+                nla_cfg.price_strategy_ =
+                    simplex::nla::NLAConfig::PriceStrategy::RowSwitchColSwitch;
+            else if (self.opt_.price_strategy == "row_switch")
+                nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::RowSwitch;
+            else
+                nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::ColOnly;
+            fresh->setup(A.rows(), 0.1, nla_cfg);
+            fresh->setup_factor(A, basis, self.make_basis_options_());
+            return fresh;
         };
-        auto read_basis = [&]() -> FTBasis& { return *basis_factorization; };
+        auto read_basis = [&]() -> FTBasis& { return nla->factor(); };
         auto write_basis = [&]() -> FTBasis& {
-            if (!basis_factorization.unique()) {
-                basis_factorization = rebuild_basis_factorization();
+            if (!nla.unique()) {
+                nla = rebuild_nla();
             }
-            return *basis_factorization;
+            return nla->factor();
         };
         self.degen_.start_basis_history(basis);
         self.trace_line_("[primal] start basis=" + self.format_basis_(basis));
@@ -329,7 +367,9 @@ class RevisedSimplexPrimalEngine {
         int xB_cache_age = 0;
         const int xB_max_age = std::max(1, self.opt_.refactor_every);
         auto refresh_xB_cache = [&]() {
-            xB_cache = read_basis().solve_B(b, FTBasis::TranKind::ColAq).value;
+            HVector xB_hvec = read_basis().solve_B(b, FTBasis::TranKind::ColAq);
+            xB_cache = xB_hvec.value;
+            nla->update_ema_reach(xB_hvec.count, m);
             xB_cache_valid = true;
             xB_cache_age = 0;
         };
@@ -380,15 +420,17 @@ class RevisedSimplexPrimalEngine {
             for (int i = 0; i < m; ++i)
                 cB(i) = c_work(basis[i]);
 
-            Eigen::VectorXd y;
+            HVector y_hvec;
             try {
-                y = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
+                y_hvec = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
+                nla->update_ema_reach(y_hvec.count, m);
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after solve_BT failure");
                 write_basis().refactor();
                 xB_cache_valid = false;
-                y = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
+                y_hvec = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
+                nla->update_ema_reach(y_hvec.count, m);
                 if (self.opt_.pricing_rule == "adaptive") {
                     self.measure_pricing_build_(false, [&]() {
                         self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
@@ -396,14 +438,15 @@ class RevisedSimplexPrimalEngine {
                     self.adaptive_pricer_.clear_rebuild_flag();
                 }
             }
-
+            Eigen::VectorXd y = y_hvec;
             Eigen::VectorXd aTy = A.transpose() * y;
             Eigen::VectorXd rN(N.size());
             Eigen::VectorXd rN_select(N.size());
             for (int k = 0; k < (int)N.size(); ++k) {
                 const int j = N[k];
                 rN(k) = c_work(j) - aTy(j);
-                rN_select(k) = self.can_increase_from_lower_(j, l_work, u_work, self.opt_.tol) ? rN(k) : 0.0;
+                rN_select(k) =
+                    self.can_increase_from_lower_(j, l_work, u_work, self.opt_.tol) ? rN(k) : 0.0;
             }
 
             std::optional<int> e_rel;
@@ -419,7 +462,7 @@ class RevisedSimplexPrimalEngine {
                     Eigen::VectorXd x = self.assemble_primal_(n, basis, xB, l_work, u_work);
                     self.trace_line_("[primal] optimal iter=" + std::to_string(iters) +
                                      " basis=" + self.format_basis_(basis));
-                    self.remember_warm_state_(basis, basis_factorization);
+                    self.remember_warm_state_(basis, nla);
                     return {LPSolution::Status::Optimal, self.clip_small_(x), basis, iters,
                             dm_stats_to_map(self.degen_.get_stats())};
                 }
@@ -465,7 +508,7 @@ class RevisedSimplexPrimalEngine {
                     Eigen::VectorXd x = self.assemble_primal_(n, basis, xB, l_work, u_work);
                     self.trace_line_("[primal] optimal iter=" + std::to_string(iters) +
                                      " basis=" + self.format_basis_(basis));
-                    self.remember_warm_state_(basis, basis_factorization);
+                    self.remember_warm_state_(basis, nla);
                     return {LPSolution::Status::Optimal, self.clip_small_(x), basis, iters,
                             dm_stats_to_map(self.degen_.get_stats())};
                 }
@@ -476,10 +519,12 @@ class RevisedSimplexPrimalEngine {
             HVector dB;
             try {
                 dB = read_basis().solve_B(A.col(e), FTBasis::TranKind::ColAq);
+                nla->update_ema_reach(dB.count, m);
             } catch (...) {
                 write_basis().refactor();
                 xB_cache_valid = false;
                 dB = read_basis().solve_B(A.col(e), FTBasis::TranKind::ColAq);
+                nla->update_ema_reach(dB.count, m);
                 if (self.opt_.pricing_rule == "adaptive") {
                     self.measure_pricing_build_(false, [&]() {
                         self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
@@ -510,7 +555,7 @@ class RevisedSimplexPrimalEngine {
                 info["primal_ray_has_cert"] = "1";
                 info["primal_ray_dim"] = std::to_string(n);
                 info["primal_ray"] = serialize_vec(ray);
-                self.remember_warm_state_(basis, basis_factorization);
+                self.remember_warm_state_(basis, nla);
                 return {LPSolution::Status::Unbounded, x, basis, iters, std::move(info)};
             }
 
@@ -531,7 +576,7 @@ class RevisedSimplexPrimalEngine {
                 info["primal_ray_has_cert"] = "1";
                 info["primal_ray_dim"] = std::to_string(n);
                 info["primal_ray"] = serialize_vec(ray);
-                self.remember_warm_state_(basis, basis_factorization);
+                self.remember_warm_state_(basis, nla);
                 return {LPSolution::Status::Unbounded, x, basis, iters, std::move(info)};
             }
 
@@ -567,8 +612,7 @@ class RevisedSimplexPrimalEngine {
                 // stays feasible without returning to Phase 1.
                 if (self.opt_.primal_simplex_bound_perturbation && !bounds_perturbed) {
                     bounds_perturbed = degeneracy_helpers::perturbBounds(
-                        xB, basis, l_work, u_work, self.rng_,
-                        self.opt_.tol,
+                        xB, basis, l_work, u_work, self.rng_, self.opt_.tol,
                         self.opt_.primal_simplex_bound_perturbation_multiplier);
                     if (bounds_perturbed)
                         xB_cache_valid = false; // bounds changed, xB may shift
@@ -607,6 +651,22 @@ class RevisedSimplexPrimalEngine {
             basis[r] = eAbs;
             N[idxN] = oldAbs;
 
+            // NLA framework switch check — rebuild if Devex weight errors accumulate
+            if (nla->needs_framework_rebuild()) {
+                self.trace_line_("[primal] iter=" + std::to_string(iters) +
+                                 " framework rebuild triggered");
+                write_basis().refactor();
+                nla->clear_framework_rebuild();
+                xB_cache_valid = false;
+                if (self.opt_.pricing_rule == "adaptive") {
+                    self.measure_pricing_build_(false, [&]() {
+                        self.adaptive_pricer_.build_primal_pools(read_basis(), A, N);
+                    });
+                    self.adaptive_pricer_.clear_rebuild_flag();
+                }
+                continue;
+            }
+
             // ── Incremental xB update (rank-1) ─────────────────────────────
             // xB_new = xB_old − step·dB;  xB_new[r] = step (override, non-flip only).
             // For flip pivots dB was negated, so xB[r] is already correct after the
@@ -641,6 +701,17 @@ class RevisedSimplexPrimalEngine {
                                  " basis_after=" + self.format_basis_(basis));
             }
 
+            if (self.opt_.pricing_rule == "adaptive") {
+                // NLA: record PF eta vector after successful replace_column
+                nla->update(r, dB.value);
+                nla->stats().pf_updates_++;
+
+                // NLA Devex framework switch — pass weight error from pricer
+                if (self.adaptive_pricer_.needs_rebuild()) {
+                    double w_err = self.adaptive_pricer_.average_log_weight_error();
+                    nla->update_framework_stats(w_err, w_err);
+                }
+            }
             if (self.opt_.pricing_rule == "adaptive" && self.adaptive_pricer_.needs_rebuild()) {
                 self.measure_pricing_build_(
                     false, [&]() { self.adaptive_pricer_.build_primal_pools(read_basis(), A, N); });
@@ -651,7 +722,7 @@ class RevisedSimplexPrimalEngine {
         }
 
         self.trace_line_("[primal] iterlimit basis=" + self.format_basis_(basis));
-        self.remember_warm_state_(basis, basis_factorization);
+        self.remember_warm_state_(basis, nla);
         return {LPSolution::Status::IterLimit, Eigen::VectorXd::Zero(n), basis, iters,
                 dm_stats_to_map(self.degen_.get_stats())};
     }

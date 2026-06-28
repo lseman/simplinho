@@ -34,7 +34,7 @@
 #include "bindings.h"
 #include "bindings_helpers.h"
 #include "simplex/bnb.h"
-#include "simplex/simplex.h"
+#include "simplex/engine/simplex.h"
 #include "solve_stats.h"
 #include "verbose_log.h"
 
@@ -1741,8 +1741,8 @@ class Model {
                                             &it->second.slack_basis_guess};
                 }
                 ModelLPData lp_data = build_node_lp_data_(base_data, cuts);
-                auto inserted = node_lp_cache.emplace(
-                    cache_key, NodeLPCacheEntry(std::move(lp_data), cold_options_, warm_options_));
+                auto inserted = node_lp_cache.try_emplace(
+                    cache_key, std::move(lp_data), cold_options_, warm_options_);
                 auto& entry = inserted.first->second;
                 entry.slack_basis_guess = build_slack_basis_guess(entry.lp_data);
                 return NodeLPSolverView{&entry.lp_data,

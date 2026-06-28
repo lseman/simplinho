@@ -38,12 +38,13 @@
 #include <utility>
 #include <vector>
 
-#include "degeneracy.h"    // DegeneracyManager + perturbation helpers
-#include "presolver.h"     // presolve::LP, Presolver
-#include "pricer.h"        // pricing + degeneracy helpers
-#include "simplex_lu.h"    // FTBasis implementation (solve_B, solve_BT, replace_column, refactor)
-#include "simplex_types.h" // public result/status/options types
-#include "sparse_presolver.h" // sparse-native LP presolve
+#include "simplex/engine/degeneracy.h"    // DegeneracyManager + perturbation helpers
+#include "simplex/presolve/presolver.h"     // presolve::LP, Presolver
+#include "simplex/engine/pricer.h"        // pricing + degeneracy helpers
+#include "simplex/factorization/simplex_lu.h"    // FTBasis implementation (solve_B, solve_BT, replace_column, refactor)
+#include "simplex/types/simplex_types.h" // public result/status/options types
+#include "simplex/presolve/sparse_presolver.h" // sparse-native LP presolve
+#include "simplex/nla/simplex_nla.h"     // SimplexNLA — PF updates, iterate snapshots, framework switching
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -78,7 +79,7 @@ struct LPWarmStateData {
     int cols = -1;
     bool matrix_is_sparse = false;
     std::vector<int> basis_columns;
-    std::shared_ptr<FTBasis> basis_factorization;
+    std::shared_ptr<simplex::nla::SimplexNLA> nla;
     std::optional<LPDualPricingWarmState> dual_pricing_state;
 };
 
@@ -2135,7 +2136,7 @@ class RevisedSimplex {
 
     std::shared_ptr<LPWarmStateData>
     try_reuse_factorization_(const std::vector<int>& basis_columns) const {
-        if (!solve_input_warm_state_ || !solve_input_warm_state_->basis_factorization) {
+        if (!solve_input_warm_state_ || !solve_input_warm_state_->nla) {
             return nullptr;
         }
         if (solve_input_warm_state_->matrix_signature != current_matrix_signature_ ||
@@ -2144,19 +2145,19 @@ class RevisedSimplex {
             solve_input_warm_state_->matrix_is_sparse != current_matrix_is_sparse_) {
             return nullptr;
         }
-        if (solve_input_warm_state_->basis_factorization->basis() != basis_columns) {
+        if (solve_input_warm_state_->nla->factor().basis() != basis_columns) {
             return nullptr;
         }
         solve_stats_.warm_start_accepted = 1;
         solve_stats_.warm_factorization_reused = 1;
         solve_stats_.eta_stack_depth_entry =
-            solve_input_warm_state_->basis_factorization->stats().eta_count;
+            solve_input_warm_state_->nla->factor().stats().eta_count;
         return solve_input_warm_state_;
     }
 
     std::optional<std::vector<int>> warm_factorization_basis_seed_() const {
         if (opt_.mode != SimplexMode::Dual || !solve_input_warm_state_ ||
-            !solve_input_warm_state_->basis_factorization) {
+            !solve_input_warm_state_->nla) {
             return std::nullopt;
         }
         if (solve_input_warm_state_->matrix_signature != current_matrix_signature_ ||
@@ -2166,7 +2167,7 @@ class RevisedSimplex {
             return std::nullopt;
         }
         const std::vector<int>& factorized_basis =
-            solve_input_warm_state_->basis_factorization->basis();
+            solve_input_warm_state_->nla->factor().basis();
         if (static_cast<int>(factorized_basis.size()) != current_matrix_rows_) {
             return std::nullopt;
         }
@@ -2180,23 +2181,23 @@ class RevisedSimplex {
 
     void
     remember_warm_state_(const std::vector<int>& basis_columns,
-                         const std::shared_ptr<FTBasis>& basis_factorization,
+                         const std::shared_ptr<simplex::nla::SimplexNLA>& nla,
                          std::optional<LPDualPricingWarmState> dual_pricing_state = std::nullopt) {
-        if (!basis_factorization || basis_columns.empty()) {
+        if (!nla || basis_columns.empty()) {
             solve_output_warm_state_.reset();
             return;
         }
         auto warm_state = std::make_shared<LPWarmStateData>();
         warm_state->matrix_signature = current_matrix_signature_;
-        warm_state->basis_matrix_signature = basis_factorization->basis_matrix_signature();
+        warm_state->basis_matrix_signature = nla->factor().basis_matrix_signature();
         warm_state->rows = current_matrix_rows_;
         warm_state->cols = current_matrix_cols_;
         warm_state->matrix_is_sparse = current_matrix_is_sparse_;
         warm_state->basis_columns = basis_columns;
-        warm_state->basis_factorization = basis_factorization;
+        warm_state->nla = nla;
         warm_state->dual_pricing_state = std::move(dual_pricing_state);
         solve_output_warm_state_ = std::move(warm_state);
-        solve_stats_.ft_updates = basis_factorization->stats().eta_count;
+        solve_stats_.ft_updates = nla->factor().stats().eta_count;
     }
 
     template <typename Fn> void measure_pricing_build_(bool dual_pool, Fn&& builder) {
@@ -2722,7 +2723,7 @@ class RevisedSimplex {
         return has_cached_basis_state(static_cast<int>(A.rows()), static_cast<int>(A.cols()), sig,
                                       true) &&
                cached_basis_state_->warm_state &&
-               cached_basis_state_->warm_state->basis_factorization;
+               cached_basis_state_->warm_state->nla;
     }
 
   private:
@@ -2981,6 +2982,9 @@ class RevisedSimplex {
     RevisedSimplexOptions opt_;
     std::mt19937 rng_;
 
+    // NLA layer (PF updates, iterate snapshots, framework switching, price strategy)
+    simplex::nla::SimplexNLA nla_;
+
     // Degeneracy + pricing
     DegeneracyManager degen_;
     AdaptivePricer adaptive_pricer_{1};
@@ -3011,13 +3015,13 @@ class RevisedSimplex {
     mutable LPSolveStats solve_stats_;
 };
 
-#include "crash.h"
-#include "dual.h"
-#include "phase1.h"
-#include "postsolve.h"
-#include "primal.h"
-#include "simplex_reformulation.h"
-#include "sparse_utils.h"
+#include "simplex/factorization/crash.h"
+#include "simplex/types/dual.h"
+#include "simplex/engine/phase1.h"
+#include "simplex/engine/postsolve.h"
+#include "simplex/primal.h"
+#include "simplex/engine/simplex_reformulation.h"
+#include "simplex/core/sparse_utils.h"
 
 inline RevisedSimplex::PhaseResult
 RevisedSimplex::phase_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,

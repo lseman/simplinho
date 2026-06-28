@@ -1,6 +1,6 @@
 #pragma once
 
-#include "aux.h"
+#include "simplex/core/aux.h"
 
 #include <Eigen/Dense>
 

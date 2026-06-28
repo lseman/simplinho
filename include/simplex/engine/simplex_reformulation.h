@@ -5,8 +5,8 @@
 // simplex.h; this header is included after the class is complete (same pattern
 // as crash.h / phase1.h / postsolve.h).
 
-#include "presolver.h"
-#include "simplex.h"
+#include "simplex/presolve/presolver.h"
+#include "simplex/engine/simplex.h"
 
 inline void RevisedSimplex::build_sparse_bound_only_cache_(const SparseMatrix& A,
                                                            const Eigen::VectorXd& b,

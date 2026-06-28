@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../extern/pdqsort/pdqsort.h"
+#include "../../../extern/pdqsort/pdqsort.h"
 #include <Eigen/Dense>
 #include <Eigen/LU> // for FullPivLU
 #include <algorithm>

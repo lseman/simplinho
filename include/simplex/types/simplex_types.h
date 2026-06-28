@@ -175,6 +175,13 @@ struct RevisedSimplexOptions {
     int parallel_pricing_workers = 1;
     int parallel_pricing_min_cols = 2048;
 
+    // NLA framework switching — Devex weight error accumulation
+    double framework_switch_threshold = 1.3862943611198906; // log(4)
+    int framework_switch_consecutive = 3;
+    bool allow_framework_switch = true;
+    // Price strategy: "col" | "row_switch" | "row_switch_col_switch"
+    std::string price_strategy = "col";
+
     // Opt-in explicit dualization for sparse nonnegative equality-form LPs.
     // "off" keeps the current path; "on" always tries; "auto" uses the row/col ratio.
     std::string dualization = "off";

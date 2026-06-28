@@ -193,6 +193,9 @@ set(SIMPLINHO_BINDING_SOURCES
 
 set(SIMPLINHO_EXTRA_SOURCES "")
 
+# NLA layer — HiGHS HSimplexNla equivalent (ftran/btran chain, PF, SimplexIterate)
+list(APPEND SIMPLINHO_EXTRA_SOURCES src/nla/simplex_nla.cpp)
+
 if(SIMPLEX_ENABLE_BNB)
     list(APPEND SIMPLINHO_EXTRA_SOURCES
         src/bnb/async_heuristic_manager.cpp

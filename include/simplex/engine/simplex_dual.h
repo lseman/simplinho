@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../extern/pdqsort/pdqsort.h"
+#include "../../../extern/pdqsort/pdqsort.h"
 #include <algorithm>
 #include <future>
 #include <type_traits>
@@ -679,14 +679,26 @@ class RevisedSimplexDualEngine {
             }
         }
 
-        std::shared_ptr<FTBasis> basis_factorization;
+        std::shared_ptr<simplex::nla::SimplexNLA> nla;
         std::shared_ptr<LPWarmStateData> reused_warm_state = self.try_reuse_factorization_(basis);
         if (reused_warm_state) {
-            basis_factorization = reused_warm_state->basis_factorization;
+            nla = reused_warm_state->nla;
         } else {
+            nla = std::make_shared<simplex::nla::SimplexNLA>();
             try {
-                basis_factorization =
-                    std::make_shared<FTBasis>(Ahat, basis, self.make_basis_options_());
+                simplex::nla::NLAConfig nla_cfg;
+                nla_cfg.framework_switch_threshold_ = self.opt_.framework_switch_threshold;
+                nla_cfg.framework_switch_consecutive_ = self.opt_.framework_switch_consecutive;
+                nla_cfg.allow_framework_switch_ = self.opt_.allow_framework_switch;
+                if (self.opt_.price_strategy == "row_switch")
+                    nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::RowSwitch;
+                else if (self.opt_.price_strategy == "row_switch_col_switch")
+                    nla_cfg.price_strategy_ =
+                        simplex::nla::NLAConfig::PriceStrategy::RowSwitchColSwitch;
+                else
+                    nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::ColOnly;
+                nla->setup(Ahat.rows(), 0.1, nla_cfg);
+                nla->setup_factor(Ahat, basis, self.make_basis_options_());
             } catch (const std::exception& e) {
                 return {LPSolution::Status::Singular,
                         Eigen::VectorXd::Zero(n),
@@ -695,15 +707,29 @@ class RevisedSimplexDualEngine {
                         {{"where", "dual initial basis factorization failed"}, {"what", e.what()}}};
             }
         }
-        auto rebuild_basis_factorization = [&]() -> std::shared_ptr<FTBasis> {
-            return std::make_shared<FTBasis>(Ahat, basis, self.make_basis_options_());
+        auto rebuild_nla = [&]() -> std::shared_ptr<simplex::nla::SimplexNLA> {
+            auto fresh = std::make_shared<simplex::nla::SimplexNLA>();
+            simplex::nla::NLAConfig nla_cfg;
+            nla_cfg.framework_switch_threshold_ = self.opt_.framework_switch_threshold;
+            nla_cfg.framework_switch_consecutive_ = self.opt_.framework_switch_consecutive;
+            nla_cfg.allow_framework_switch_ = self.opt_.allow_framework_switch;
+            if (self.opt_.price_strategy == "row_switch_col_switch")
+                nla_cfg.price_strategy_ =
+                    simplex::nla::NLAConfig::PriceStrategy::RowSwitchColSwitch;
+            else if (self.opt_.price_strategy == "row_switch")
+                nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::RowSwitch;
+            else
+                nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::ColOnly;
+            fresh->setup(Ahat.rows(), 0.1, nla_cfg);
+            fresh->setup_factor(Ahat, basis, self.make_basis_options_());
+            return fresh;
         };
-        auto read_basis = [&]() -> FTBasis& { return *basis_factorization; };
+        auto read_basis = [&]() -> FTBasis& { return nla->factor(); };
         auto write_basis = [&]() -> FTBasis& {
-            if (!basis_factorization.unique()) {
-                basis_factorization = rebuild_basis_factorization();
+            if (!nla.unique()) {
+                nla = rebuild_nla();
             }
-            return *basis_factorization;
+            return nla->factor();
         };
         self.degen_.start_basis_history(basis);
 
@@ -802,8 +828,6 @@ class RevisedSimplexDualEngine {
                 case LPDualPricingWarmState::Rule::RowPricing:
                     imported.active_rule = DualAdaptivePricer::Rule::RowPricing;
                     imported.row.row_weights = reused_warm_state->dual_pricing_state->row_weights;
-                    imported.row.prefer_row_pricing =
-                        reused_warm_state->dual_pricing_state->prefer_row_pricing;
                     break;
                 case LPDualPricingWarmState::Rule::MostInfeasible:
                     imported.active_rule = DualAdaptivePricer::Rule::MostInfeasible;
@@ -877,7 +901,11 @@ class RevisedSimplexDualEngine {
         int yB_cache_age = 0;
         const int yB_max_age = std::max(1, self.opt_.refactor_every);
         auto refresh_yB_cache = [&]() {
-            yB_cache = read_basis().solve_B(rhs_eff, FTBasis::TranKind::ColAq).value;
+            {
+                HVector yB_hvec = read_basis().solve_B(rhs_eff, FTBasis::TranKind::ColAq);
+                yB_cache = yB_hvec.value;
+                nla->update_ema_reach(yB_hvec.count, m);
+            }
             yB_cache_valid = true;
             yB_cache_age = 0;
         };
@@ -927,8 +955,13 @@ class RevisedSimplexDualEngine {
                     cB(i) = chat(basis[i]);
                 if (!ydual_cached) {
                     try {
-                        ydual = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
-                        ydual_cached = true;
+                        {
+                            HVector ydual_hvec =
+                                read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
+                            ydual = ydual_hvec.value;
+                            nla->update_ema_reach(ydual_hvec.count, m);
+                            ydual_cached = true;
+                        }
                     } catch (...) {
                         self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                          " refactor after solve_BT failure");
@@ -937,8 +970,13 @@ class RevisedSimplexDualEngine {
                                 "dual pricing rebuild failed after solve_BT", iters)) {
                             return *failed;
                         }
-                        ydual = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
-                        ydual_cached = true;
+                        {
+                            HVector ydual_hvec =
+                                read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
+                            ydual = ydual_hvec.value;
+                            nla->update_ema_reach(ydual_hvec.count, m);
+                            ydual_cached = true;
+                        }
                     }
                 }
 
@@ -987,15 +1025,13 @@ class RevisedSimplexDualEngine {
                                 pricing_state.active_rule =
                                     LPDualPricingWarmState::Rule::RowPricing;
                                 pricing_state.row_weights = dual_state.row.row_weights;
-                                pricing_state.prefer_row_pricing =
-                                    dual_state.row.prefer_row_pricing;
                                 break;
                             case DualAdaptivePricer::Rule::MostInfeasible:
                                 pricing_state.active_rule =
                                     LPDualPricingWarmState::Rule::MostInfeasible;
                                 break;
                         }
-                        self.remember_warm_state_(basis, basis_factorization, pricing_state);
+                        self.remember_warm_state_(basis, nla, pricing_state);
                         return {LPSolution::Status::Optimal, std::move(x), basis, iters,
                                 std::move(info_map)};
                     }
@@ -1190,7 +1226,10 @@ class RevisedSimplexDualEngine {
                     }
                 }
                 try {
-                    s_enter = read_basis().solve_B(Ahat.col(eAbs), FTBasis::TranKind::ColAq);
+                    {
+                        s_enter = read_basis().solve_B(Ahat.col(eAbs), FTBasis::TranKind::ColAq);
+                        nla->update_ema_reach(s_enter.count, m);
+                    }
                 } catch (...) {
                     if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
                         ++rebuild_attempts;
@@ -1229,7 +1268,7 @@ class RevisedSimplexDualEngine {
                 info_map["farkas_y"] = serialize_vec(yF);
                 self.trace_line_("[dual] infeasible iter=" + std::to_string(iters) +
                                  " produced Farkas certificate");
-                self.remember_warm_state_(basis, basis_factorization);
+                self.remember_warm_state_(basis, nla);
                 return {LPSolution::Status::Infeasible, Eigen::VectorXd::Zero(n), basis, iters,
                         std::move(info_map)};
             }
@@ -1307,6 +1346,20 @@ class RevisedSimplexDualEngine {
             N[e_rel] = oldAbs;
             rN(e_rel) = chat(oldAbs) - column_dot(Ahat, oldAbs, ydual);
 
+            // NLA framework switch check — rebuild if Devex weight errors accumulate
+            if (nla->needs_framework_rebuild()) {
+                self.trace_line_("[dual] iter=" + std::to_string(iters) +
+                                 " framework rebuild triggered");
+                write_basis().refactor();
+                nla->clear_framework_rebuild();
+                yB_cache_valid = false;
+                if (auto failed = rebuild_dual_pool(
+                        "dual pricing rebuild failed after framework rebuild", iters)) {
+                    return *failed;
+                }
+                continue;
+            }
+
             bool backtracked_this_iter = false;
             try {
                 write_basis().replace_column(r_leave, eAbs, Ahat.col(eAbs));
@@ -1369,8 +1422,19 @@ class RevisedSimplexDualEngine {
                 }
             }
 
+            // NLA: record PF eta vector after successful replace_column
+            if (!backtracked_this_iter) {
+                nla->update(r_leave, s_enter.value);
+                nla->stats().pf_updates_++;
+            }
+
             dual_pricer.update_after_dual_pivot(r_leave, eAbs, oldAbs, s_enter, s_enter(r_leave),
                                                 Ahat, N, w, true);
+            // NLA Devex framework switch — pass weight error from pricer
+            if (dual_pricer.needs_rebuild() && nla->allow_framework_switch()) {
+                double w_err = dual_pricer.average_log_weight_error();
+                nla->update_framework_stats(w_err, w_err);
+            }
             if (dual_pricer.needs_rebuild()) {
                 if (auto failed = rebuild_dual_pool(
                         "dual pricing rebuild failed after pivot update", iters)) {
@@ -1390,8 +1454,7 @@ class RevisedSimplexDualEngine {
             // be parallelized); the throughput gain comes from amortizing the
             // per-outer-iteration overhead (pricing pool setup, cache priming)
             // across multiple pivots.
-            for (int pami_k = 1;
-                 pami_k < self.opt_.dual_pami_rows && iters < self.opt_.max_iters;
+            for (int pami_k = 1; pami_k < self.opt_.dual_pami_rows && iters < self.opt_.max_iters;
                  ++pami_k) {
                 // Need a fresh primal solution to identify most-infeasible row.
                 if (!yB_cache_valid || yB_cache_age >= yB_max_age)
@@ -1414,25 +1477,23 @@ class RevisedSimplexDualEngine {
                         self.opt_.dual_pricing == "col" ||
                         (self.opt_.dual_pricing == "switch" && sub_density > 0.75);
                     if (use_col_price)
-                        compute_pricing_products_by_column(Ahat, N, sub_w, ydual, chat,
-                                                           sub_pN, sub_rN);
+                        compute_pricing_products_by_column(Ahat, N, sub_w, ydual, chat, sub_pN,
+                                                           sub_rN);
                     else
-                        compute_pricing_products(Ahat, *Ahat_row, N, sub_w, ydual, chat,
-                                                 sub_pN, sub_rN);
+                        compute_pricing_products(Ahat, *Ahat_row, N, sub_w, ydual, chat, sub_pN,
+                                                 sub_rN);
                 } else {
                     compute_pricing_products(Ahat, N, sub_w, ydual, chat, sub_pN, sub_rN);
                 }
 
-                const DualBFRTDecision sub_bfrt =
-                    dual_bfrt_decide(self, sub_rN, sub_pN, N, view, l, u,
-                                     self.opt_.dual_allow_bound_flip
-                                         ? self.opt_.dual_flip_max_per_iter
-                                         : 0);
+                const DualBFRTDecision sub_bfrt = dual_bfrt_decide(
+                    self, sub_rN, sub_pN, N, view, l, u,
+                    self.opt_.dual_allow_bound_flip ? self.opt_.dual_flip_max_per_iter : 0);
                 if (!sub_bfrt.pivot_rel || !sub_bfrt.flip_rels.empty())
                     break; // bound flip or no pivot: fall back to outer loop
 
                 const int sub_e_rel = *sub_bfrt.pivot_rel;
-                const int sub_eAbs  = N[sub_e_rel];
+                const int sub_eAbs = N[sub_e_rel];
                 const double sub_tau = sub_bfrt.tau;
                 if (!std::isfinite(sub_tau))
                     break; // infeasibility detected — outer loop handles it
@@ -1440,6 +1501,7 @@ class RevisedSimplexDualEngine {
                 HVector sub_s;
                 try {
                     sub_s = read_basis().solve_B(Ahat.col(sub_eAbs), FTBasis::TranKind::ColAq);
+                    nla->update_ema_reach(sub_s.count, m);
                 } catch (...) {
                     break; // numerical issue; let outer loop deal with it
                 }
@@ -1450,18 +1512,20 @@ class RevisedSimplexDualEngine {
                 // Apply the sub-pivot dual update
                 {
                     HVector sub_z = read_basis().solve_BT_unit(sub_r, FTBasis::TranKind::RowEp);
+                    nla->update_ema_reach(sub_z.count, m);
                     const double sub_pivot = sub_s(sub_r);
                     const double sub_alpha = sub_rN(sub_e_rel) / sub_pivot;
                     ydual.noalias() += sub_alpha * sub_z.value;
                     for (int k = 0; k < static_cast<int>(N.size()); ++k) {
-                        if (k == sub_e_rel) continue;
+                        if (k == sub_e_rel)
+                            continue;
                         sub_rN(k) -= sub_alpha * column_dot(Ahat, N[k], sub_z);
                     }
                 }
 
                 basis[sub_r] = sub_eAbs;
-                N[sub_e_rel]  = sub_oldAbs;
-                ydual_cached  = false;
+                N[sub_e_rel] = sub_oldAbs;
+                ydual_cached = false;
 
                 try {
                     write_basis().replace_column(sub_r, sub_eAbs, Ahat.col(sub_eAbs));
@@ -1470,6 +1534,10 @@ class RevisedSimplexDualEngine {
                     yB_cache_valid = false;
                     break; // stop PAMI sub-iters on numerical failure
                 }
+
+                // NLA: record PF eta vector for PAMI sub-pivot
+                nla->update(sub_r, sub_s.value);
+                nla->stats().pf_updates_++;
 
                 // Update yB cache with rank-1 formula
                 if (yB_cache_valid) {
@@ -1515,7 +1583,7 @@ class RevisedSimplexDualEngine {
                         "[dual] objective-bound bailout iter=" + std::to_string(iters) +
                         " obj=" + std::to_string(obj_check) +
                         " bound=" + std::to_string(self.opt_.objective_bound_internal));
-                    self.remember_warm_state_(basis, basis_factorization);
+                    self.remember_warm_state_(basis, nla);
                     return {LPSolution::Status::ObjectiveBound, std::move(x_check), basis, iters,
                             std::move(info_map)};
                 }
@@ -1525,7 +1593,7 @@ class RevisedSimplexDualEngine {
         auto info_map = dm_stats_to_map(self.degen_.get_stats());
         attach_dual_pricing_info(info_map);
         self.trace_line_("[dual] iterlimit basis=" + self.format_basis_(basis));
-        self.remember_warm_state_(basis, basis_factorization);
+        self.remember_warm_state_(basis, nla);
         return {LPSolution::Status::IterLimit, Eigen::VectorXd::Zero(n), basis, iters,
                 std::move(info_map)};
     }

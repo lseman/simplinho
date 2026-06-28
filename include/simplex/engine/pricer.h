@@ -1,7 +1,7 @@
 #pragma once
 
-#include "degeneracy.h"
-#include "hvector.h"
+#include "simplex/core/hvector.h"
+#include "simplex/engine/degeneracy.h"
 
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
@@ -663,6 +663,12 @@ class DevexPricer {
                 const double old_w = w;
                 const double nw = w + add;
                 w = std::max(nw, threshold_ * w);
+                // NLA framework switch — track weight error
+                if (old_w > 0) {
+                    double nw_val = w;
+                    if (nw_val > 0 && nw_val != old_w)
+                        weight_error_sum_ += std::abs(std::log(nw_val / old_w));
+                }
                 // HiGHS-inspired: check for weight corruption
                 if (w < kMinWeightAcceptRatio * old_w && old_w > 0) {
                     // Weight dropped too far - mark for rebuild
@@ -678,6 +684,11 @@ class DevexPricer {
     }
 
     bool needs_rebuild() const { return need_rebuild_; }
+
+    // NLA hook — expose accumulated weight error for framework switching
+    double average_log_weight_error_sum() const {
+        return iter_count_ > 0 ? weight_error_sum_ / iter_count_ : 0.0;
+    }
     void clear_rebuild_flag() { need_rebuild_ = false; }
 
   private:
@@ -765,6 +776,9 @@ class DevexPricer {
     int no_improvement_count_{0};
     int partial_cursor_{0};
     bool need_rebuild_{false};
+    // NLA hook — weight error accumulation for framework switching
+    double weight_error_sum_{0.0};
+    int weight_error_count_{0};
 };
 
 // ============================================================================
@@ -1073,6 +1087,8 @@ class DualDevexPricer {
         row_weights_.assign(A.rows(), 1.0);
         iter_count_ = 0;
         no_improvement_count_ = 0;
+        weight_error_sum_ = 0.0;
+        weight_error_count_ = 0;
         need_rebuild_ = false;
     }
 
@@ -1122,6 +1138,12 @@ class DualDevexPricer {
             const double sigma = (i == leave_rel) ? inv_alpha : s(i) * inv_alpha;
             const double candidate = sigma * sigma * pivot_weight;
             row_weights_[i] = std::max({1.0, threshold_ * row_weights_[i], candidate});
+            // NLA framework switch — track weight error
+            if (old_weight > 0) {
+                double nw = row_weights_[i];
+                if (nw > 0 && nw != old_weight)
+                    weight_error_sum_ += std::abs(std::log(nw / old_weight));
+            }
             // HiGHS-inspired: check for weight corruption
             if (row_weights_[i] < kMinWeightAcceptRatio * old_weight && old_weight > 0) {
                 need_rebuild_ = true;
@@ -1138,7 +1160,11 @@ class DualDevexPricer {
                 seen[static_cast<std::size_t>(i)] = 1;
                 const double sigma = (i == leave_rel) ? inv_alpha : s(i) * inv_alpha;
                 const double candidate = sigma * sigma * pivot_weight;
+                const double old_weight = row_weights_[i];
                 row_weights_[i] = std::max(row_weights_[i], candidate);
+                // NLA framework switch — track weight error
+                if (old_weight > 0 && row_weights_[i] > 0 && row_weights_[i] != old_weight)
+                    weight_error_sum_ += std::abs(std::log(row_weights_[i] / old_weight));
             };
             visit(leave_rel);
             for (int k = 0; k < s.count; ++k)
@@ -1166,8 +1192,23 @@ class DualDevexPricer {
         }
         iter_count_ = 0;
         no_improvement_count_ = 0;
+        weight_error_sum_ = 0.0;
+        weight_error_count_ = 0;
         need_rebuild_ = false;
         return true;
+    }
+
+    // NLA hook — get row weight for framework switching tracking
+    double row_weight(int i) const {
+        return (i >= 0 && i < (int)row_weights_.size()) ? row_weights_[i] : 1.0;
+    }
+
+    // NLA hook — total weight error accumulated (for framework switch)
+    double weight_error_sum() const { return weight_error_sum_; }
+
+    // NLA hook — average log weight error for framework switching
+    double average_log_weight_error_sum() const {
+        return weight_error_count_ > 0 ? weight_error_sum_ / weight_error_count_ : 0.0;
     }
 
   private:
@@ -1177,6 +1218,9 @@ class DualDevexPricer {
     int iter_count_{0};
     int no_improvement_count_{0};
     bool need_rebuild_{false};
+    // NLA hook — weight error accumulation for framework switching
+    double weight_error_sum_{0.0};
+    int weight_error_count_{0};
 };
 
 // ============================================================================
@@ -1187,7 +1231,6 @@ class DualRowPricer {
   public:
     struct WarmStartState {
         std::vector<double> row_weights;
-        std::vector<char> prefer_row_pricing;
     };
 
     struct LeavingChoice {
@@ -1219,19 +1262,13 @@ class DualRowPricer {
                 continue;
 
             const double infeas = -yB(i);
-            const bool use_row_pricing =
-                (i < (int)prefer_row_pricing_.size()) && prefer_row_pricing_[i];
-            const double weight =
-                use_row_pricing && i < (int)row_weights_.size() ? row_weights_[i] : 1.0;
+            const double weight = i < (int)row_weights_.size() ? row_weights_[i] : 1.0;
             const double score = (infeas * infeas) / std::max(1.0, weight);
 
             if (score > best_score) {
                 best_score = score;
                 best.row = i;
                 best.weight = std::max(1.0, weight);
-                if (use_row_pricing) {
-                    best.dual_row = B.solve_BT_unit(i);
-                }
             }
         }
 
@@ -1249,14 +1286,10 @@ class DualRowPricer {
     void update_row_weights(const BasisLike& B_inv, const MatrixLike& A,
                             const std::vector<int>& N) {
         row_weights_.resize(A.rows());
-        prefer_row_pricing_.resize(A.rows(), false);
         for (int i = 0; i < A.rows(); ++i) {
-            // Compute row weight as ||B^{-T} e_i||^2
             const Eigen::VectorXd psi_i = B_inv.solve_BT_unit(i);
             row_weights_[i] =
                 std::max(1.0, pricing_detail::edge_weight_from_direction(psi_i, weight_strategy_));
-            prefer_row_pricing_[i] =
-                computeRowDensity(i, A, N) < static_cast<double>(density_threshold_);
         }
         iter_count_ = 0;
     }
@@ -1274,23 +1307,20 @@ class DualRowPricer {
 
     bool needs_rebuild() const { return need_rebuild_; }
     void clear_rebuild_flag() { need_rebuild_ = false; }
-    WarmStartState export_state() const {
-        return WarmStartState{row_weights_, prefer_row_pricing_};
-    }
+    WarmStartState export_state() const { return WarmStartState{row_weights_}; }
     bool import_state(const WarmStartState& state, int rows) {
-        if (rows < 0 || static_cast<int>(state.row_weights.size()) != rows ||
-            static_cast<int>(state.prefer_row_pricing.size()) != rows) {
+        if (rows < 0 || static_cast<int>(state.row_weights.size()) != rows)
             return false;
-        }
         row_weights_ = state.row_weights;
-        for (double& weight : row_weights_) {
+        for (double& weight : row_weights_)
             weight = std::max(1.0, weight);
-        }
-        prefer_row_pricing_ = state.prefer_row_pricing;
         iter_count_ = 0;
         need_rebuild_ = false;
         return true;
     }
+
+    // NLA hook — DualRowPricer doesn't track weight errors (uses density-based)
+    double average_log_weight_error_sum() const { return 0.0; }
 
   private:
     template <class MatrixLike>
@@ -1321,7 +1351,6 @@ class DualRowPricer {
     }
 
     std::vector<double> row_weights_;
-    std::vector<char> prefer_row_pricing_;
     int reset_freq_{200};
     int density_threshold_{10};
     int iter_count_{0};
@@ -1573,6 +1602,21 @@ class DualAdaptivePricer {
         return ok;
     }
 
+    // NLA hook — expose accumulated weight error for framework switching
+    double average_log_weight_error() const {
+        switch (active_rule_) {
+            case Rule::SteepestEdge:
+                return steepest_pricer_.average_log_weight_error_sum();
+            case Rule::Devex:
+                return devex_pricer_.average_log_weight_error_sum();
+            case Rule::RowPricing:
+                return row_pricer_.average_log_weight_error_sum();
+            case Rule::MostInfeasible:
+                return 0.0;
+        }
+        return 0.0;
+    }
+
   private:
     template <class MatrixLike>
     Rule select_rule_(const MatrixLike& A, const std::vector<int>& N, int basis_rows) const {
@@ -1732,6 +1776,18 @@ class AdaptivePricer {
     }
 
     void clear_rebuild_flag() { steepest_pricer_.clear_rebuild_flag(); }
+
+    // NLA hook — expose accumulated weight error for framework switching
+    double average_log_weight_error() const {
+        switch (current_strategy_) {
+            case STEEPEST_EDGE:
+                return steepest_pricer_.average_log_weight_error_sum();
+            case DEVEX:
+                return devex_pricer_.average_log_weight_error_sum();
+            default:
+                return 0.0;
+        }
+    }
 
     const char* get_current_strategy_name() const {
         switch (current_strategy_) {

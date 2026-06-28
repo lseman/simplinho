@@ -1,3 +1,4 @@
+
 #pragma once
 #include <Eigen/Dense>
 #include <algorithm>
@@ -13,7 +14,7 @@
 #include <variant>
 #include <vector>
 
-#include "presolve_types.h"
+#include "simplex/presolve/presolve_types.h"
 
 namespace presolve {
 

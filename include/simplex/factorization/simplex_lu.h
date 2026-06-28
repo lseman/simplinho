@@ -1,16 +1,16 @@
 #pragma once
 
-#include "../../extern/pdqsort/pdqsort.h"
+#include "../../../extern/pdqsort/pdqsort.h"
 #include <Eigen/Dense>
 #include <Eigen/SVD>
 #include <Eigen/Sparse>
 
 #include <ankerl/unordered_dense.h>
 
-#include "amd.h"
-#include "hvector.h"
-#include "markowitz.h"
-#include "sparse_lu.h"
+#include "simplex/core/hvector.h"
+#include "simplex/core/markowitz.h"
+#include "simplex/factorization/amd.h"
+#include "simplex/factorization/sparse_lu.h"
 
 #include <algorithm>
 #include <chrono>
@@ -203,11 +203,11 @@ class FTBasis {
             std::vector<char> used(static_cast<size_t>(A.cols()), 0);
             for (int j : basis_) {
                 if (j < 0 || j >= static_cast<int>(A.cols()))
-                    throw std::invalid_argument(
-                        "FTBasis: basis has out-of-range column index " + std::to_string(j));
+                    throw std::invalid_argument("FTBasis: basis has out-of-range column index " +
+                                                std::to_string(j));
                 if (used[static_cast<size_t>(j)])
-                    throw std::invalid_argument(
-                        "FTBasis: basis has duplicate column index " + std::to_string(j));
+                    throw std::invalid_argument("FTBasis: basis has duplicate column index " +
+                                                std::to_string(j));
                 used[static_cast<size_t>(j)] = 1;
             }
         }
@@ -230,11 +230,11 @@ class FTBasis {
             std::vector<char> used(static_cast<size_t>(A.cols()), 0);
             for (int j : basis_) {
                 if (j < 0 || j >= static_cast<int>(A.cols()))
-                    throw std::invalid_argument(
-                        "FTBasis: basis has out-of-range column index " + std::to_string(j));
+                    throw std::invalid_argument("FTBasis: basis has out-of-range column index " +
+                                                std::to_string(j));
                 if (used[static_cast<size_t>(j)])
-                    throw std::invalid_argument(
-                        "FTBasis: basis has duplicate column index " + std::to_string(j));
+                    throw std::invalid_argument("FTBasis: basis has duplicate column index " +
+                                                std::to_string(j));
                 used[static_cast<size_t>(j)] = 1;
             }
         }
@@ -1042,7 +1042,7 @@ class FTBasis {
         reset_update_state_();
         refresh_refactor_diagnostics_();
         report_refactor_telemetry_(t0);
-        put_backtracking_basis_();
+        save_backtracking_basis_();
     }
 
     void sparse_build_B_(SparseMat& B) const {
@@ -1077,7 +1077,7 @@ class FTBasis {
         reset_update_state_();
         refresh_refactor_diagnostics_();
         report_refactor_telemetry_(t0);
-        put_backtracking_basis_();
+        save_backtracking_basis_();
     }
 
     void report_refactor_telemetry_(const std::chrono::steady_clock::time_point& t0) noexcept {
@@ -1759,6 +1759,18 @@ class FTBasis {
         report_pivot_telemetry();
     }
 
+    // NLA hook — save current basis for backtracking (public API for SimplexNLA)
+  public:
+    void save_backtracking_basis_() {
+        Snapshot snap;
+        snap.basis = basis_;
+        if (A_is_sparse_)
+            snap.Bcols_sparse = Bcols_sparse_;
+        else
+            snap.Bcols_dense = Bcols_dense_;
+        backtracking_snapshot_ = std::move(snap);
+    }
+
   private:
     const DenseMat* A_dense_{nullptr};
     const SparseMat* A_sparse_{nullptr};
@@ -1830,16 +1842,6 @@ class FTBasis {
                     ++count;
         }
         density_tracker_.update(kind, count, m_);
-    }
-
-    void put_backtracking_basis_() {
-        Snapshot snap;
-        snap.basis = basis_;
-        if (A_is_sparse_)
-            snap.Bcols_sparse = Bcols_sparse_;
-        else
-            snap.Bcols_dense = Bcols_dense_;
-        backtracking_snapshot_ = std::move(snap);
     }
 };
 

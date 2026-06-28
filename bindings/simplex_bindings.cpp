@@ -13,7 +13,7 @@
 
 #include "bindings.h"
 #include "bindings_helpers.h"
-#include "simplex/simplex.h"
+#include "simplex/engine/simplex.h"
 #include "solve_stats.h"
 
 namespace py = pybind11;

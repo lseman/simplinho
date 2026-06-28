@@ -1,7 +1,7 @@
 // Focused trace: does RevisedSimplex reuse its FTBasis factorization across two
 // solves of the SAME matrix when only bounds change (the BnB dual-reoptimize case)?
 // Build: see command in chat. Run: ./trace_reuse
-#include "../include/simplex/simplex.h"
+#include "../include/simplex/engine/simplex.h"
 #include <Eigen/Sparse>
 #include <cstdio>
 

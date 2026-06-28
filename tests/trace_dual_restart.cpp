@@ -6,7 +6,7 @@
 //
 // Goal: reproduce the ~196-iter warm-restart thrash in a standalone so the dual
 // engine can be studied/fixed directly.
-#include "../include/simplex/simplex.h"
+#include "../include/simplex/engine/simplex.h"
 #include <Eigen/Sparse>
 #include <cstdio>
 #include <vector>

@@ -1,14 +1,14 @@
 #pragma once
 
+#include "../../../extern/pdqsort/pdqsort.h"
 #include <Eigen/Dense>
-#include "../../extern/pdqsort/pdqsort.h"
 #include <Eigen/SVD>
 #include <Eigen/Sparse>
 
 #include <ankerl/unordered_dense.h>
 
-#include "amd.h"
-#include "markowitz.h"
+#include "simplex/factorization/amd.h"
+#include "simplex/core/markowitz.h"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -184,9 +184,21 @@ class SparseForrestTomlinLU {
         ensure_U_cols_ready_();
         symbolic_analyze_();
         initialize_active_stats_();
+
+        // P1-2: Reset refactor cache at start of factorization
+        refactor_info_.clear();
+        refactor_info_.build_synthetic_tick = synthetic_tick_;
+
         try {
             factorize_sparse_();
+            // P2-2: After factorization, complete any remaining logical injections
+            //       for rows that were not yet processed (rank deficiency).
+            complete_rank_deficient_basis_();
             build_solve_metadata_();
+            // Mark refactor cache as valid after successful factorization
+            if (!refactor_info_.pivot_row.empty() && !use_fallback_sparse_lu_) {
+                refactor_info_.use = true;
+            }
         } catch (const std::runtime_error&) {
             activate_sparse_lu_fallback_(base_matrix_original_);
         }
@@ -196,6 +208,28 @@ class SparseForrestTomlinLU {
     bool supports_inplace_updates() const noexcept { return n_ > 0 && !use_fallback_sparse_lu_; }
 
     bool has_updates() const noexcept { return !updates_.empty(); }
+
+    // P2-2: Return true if the factorization had rank deficiency.
+    bool is_rank_deficient() const noexcept { return rank_deficiency_ < 0; }
+    int rank_deficiency() const noexcept { return -rank_deficiency_; }
+
+    // P0-2: Refactor cache (Highs-style pivot records for fast rebuild)
+    // ================================================================
+    struct RefactorInfo {
+        bool use{false};
+        double build_synthetic_tick{0.0};
+        std::vector<int> pivot_row;     // pivot row for each factor step
+        std::vector<int> pivot_var;     // pivot column variable index
+        std::vector<int8_t> pivot_type; // pivot type: 0=Markowitz, 1=Unit, 2=ColSingleton
+
+        void clear() {
+            use = false;
+            build_synthetic_tick = 0.0;
+            pivot_row.clear();
+            pivot_var.clear();
+            pivot_type.clear();
+        }
+    } refactor_info_;
 
     void clear_updates() noexcept {
         updates_.clear();
@@ -447,8 +481,7 @@ class SparseForrestTomlinLU {
         const bool watchdog_ok = ema_reach_ratio_ < kHyperSparseFallbackRatio_;
 
         const bool L_hyper = config_.enable_hyper_sparse_rhs && watchdog_ok &&
-                             rhs_density <= kHyperCancel_ &&
-                             expected_density <= kHyperFtranL_;
+                             rhs_density <= kHyperCancel_ && expected_density <= kHyperFtranL_;
         if (L_hyper) {
             try {
                 // Reset output scratch only at positions touched by the previous solve.
@@ -460,13 +493,11 @@ class SparseForrestTomlinLU {
 
                 // Per-stage U decision uses the post-L count (HiGHS pattern).
                 const double z_density =
-                    static_cast<double>(l_reach_seeds_scratch_.size()) /
-                    static_cast<double>(n_);
-                const bool U_hyper = z_density <= kHyperCancel_ &&
-                                     expected_density <= kHyperFtranU_;
+                    static_cast<double>(l_reach_seeds_scratch_.size()) / static_cast<double>(n_);
+                const bool U_hyper =
+                    z_density <= kHyperCancel_ && expected_density <= kHyperFtranU_;
                 if (U_hyper) {
-                    back_solve_U_sparse_inplace_(sparse_l_scratch_,
-                                                 &l_reach_seeds_scratch_,
+                    back_solve_U_sparse_inplace_(sparse_l_scratch_, &l_reach_seeds_scratch_,
                                                  sparse_u_scratch_);
                     hyper_solve_reach_valid_ = true;
                     last_solve_reach_original_.reserve(reach_scratch_.size());
@@ -562,8 +593,7 @@ class SparseForrestTomlinLU {
         const bool watchdog_ok = ema_reach_ratio_ < kHyperSparseFallbackRatio_;
 
         const bool UT_hyper = config_.enable_hyper_sparse_rhs && watchdog_ok &&
-                              rhs_density <= kHyperCancel_ &&
-                              expected_density <= kHyperBtranU_;
+                              rhs_density <= kHyperCancel_ && expected_density <= kHyperBtranU_;
         if (UT_hyper) {
             try {
                 clear_scratch_at_indices_(output_scratch_, last_solve_reach_original_);
@@ -573,13 +603,11 @@ class SparseForrestTomlinLU {
                 l_reach_seeds_scratch_ = std::move(reach_scratch_);
 
                 const double t_density =
-                    static_cast<double>(l_reach_seeds_scratch_.size()) /
-                    static_cast<double>(n_);
-                const bool LT_hyper = t_density <= kHyperCancel_ &&
-                                      expected_density <= kHyperBtranL_;
+                    static_cast<double>(l_reach_seeds_scratch_.size()) / static_cast<double>(n_);
+                const bool LT_hyper =
+                    t_density <= kHyperCancel_ && expected_density <= kHyperBtranL_;
                 if (LT_hyper) {
-                    back_solve_LT_sparse_inplace_(sparse_u_scratch_,
-                                                  &l_reach_seeds_scratch_,
+                    back_solve_LT_sparse_inplace_(sparse_u_scratch_, &l_reach_seeds_scratch_,
                                                   sparse_l_scratch_);
                     hyper_solve_reach_valid_ = true;
                     last_solve_reach_original_.reserve(reach_scratch_.size());
@@ -644,8 +672,7 @@ class SparseForrestTomlinLU {
     // back-solve when the post-L count exceeds the FtranU threshold or the
     // EWMA expects a dense result.
     Eigen::VectorXd solve_sparse_impl_(const std::vector<int>& seed_idx,
-                                       const std::vector<double>& seed_val,
-                                       bool enable_refinement,
+                                       const std::vector<double>& seed_val, bool enable_refinement,
                                        double expected_density) const {
         if (n_ == 0) [[unlikely]]
             return Eigen::VectorXd::Zero(0);
@@ -674,19 +701,16 @@ class SparseForrestTomlinLU {
 
         const double z_density =
             static_cast<double>(l_reach_seeds_scratch_.size()) / static_cast<double>(n_);
-        const bool U_hyper = z_density <= kHyperCancel_ &&
-                             expected_density <= kHyperFtranU_;
+        const bool U_hyper = z_density <= kHyperCancel_ && expected_density <= kHyperFtranU_;
         bool pattern_via_reach = false;
         if (U_hyper) {
-            back_solve_U_sparse_inplace_(sparse_l_scratch_,
-                                         &l_reach_seeds_scratch_,
+            back_solve_U_sparse_inplace_(sparse_l_scratch_, &l_reach_seeds_scratch_,
                                          sparse_u_scratch_);
             pattern_via_reach = true;
             last_solve_reach_original_.reserve(reach_scratch_.size());
             for (const int i : reach_scratch_) {
                 const int xi = Pc_[i];
-                output_scratch_(xi) =
-                    sparse_u_scratch_(i) * col_scale_[static_cast<size_t>(xi)];
+                output_scratch_(xi) = sparse_u_scratch_(i) * col_scale_[static_cast<size_t>(xi)];
                 last_solve_reach_original_.push_back(xi);
             }
             clear_scratch_at_indices_(sparse_u_scratch_, reach_scratch_);
@@ -724,8 +748,7 @@ class SparseForrestTomlinLU {
     }
 
     Eigen::VectorXd solveT_sparse_impl_(const std::vector<int>& seed_idx,
-                                        const std::vector<double>& seed_val,
-                                        bool enable_refinement,
+                                        const std::vector<double>& seed_val, bool enable_refinement,
                                         double expected_density) const {
         if (n_ == 0) [[unlikely]]
             return Eigen::VectorXd::Zero(0);
@@ -755,19 +778,16 @@ class SparseForrestTomlinLU {
 
         const double t_density =
             static_cast<double>(l_reach_seeds_scratch_.size()) / static_cast<double>(n_);
-        const bool LT_hyper = t_density <= kHyperCancel_ &&
-                              expected_density <= kHyperBtranL_;
+        const bool LT_hyper = t_density <= kHyperCancel_ && expected_density <= kHyperBtranL_;
         bool pattern_via_reach = false;
         if (LT_hyper) {
-            back_solve_LT_sparse_inplace_(sparse_u_scratch_,
-                                          &l_reach_seeds_scratch_,
+            back_solve_LT_sparse_inplace_(sparse_u_scratch_, &l_reach_seeds_scratch_,
                                           sparse_l_scratch_);
             pattern_via_reach = true;
             last_solve_reach_original_.reserve(reach_scratch_.size());
             for (const int i : reach_scratch_) {
                 const int yi = Pr_[i];
-                output_scratch_(yi) =
-                    sparse_l_scratch_(i) * row_scale_[static_cast<size_t>(yi)];
+                output_scratch_(yi) = sparse_l_scratch_(i) * row_scale_[static_cast<size_t>(yi)];
                 last_solve_reach_original_.push_back(yi);
             }
             clear_scratch_at_indices_(sparse_l_scratch_, reach_scratch_);
@@ -1727,6 +1747,31 @@ class SparseForrestTomlinLU {
         last_solve_reach_original_.clear();
         last_solve_reach_original_.reserve(n_);
 
+        // ================================================================
+        // P0-2: Build LR (row-wise L^T) storage — HiGHS-style explicit row CSR
+        //       for efficient BTRAN L hyper-sparse solves.
+        //       LR_ptr_[i] = start offset (like HiGHS lr_start)
+        //       LR_idx_[k]  = row index in L^T (= column index in L^T)
+        //       LR_val_[k]  = corresponding value
+        //       Row i of LR_ = Column i of L = L^T row i.
+        //       This matches HiGHS's lr_start/lr_index/lr_value layout.
+        // ================================================================
+        LR_ptr_.assign(n_ + 1, 0);
+        LR_idx_.clear();
+        LR_val_.clear();
+        for (int i = 0; i < n_; ++i) {
+            LR_ptr_[i] = static_cast<int>(LR_idx_.size());
+            // L_cols_[i] = column i of L: IndexedValue{row_idx, val}
+            // For lower triangular L, row_idx >= i. Skip diagonal.
+            for (const auto& entry : L_cols_[i]) {
+                if (entry.idx > i) {
+                    LR_idx_.push_back(entry.idx);
+                    LR_val_.push_back(entry.val);
+                }
+            }
+            LR_ptr_[i + 1] = static_cast<int>(LR_idx_.size());
+        }
+
         // Build pivot lookup tables for hyper-sparse solves.
         // In our representation, L and U are stored row-wise with diagonals separate.
         // For hyper-sparse solves, we need pivot_lookup: physical → logical position.
@@ -1884,6 +1929,30 @@ class SparseForrestTomlinLU {
         queue_column_candidate_invalidation_(b);
     }
 
+    // P2-2: Helper to inject identity column/row for rank deficiency.
+    // Clears all entries in row k and column k of U (except diagonal),
+    // sets diagonal to 1.0. Used when no acceptable pivot exists.
+    void clear_U_row_col_(int k) {
+        // Clear row k of U (all entries in U_rows_[row_map_[k]])
+        const int phys_row = row_map_[k];
+        U_rows_[phys_row].clear();
+        U_cols_dirty_ = true;
+
+        // Clear column k of U
+        // U_cols_[col_map_[k]] contains (row, val) entries for column k
+        const int phys_col = col_map_[k];
+        U_cols_[phys_col].clear();
+
+        // Set diagonal to 1
+        set_U_(k, k, 1.0);
+
+        // Also clear L column k (should be zero except diagonal)
+        // L_rows_[k] contains entries L[k][j] for j < k (lower triangular)
+        // For injected logical, L[k][j] = 0 for all j < k
+        L_rows_[k].clear();
+        L_cols_dirty_ = true;
+    }
+
     void swap_L_prefix_rows_(int a, int b, int prefix_cols) {
         if (a == b || prefix_cols <= 0)
             return;
@@ -1992,9 +2061,59 @@ class SparseForrestTomlinLU {
 
     void factorize_sparse_() {
         for (int k = 0; k < n_; ++k) {
-            auto [pi, pj] = choose_pivot_sparse_(k);
-            if (pi < 0 || pj < 0)
-                throw std::runtime_error("SparseForrestTomlinLU: no pivot found");
+            // P1-1: Check for column singletons before full Markowitz search.
+            // A column with exactly 1 active entry can be pivoted immediately,
+            // skipping the O(n) Markowitz search. This matches HiGHS's
+            // buildSimple() singleton extraction pass.
+            bool found_singleton = false;
+            int singleton_row = -1;
+            int singleton_col = -1;
+            ensure_U_cols_ready_();
+            for (int col = k; col < n_; ++col) {
+                if (col_degree_[col] == 1) {
+                    // Column singleton: find the row with the active entry
+                    for (const auto& [phys_row, val] : U_cols_[col]) {
+                        const int logical_row = row_inv_[phys_row];
+                        if (logical_row >= k && std::abs(val) > abs_floor_) {
+                            singleton_row = logical_row;
+                            singleton_col = col;
+                            found_singleton = true;
+                            break;
+                        }
+                    }
+                    if (found_singleton)
+                        break;
+                }
+            }
+            int pi, pj;
+            if (found_singleton) {
+                pi = singleton_row;
+                pj = singleton_col;
+                ++num_col_singleton_pivots_;
+            } else {
+                auto [candidate_pi, candidate_pj] = choose_pivot_sparse_(k);
+                pi = candidate_pi;
+                pj = candidate_pj;
+                ++num_markowitz_pivots_;
+            }
+
+            // P2-2: Rank deficiency handling. If no pivot found or singular,
+            // inject a logical (identity) column for this row. This matches
+            // HiGHS's buildHandleRankDeficiency: reorder basis so singular
+            // columns are replaced by logicals.
+            bool injected_logical = false;
+            if (pi < 0 || pj < 0) {
+                // No pivot found — inject identity column for row k
+                // Find an unused column (one not yet in basis)
+                injected_logical = true;
+                --rank_deficiency_;
+                // Record this row as having no pivot
+                row_with_no_pivot_.push_back(k);
+                col_with_no_pivot_.push_back(-1); // no column to pair
+                // Swap row k with itself, column k with itself
+                pi = k;
+                pj = k;
+            }
 
             swap_U_rows_(k, pi);
             swap_U_cols_(k, pj);
@@ -2009,9 +2128,37 @@ class SparseForrestTomlinLU {
             std::swap(Pr_inv_[old_Pr_k], Pr_inv_[old_Pr_pi]);
             std::swap(Pc_inv_[old_Pc_k], Pc_inv_[old_Pc_pj]);
 
+            // P1-2: Record pivot info for refactor cache (HiGHS-style)
+            // pivot_row[k] = logical row index after swap (= k)
+            // pivot_var[k] = original variable index = Pc_[k] (after swap)
+            // pivot_type[k] = 0 = Markowitz, 1 = Unit, 2 = ColSingleton, 3 = Logical(injected)
+            if (refactor_info_.pivot_row.size() < static_cast<size_t>(n_)) {
+                refactor_info_.pivot_row.push_back(k);
+                refactor_info_.pivot_var.push_back(Pc_[k]);
+                if (injected_logical)
+                    refactor_info_.pivot_type.push_back(3); // 3 = Logical injection
+                else if (found_singleton)
+                    refactor_info_.pivot_type.push_back(2);
+                else
+                    refactor_info_.pivot_type.push_back(0);
+            }
+
             const double piv = get_U_(k, k);
-            if (!std::isfinite(piv) || std::abs(piv) < abs_floor_)
-                throw std::runtime_error("SparseForrestTomlinLU: singular pivot");
+            // If pivot is singular after injection (or was already singular),
+            // inject identity: set diagonal to 1, clear off-diagonals
+            if (!std::isfinite(piv) || std::abs(piv) < abs_floor_) {
+                if (!injected_logical) {
+                    // Pivot is singular — inject identity for this row/column
+                    injected_logical = true;
+                    --rank_deficiency_;
+                    row_with_no_pivot_.push_back(k);
+                    col_with_no_pivot_.push_back(-1);
+                    // Clear row k and column k of U, set diagonal to 1
+                    clear_U_row_col_(k);
+                    set_U_(k, k, 1.0);
+                }
+                // If we already injected logical, U_(k,k) is already 1.0
+            }
 
             set_L_(k, k, 1.0);
             ensure_U_cols_ready_();
@@ -2035,6 +2182,47 @@ class SparseForrestTomlinLU {
             finalize_pivot_step_(k);
         }
         rebuild_perm_inverses_();
+    }
+
+    // P2-2: Complete rank-deficient basis by injecting identity columns for
+    //        any remaining rows without pivots. This matches HiGHS's
+    //        buildHandleRankDeficiency: inject logical columns for singular rows.
+    void complete_rank_deficient_basis_() {
+        if (rank_deficiency_ <= 0)
+            return;
+
+        // Find rows that still need pivots (those not in row_with_no_pivot_)
+        std::vector<bool> has_pivot(n_, false);
+        for (int k = 0; k < n_; ++k) {
+            if (!refactor_info_.pivot_row.empty() &&
+                static_cast<size_t>(k) < refactor_info_.pivot_row.size()) {
+                has_pivot[refactor_info_.pivot_row[k]] = true;
+            }
+        }
+
+        // For each row without a pivot, inject an identity column
+        int injected = 0;
+        for (int k = 0; k < n_ && rank_deficiency_ > 0; ++k) {
+            if (!has_pivot[k]) {
+                // Inject identity for row k
+                has_pivot[k] = true;
+                clear_U_row_col_(k);
+                set_L_(k, k, 1.0);
+
+                // Record in refactor info
+                if (refactor_info_.pivot_row.size() < static_cast<size_t>(n_)) {
+                    refactor_info_.pivot_row.push_back(k);
+                    refactor_info_.pivot_var.push_back(-1); // no variable
+                    refactor_info_.pivot_type.push_back(3); // 3 = Logical injection
+                }
+
+                row_with_no_pivot_.push_back(k);
+                col_with_no_pivot_.push_back(-1);
+                ++injected;
+                --rank_deficiency_;
+            }
+        }
+        (void)injected;
     }
 
     void activate_sparse_lu_fallback_(const SparseMat& A) {
@@ -2213,8 +2401,7 @@ class SparseForrestTomlinLU {
     // In-place variant: writes the solve result into x_out (must be sized n_ and zero
     // at every position the caller hasn't already populated). Caller is responsible
     // for clearing touched entries after consumption — see clear_scratch_at_reach_.
-    void forward_solve_L_sparse_inplace_(const Eigen::VectorXd& b,
-                                         const std::vector<int>* seeds,
+    void forward_solve_L_sparse_inplace_(const Eigen::VectorXd& b, const std::vector<int>* seeds,
                                          Eigen::VectorXd& x_out) const {
         if (n_ == 0) [[unlikely]]
             return;
@@ -2295,8 +2482,7 @@ class SparseForrestTomlinLU {
     // seeds: when provided (L-reach from prior solve), no O(n) scan needed (Item 1).
     //
     // In-place variant: writes into x_out (must be zero at uninitialized positions).
-    void back_solve_U_sparse_inplace_(const Eigen::VectorXd& b,
-                                      const std::vector<int>* seeds,
+    void back_solve_U_sparse_inplace_(const Eigen::VectorXd& b, const std::vector<int>* seeds,
                                       Eigen::VectorXd& x_out) const {
         if (n_ == 0) [[unlikely]]
             return;
@@ -2368,8 +2554,7 @@ class SparseForrestTomlinLU {
     // seeds (Item 1): UT-reach left in reach_scratch_ for chaining into LT solve.
     //
     // In-place variant: writes into x_out (must be zero at uninitialized positions).
-    void forward_solve_UT_sparse_inplace_(const Eigen::VectorXd& b,
-                                          const std::vector<int>* seeds,
+    void forward_solve_UT_sparse_inplace_(const Eigen::VectorXd& b, const std::vector<int>* seeds,
                                           Eigen::VectorXd& x_out) const {
         if (n_ == 0) [[unlikely]]
             return;
@@ -2445,8 +2630,7 @@ class SparseForrestTomlinLU {
     // seeds (Item 1): UT-reach from prior solve, no O(n) scan needed.
     //
     // In-place variant: writes into x_out (must be zero at uninitialized positions).
-    void back_solve_LT_sparse_inplace_(const Eigen::VectorXd& b,
-                                       const std::vector<int>* seeds,
+    void back_solve_LT_sparse_inplace_(const Eigen::VectorXd& b, const std::vector<int>* seeds,
                                        Eigen::VectorXd& x_out) const {
         if (n_ == 0) [[unlikely]]
             return;
@@ -2891,6 +3075,23 @@ class SparseForrestTomlinLU {
     double updates_max_w_inf_{0.0};
     double updates_cumulative_z_inf_{0.0};
     double updates_density_sum_{0.0};
+
+    // P0-2: LR (row-wise L^T) storage — HiGHS-style explicit CSR for hyper-sparse BTRAN L.
+    //       LR_ptr_ = start offset per row (like HiGHS lr_start)
+    //       LR_idx_  = column indices per row of L^T (= row indices of L)
+    //       LR_val_  = corresponding values
+    std::vector<int> LR_ptr_;
+    std::vector<int> LR_idx_;
+    std::vector<double> LR_val_;
+
+    // P2-2: Rank deficiency tracking (HiGHS-style). When no acceptable pivot is found,
+    // we inject identity/logical columns to complete the factorization. The rows/columns
+    // that had no valid pivot are recorded here.
+    int rank_deficiency_{0};
+    std::vector<int> row_with_no_pivot_; // row indices that had no pivot
+    std::vector<int> col_with_no_pivot_; // column indices that had no pivot
+    // Maps from pivot step k → whether it was a logical injection (true) or real pivot (false)
+    std::vector<bool> pivot_was_logical_;
 
     std::vector<int> Pr_, Pc_;
     std::vector<SparseRow> U_rows_, L_rows_, U_cols_, L_cols_;

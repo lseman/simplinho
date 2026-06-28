@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../simplex/simplex_types.h"
+#include "../simplex/types/simplex_types.h"
 #include <Eigen/Dense>
 
 #include <algorithm>
@@ -12,7 +12,7 @@
 #include <thread>
 #include <vector>
 
-#include "simplex/simplex_types.h"
+#include "simplex/types/simplex_types.h"
 
 namespace simplex::bnb {
 

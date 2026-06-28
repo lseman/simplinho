@@ -30,6 +30,13 @@ class HVector {
     std::vector<int> index;
     int count{-1}; // -1 means pattern unknown; treat as dense
 
+    // P0-1: HiGHS-style packed representation for FT update routines.
+    // packIndex/packValue store the nonzero entries in a compact format.
+    // packCount = number of packed entries.
+    std::vector<int> packIndex;
+    std::vector<double> packValue;
+    int packCount{0};
+
     HVector() = default;
 
     // Dense construction: pattern is not computed. Implicit so existing code
@@ -38,8 +45,7 @@ class HVector {
 
     // Sparse construction: caller provides the pattern.
     HVector(Eigen::VectorXd v, std::vector<int> idx)
-        : value(std::move(v)), index(std::move(idx)),
-          count(static_cast<int>(index.size())) {}
+        : value(std::move(v)), index(std::move(idx)), count(static_cast<int>(index.size())) {}
 
     // Pattern is known if count >= 0. Consumers that support sparse iteration
     // should test this and iterate index[0..count) instead of [0, m).
@@ -77,5 +83,76 @@ class HVector {
     void drop_pattern() noexcept {
         index.clear();
         count = -1;
+    }
+
+    // ================================================================
+    // HiGHS HVector operations
+    // ================================================================
+
+    // tight(): set values below kHighsTiny in magnitude to zero,
+    // then rebuild index list by scanning value[]. Removes
+    // spurious nonzeros that accumulate over successive solves.
+    // O(n) scan, but keeps index[0..count) consistent with value.
+    static constexpr double kHighsTiny = 1e-14;
+    void tight(double tol = kHighsTiny) {
+        // Zero out values below tolerance.
+        bool changed = false;
+        for (Eigen::Index i = 0; i < value.size(); ++i) {
+            if (std::abs(value(i)) < tol)
+                value(i) = 0.0;
+        }
+
+        // Rebuild index list if we had a pattern or are being called
+        // to enforce consistency.
+        if (count >= 0 || true) {
+            index.clear();
+            index.reserve(static_cast<size_t>(value.size()));
+            for (Eigen::Index i = 0; i < value.size(); ++i) {
+                if (std::abs(value(i)) > tol)
+                    index.push_back(static_cast<int>(i));
+            }
+            count = static_cast<int>(index.size());
+            changed = true;
+        }
+        (void)changed;
+    }
+
+    // pack(): copy nonzero entries from value[]/index[] into
+    // packValue/packIndex arrays. Used by FT update routines that
+    // need a compact representation of the vector for elimination.
+    void pack() {
+        packIndex.clear();
+        packValue.clear();
+        packIndex.reserve(static_cast<size_t>(count >= 0 ? count : value.size()));
+        packValue.reserve(packIndex.capacity());
+        if (count >= 0) {
+            for (int i = 0; i < count; ++i) {
+                const int idx = index[i];
+                if (idx >= 0 && idx < static_cast<int>(value.size()) &&
+                    std::abs(value(idx)) > kHighsTiny) {
+                    packIndex.push_back(idx);
+                    packValue.push_back(value(idx));
+                }
+            }
+        } else {
+            for (Eigen::Index i = 0; i < value.size(); ++i) {
+                if (std::abs(value(i)) > kHighsTiny)
+                    packIndex.push_back(static_cast<int>(i));
+            }
+        }
+        packCount = static_cast<int>(packIndex.size());
+    }
+
+    // reIndex(): rebuild index[] and count from scratch by scanning
+    // value[] for nonzeros above kHighsTiny. Use after manual
+    // modifications to value[] that bypass the normal sparse path.
+    void reIndex(double tol = kHighsTiny) {
+        index.clear();
+        index.reserve(static_cast<size_t>(value.size()));
+        for (Eigen::Index i = 0; i < value.size(); ++i) {
+            if (std::abs(value(i)) > tol)
+                index.push_back(static_cast<int>(i));
+        }
+        count = static_cast<int>(index.size());
     }
 };

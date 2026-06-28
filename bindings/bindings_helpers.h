@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "simplex/simplex.h"
+#include "simplex/engine/simplex.h"
 #include "solve_stats.h"
 
 namespace simplinho::bindings {
