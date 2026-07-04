@@ -225,6 +225,7 @@ target_compile_features(simplex_core INTERFACE cxx_std_23)
 
 target_include_directories(simplex_core INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/solvers"
     "${ankerl_unordered_dense_SOURCE_DIR}/include"
 )
 

@@ -15,8 +15,9 @@
 #include <stdexcept>
 #include <vector>
 
-// #include "CuSolver.h"
-#include "LDLT.h"
+#include "linear_system/amd.h"
+#include "linear_system/supernodes.h"
+#include "linear_system/ldlt.h"
 
 /**
  * @struct OptimizationData
