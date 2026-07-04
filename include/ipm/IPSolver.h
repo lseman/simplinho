@@ -18,6 +18,9 @@
 #include "linear_system/supernodes.h"
 #include "linear_system/ldlt.h"
 #include "linear_system/schur_frontal_ldlt.h"
+#include "ipm/ipm_linear_solver.h"
+#include "ipm/diagonal_regularization.h"
+#include "ipm/iterative_refinement.h"
 
 /**
  * @struct OptimizationData
