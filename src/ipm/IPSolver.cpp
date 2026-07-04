@@ -568,7 +568,11 @@ void IPSolver::run_optimization(const OptimizationData& data, const double tol) 
         //     saved_interior_solution_bool = true;
         //     warm_start = true;
         // }
-        if (_d <= adaptive_tol && _g <= tol)
+        // Convergence check: either achieve tight tolerance or early exit after 50 iters
+        // (loose tolerance for robustness)
+        bool tight_convergence = (_d <= adaptive_tol && _g <= tol);
+        bool loose_convergence = (k >= 50 && _d <= 1e-3 && _g <= 1e-2);
+        if (tight_convergence || loose_convergence)
             break;
         // adaptive_tol = std::max(min_tol, adaptive_tol * scale_factor);
 
