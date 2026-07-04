@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "bindings.h"
-#include "ipm/IPSolver.h"
+#include "../solvers/ipm/IPSolver.h"
 #include "simplex/engine/simplex.h"
 
 namespace py = pybind11;

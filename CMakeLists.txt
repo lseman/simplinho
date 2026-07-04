@@ -212,8 +212,8 @@ endif()
 
 if(SIMPLEX_ENABLE_IPM)
     list(APPEND SIMPLINHO_EXTRA_SOURCES
-        src/ipm/IPSolver.cpp
-        src/ipm/ipm_linear_solver.cpp
+        solvers/src/ipm/IPSolver.cpp
+        solvers/src/ipm/ipm_linear_solver.cpp
     )
     list(APPEND SIMPLINHO_BINDING_SOURCES bindings/ipm_bindings.cpp)
 endif()
