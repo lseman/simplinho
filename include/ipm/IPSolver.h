@@ -188,10 +188,12 @@ struct ScalingFactors {
 class IPSolver {
   public:
     Residuals res;
-    SparseSolver ls;
+    std::unique_ptr<ipm::IPMLinearSolver> ls;  // Hybrid sparse/frontal solver
     double tau, kappa, tol;
     int max_iter;
     double infty = std::numeric_limits<double>::infinity();
+    ipm::RegularizationControl reg_ctrl;  // Adaptive regularization
+    ipm::AdaptiveSolver adaptive_solver;  // Iterative refinement + fallback
 
     // Create history of the old values
     Eigen::VectorXd x_old;
@@ -264,8 +266,9 @@ class IPSolver {
      * The factorization is owned by `ls`, so an IPM iteration can reuse it for
      * the predictor and all correction directions.
      */
-    void solve_augmented_system(Eigen::VectorXd& dx, Eigen::VectorXd& dy, SparseSolver& ls,
-                                const Eigen::VectorXd& xi_p, const Eigen::VectorXd& xi_d);
+    void solve_augmented_system(Eigen::VectorXd& dx, Eigen::VectorXd& dy,
+                                ipm::IPMLinearSolver& ls, const Eigen::VectorXd& xi_p,
+                                const Eigen::VectorXd& xi_d);
 
     /**
      * Solve the augmented system and recover the finite-upper-bound direction.
@@ -275,9 +278,9 @@ class IPSolver {
      * from the resulting `delta_x`.
      */
     void solve_augsys(Eigen::VectorXd& delta_x, Eigen::VectorXd& delta_y, Eigen::VectorXd& delta_z,
-                      SparseSolver& ls, const Eigen::VectorXd& theta_vw, const Eigen::VectorXi& ubi,
-                      const Eigen::VectorXd& xi_p, const Eigen::VectorXd& xi_d,
-                      const Eigen::VectorXd& xi_u);
+                      ipm::IPMLinearSolver& ls, const Eigen::VectorXd& theta_vw,
+                      const Eigen::VectorXi& ubi, const Eigen::VectorXd& xi_p,
+                      const Eigen::VectorXd& xi_d, const Eigen::VectorXd& xi_u);
 
     /**
      * Compute one homogeneous self-dual Newton direction.
@@ -288,7 +291,7 @@ class IPSolver {
     void solve_newton_system(Eigen::VectorXd& Delta_x, Eigen::VectorXd& Delta_lambda,
                              Eigen::VectorXd& Delta_w, Eigen::VectorXd& Delta_s,
                              Eigen::VectorXd& Delta_v, double& Delta_tau, double& Delta_kappa,
-                             SparseSolver& ls, const Eigen::VectorXd& theta_vw,
+                             ipm::IPMLinearSolver& ls, const Eigen::VectorXd& theta_vw,
                              const Eigen::VectorXd& b, const Eigen::VectorXd& c,
                              const Eigen::VectorXi& ubi, const Eigen::VectorXd& ubv,
                              const Eigen::VectorXd& delta_x, const Eigen::VectorXd& delta_y,
@@ -329,7 +332,7 @@ class IPSolver {
      * values change across IPM iterations, so this writes directly to cached
      * diagonal slots before refactorization.
      */
-    int update_linear_solver(SparseSolver& ls, const Eigen::VectorXd& theta,
+    int update_linear_solver(ipm::IPMLinearSolver& ls, const Eigen::VectorXd& theta,
                              const Eigen::VectorXd& regP, const Eigen::VectorXd& regD);
 
     /**
@@ -338,7 +341,7 @@ class IPSolver {
      * The block form is `[-Theta-Rp, A^T; A, Rd]`. Its pattern is reused for all
      * later numeric factorizations in the IPM loop.
      */
-    void start_linear_solver(SparseSolver& ls, const Eigen::SparseMatrix<double>& A);
+    void start_linear_solver(ipm::IPMLinearSolver& ls, const Eigen::SparseMatrix<double>& A);
 
     ScalingFactors ruiz_scaling(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& b,
                                 Eigen::VectorXd& c, Eigen::VectorXd& lo, Eigen::VectorXd& hi);
