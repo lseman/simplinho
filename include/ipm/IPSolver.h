@@ -15,9 +15,9 @@
 #include <stdexcept>
 #include <vector>
 
-#include "linear_system/amd.h"
 #include "linear_system/supernodes.h"
 #include "linear_system/ldlt.h"
+#include "linear_system/schur_frontal_ldlt.h"
 
 /**
  * @struct OptimizationData
