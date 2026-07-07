@@ -25,7 +25,6 @@ option(SIMPLEX_ENABLE_CCACHE "Enable ccache/sccache for faster builds" ON)
 option(SIMPLEX_ENABLE_UNITY_BUILD "Enable Unity (jumbo) builds for faster compilation" ON)
 option(SIMPLEX_ENABLE_PCH "Enable precompiled headers" OFF)
 option(SIMPLEX_ENABLE_BNB "Build the branch-and-bound MIP solver" OFF)
-option(SIMPLEX_ENABLE_IPM "Build the interior-point solver" OFF)
 option(BNB_PROFILE_TIMERS "Enable per-phase BnB timing counters" OFF)
 option(SIMPLEX_BNB_DEBUG_LOCKS "Enable BnB lock tracing" OFF)
 option(SIMPLEX_BNB_DEBUG_TIMING "Enable BnB phase timing debug output" OFF)
@@ -127,16 +126,18 @@ if(NOT COMMAND CPMAddPackage)
     include(${cpm_SOURCE_DIR}/cmake/CPM.cmake)
 endif()
 
-cpmaddpackage(
-    NAME stdexec
-    GITHUB_REPOSITORY NVIDIA/stdexec
-    GIT_TAG main
-    OPTIONS
-    "STDEXEC_BUILD_TESTS OFF"
-    "STDEXEC_BUILD_EXAMPLES OFF"
-    "STDEXEC_BUILD_BENCHMARKS OFF"
-    "STDEXEC_BUILD_DOCS OFF"
-)
+if(SIMPLEX_ENABLE_BNB)
+    cpmaddpackage(
+        NAME stdexec
+        GITHUB_REPOSITORY NVIDIA/stdexec
+        GIT_TAG main
+        OPTIONS
+        "STDEXEC_BUILD_TESTS OFF"
+        "STDEXEC_BUILD_EXAMPLES OFF"
+        "STDEXEC_BUILD_BENCHMARKS OFF"
+        "STDEXEC_BUILD_DOCS OFF"
+    )
+endif()
 
 cpmaddpackage(
     NAME ankerl_unordered_dense
@@ -210,14 +211,6 @@ if(SIMPLEX_ENABLE_BNB)
     list(APPEND SIMPLINHO_BINDING_SOURCES bindings/bnb_bindings.cpp)
 endif()
 
-if(SIMPLEX_ENABLE_IPM)
-    list(APPEND SIMPLINHO_EXTRA_SOURCES
-        solvers/src/ipm/IPSolver.cpp
-        solvers/src/ipm/ipm_linear_solver.cpp
-    )
-    list(APPEND SIMPLINHO_BINDING_SOURCES bindings/ipm_bindings.cpp)
-endif()
-
 # ==============================================================================
 # Core interface target
 # ==============================================================================
@@ -238,13 +231,15 @@ target_compile_definitions(simplex_core INTERFACE
     SIMPLEX_GIT_BRANCH="${SIMPLEX_GIT_BRANCH}"
     _GLIBCXX_USE_TBB_PAR_BACKEND=0
     $<$<BOOL:${SIMPLEX_ENABLE_BNB}>:SIMPLEX_ENABLE_BNB>
-    $<$<BOOL:${SIMPLEX_ENABLE_IPM}>:SIMPLEX_ENABLE_IPM>
 )
 
 target_link_libraries(simplex_core INTERFACE
     Eigen3::Eigen
-    STDEXEC::stdexec
 )
+
+if(SIMPLEX_ENABLE_BNB)
+    target_link_libraries(simplex_core INTERFACE STDEXEC::stdexec)
+endif()
 
 simplinho_apply_perf_flags(simplex_core)
 
@@ -287,4 +282,4 @@ simplinho_apply_module_link_flags(simplinho)
 
 message(STATUS "simplinho build configured with ccache=${SIMPLEX_ENABLE_CCACHE}, "
     "PCH=${SIMPLEX_ENABLE_PCH}, unity=${SIMPLEX_ENABLE_UNITY_BUILD}, "
-    "BnB=${SIMPLEX_ENABLE_BNB}, IPM=${SIMPLEX_ENABLE_IPM}")
+    "BnB=${SIMPLEX_ENABLE_BNB}")

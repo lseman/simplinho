@@ -25,9 +25,6 @@ PYBIND11_MODULE(simplinho, m) {
 #ifdef SIMPLEX_ENABLE_BNB
     bind_bnb_bindings(m);
 #endif
-#ifdef SIMPLEX_ENABLE_IPM
-    bind_ipm_bindings(m);
-#endif
     bind_simplex_bindings(m);
     bind_model_bindings(m);
 

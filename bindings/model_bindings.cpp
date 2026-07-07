@@ -33,7 +33,14 @@
 
 #include "bindings.h"
 #include "bindings_helpers.h"
-#include "simplex/bnb.h"
+#ifdef SIMPLEX_ENABLE_BNB
+#    include "simplex/bnb.h"
+#else
+// LP-only builds still need the BNB value types (VariableType, SOSType,
+// Problem, Cut, ...) used by the modeling layer; bnb/types.h is header-only
+// and does not pull in the compiled solver.
+#    include "bnb/types.h"
+#endif
 #include "simplex/engine/simplex.h"
 #include "solve_stats.h"
 #include "verbose_log.h"
@@ -67,6 +74,7 @@ using DivingStrategy = simplex_bnb::DivingStrategy;
 using BranchAndBoundOptions = simplex_bnb::Options;
 using MIPTreeNode = simplex_bnb::TreeNode;
 using MIPTreeNodeStatus = simplex_bnb::TreeNodeStatus;
+#ifdef SIMPLEX_ENABLE_BNB
 using SimplifiedCutsResult = simplex_bnb::presolve::SimplifiedCutsResult;
 using NodeBoundPresolveResult = simplex_bnb::presolve::NodeBoundPresolveResult;
 using RootProblemPresolveResult = simplex_bnb::presolve::RootProblemPresolveResult;
@@ -74,6 +82,7 @@ using simplex_bnb::presolve::cut_set_signature;
 using simplex_bnb::presolve::presolve_mip_node_bounds;
 using simplex_bnb::presolve::presolve_mip_root_problem;
 using simplex_bnb::presolve::simplify_cuts_for_bounds;
+#endif
 
 const char* simplex_mode_name(SimplexMode mode) {
     switch (mode) {
@@ -87,6 +96,7 @@ const char* simplex_mode_name(SimplexMode mode) {
     return "unknown";
 }
 
+#ifdef SIMPLEX_ENABLE_BNB
 RevisedSimplexOptions tune_mip_lp_options(const RevisedSimplexOptions& base_options,
                                           const BranchAndBoundOptions& mip_options,
                                           bool warm_start_expected) {
@@ -152,6 +162,7 @@ RevisedSimplexOptions tune_mip_lp_options(const RevisedSimplexOptions& base_opti
 
     return tuned;
 }
+#endif // SIMPLEX_ENABLE_BNB
 
 struct LinearExprData {
     std::unordered_map<int, double> coeffs;
@@ -1447,6 +1458,7 @@ class Model {
         return make_model_solution_(std::move(raw), data);
     }
 
+#ifdef SIMPLEX_ENABLE_BNB
     MIPSolution
     solve_mip(const BranchAndBoundOptions& mip_options = BranchAndBoundOptions()) const {
         // Keep cold/root LP solves on the model's baseline profile. The
@@ -1491,10 +1503,9 @@ class Model {
             print_verbose_solver_configuration(mip_options);
         }
 
-        const RootProblemPresolveResult root_presolve =
-            mip_options.use_node_presolve
-                ? presolve_mip_root_problem(problem)
-                : RootProblemPresolveResult{problem};
+        const RootProblemPresolveResult root_presolve = mip_options.use_node_presolve
+                                                            ? presolve_mip_root_problem(problem)
+                                                            : RootProblemPresolveResult{problem};
         if (root_presolve.infeasible) {
             simplex_bnb::SolveResult infeasible_result;
             infeasible_result.status = simplex_bnb::Status::Infeasible;
@@ -1741,8 +1752,8 @@ class Model {
                                             &it->second.slack_basis_guess};
                 }
                 ModelLPData lp_data = build_node_lp_data_(base_data, cuts);
-                auto inserted = node_lp_cache.try_emplace(
-                    cache_key, std::move(lp_data), cold_options_, warm_options_);
+                auto inserted = node_lp_cache.try_emplace(cache_key, std::move(lp_data),
+                                                          cold_options_, warm_options_);
                 auto& entry = inserted.first->second;
                 entry.slack_basis_guess = build_slack_basis_guess(entry.lp_data);
                 return NodeLPSolverView{&entry.lp_data,
@@ -2298,6 +2309,7 @@ class Model {
         result.root_presolve_aggregations = root_presolve.aggregations;
         return MIPSolution(state_, std::move(result), data.original_vars);
     }
+#endif // SIMPLEX_ENABLE_BNB
 
     std::string repr() const {
         std::ostringstream oss;
@@ -3243,6 +3255,15 @@ class Model {
 } // namespace
 
 void bind_model_bindings(py::module_& m) {
+#ifndef SIMPLEX_ENABLE_BNB
+    // Normally registered by bind_bnb_bindings; Var.type and the add_var
+    // var_type default still need the enum in LP-only builds.
+    py::enum_<VarType>(m, "VarType")
+        .value("Continuous", VarType::Continuous)
+        .value("Integer", VarType::Integer)
+        .value("Binary", VarType::Binary);
+#endif
+
     py::enum_<ConstraintSense>(m, "ConstraintSense")
         .value("LessEqual", ConstraintSense::LessEqual)
         .value("Equal", ConstraintSense::Equal)
@@ -3523,6 +3544,7 @@ void bind_model_bindings(py::module_& m) {
              py::arg("name"))
         .def("__repr__", &ModelSolution::repr);
 
+#ifdef SIMPLEX_ENABLE_BNB
     py::class_<MIPSolution>(m, "MIPSolution")
         .def_property_readonly("status", &MIPSolution::status)
         .def_property_readonly("x", &MIPSolution::x, py::return_value_policy::reference_internal)
@@ -3646,6 +3668,7 @@ void bind_model_bindings(py::module_& m) {
         .def("value", py::overload_cast<const std::string&>(&MIPSolution::value, py::const_),
              py::arg("name"))
         .def("__repr__", &MIPSolution::repr);
+#endif // SIMPLEX_ENABLE_BNB
 
     py::class_<Model>(m, "Model")
         .def(py::init<const RevisedSimplexOptions&>(), py::arg("options") = RevisedSimplexOptions())
@@ -3744,7 +3767,9 @@ void bind_model_bindings(py::module_& m) {
                 throw std::invalid_argument("simplex: model.reoptimize basis must be an LPBasis");
             },
             py::arg("basis") = py::none())
+#ifdef SIMPLEX_ENABLE_BNB
         .def("solve_mip", &Model::solve_mip, py::arg("options") = BranchAndBoundOptions())
+#endif
         .def("write_mps", &Model::write_mps, py::arg("path"), py::arg("name") = "SIMPLINHO")
         .def("writeMPS", &Model::write_mps, py::arg("path"), py::arg("name") = "SIMPLINHO")
         .def_static("read_mps", &Model::read_mps, py::arg("path"),

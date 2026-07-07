@@ -14,7 +14,9 @@
 #    include <cstdio>
 #endif
 
-#include "simplex/bnb.h"
+// Only the BNB value types (Options, to_string helpers) are needed here;
+// bnb/types.h is header-only and safe for LP-only builds.
+#include "bnb/types.h"
 
 #ifndef SIMPLEX_PROJECT_VERSION
 #    define SIMPLEX_PROJECT_VERSION "unknown"
