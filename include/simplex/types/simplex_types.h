@@ -208,7 +208,7 @@ struct RevisedSimplexOptions {
     bool primal_simplex_bound_perturbation = true;
     double primal_simplex_bound_perturbation_multiplier = 1.0;
     // PAMI-style parallel dual simplex: process up to this many leaving rows
-    // per outer iteration using std::async workers. 1 = serial (default).
+    // per outer iteration using a reusable thread pool. 1 = serial (default).
     int dual_pami_rows = 1;
 
     // Recovery

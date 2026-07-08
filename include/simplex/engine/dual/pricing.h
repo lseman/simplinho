@@ -1,7 +1,7 @@
 #pragma once
 
+#include "simplex/core/thread_pool.h"
 #include "simplex/engine/dual/bounds.h"
-#include <future>
 
 namespace simplex::engine {
 
@@ -181,29 +181,28 @@ class DualPricingOperations : public DualBoundModel {
         row_price = Eigen::VectorXd::Zero(total);
         reduced_cost.resize(total);
         const int worker_count = std::min(workers, total);
-        const int chunk = (total + worker_count - 1) / worker_count;
-        std::vector<std::future<void>> tasks;
-        for (int worker = 0; worker < worker_count; ++worker) {
-            const int begin = worker * chunk;
-            const int end = std::min(total, begin + chunk);
-            if (begin >= end)
-                break;
-            tasks.push_back(std::async(std::launch::async, [&, begin, end] {
-                for (int k = begin; k < end; ++k) {
-                    const int j = nonbasis[k];
-                    double price = 0.0;
-                    double cost = costs(j);
-                    for (RevisedSimplex::SparseMatrix::InnerIterator it(Ahat, j); it; ++it) {
-                        price += it.value() * pivot_row(it.row());
-                        cost -= it.value() * dual(it.row());
-                    }
-                    row_price(k) = price;
-                    reduced_cost(k) = cost;
+
+        // Use the process-wide thread pool instead of std::async — avoids
+        // spawning a new thread per pricing call, which is the dominant
+        // overhead when BnB solves many node LPs in parallel.
+        auto worker_fn = [&](int tid) {
+            // Distribute tasks evenly across workers (same chunking as the
+            // old std::async loop, but driven by the pool's internal thread id).
+            const int begin = tid * total / worker_count;
+            const int end = (tid + 1) * total / worker_count;
+            for (int k = begin; k < end; ++k) {
+                const int j = nonbasis[k];
+                double price = 0.0;
+                double cost = costs(j);
+                for (RevisedSimplex::SparseMatrix::InnerIterator it(Ahat, j); it; ++it) {
+                    price += it.value() * pivot_row(it.row());
+                    cost -= it.value() * dual(it.row());
                 }
-            }));
-        }
-        for (auto& task : tasks)
-            task.get();
+                row_price(k) = price;
+                reduced_cost(k) = cost;
+            }
+        };
+        ThreadPool::instance().submit(worker_count, std::move(worker_fn));
     }
 };
 
