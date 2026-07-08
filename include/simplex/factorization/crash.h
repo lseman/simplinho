@@ -10,9 +10,48 @@ inline double RevisedSimplex::positive_violation_max_(const Eigen::VectorXd& x, 
     return worst;
 }
 
+namespace simplex_detail {
+// Two-sided primal violation: how far each basic value sits outside its
+// [l, u] bound. Free (both-infinite) basics never contribute.
+inline double basic_bound_violation_max_(const Eigen::VectorXd& xB, const std::vector<int>& basis,
+                                          const Eigen::VectorXd& l, const Eigen::VectorXd& u,
+                                          double tol) {
+    double worst = 0.0;
+    for (int i = 0; i < (int)basis.size(); ++i) {
+        const int j = basis[i];
+        const double lo = (j >= 0 && j < l.size() && std::isfinite(l(j)))
+                              ? l(j)
+                              : -std::numeric_limits<double>::infinity();
+        const double hi = (j >= 0 && j < u.size() && std::isfinite(u(j)))
+                              ? u(j)
+                              : std::numeric_limits<double>::infinity();
+        if (std::isfinite(lo))
+            worst = std::max(worst, lo - xB(i));
+        if (std::isfinite(hi))
+            worst = std::max(worst, xB(i) - hi);
+    }
+    return worst;
+}
+
+// Dual violation for nonbasic j with reduced cost rc = c_j - a_j^T y: at a
+// variable resting at its lower bound (or free), rc must be >= -tol; at a
+// variable that could equally rest at its upper bound (only an upper bound
+// is finite), rc must be <= tol. A boxed variable is not penalized either
+// way -- crash-phase quality checks don't know which bound it will settle
+// on, so only genuinely one-sided restrictions are scored.
+inline double nonbasic_dual_violation_(double rc, bool has_l, bool has_u) {
+    if (has_l && !has_u)
+        return std::max(0.0, -rc);
+    if (has_u && !has_l)
+        return std::max(0.0, rc);
+    return 0.0;
+}
+}  // namespace simplex_detail
+
 inline RevisedSimplex::BasisQuality
 RevisedSimplex::evaluate_basis_quality_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                                         const Eigen::VectorXd& c, const std::vector<int>& basis,
+                                        const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                                         double tol) {
     BasisQuality q;
     const int m = static_cast<int>(A.rows());
@@ -64,7 +103,7 @@ RevisedSimplex::evaluate_basis_quality_(const Eigen::MatrixXd& A, const Eigen::V
         q.solve_residual = sanity_residual.lpNorm<Eigen::Infinity>() /
                            std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
     }
-    q.primal_violation = positive_violation_max_(-xB, tol);
+    q.primal_violation = simplex_detail::basic_bound_violation_max_(xB, basis, l, u, tol);
     q.primal_feasible = xB.allFinite() && q.primal_violation <= tol;
 
     Eigen::VectorXd cB(m);
@@ -75,14 +114,17 @@ RevisedSimplex::evaluate_basis_quality_(const Eigen::MatrixXd& A, const Eigen::V
     if (y.size() != m || !y.allFinite())
         return q;
 
-    Eigen::VectorXd neg_rc = Eigen::VectorXd::Zero(n - m);
-    int k = 0;
+    double dual_violation = 0.0;
     for (int j = 0; j < n; ++j) {
         if (in_basis[j])
             continue;
-        neg_rc(k++) = -(c(j) - A.col(j).dot(y));
+        const double rc = c(j) - A.col(j).dot(y);
+        const bool has_l = (j < l.size()) && std::isfinite(l(j));
+        const bool has_u = (j < u.size()) && std::isfinite(u(j));
+        dual_violation =
+            std::max(dual_violation, simplex_detail::nonbasic_dual_violation_(rc, has_l, has_u));
     }
-    q.dual_violation = positive_violation_max_(neg_rc, tol);
+    q.dual_violation = std::max(0.0, dual_violation - tol);
     q.dual_feasible = q.dual_violation <= tol;
     return q;
 }
@@ -90,6 +132,7 @@ RevisedSimplex::evaluate_basis_quality_(const Eigen::MatrixXd& A, const Eigen::V
 inline RevisedSimplex::BasisQuality
 RevisedSimplex::evaluate_basis_quality_(const SparseMatrix& A, const Eigen::VectorXd& b,
                                         const Eigen::VectorXd& c, const std::vector<int>& basis,
+                                        const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                                         double tol) {
     BasisQuality q;
     const int m = static_cast<int>(A.rows());
@@ -144,7 +187,7 @@ RevisedSimplex::evaluate_basis_quality_(const SparseMatrix& A, const Eigen::Vect
         q.solve_residual = sanity_residual.lpNorm<Eigen::Infinity>() /
                            std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
     }
-    q.primal_violation = positive_violation_max_(-xB, tol);
+    q.primal_violation = simplex_detail::basic_bound_violation_max_(xB, basis, l, u, tol);
     q.primal_feasible = xB.allFinite() && q.primal_violation <= tol;
 
     Eigen::VectorXd cB(m);
@@ -154,8 +197,7 @@ RevisedSimplex::evaluate_basis_quality_(const SparseMatrix& A, const Eigen::Vect
     if (y.size() != m || !y.allFinite())
         return q;
 
-    Eigen::VectorXd neg_rc = Eigen::VectorXd::Zero(n - m);
-    int k = 0;
+    double dual_violation = 0.0;
     for (int j = 0; j < n; ++j) {
         if (in_basis[j])
             continue;
@@ -163,9 +205,13 @@ RevisedSimplex::evaluate_basis_quality_(const SparseMatrix& A, const Eigen::Vect
         for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
             ay += it.value() * y(it.row());
         }
-        neg_rc(k++) = -(c(j) - ay);
+        const double rc = c(j) - ay;
+        const bool has_l = (j < l.size()) && std::isfinite(l(j));
+        const bool has_u = (j < u.size()) && std::isfinite(u(j));
+        dual_violation =
+            std::max(dual_violation, simplex_detail::nonbasic_dual_violation_(rc, has_l, has_u));
     }
-    q.dual_violation = positive_violation_max_(neg_rc, tol);
+    q.dual_violation = std::max(0.0, dual_violation - tol);
     q.dual_feasible = q.dual_violation <= tol;
     return q;
 }
@@ -1156,6 +1202,7 @@ inline std::vector<int>
 RevisedSimplex::improve_basis_by_swaps_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                                         const Eigen::VectorXd& c, std::vector<int> basis,
                                         const CrashAttemptConfig& cfg, double tol, SimplexMode mode,
+                                        const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                                         std::optional<std::vector<int>> seed_basis) {
     const int m = static_cast<int>(A.rows());
     const int n = static_cast<int>(A.cols());
@@ -1182,7 +1229,7 @@ RevisedSimplex::improve_basis_by_swaps_(const Eigen::MatrixXd& A, const Eigen::V
 
     CrashSelection best;
     best.basis = basis;
-    best.quality = evaluate_basis_quality_(A, b, c, basis, tol);
+    best.quality = evaluate_basis_quality_(A, b, c, basis, l, u, tol);
 
     auto promising_swap = [&](int entering, int leaving) {
         const double score_enter = col_nnz[entering] + col_weight[entering];
@@ -1239,7 +1286,7 @@ RevisedSimplex::improve_basis_by_swaps_(const Eigen::MatrixXd& A, const Eigen::V
 
                 CrashSelection trial;
                 trial.basis = std::move(cand);
-                trial.quality = evaluate_basis_quality_(A, b, c, trial.basis, tol);
+                trial.quality = evaluate_basis_quality_(A, b, c, trial.basis, l, u, tol);
                 if (!trial.quality.valid)
                     continue;
                 if (!better_basis_quality_(trial, best, mode))
@@ -1263,6 +1310,7 @@ inline std::vector<int>
 RevisedSimplex::improve_basis_by_swaps_(const SparseMatrix& A, const Eigen::VectorXd& b,
                                         const Eigen::VectorXd& c, std::vector<int> basis,
                                         const CrashAttemptConfig& cfg, double tol, SimplexMode mode,
+                                        const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                                         std::optional<std::vector<int>> seed_basis) {
     const int m = static_cast<int>(A.rows());
     const int n = static_cast<int>(A.cols());
@@ -1292,7 +1340,7 @@ RevisedSimplex::improve_basis_by_swaps_(const SparseMatrix& A, const Eigen::Vect
 
     CrashSelection best;
     best.basis = basis;
-    best.quality = evaluate_basis_quality_(A, b, c, basis, tol);
+    best.quality = evaluate_basis_quality_(A, b, c, basis, l, u, tol);
 
     auto promising_swap = [&](int entering, int leaving) {
         const double score_enter = col_nnz[entering] + col_weight[entering];
@@ -1349,7 +1397,7 @@ RevisedSimplex::improve_basis_by_swaps_(const SparseMatrix& A, const Eigen::Vect
 
                 CrashSelection trial;
                 trial.basis = std::move(cand);
-                trial.quality = evaluate_basis_quality_(A, b, c, trial.basis, tol);
+                trial.quality = evaluate_basis_quality_(A, b, c, trial.basis, l, u, tol);
                 if (!trial.quality.valid)
                     continue;
                 if (!better_basis_quality_(trial, best, mode))
@@ -1372,7 +1420,8 @@ RevisedSimplex::improve_basis_by_swaps_(const SparseMatrix& A, const Eigen::Vect
 inline std::vector<int>
 RevisedSimplex::build_basis_attempt_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                                      const Eigen::VectorXd& c, const CrashAttemptConfig& cfg,
-                                     double tol, SimplexMode mode,
+                                     double tol, SimplexMode mode, const Eigen::VectorXd& l,
+                                     const Eigen::VectorXd& u,
                                      std::optional<std::vector<int>> seed_basis) {
     const int m = static_cast<int>(A.rows());
     const int n = static_cast<int>(A.cols());
@@ -1453,13 +1502,14 @@ RevisedSimplex::build_basis_attempt_(const Eigen::MatrixXd& A, const Eigen::Vect
 
     if ((int)basis.size() != m)
         return {};
-    return improve_basis_by_swaps_(A, b, c, std::move(basis), cfg, tol, mode, seed_basis);
+    return improve_basis_by_swaps_(A, b, c, std::move(basis), cfg, tol, mode, l, u, seed_basis);
 }
 
 inline std::vector<int>
 RevisedSimplex::build_basis_attempt_(const SparseMatrix& A, const Eigen::VectorXd& b,
                                      const Eigen::VectorXd& c, const CrashAttemptConfig& cfg,
-                                     double tol, SimplexMode mode,
+                                     double tol, SimplexMode mode, const Eigen::VectorXd& l,
+                                     const Eigen::VectorXd& u,
                                      std::optional<std::vector<int>> seed_basis) {
     const int m = static_cast<int>(A.rows());
     const int n = static_cast<int>(A.cols());
@@ -1540,12 +1590,13 @@ RevisedSimplex::build_basis_attempt_(const SparseMatrix& A, const Eigen::VectorX
 
     if ((int)basis.size() != m)
         return {};
-    return improve_basis_by_swaps_(A, b, c, std::move(basis), cfg, tol, mode, seed_basis);
+    return improve_basis_by_swaps_(A, b, c, std::move(basis), cfg, tol, mode, l, u, seed_basis);
 }
 
 inline RevisedSimplex::CrashSelection
 RevisedSimplex::choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                                       const Eigen::VectorXd& c, const RevisedSimplexOptions& opt,
+                                      const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                                       std::optional<std::vector<int>> seed_basis,
                                       bool allow_direct_warm_start) {
     CrashSelection best;
@@ -1555,7 +1606,7 @@ RevisedSimplex::choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::Vec
             return;
         CrashSelection sel;
         sel.basis = std::move(candidate);
-        sel.quality = evaluate_basis_quality_(A, b, c, sel.basis, opt.tol);
+        sel.quality = evaluate_basis_quality_(A, b, c, sel.basis, l, u, opt.tol);
         sel.source = std::move(source);
         if (attempt >= 0) {
             sel.style = crash_attempt_config_(opt, attempt).style_name;
@@ -1598,7 +1649,7 @@ RevisedSimplex::choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::Vec
             const int attempts = std::max(1, opt.crash_attempts);
             for (int k = 0; k < attempts; ++k) {
                 consider(build_basis_attempt_(A, b, c, crash_attempt_config_(opt, k), opt.tol,
-                                              opt.mode, seed_basis),
+                                              opt.mode, l, u, seed_basis),
                          "repaired_warm_start", k);
                 if (can_accept_early(best.quality)) {
                     return best;
@@ -1609,7 +1660,7 @@ RevisedSimplex::choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::Vec
                 for (int k = 0; k < attempts; ++k) {
                     consider(build_basis_attempt_(
                                  A, b, c, quadratic_warm_start_repair_attempt_config_(opt, k),
-                                 opt.tol, opt.mode, seed_basis),
+                                 opt.tol, opt.mode, l, u, seed_basis),
                              "quadratic_repaired_warm_start", k);
                     if (can_accept_early(best.quality)) {
                         return best;
@@ -1626,7 +1677,8 @@ RevisedSimplex::choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::Vec
 
     const int attempts = std::max(1, opt.crash_attempts);
     for (int k = 0; k < attempts; ++k) {
-        consider(build_basis_attempt_(A, b, c, crash_attempt_config_(opt, k), opt.tol, opt.mode),
+        consider(build_basis_attempt_(A, b, c, crash_attempt_config_(opt, k), opt.tol, opt.mode, l,
+                                      u),
                  "crash", k);
         if (can_accept_early(best.quality)) {
             return best;
@@ -1638,6 +1690,7 @@ RevisedSimplex::choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::Vec
 inline RevisedSimplex::CrashSelection
 RevisedSimplex::choose_initial_basis_(const SparseMatrix& A, const Eigen::VectorXd& b,
                                       const Eigen::VectorXd& c, const RevisedSimplexOptions& opt,
+                                      const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                                       std::optional<std::vector<int>> seed_basis,
                                       bool allow_direct_warm_start) {
     CrashSelection best;
@@ -1647,7 +1700,7 @@ RevisedSimplex::choose_initial_basis_(const SparseMatrix& A, const Eigen::Vector
             return;
         CrashSelection sel;
         sel.basis = std::move(candidate);
-        sel.quality = evaluate_basis_quality_(A, b, c, sel.basis, opt.tol);
+        sel.quality = evaluate_basis_quality_(A, b, c, sel.basis, l, u, opt.tol);
         sel.source = std::move(source);
         if (attempt >= 0) {
             sel.style = crash_attempt_config_(opt, attempt).style_name;
@@ -1716,7 +1769,7 @@ RevisedSimplex::choose_initial_basis_(const SparseMatrix& A, const Eigen::Vector
             const int attempts = std::max(1, opt.crash_attempts);
             for (int k = 0; k < attempts; ++k) {
                 consider(build_basis_attempt_(A, b, c, crash_attempt_config_(opt, k), opt.tol,
-                                              opt.mode, seed_basis),
+                                              opt.mode, l, u, seed_basis),
                          "repaired_warm_start", k);
                 if (can_accept_early(best.quality)) {
                     return best;
@@ -1727,7 +1780,7 @@ RevisedSimplex::choose_initial_basis_(const SparseMatrix& A, const Eigen::Vector
                 for (int k = 0; k < attempts; ++k) {
                     consider(build_basis_attempt_(
                                  A, b, c, quadratic_warm_start_repair_attempt_config_(opt, k),
-                                 opt.tol, opt.mode, seed_basis),
+                                 opt.tol, opt.mode, l, u, seed_basis),
                              "quadratic_repaired_warm_start", k);
                     if (can_accept_early(best.quality)) {
                         return best;
@@ -1744,7 +1797,8 @@ RevisedSimplex::choose_initial_basis_(const SparseMatrix& A, const Eigen::Vector
 
     const int attempts = std::max(1, opt.crash_attempts);
     for (int k = 0; k < attempts; ++k) {
-        consider(build_basis_attempt_(A, b, c, crash_attempt_config_(opt, k), opt.tol, opt.mode),
+        consider(build_basis_attempt_(A, b, c, crash_attempt_config_(opt, k), opt.tol, opt.mode, l,
+                                      u),
                  "crash", k);
         if (can_accept_early(best.quality)) {
             return best;
@@ -1756,6 +1810,7 @@ RevisedSimplex::choose_initial_basis_(const SparseMatrix& A, const Eigen::Vector
 inline std::optional<std::vector<int>>
 RevisedSimplex::find_initial_basis_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                                     const Eigen::VectorXd& c, const RevisedSimplexOptions& opt,
+                                    const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                                     std::optional<std::vector<int>> seed_basis) {
     // Logical slack basis: guaranteed dual-feasible start for dual mode.
     if (opt.mode == SimplexMode::Dual) {
@@ -1763,7 +1818,8 @@ RevisedSimplex::find_initial_basis_(const Eigen::MatrixXd& A, const Eigen::Vecto
         const int n = static_cast<int>(A.cols());
 
         std::vector<int> logical = find_logical_basis_(A);
-        const BasisQuality logical_quality = evaluate_basis_quality_(A, b, c, logical, opt.tol);
+        const BasisQuality logical_quality =
+            evaluate_basis_quality_(A, b, c, logical, l, u, opt.tol);
         if (logical_quality.valid && logical_quality.rank == m) {
             return logical;
         }
@@ -1806,13 +1862,13 @@ RevisedSimplex::find_initial_basis_(const Eigen::MatrixXd& A, const Eigen::Vecto
                     }
                 }
             }
-            BasisQuality repaired_q = evaluate_basis_quality_(A, b, c, logical, opt.tol);
+            BasisQuality repaired_q = evaluate_basis_quality_(A, b, c, logical, l, u, opt.tol);
             if (repaired_q.valid && repaired_q.rank == m) {
                 return logical;
             }
         }
     }
-    CrashSelection sel = choose_initial_basis_(A, b, c, opt, seed_basis);
+    CrashSelection sel = choose_initial_basis_(A, b, c, opt, l, u, seed_basis);
     if (!sel.quality.valid)
         return std::nullopt;
     return sel.basis;
@@ -1821,6 +1877,7 @@ RevisedSimplex::find_initial_basis_(const Eigen::MatrixXd& A, const Eigen::Vecto
 inline std::optional<std::vector<int>>
 RevisedSimplex::find_initial_basis_(const SparseMatrix& A, const Eigen::VectorXd& b,
                                     const Eigen::VectorXd& c, const RevisedSimplexOptions& opt,
+                                    const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                                     std::optional<std::vector<int>> seed_basis) {
     // Logical slack basis: guaranteed dual-feasible start for dual mode.
     if (opt.mode == SimplexMode::Dual) {
@@ -1828,7 +1885,8 @@ RevisedSimplex::find_initial_basis_(const SparseMatrix& A, const Eigen::VectorXd
         const int n = static_cast<int>(A.cols());
 
         std::vector<int> logical = find_logical_basis_(A);
-        const BasisQuality logical_quality = evaluate_basis_quality_(A, b, c, logical, opt.tol);
+        const BasisQuality logical_quality =
+            evaluate_basis_quality_(A, b, c, logical, l, u, opt.tol);
         if (logical_quality.valid && logical_quality.rank == m) {
             return logical;
         }
@@ -1876,13 +1934,13 @@ RevisedSimplex::find_initial_basis_(const SparseMatrix& A, const Eigen::VectorXd
                     }
                 }
             }
-            BasisQuality repaired_q = evaluate_basis_quality_(A, b, c, logical, opt.tol);
+            BasisQuality repaired_q = evaluate_basis_quality_(A, b, c, logical, l, u, opt.tol);
             if (repaired_q.valid && repaired_q.rank == m) {
                 return logical;
             }
         }
     }
-    CrashSelection sel = choose_initial_basis_(A, b, c, opt, seed_basis);
+    CrashSelection sel = choose_initial_basis_(A, b, c, opt, l, u, seed_basis);
     if (!sel.quality.valid)
         return std::nullopt;
     return sel.basis;

@@ -63,16 +63,42 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
         }
 
         bool is_nonnegative_standard = true;
+        bool has_free_vars = false;
         for (int j = 0; j < n; ++j) {
-            const bool l_is_zero = std::isfinite(l_use(j)) && std::abs(l_use(j)) <= opt_.tol;
-            const bool u_is_inf = !std::isfinite(u_use(j));
-            if (!l_is_zero || !u_is_inf) {
+            const bool has_l = std::isfinite(l_use(j));
+            const bool has_u = std::isfinite(u_use(j));
+            const bool l_is_zero = has_l && std::abs(l_use(j)) <= opt_.tol;
+            if (!l_is_zero || has_u) {
                 is_nonnegative_standard = false;
-                break;
+            }
+            if (!has_l && !has_u) {
+                has_free_vars = true;
             }
         }
 
-        if (!is_nonnegative_standard) {
+        // Native-bounds path: bounded variables are handled directly by the
+        // engines (anchored model below). The standard-form reformulation is
+        // only needed for free variables (both bounds infinite), when
+        // explicitly requested via opt_.native_bounds = false, or when the
+        // dual engine might run (mode Dual or Auto): the dual engine's
+        // leaving-variable selection is not yet upper-bound-aware (it can
+        // accept a basis with a basic variable above its upper bound as
+        // "optimal"), so any solve that could invoke it on a problem with
+        // finite upper bounds must go through the reformulation instead.
+        // Only Primal-forced solves use the native path when upper bounds
+        // are present.
+        bool has_upper_bounds = false;
+        for (int j = 0; j < n; ++j) {
+            if (std::isfinite(u_use(j))) {
+                has_upper_bounds = true;
+                break;
+            }
+        }
+        const bool use_reformulation =
+            !is_nonnegative_standard &&
+            (has_free_vars || !opt_.native_bounds ||
+             (opt_.mode != SimplexMode::Primal && has_upper_bounds));
+        if (use_reformulation) {
             struct ReformVar {
                 int y = -1;
                 int y_pos = -1;
@@ -280,7 +306,7 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
             std::optional<BasisQuality> reformulated_warm_basis_quality = std::nullopt;
             if (reformulated_basis_guess && !reformulated_basis_guess->empty()) {
                 reformulated_warm_basis_quality = evaluate_basis_quality_(
-                    A_std, b_std, c_std, *reformulated_basis_guess, opt_.tol);
+                    A_std, b_std, c_std, *reformulated_basis_guess, l_std, u_std, opt_.tol);
             }
             const bool use_dual_first = opt_.mode != SimplexMode::Primal &&
                                         reformulated_warm_basis_quality &&
@@ -652,7 +678,7 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
             (crash_seed_basis_opt && static_cast<int>(crash_seed_basis_opt->size()) == m_eff);
         auto t0_crash = std::chrono::steady_clock::now();
         CrashSelection basis_choice = choose_initial_basis_(
-            Ared, bred, cred, opt_, crash_seed_basis_opt, allow_direct_warm_start);
+            Ared, bred, cred, opt_, l_eff, u_eff, crash_seed_basis_opt, allow_direct_warm_start);
         auto t1_crash = std::chrono::steady_clock::now();
         current_timing_.crash_ns +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1_crash - t0_crash).count();
@@ -876,10 +902,16 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1_presolve2 - t1_crash).count();
         // ---- (6) Phase I on reduced problem ----
         auto [A1, b1, c1, basis1, n_orig_eff, m_rows] = make_phase1_(Ared, bred);
+        // Phase-1 bounds: original columns keep their finite upper bounds so
+        // the feasible point found also respects them; lower bounds stay 0
+        // (the artificial identity basis starts from x = 0).
+        Eigen::VectorXd l_phase1 = Eigen::VectorXd::Zero(A1.cols());
+        Eigen::VectorXd u_phase1 = Eigen::VectorXd::Constant(A1.cols(), presolve::inf());
+        if (u_eff.size() == static_cast<Eigen::Index>(n_orig_eff)) {
+            u_phase1.head(n_orig_eff) = u_eff;
+        }
         auto t0_p1 = std::chrono::steady_clock::now();
-        auto [status1, v1, basis1_out, it1, info1] =
-            phase_(A1, b1, c1, basis1, Eigen::VectorXd::Zero(A1.cols()),
-                   Eigen::VectorXd::Constant(A1.cols(), presolve::inf()));
+        auto [status1, v1, basis1_out, it1, info1] = phase_(A1, b1, c1, basis1, l_phase1, u_phase1);
         auto t1_p1 = std::chrono::steady_clock::now();
         current_timing_.simplex_iters_ns +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1_p1 - t0_p1).count();
@@ -888,9 +920,8 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
             info1.at("reason") == std::string("negative_basic_vars")) {
             auto t0_d1 = std::chrono::steady_clock::now();
             std::tie(status1, v1, basis1_out, it1, info1) =
-                dual_phase_(A1, b1, c1, basis1_out.empty() ? basis1 : basis1_out,
-                            Eigen::VectorXd::Zero(A1.cols()),
-                            Eigen::VectorXd::Constant(A1.cols(), presolve::inf()));
+                dual_phase_(A1, b1, c1, basis1_out.empty() ? basis1 : basis1_out, l_phase1,
+                            u_phase1);
             auto t1_d1 = std::chrono::steady_clock::now();
             current_timing_.simplex_iters_ns +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t1_d1 - t0_d1).count();
@@ -932,7 +963,7 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                 if (!(lu.rank() == (int)cand.size() && lu.isInvertible())) {
                     continue;
                 }
-                if (basis_is_primal_feasible_(Ared, bred, cand, opt_.tol)) {
+                if (basis_is_primal_feasible_(Ared, bred, cand, l_eff, u_eff, opt_.tol)) {
                     red_basis2 = std::move(cand);
                     continue;
                 }
@@ -945,7 +976,7 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
             }
         }
         if ((int)red_basis2.size() == m_rows &&
-            !basis_is_primal_feasible_(Ared, bred, red_basis2, opt_.tol)) {
+            !basis_is_primal_feasible_(Ared, bred, red_basis2, l_eff, u_eff, opt_.tol)) {
             for (int j = 0; j < (int)n_orig_eff; ++j) {
                 if (std::find(red_basis2.begin(), red_basis2.end(), j) != red_basis2.end()) {
                     continue;
@@ -959,7 +990,7 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                     Eigen::FullPivLU<Eigen::MatrixXd> lu(Btest);
                     if (!(lu.rank() == m_rows && lu.isInvertible()))
                         continue;
-                    if (!basis_is_primal_feasible_(Ared, bred, cand, opt_.tol)) {
+                    if (!basis_is_primal_feasible_(Ared, bred, cand, l_eff, u_eff, opt_.tol)) {
                         continue;
                     }
                     red_basis2 = std::move(cand);
@@ -969,6 +1000,25 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                 if (improved)
                     break;
             }
+        }
+
+        // Phase 1 may finish with nonbasics at their upper bounds; seed
+        // phase 2 with those statuses so its starting point matches the
+        // feasible point found by phase 1 (native bounds).
+        std::optional<std::vector<LPBasisStatus>> phase2_seed_status;
+        if (v1.size() >= static_cast<Eigen::Index>(n_orig_eff) &&
+            static_cast<int>(n_orig_eff) == u_eff.size()) {
+            const int nred = static_cast<int>(n_orig_eff);
+            std::vector<LPBasisStatus> stv(nred, LPBasisStatus::AtLower);
+            for (int j = 0; j < nred; ++j) {
+                const bool near_u =
+                    std::isfinite(u_eff(j)) && std::abs(v1(j) - u_eff(j)) <= 10.0 * opt_.tol;
+                const bool near_l =
+                    std::isfinite(l_eff(j)) && std::abs(v1(j) - l_eff(j)) <= 10.0 * opt_.tol;
+                if (near_u && !near_l)
+                    stv[j] = LPBasisStatus::AtUpper;
+            }
+            phase2_seed_status = std::move(stv);
         }
 
         // Final Phase II on reduced problem (respect mode)
@@ -981,10 +1031,10 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
         if ((int)red_basis2.size() == m_rows) {
             if (opt_.mode == SimplexMode::Dual) {
                 const auto phase2_basis_quality =
-                    evaluate_basis_quality_(Ared, bred, cred, red_basis2, opt_.tol);
+                    evaluate_basis_quality_(Ared, bred, cred, red_basis2, l_eff, u_eff, opt_.tol);
                 if (phase2_basis_quality.valid && phase2_basis_quality.dual_feasible) {
-                    std::tie(status2, v2, red_basis_out, it2, info2) =
-                        dual_phase_(Ared, bred, cred, red_basis2, l_eff, u_eff);
+                    std::tie(status2, v2, red_basis_out, it2, info2) = dual_phase_(
+                        Ared, bred, cred, red_basis2, l_eff, u_eff, phase2_seed_status);
                     if (status2 == LPSolution::Status::Infeasible) {
                         auto it = info2.find("farkas_has_cert");
                         if (it != info2.end() && it->second == "1") {
@@ -1000,23 +1050,23 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                         }
                     }
                 } else {
-                    std::tie(status2, v2, red_basis_out, it2, info2) =
-                        phase_(Ared, bred, cred, red_basis2, l_eff, u_eff);
+                    std::tie(status2, v2, red_basis_out, it2, info2) = phase_(
+                        Ared, bred, cred, red_basis2, l_eff, u_eff, phase2_seed_status);
                     info2["phase2_mode"] = "primal";
                     info2["phase2_dual_requested_but_basis_not_dual_feasible"] = "1";
                 }
 
             } else if (opt_.mode == SimplexMode::Primal) {
                 std::tie(status2, v2, red_basis_out, it2, info2) =
-                    phase_(Ared, bred, cred, red_basis2, l_eff, u_eff);
+                    phase_(Ared, bred, cred, red_basis2, l_eff, u_eff, phase2_seed_status);
             } else {
                 // Auto: primal first; if negative basics → dual
                 std::tie(status2, v2, red_basis_out, it2, info2) =
-                    phase_(Ared, bred, cred, red_basis2, l_eff, u_eff);
+                    phase_(Ared, bred, cred, red_basis2, l_eff, u_eff, phase2_seed_status);
                 if (status2 == LPSolution::Status::NeedPhase1 && info2.count("reason") &&
                     info2.at("reason") == std::string("negative_basic_vars")) {
-                    std::tie(status2, v2, red_basis_out, it2, info2) =
-                        dual_phase_(Ared, bred, cred, red_basis2, l_eff, u_eff);
+                    std::tie(status2, v2, red_basis_out, it2, info2) = dual_phase_(
+                        Ared, bred, cred, red_basis2, l_eff, u_eff, phase2_seed_status);
                 }
             }
         } else {

@@ -566,7 +566,7 @@ class RevisedSimplexDualEngine {
                         0,
                         {{"reason", "basis size != m"}}};
         } else {
-            auto maybe = self.find_initial_basis_(A, b, c, self.opt_);
+            auto maybe = self.find_initial_basis_(A, b, c, self.opt_, l, u);
             if (!maybe)
                 return {LPSolution::Status::NeedPhase1,
                         Eigen::VectorXd::Zero(n),

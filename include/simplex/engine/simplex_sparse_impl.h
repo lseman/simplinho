@@ -18,8 +18,10 @@
 inline RevisedSimplex::PhaseResult
 RevisedSimplex::phase_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
                        std::optional<std::vector<int>> basis_opt, const Eigen::VectorXd& l,
-                       const Eigen::VectorXd& u) {
-    return RevisedSimplexPrimalEngine::run(*this, A, b, c, std::move(basis_opt), l, u);
+                       const Eigen::VectorXd& u,
+                       std::optional<std::vector<LPBasisStatus>> warm_status) {
+    return RevisedSimplexPrimalEngine::run(*this, A, b, c, std::move(basis_opt), l, u,
+                                           std::move(warm_status));
 }
 
 inline LPSolution RevisedSimplex::solve_impl_sparse_(
@@ -96,12 +98,16 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     }
 
     bool is_nonnegative_standard = true;
+    bool has_free_vars = false;
     for (int j = 0; j < n; ++j) {
-        const bool l_is_zero = std::isfinite(l_use(j)) && std::abs(l_use(j)) <= opt_.tol;
-        const bool u_is_inf = !std::isfinite(u_use(j));
-        if (!l_is_zero || !u_is_inf) {
+        const bool has_l = std::isfinite(l_use(j));
+        const bool has_u = std::isfinite(u_use(j));
+        const bool l_is_zero = has_l && std::abs(l_use(j)) <= opt_.tol;
+        if (!l_is_zero || has_u) {
             is_nonnegative_standard = false;
-            break;
+        }
+        if (!has_l && !has_u) {
+            has_free_vars = true;
         }
     }
 
@@ -189,7 +195,28 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         }
     }
 
-    if (!is_nonnegative_standard) {
+    // Native-bounds path: bounded variables are handled directly by the
+    // engines (anchored model below). The standard-form reformulation is only
+    // needed for free variables (both bounds infinite), when explicitly
+    // requested via opt_.native_bounds = false, or when the dual engine
+    // might run (mode Dual or Auto): the dual engine's leaving-variable
+    // selection is not yet upper-bound-aware (it can accept a basis with a
+    // basic variable above its upper bound as "optimal"), so any solve that
+    // could invoke it on a problem with finite upper bounds must go through
+    // the reformulation instead. Only Primal-forced solves use the native
+    // path when upper bounds are present.
+    bool has_upper_bounds = false;
+    for (int j = 0; j < n; ++j) {
+        if (std::isfinite(u_use(j))) {
+            has_upper_bounds = true;
+            break;
+        }
+    }
+    const bool use_reformulation =
+        !is_nonnegative_standard &&
+        (has_free_vars || !opt_.native_bounds ||
+         (opt_.mode != SimplexMode::Primal && has_upper_bounds));
+    if (use_reformulation) {
         const bool cache_reuse = sparse_bound_only_cache_.same_problem(A_in, b_in, c_in) &&
                                  sparse_bound_only_cache_.orientation_matches(l_use, u_use);
         if (std::getenv("SIMPLINHO_TRACE_REFORM")) {
@@ -474,8 +501,8 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             assumed_quality.primal_feasible = false; // conservative; dual simplex handles this
             reformulated_warm_basis_quality = assumed_quality;
         } else if (reformulated_basis_guess && !reformulated_basis_guess->empty()) {
-            reformulated_warm_basis_quality =
-                evaluate_basis_quality_(A_std, b_std, c_std, *reformulated_basis_guess, opt_.tol);
+            reformulated_warm_basis_quality = evaluate_basis_quality_(
+                A_std, b_std, c_std, *reformulated_basis_guess, l_std, u_std, opt_.tol);
         }
         // Prefer dual when the mapped warm basis is dual-feasible, regardless of opt_.mode.
         // A dual-feasible warm basis makes dual simplex O(pivots) to optimality; primal
@@ -837,7 +864,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         (crash_seed_basis_opt && static_cast<int>(crash_seed_basis_opt->size()) == m_in);
     auto t0_crash = std::chrono::steady_clock::now();
     CrashSelection basis_choice = choose_initial_basis_(
-        Ared, bred, cred, opt_, crash_seed_basis_opt, allow_direct_warm_start);
+        Ared, bred, cred, opt_, l_eff, u_eff, crash_seed_basis_opt, allow_direct_warm_start);
     if (factorized_basis_seed_opt && crash_seed_basis_opt &&
         static_cast<int>(crash_seed_basis_opt->size()) == m_in &&
         basis_choice.basis != *crash_seed_basis_opt) {
@@ -934,10 +961,24 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         return finalize_solution_(attach_basis_state_(std::move(sol), l_in, u_in, opt_.tol));
     };
 
+    // Nonbasic bound statuses to seed phase 2 with (set after phase 1: with
+    // native bounds, phase 1 may finish with nonbasics resting at their upper
+    // bounds, and restarting them at lower would discard feasibility).
+    std::optional<std::vector<LPBasisStatus>> phase2_seed_status;
+
     auto run_phase2_p = [&](std::optional<std::vector<int>> b) {
         auto t0 = std::chrono::steady_clock::now();
+        const bool use_warm_status =
+            red_basis_state_opt &&
+            (basis_choice.source == "warm_start" || basis_choice.source == "repaired_warm_start") &&
+            red_basis_state_opt->column_status.size() == static_cast<std::size_t>(n);
+        std::optional<std::vector<LPBasisStatus>> ws;
+        if (phase2_seed_status)
+            ws = phase2_seed_status;
+        else if (use_warm_status)
+            ws = red_basis_state_opt->column_status;
         try {
-            auto res = phase_(Ared, bred, cred, std::move(b), l_eff, u_eff);
+            auto res = phase_(Ared, bred, cred, std::move(b), l_eff, u_eff, std::move(ws));
             auto t1 = std::chrono::steady_clock::now();
             current_timing_.simplex_iters_ns +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
@@ -963,11 +1004,13 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             red_basis_state_opt &&
             (basis_choice.source == "warm_start" || basis_choice.source == "repaired_warm_start") &&
             red_basis_state_opt->column_status.size() == static_cast<std::size_t>(n);
+        std::optional<std::vector<LPBasisStatus>> ws;
+        if (phase2_seed_status)
+            ws = phase2_seed_status;
+        else if (use_warm_status)
+            ws = red_basis_state_opt->column_status;
         try {
-            auto res = dual_phase_(Ared, bred, cred, std::move(b), l_eff, u_eff,
-                                   use_warm_status ? std::optional<std::vector<LPBasisStatus>>(
-                                                         red_basis_state_opt->column_status)
-                                                   : std::nullopt);
+            auto res = dual_phase_(Ared, bred, cred, std::move(b), l_eff, u_eff, std::move(ws));
             auto t1 = std::chrono::steady_clock::now();
             current_timing_.simplex_iters_ns +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
@@ -1075,10 +1118,17 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         std::chrono::duration_cast<std::chrono::nanoseconds>(t1_presolve2 - t1_crash).count();
 
     auto [A1, b1, c1, basis1, n_orig_eff, m_rows] = make_phase1_(Ared, bred);
+    // Phase-1 bounds: original columns keep their finite upper bounds so the
+    // feasible point found also respects them; lower bounds stay 0 (the
+    // artificial identity basis starts from x = 0). Artificials are [0, inf).
+    Eigen::VectorXd l_phase1 = Eigen::VectorXd::Zero(A1.cols());
+    Eigen::VectorXd u_phase1 = Eigen::VectorXd::Constant(A1.cols(), presolve::inf());
+    if (u_eff.size() == static_cast<Eigen::Index>(n_orig_eff)) {
+        u_phase1.head(n_orig_eff) = u_eff;
+    }
     PhaseResult phase1_result;
     try {
-        phase1_result = phase_(A1, b1, c1, basis1, Eigen::VectorXd::Zero(A1.cols()),
-                               Eigen::VectorXd::Constant(A1.cols(), presolve::inf()));
+        phase1_result = phase_(A1, b1, c1, basis1, l_phase1, u_phase1);
     } catch (const std::runtime_error& e) {
         if (!is_recoverable_basis_runtime_(e.what()))
             throw;
@@ -1095,9 +1145,8 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         info1.at("reason") == std::string("negative_basic_vars")) {
         try {
             std::tie(status1, v1, basis1_out, it1, info1) =
-                dual_phase_(A1, b1, c1, basis1_out.empty() ? basis1 : basis1_out,
-                            Eigen::VectorXd::Zero(A1.cols()),
-                            Eigen::VectorXd::Constant(A1.cols(), presolve::inf()));
+                dual_phase_(A1, b1, c1, basis1_out.empty() ? basis1 : basis1_out, l_phase1,
+                            u_phase1);
         } catch (const std::runtime_error& e) {
             if (!is_recoverable_basis_runtime_(e.what()))
                 throw;
@@ -1124,6 +1173,22 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                            std::numeric_limits<double>::infinity(), {}, it1, std::move(info)));
     }
 
+    // Phase 1 may finish with nonbasics at their upper bounds; seed phase 2
+    // with those statuses so its starting point matches the feasible point.
+    if (v1.size() >= static_cast<Eigen::Index>(n_orig_eff) &&
+        static_cast<int>(n_orig_eff) == n) {
+        std::vector<LPBasisStatus> st(n, LPBasisStatus::AtLower);
+        for (int j = 0; j < n; ++j) {
+            const bool near_u =
+                std::isfinite(u_eff(j)) && std::abs(v1(j) - u_eff(j)) <= 10.0 * opt_.tol;
+            const bool near_l =
+                std::isfinite(l_eff(j)) && std::abs(v1(j) - l_eff(j)) <= 10.0 * opt_.tol;
+            if (near_u && !near_l)
+                st[j] = LPBasisStatus::AtUpper;
+        }
+        phase2_seed_status = std::move(st);
+    }
+
     std::vector<int> red_basis2;
     red_basis2.reserve(m_rows);
     for (int j : basis1_out)
@@ -1143,7 +1208,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 continue;
             if (!sparse_basis_has_full_rank_(Ared, cand))
                 continue;
-            if (basis_is_primal_feasible_(Ared, bred, cand, opt_.tol)) {
+            if (basis_is_primal_feasible_(Ared, bred, cand, l_eff, u_eff, opt_.tol)) {
                 red_basis2 = std::move(cand);
                 continue;
             }
@@ -1157,12 +1222,12 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     }
     if ((int)red_basis2.size() == m_rows) {
         const BasisQuality phase2_start_quality =
-            evaluate_basis_quality_(Ared, bred, cred, red_basis2, opt_.tol);
+            evaluate_basis_quality_(Ared, bred, cred, red_basis2, l_eff, u_eff, opt_.tol);
         const double solve_residual_guard = std::max(1e-7, 100.0 * opt_.tol);
         if (!phase2_start_quality.valid || !std::isfinite(phase2_start_quality.solve_residual) ||
             phase2_start_quality.solve_residual > solve_residual_guard) {
             const CrashSelection repaired_phase2_start =
-                choose_initial_basis_(Ared, bred, cred, opt_, red_basis2);
+                choose_initial_basis_(Ared, bred, cred, opt_, l_eff, u_eff, red_basis2);
             if (repaired_phase2_start.quality.valid &&
                 better_basis_quality_(
                     repaired_phase2_start,
@@ -1189,7 +1254,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     auto run_sparse_phase2_from_basis = [&](const std::vector<int>& basis) {
         if (opt_.mode == SimplexMode::Dual) {
             const auto phase2_basis_quality =
-                evaluate_basis_quality_(Ared, bred, cred, basis, opt_.tol);
+                evaluate_basis_quality_(Ared, bred, cred, basis, l_eff, u_eff, opt_.tol);
             if (phase2_basis_quality.valid && phase2_basis_quality.dual_feasible) {
                 auto res = run_phase2_d(basis);
                 std::get<4>(res)["phase2_mode"] = "dual";
@@ -1227,9 +1292,9 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             ((int)red_basis2.size() == m_rows) ? std::optional<std::vector<int>>(red_basis2)
                                                : std::nullopt;
         const CrashSelection repaired_seed =
-            choose_initial_basis_(Ared, bred, cred, opt_, seeded_repair_basis);
+            choose_initial_basis_(Ared, bred, cred, opt_, l_eff, u_eff, seeded_repair_basis);
         const CrashSelection repaired_cold =
-            choose_initial_basis_(Ared, bred, cred, opt_, std::nullopt);
+            choose_initial_basis_(Ared, bred, cred, opt_, l_eff, u_eff, std::nullopt);
 
         const CrashSelection* repaired = nullptr;
         if (repaired_seed.quality.valid &&
@@ -1282,8 +1347,10 @@ RevisedSimplex::dual_phase_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
 inline RevisedSimplex::PhaseResult
 RevisedSimplex::phase_(const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
                        std::optional<std::vector<int>> basis_opt, const Eigen::VectorXd& l,
-                       const Eigen::VectorXd& u) {
-    return RevisedSimplexPrimalEngine::run(*this, A, b, c, std::move(basis_opt), l, u);
+                       const Eigen::VectorXd& u,
+                       std::optional<std::vector<LPBasisStatus>> warm_status) {
+    return RevisedSimplexPrimalEngine::run(*this, A, b, c, std::move(basis_opt), l, u,
+                                           std::move(warm_status));
 }
 
 inline RevisedSimplex::PhaseResult

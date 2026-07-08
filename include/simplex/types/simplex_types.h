@@ -182,6 +182,13 @@ struct RevisedSimplexOptions {
     // Price strategy: "col" | "row_switch" | "row_switch_col_switch"
     std::string price_strategy = "col";
 
+    // Native bounded-variable simplex: solve l <= x <= u directly in the
+    // engines (nonbasic-at-lower/upper, two-sided ratio test). When false,
+    // finite bounds are converted to extra rows/columns via the standard-form
+    // reformulation. Free variables (both bounds infinite) always use the
+    // reformulation.
+    bool native_bounds = true;
+
     // Opt-in explicit dualization for sparse nonnegative equality-form LPs.
     // "off" keeps the current path; "on" always tries; "auto" uses the row/col ratio.
     std::string dualization = "off";

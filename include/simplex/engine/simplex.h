@@ -1376,11 +1376,15 @@ class RevisedSimplex {
 
     static BasisQuality evaluate_basis_quality_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                                                 const Eigen::VectorXd& c,
-                                                const std::vector<int>& basis, double tol);
+                                                const std::vector<int>& basis,
+                                                const Eigen::VectorXd& l, const Eigen::VectorXd& u,
+                                                double tol);
 
     static BasisQuality evaluate_basis_quality_(const SparseMatrix& A, const Eigen::VectorXd& b,
                                                 const Eigen::VectorXd& c,
-                                                const std::vector<int>& basis, double tol);
+                                                const std::vector<int>& basis,
+                                                const Eigen::VectorXd& l, const Eigen::VectorXd& u,
+                                                double tol);
 
     static bool better_basis_quality_(const CrashSelection& lhs, const CrashSelection& rhs,
                                       SimplexMode mode);
@@ -1482,53 +1486,61 @@ class RevisedSimplex {
     improve_basis_by_swaps_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                             const Eigen::VectorXd& c, std::vector<int> basis,
                             const CrashAttemptConfig& cfg, double tol, SimplexMode mode,
+                            const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                             std::optional<std::vector<int>> seed_basis = std::nullopt);
 
     static std::vector<int>
     improve_basis_by_swaps_(const SparseMatrix& A, const Eigen::VectorXd& b,
                             const Eigen::VectorXd& c, std::vector<int> basis,
                             const CrashAttemptConfig& cfg, double tol, SimplexMode mode,
+                            const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                             std::optional<std::vector<int>> seed_basis = std::nullopt);
 
     static std::vector<int>
     build_basis_attempt_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                          const Eigen::VectorXd& c, const CrashAttemptConfig& cfg, double tol,
-                         SimplexMode mode,
+                         SimplexMode mode, const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                          std::optional<std::vector<int>> seed_basis = std::nullopt);
 
     static std::vector<int>
     build_basis_attempt_(const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
                          const CrashAttemptConfig& cfg, double tol, SimplexMode mode,
+                         const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                          std::optional<std::vector<int>> seed_basis = std::nullopt);
 
     static CrashSelection
     choose_initial_basis_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                           const Eigen::VectorXd& c, const RevisedSimplexOptions& opt,
+                          const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                           std::optional<std::vector<int>> seed_basis = std::nullopt,
                           bool allow_direct_warm_start = true);
 
     static CrashSelection
     choose_initial_basis_(const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
-                          const RevisedSimplexOptions& opt,
+                          const RevisedSimplexOptions& opt, const Eigen::VectorXd& l,
+                          const Eigen::VectorXd& u,
                           std::optional<std::vector<int>> seed_basis = std::nullopt,
                           bool allow_direct_warm_start = true);
 
     static std::optional<std::vector<int>>
     find_initial_basis_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
-                        const Eigen::VectorXd& c,
-                        const RevisedSimplexOptions& opt = RevisedSimplexOptions{},
+                        const Eigen::VectorXd& c, const RevisedSimplexOptions& opt,
+                        const Eigen::VectorXd& l, const Eigen::VectorXd& u,
                         std::optional<std::vector<int>> seed_basis = std::nullopt);
 
     static std::optional<std::vector<int>>
     find_initial_basis_(const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
-                        const RevisedSimplexOptions& opt = RevisedSimplexOptions{},
+                        const RevisedSimplexOptions& opt, const Eigen::VectorXd& l,
+                        const Eigen::VectorXd& u,
                         std::optional<std::vector<int>> seed_basis = std::nullopt);
 
     static bool basis_is_primal_feasible_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
-                                          const std::vector<int>& basis, double tol);
+                                          const std::vector<int>& basis, const Eigen::VectorXd& l,
+                                          const Eigen::VectorXd& u, double tol);
 
     static bool basis_is_primal_feasible_(const SparseMatrix& A, const Eigen::VectorXd& b,
-                                          const std::vector<int>& basis, double tol);
+                                          const std::vector<int>& basis, const Eigen::VectorXd& l,
+                                          const Eigen::VectorXd& u, double tol);
 
     static std::tuple<Eigen::MatrixXd, Eigen::VectorXd, Eigen::VectorXd, std::vector<int>,
                       std::size_t, int>
@@ -1541,11 +1553,13 @@ class RevisedSimplex {
     // --------------------------- PRIMAL PHASE ---------------------------
     PhaseResult phase_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
                        std::optional<std::vector<int>> basis_opt, const Eigen::VectorXd& l,
-                       const Eigen::VectorXd& u);
+                       const Eigen::VectorXd& u,
+                       std::optional<std::vector<LPBasisStatus>> warm_status = std::nullopt);
 
     PhaseResult phase_(const SparseMatrix& A, const Eigen::VectorXd& b, const Eigen::VectorXd& c,
                        std::optional<std::vector<int>> basis_opt, const Eigen::VectorXd& l,
-                       const Eigen::VectorXd& u);
+                       const Eigen::VectorXd& u,
+                       std::optional<std::vector<LPBasisStatus>> warm_status = std::nullopt);
 
     // --------------------------- DUAL PHASE ---------------------------
     PhaseResult dual_phase_(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,

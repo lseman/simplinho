@@ -1,8 +1,27 @@
 #pragma once
 
+namespace simplex_detail {
+inline bool basic_values_within_bounds_(const Eigen::VectorXd &xB,
+                                        const std::vector<int> &basis,
+                                        const Eigen::VectorXd &l,
+                                        const Eigen::VectorXd &u, double tol) {
+  for (int i = 0; i < (int)basis.size(); ++i) {
+    const int j = basis[i];
+    const double lo = (j >= 0 && j < l.size() && std::isfinite(l(j))) ? l(j)
+                                                                       : -std::numeric_limits<double>::infinity();
+    const double hi = (j >= 0 && j < u.size() && std::isfinite(u(j))) ? u(j)
+                                                                       : std::numeric_limits<double>::infinity();
+    if (xB(i) < lo - tol || xB(i) > hi + tol)
+      return false;
+  }
+  return true;
+}
+}  // namespace simplex_detail
+
 inline bool RevisedSimplex::basis_is_primal_feasible_(
     const Eigen::MatrixXd &A, const Eigen::VectorXd &b,
-    const std::vector<int> &basis, double tol) {
+    const std::vector<int> &basis, const Eigen::VectorXd &l,
+    const Eigen::VectorXd &u, double tol) {
   const int m = static_cast<int>(A.rows());
   if ((int)basis.size() != m)
     return false;
@@ -14,12 +33,14 @@ inline bool RevisedSimplex::basis_is_primal_feasible_(
   if (lu.rank() != m || !lu.isInvertible())
     return false;
   const Eigen::VectorXd xB = lu.solve(b);
-  return xB.allFinite() && (xB.array() >= -tol).all();
+  return xB.allFinite() &&
+         simplex_detail::basic_values_within_bounds_(xB, basis, l, u, tol);
 }
 
 inline bool RevisedSimplex::basis_is_primal_feasible_(
     const SparseMatrix &A, const Eigen::VectorXd &b,
-    const std::vector<int> &basis, double tol) {
+    const std::vector<int> &basis, const Eigen::VectorXd &l,
+    const Eigen::VectorXd &u, double tol) {
   const int m = static_cast<int>(A.rows());
   if ((int)basis.size() != m)
     return false;
@@ -34,7 +55,8 @@ inline bool RevisedSimplex::basis_is_primal_feasible_(
   const Eigen::VectorXd xB = lu.solve(b);
   if (lu.info() != Eigen::Success)
     return false;
-  return xB.allFinite() && (xB.array() >= -tol).all();
+  return xB.allFinite() &&
+         simplex_detail::basic_values_within_bounds_(xB, basis, l, u, tol);
 }
 
 inline std::tuple<Eigen::MatrixXd, Eigen::VectorXd, Eigen::VectorXd,
