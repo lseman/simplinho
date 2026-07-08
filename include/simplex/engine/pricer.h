@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <deque>
 #include <limits>
 #include <numeric>
@@ -843,7 +844,19 @@ class DualSteepestEdgePricer {
                                       double tol) const {
         LeavingChoice best;
         double best_score = -1.0;
-        for (int i = 0; i < yB.size(); ++i) {
+        const int m = static_cast<int>(yB.size());
+        // HiGHS-style rotated scan start (HEkkDualRHS::chooseNormal): the
+        // strict `>` comparison below never overwrites an exact tie, so a
+        // fixed i=0..m-1 scan order always resolves the same tie the same
+        // way. When the same tie recurs every time the solve returns to a
+        // given state (a 2-cycle), that determinism makes the cycle
+        // permanent. Rotating the start index breaks that: on any solve
+        // where the tie doesn't recur, this has no effect (best_score
+        // dominates); it only changes the outcome when a genuine tie exists.
+        const int start = m > 0 ? static_cast<int>(leaving_scan_seed_ % static_cast<std::uint64_t>(m)) : 0;
+        ++leaving_scan_seed_;
+        for (int k = 0; k < m; ++k) {
+            const int i = (start + k) % m;
             if (yB(i) >= -tol)
                 continue;
             double weight = 1.0;
@@ -1056,6 +1069,12 @@ class DualSteepestEdgePricer {
     double log_error_threshold_{1.3862943611198906};
     double average_log_low_weight_error_{0.0};
     double average_log_high_weight_error_{0.0};
+    // HiGHS-style anti-cycling for CHUZR (HEkkDualRHS::chooseNormal):
+    // rotate the row-scan start each call so an exact tie between two rows'
+    // merit scores doesn't deterministically pick the same row every time —
+    // a fixed scan order can otherwise lock into a 2-cycle between the same
+    // pair of leaving rows forever, since scoring alone never breaks the tie.
+    mutable std::uint64_t leaving_scan_seed_{0};
 };
 
 // ============================================================================
@@ -1097,7 +1116,13 @@ class DualDevexPricer {
                                       double tol) const {
         LeavingChoice best;
         double best_score = -1.0;
-        for (int i = 0; i < yB.size(); ++i) {
+        const int m = static_cast<int>(yB.size());
+        // See DualSteepestEdgePricer::choose_dual_leaving for why the scan
+        // start is rotated (anti-cycling; matches HEkkDualRHS::chooseNormal).
+        const int start = m > 0 ? static_cast<int>(leaving_scan_seed_ % static_cast<std::uint64_t>(m)) : 0;
+        ++leaving_scan_seed_;
+        for (int k = 0; k < m; ++k) {
+            const int i = (start + k) % m;
             if (yB(i) >= -tol)
                 continue;
             const double weight = (i < (int)row_weights_.size()) ? row_weights_[i] : 1.0;
@@ -1221,6 +1246,8 @@ class DualDevexPricer {
     // NLA hook — weight error accumulation for framework switching
     double weight_error_sum_{0.0};
     int weight_error_count_{0};
+    // See DualSteepestEdgePricer::leaving_scan_seed_.
+    mutable std::uint64_t leaving_scan_seed_{0};
 };
 
 // ============================================================================
@@ -1256,8 +1283,13 @@ class DualRowPricer {
                                       double tol) const {
         LeavingChoice best;
         double best_score = -1.0;
-
-        for (int i = 0; i < yB.size(); ++i) {
+        const int m = static_cast<int>(yB.size());
+        // See DualSteepestEdgePricer::choose_dual_leaving for why the scan
+        // start is rotated (anti-cycling; matches HEkkDualRHS::chooseNormal).
+        const int start = m > 0 ? static_cast<int>(leaving_scan_seed_ % static_cast<std::uint64_t>(m)) : 0;
+        ++leaving_scan_seed_;
+        for (int k = 0; k < m; ++k) {
+            const int i = (start + k) % m;
             if (yB(i) >= -tol)
                 continue;
 
@@ -1356,6 +1388,8 @@ class DualRowPricer {
     int iter_count_{0};
     bool need_rebuild_{false};
     std::string weight_strategy_{"dense"};
+    // See DualSteepestEdgePricer::leaving_scan_seed_.
+    mutable std::uint64_t leaving_scan_seed_{0};
 };
 
 // ============================================================================

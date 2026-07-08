@@ -1,6 +1,8 @@
 #pragma once
 
 #include "simplex/core/hvector.h"
+#include "simplex/engine/common/utils.h"
+#include "simplex/engine/primal/components.h"
 #include "simplex/nla/simplex_nla.h"
 
 // Bounded-variable primal revised simplex engine.
@@ -11,169 +13,11 @@
 // the tightest block performs a bound flip (no basis change). Free nonbasic
 // variables (both bounds infinite) rest at 0 and may move in either
 // direction.
-class RevisedSimplexPrimalEngine {
+class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
+                                   public simplex::engine::MatrixUtilities {
   public:
-    struct RatioResult {
-        std::optional<int> row;
-        double theta = std::numeric_limits<double>::infinity();
-        bool leaving_to_upper = false; // leaving basic exits at its upper bound
-    };
-
-    // Two-sided Harris-style ratio test. `sigma` is the movement direction of
-    // the entering variable (+1 increasing, -1 decreasing); the basic values
-    // move by -sigma*t*dB. A row blocks when its basic variable hits its
-    // lower bound (sigma*dB > delta) or its finite upper bound
-    // (sigma*dB < -delta). Among near-minimal ratios, prefers the largest
-    // |pivot| for numerical stability.
-    template <class RowRange>
-    static RatioResult ratio_test_core_(const Eigen::VectorXd& xB, const Eigen::VectorXd& dB,
-                                        double sigma, const RowRange& rows,
-                                        const std::vector<int>& basis, const Eigen::VectorXd& l,
-                                        const Eigen::VectorXd& u, double delta, double eta) {
-        RatioResult out;
-        double theta_star = std::numeric_limits<double>::infinity();
-
-        auto row_ratio = [&](int i, double& ratio, bool& to_upper) -> bool {
-            const double d = sigma * dB(i);
-            const int j = basis[i];
-            if (d > delta) {
-                // basic decreases toward its lower bound
-                const double lo = (j >= 0 && j < l.size()) ? l(j) : 0.0;
-                if (!std::isfinite(lo))
-                    return false;
-                ratio = std::max(0.0, xB(i) - lo) / d;
-                to_upper = false;
-                return true;
-            }
-            if (d < -delta) {
-                // basic increases toward its upper bound
-                const double hi =
-                    (j >= 0 && j < u.size()) ? u(j) : std::numeric_limits<double>::infinity();
-                if (!std::isfinite(hi))
-                    return false;
-                ratio = std::max(0.0, hi - xB(i)) / (-d);
-                to_upper = true;
-                return true;
-            }
-            return false;
-        };
-
-        for (int i : rows) {
-            double ratio;
-            bool to_upper;
-            if (row_ratio(i, ratio, to_upper))
-                theta_star = std::min(theta_star, ratio);
-        }
-        if (!std::isfinite(theta_star))
-            return out; // no blocking row
-
-        const double kappa = std::max(eta, eta * theta_star);
-        int best = -1;
-        double best_pivot = 0.0;
-        bool best_to_upper = false;
-        for (int i : rows) {
-            double ratio;
-            bool to_upper;
-            if (!row_ratio(i, ratio, to_upper))
-                continue;
-            if (ratio <= theta_star + kappa) {
-                const double piv = std::abs(dB(i));
-                if (piv > best_pivot) {
-                    best_pivot = piv;
-                    best = i;
-                    best_to_upper = to_upper;
-                }
-            }
-        }
-        if (best < 0)
-            return out;
-        double theta;
-        bool to_upper;
-        row_ratio(best, theta, to_upper);
-        out.row = best;
-        out.theta = std::max(0.0, theta);
-        out.leaving_to_upper = best_to_upper;
-        return out;
-    }
-
-    struct AllRows {
-        int m;
-        struct It {
-            int i;
-            int operator*() const { return i; }
-            It& operator++() {
-                ++i;
-                return *this;
-            }
-            bool operator!=(const It& o) const { return i != o.i; }
-        };
-        It begin() const { return {0}; }
-        It end() const { return {m}; }
-    };
-
-    static RatioResult ratio_test(const Eigen::VectorXd& xB, const HVector& dB, double sigma,
-                                  const std::vector<int>& basis, const Eigen::VectorXd& l,
-                                  const Eigen::VectorXd& u, double delta, double eta) {
-        if (dB.has_pattern()) {
-            std::vector<int> rows(dB.index.begin(), dB.index.begin() + dB.count);
-            return ratio_test_core_(xB, dB.value, sigma, rows, basis, l, u, delta, eta);
-        }
-        return ratio_test_core_(xB, dB.value, sigma, AllRows{static_cast<int>(dB.value.size())},
-                                basis, l, u, delta, eta);
-    }
-
-    // Value a nonbasic variable rests at.
-    static double nonbasic_value_(int j, const Eigen::VectorXd& l, const Eigen::VectorXd& u,
-                                  bool upper) {
-        const bool has_l = (j < l.size()) && std::isfinite(l(j));
-        const bool has_u = (j < u.size()) && std::isfinite(u(j));
-        if (upper && has_u)
-            return u(j);
-        if (has_l)
-            return l(j);
-        if (has_u)
-            return u(j);
-        return 0.0;
-    }
-
-    template <class MatrixType>
-    static void axpy_col_(const MatrixType& A, int j, double coef, Eigen::VectorXd& target) {
-        if (coef == 0.0)
-            return;
-        if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
-            for (typename MatrixType::InnerIterator it(A, j); it; ++it)
-                target(it.row()) += coef * it.value();
-        } else {
-            target.noalias() += coef * A.col(j);
-        }
-    }
-
-    static bool clamp_basic_solution_to_bounds_(Eigen::VectorXd& xB, const std::vector<int>& basis,
-                                                const Eigen::VectorXd& l, const Eigen::VectorXd& u,
-                                                double tol) {
-        for (int i = 0; i < xB.size(); ++i) {
-            const int j = basis[i];
-            const double lo = (j >= 0 && j < l.size() && std::isfinite(l(j)))
-                                  ? l(j)
-                                  : -std::numeric_limits<double>::infinity();
-            const double hi = (j >= 0 && j < u.size() && std::isfinite(u(j)))
-                                  ? u(j)
-                                  : std::numeric_limits<double>::infinity();
-            if (xB(i) < lo - tol || xB(i) > hi + tol)
-                return false;
-            if (xB(i) < lo)
-                xB(i) = lo;
-            else if (xB(i) > hi)
-                xB(i) = hi;
-        }
-        return true;
-    }
-
-    struct ReducedCostView {
-        Eigen::VectorXd raw;
-        Eigen::VectorXd entering_measure;
-    };
-
+    using RatioResult = simplex::engine::PrimalPivotSelection::RatioResult;
+    using ReducedCostView = simplex::engine::PrimalPivotSelection::ReducedCostView;
     struct IterationWork {
         Eigen::VectorXd base_value;
         Eigen::VectorXd base_cost;
@@ -184,82 +28,6 @@ class RevisedSimplexPrimalEngine {
         int entering_col = -1;
         double entering_direction = 0.0;
     };
-
-    static int nonbasic_move_(int j, const std::vector<char>& at_upper, const Eigen::VectorXd& l,
-                              const Eigen::VectorXd& u, double tol) {
-        const bool has_l = (j < l.size()) && std::isfinite(l(j));
-        const bool has_u = (j < u.size()) && std::isfinite(u(j));
-        if (has_l && has_u && (u(j) - l(j)) <= tol)
-            return 0;
-        if (at_upper[j])
-            return -1;
-        if (has_l)
-            return 1;
-        if (has_u)
-            return -1;
-        return 0;
-    }
-
-    template <class MatrixType>
-    static ReducedCostView
-    compute_reduced_costs_(const MatrixType& A, const Eigen::VectorXd& c, const Eigen::VectorXd& y,
-                           const std::vector<int>& nonbasis, const std::vector<char>& at_upper,
-                           const Eigen::VectorXd& l, const Eigen::VectorXd& u, double tol) {
-        ReducedCostView out;
-        out.raw.resize(nonbasis.size());
-        out.entering_measure.resize(nonbasis.size());
-        Eigen::VectorXd aTy = A.transpose() * y;
-        for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k) {
-            const int j = nonbasis[k];
-            out.raw(k) = c(j) - aTy(j);
-            const int move = nonbasic_move_(j, at_upper, l, u, tol);
-            if (move == 0) {
-                const bool has_l = (j < l.size()) && std::isfinite(l(j));
-                const bool has_u = (j < u.size()) && std::isfinite(u(j));
-                const bool fixed = has_l && has_u && (u(j) - l(j)) <= tol;
-                out.entering_measure(k) = 0.0;
-                if (!fixed)
-                    out.entering_measure(k) = -std::abs(out.raw(k));
-            } else {
-                out.entering_measure(k) = static_cast<double>(move) * out.raw(k);
-            }
-        }
-        return out;
-    }
-
-    static std::optional<int> choose_dantzig_entering_(const Eigen::VectorXd& entering_measure,
-                                                       double tol) {
-        int idx = -1;
-        double best = 0.0;
-        for (int k = 0; k < entering_measure.size(); ++k) {
-            if (entering_measure(k) < -tol && (idx < 0 || entering_measure(k) < best)) {
-                best = entering_measure(k);
-                idx = k;
-            }
-        }
-        if (idx < 0)
-            return std::nullopt;
-        return idx;
-    }
-
-    static std::optional<int> choose_bland_entering_(const Eigen::VectorXd& entering_measure,
-                                                     double tol) {
-        for (int k = 0; k < entering_measure.size(); ++k) {
-            if (entering_measure(k) < -tol)
-                return k;
-        }
-        return std::nullopt;
-    }
-
-    static double entering_direction_(int entering_col, double reduced_cost,
-                                      const std::vector<char>& at_upper, const Eigen::VectorXd& l,
-                                      const Eigen::VectorXd& u, double tol) {
-        const int move = nonbasic_move_(entering_col, at_upper, l, u, tol);
-        if (move != 0)
-            return static_cast<double>(move);
-        const bool has_lower = (entering_col < l.size()) && std::isfinite(l(entering_col));
-        return (reduced_cost > 0.0 && !has_lower) ? -1.0 : 1.0;
-    }
 
     template <class MatrixType>
     static bool

@@ -1146,6 +1146,8 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             }
         }
 
+        const bool direct_dual_native_bounds =
+            opt_.mode == SimplexMode::Dual && allow_direct_dual && has_upper_bounds;
         if (st == LPSolution::Status::Optimal) {
             const Eigen::VectorXd x_full = anchor + sign.cwiseProduct(v2);
             if (primal_feasible_(A_in, b_in, x_full, l_in, u_in, opt_.tol)) {
@@ -1153,14 +1155,18 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             }
             info2["reason"] = "invalid_returned_primal";
         } else if (st == LPSolution::Status::Unbounded ||
-                   (st == LPSolution::Status::IterLimit &&
-                    !(opt_.mode == SimplexMode::Dual && allow_direct_dual && has_upper_bounds)) ||
+                   (st == LPSolution::Status::IterLimit && !direct_dual_native_bounds) ||
                    st == LPSolution::Status::ObjectiveBound ||
-                   (st == LPSolution::Status::Infeasible && !basis_guess_from_warm_start)) {
+                   (st == LPSolution::Status::Infeasible && !basis_guess_from_warm_start &&
+                    !direct_dual_native_bounds)) {
             return finalize_sparse_solution(st, v2, red_basis2, it2, std::move(info2));
         } else if (st == LPSolution::Status::IterLimit) {
             info2["direct_phase2_status"] = to_string(st);
             info2["direct_phase2_recovery"] = "phase1";
+        } else if (st == LPSolution::Status::Infeasible) {
+            info2["direct_phase2_status"] = to_string(st);
+            info2["direct_phase2_recovery"] = "phase1";
+            info2["direct_phase2_recovery_reason"] = "cross_check_infeasibility";
         }
     }
 
@@ -1239,6 +1245,33 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         }
         phase2_seed_status = std::move(st);
     }
+    auto phase2_effective_rhs = [&](const std::vector<int>& basis) {
+        Eigen::VectorXd rhs = bred;
+        if (!phase2_seed_status || phase2_seed_status->size() != static_cast<std::size_t>(n_orig_eff))
+            return rhs;
+        std::vector<char> in_basis(static_cast<std::size_t>(n_orig_eff), 0);
+        for (int j : basis)
+            if (j >= 0 && j < static_cast<int>(n_orig_eff))
+                in_basis[static_cast<std::size_t>(j)] = 1;
+        for (int j = 0; j < static_cast<int>(n_orig_eff); ++j) {
+            if (in_basis[static_cast<std::size_t>(j)])
+                continue;
+            double xj = 0.0;
+            if ((*phase2_seed_status)[j] == LPBasisStatus::AtUpper && std::isfinite(u_eff(j)))
+                xj = u_eff(j);
+            else if (std::isfinite(l_eff(j)))
+                xj = l_eff(j);
+            if (xj != 0.0) {
+                for (SparseMatrix::InnerIterator it(Ared, j); it; ++it)
+                    rhs(it.row()) -= it.value() * xj;
+            }
+        }
+        return rhs;
+    };
+    auto phase2_basis_primal_feasible = [&](const std::vector<int>& basis) {
+        return basis_is_primal_feasible_(Ared, phase2_effective_rhs(basis), basis, l_eff, u_eff,
+                                         opt_.tol);
+    };
 
     std::vector<int> red_basis2;
     red_basis2.reserve(m_rows);
@@ -1259,7 +1292,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 continue;
             if (!sparse_basis_has_full_rank_(Ared, cand))
                 continue;
-            if (basis_is_primal_feasible_(Ared, bred, cand, l_eff, u_eff, opt_.tol)) {
+            if (phase2_basis_primal_feasible(cand)) {
                 red_basis2 = std::move(cand);
                 continue;
             }
@@ -1289,7 +1322,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         }
     }
     if ((int)red_basis2.size() != m_rows ||
-        !basis_is_primal_feasible_(Ared, bred, red_basis2, l_eff, u_eff, opt_.tol)) {
+        !phase2_basis_primal_feasible(red_basis2)) {
         std::vector<int> candidates;
         candidates.reserve(static_cast<std::size_t>(n_orig_eff));
         for (int j = 0; j < static_cast<int>(n_orig_eff); ++j) {
@@ -1325,9 +1358,8 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 support_basis = std::move(trial);
         }
         if (static_cast<int>(support_basis.size()) == m_rows &&
-            basis_is_primal_feasible_(Ared, bred, support_basis, l_eff, u_eff, opt_.tol)) {
+            phase2_basis_primal_feasible(support_basis)) {
             red_basis2 = std::move(support_basis);
-            phase2_seed_status.reset();
         }
     }
 
@@ -1360,12 +1392,18 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                      !primal_feasible_(Ared, bred, dual_primal, l_eff, u_eff, opt_.tol));
                 const bool recover_with_primal =
                     dual_status == LPSolution::Status::Singular ||
-                    dual_status == LPSolution::Status::IterLimit || invalid_dual_optimum;
+                    dual_status == LPSolution::Status::IterLimit ||
+                    dual_status == LPSolution::Status::NeedPhase1 ||
+                    dual_status == LPSolution::Status::Infeasible || invalid_dual_optimum;
                 if (recover_with_primal) {
+                    const bool dual_basis_is_reliable =
+                        dual_status == LPSolution::Status::Infeasible || invalid_dual_optimum;
                     const std::vector<int>& recovery_basis =
-                        static_cast<int>(std::get<2>(res).size()) == m_rows ? std::get<2>(res)
-                                                                             : basis;
-                    auto primal_res = run_phase2_p(recovery_basis, true);
+                        dual_basis_is_reliable &&
+                                static_cast<int>(std::get<2>(res).size()) == m_rows
+                            ? std::get<2>(res)
+                            : basis;
+                    auto primal_res = run_phase2_p(recovery_basis);
                     std::get<4>(primal_res)["phase2_mode"] = "primal";
                     std::get<4>(primal_res)["phase2_dual_recovery"] = "1";
                     std::get<4>(primal_res)["phase2_dual_recovery_status"] =
@@ -1373,6 +1411,9 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                     if (invalid_dual_optimum)
                         std::get<4>(primal_res)["phase2_dual_recovery_reason"] =
                             "invalid_returned_primal";
+                    else if (dual_status == LPSolution::Status::Infeasible)
+                        std::get<4>(primal_res)["phase2_dual_recovery_reason"] =
+                            "cross_check_infeasibility";
                     return primal_res;
                 }
                 return res;
@@ -1408,15 +1449,17 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         const std::optional<std::vector<int>> seeded_repair_basis =
             ((int)red_basis2.size() == m_rows) ? std::optional<std::vector<int>>(red_basis2)
                                                : std::nullopt;
+        RevisedSimplexOptions repair_opt = opt_;
+        repair_opt.mode = SimplexMode::Primal;
         const CrashSelection repaired_seed =
-            choose_initial_basis_(Ared, bred, cred, opt_, l_eff, u_eff, seeded_repair_basis);
+            choose_initial_basis_(Ared, bred, cred, repair_opt, l_eff, u_eff, seeded_repair_basis);
         const CrashSelection repaired_cold =
-            choose_initial_basis_(Ared, bred, cred, opt_, l_eff, u_eff, std::nullopt);
+            choose_initial_basis_(Ared, bred, cred, repair_opt, l_eff, u_eff, std::nullopt);
 
         const CrashSelection* repaired = nullptr;
         if (repaired_seed.quality.valid &&
             (!repaired_cold.quality.valid ||
-             better_basis_quality_(repaired_seed, repaired_cold, opt_.mode))) {
+             better_basis_quality_(repaired_seed, repaired_cold, repair_opt.mode))) {
             repaired = &repaired_seed;
         } else if (repaired_cold.quality.valid) {
             repaired = &repaired_cold;
@@ -1429,7 +1472,13 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             int repaired_iters = 0;
             std::unordered_map<std::string, std::string> repaired_info;
             std::tie(repaired_status, repaired_v, repaired_basis_out, repaired_iters,
-                     repaired_info) = run_sparse_phase2_from_basis(repaired->basis, true);
+                     repaired_info) = run_sparse_phase2_from_basis(repaired->basis);
+            if (repaired_status == LPSolution::Status::NeedPhase1 &&
+                repaired_info.count("reason") &&
+                repaired_info.at("reason") == std::string("optimal_dual_check_failed")) {
+                std::tie(repaired_status, repaired_v, repaired_basis_out, repaired_iters,
+                         repaired_info) = run_sparse_phase2_from_basis(repaired->basis, true);
+            }
             if (!phase2_result_needs_basis_repair(repaired_status, repaired_v) ||
                 (repaired_status == LPSolution::Status::Optimal && repaired_v.size() == n)) {
                 status2 = repaired_status;
@@ -1446,6 +1495,25 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 info2["phase2_basis_repair_source"] = repaired->source;
                 info2["phase2_basis_repair_style"] = repaired->style;
             }
+        }
+    }
+
+    if (status2 == LPSolution::Status::NeedPhase1 && info2.count("reason") &&
+        info2.at("reason") == std::string("optimal_dual_check_failed")) {
+        RevisedSimplexOptions cold_primal_opt = opt_;
+        cold_primal_opt.mode = SimplexMode::Primal;
+        cold_primal_opt.disable_presolve = true;
+        RevisedSimplex cold_primal(cold_primal_opt);
+        LPSolution cold = cold_primal.solve(Ared, bred, cred, l_eff, u_eff);
+        if (cold.status == LPSolution::Status::Optimal && cold.x.size() == n &&
+            primal_feasible_(Ared, bred, cold.x, l_eff, u_eff, opt_.tol)) {
+            status2 = cold.status;
+            v2 = cold.x;
+            red_basis_out = cold.basis;
+            info2 = cold.info;
+            info2["phase2_mode"] = "primal";
+            info2["phase2_cold_primal_recovery"] = "1";
+            info2["phase2_cold_primal_recovery_reason"] = "optimal_dual_check_failed";
         }
     }
 

@@ -875,7 +875,8 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
             if (st == LPSolution::Status::Optimal || st == LPSolution::Status::Unbounded ||
                 (st == LPSolution::Status::IterLimit && !direct_dual_native_bounds) ||
                 st == LPSolution::Status::ObjectiveBound ||
-                (st == LPSolution::Status::Infeasible && !basis_guess_from_warm_start)) {
+                (st == LPSolution::Status::Infeasible && !basis_guess_from_warm_start &&
+                 !direct_dual_native_bounds)) {
                 auto [z_full, obj_corr] = postsolve_primal(v2);
                 Eigen::VectorXd x_full = anchor + sign.cwiseProduct(z_full);
                 const double total_obj = c_in.dot(x_full);
@@ -936,6 +937,10 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
             } else if (st == LPSolution::Status::IterLimit) {
                 info2["direct_phase2_status"] = to_string(st);
                 info2["direct_phase2_recovery"] = "phase1";
+            } else if (st == LPSolution::Status::Infeasible) {
+                info2["direct_phase2_status"] = to_string(st);
+                info2["direct_phase2_recovery"] = "phase1";
+                info2["direct_phase2_recovery_reason"] = "cross_check_infeasibility";
             }
         }
 
@@ -980,6 +985,50 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                                std::numeric_limits<double>::infinity(), {}, it1, std::move(info)));
         }
 
+        // Phase 1 may finish with nonbasics at their upper bounds; seed
+        // phase 2 with those statuses so its starting point matches the
+        // feasible point found by phase 1 (native bounds).
+        std::optional<std::vector<LPBasisStatus>> phase2_seed_status;
+        if (v1.size() >= static_cast<Eigen::Index>(n_orig_eff) &&
+            static_cast<int>(n_orig_eff) == u_eff.size()) {
+            const int nred = static_cast<int>(n_orig_eff);
+            std::vector<LPBasisStatus> stv(nred, LPBasisStatus::AtLower);
+            for (int j = 0; j < nred; ++j) {
+                const bool near_u =
+                    std::isfinite(u_eff(j)) && std::abs(v1(j) - u_eff(j)) <= 10.0 * opt_.tol;
+                const bool near_l =
+                    std::isfinite(l_eff(j)) && std::abs(v1(j) - l_eff(j)) <= 10.0 * opt_.tol;
+                if (near_u && !near_l)
+                    stv[j] = LPBasisStatus::AtUpper;
+            }
+            phase2_seed_status = std::move(stv);
+        }
+        auto phase2_effective_rhs = [&](const std::vector<int>& basis) {
+            Eigen::VectorXd rhs = bred;
+            if (!phase2_seed_status || phase2_seed_status->size() != static_cast<std::size_t>(n_orig_eff))
+                return rhs;
+            std::vector<char> in_basis(static_cast<std::size_t>(n_orig_eff), 0);
+            for (int j : basis)
+                if (j >= 0 && j < static_cast<int>(n_orig_eff))
+                    in_basis[static_cast<std::size_t>(j)] = 1;
+            for (int j = 0; j < static_cast<int>(n_orig_eff); ++j) {
+                if (in_basis[static_cast<std::size_t>(j)])
+                    continue;
+                double xj = 0.0;
+                if ((*phase2_seed_status)[j] == LPBasisStatus::AtUpper && std::isfinite(u_eff(j)))
+                    xj = u_eff(j);
+                else if (std::isfinite(l_eff(j)))
+                    xj = l_eff(j);
+                if (xj != 0.0)
+                    rhs.noalias() -= Ared.col(j) * xj;
+            }
+            return rhs;
+        };
+        auto phase2_basis_primal_feasible = [&](const std::vector<int>& basis) {
+            return basis_is_primal_feasible_(Ared, phase2_effective_rhs(basis), basis, l_eff,
+                                             u_eff, opt_.tol);
+        };
+
         // Warm-start Phase II basis by removing artificials
         std::vector<int> red_basis2;
         red_basis2.reserve(m_rows);
@@ -1005,7 +1054,7 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                 if (!(lu.rank() == (int)cand.size() && lu.isInvertible())) {
                     continue;
                 }
-                if (basis_is_primal_feasible_(Ared, bred, cand, l_eff, u_eff, opt_.tol)) {
+                if (phase2_basis_primal_feasible(cand)) {
                     red_basis2 = std::move(cand);
                     continue;
                 }
@@ -1018,7 +1067,7 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
             }
         }
         if ((int)red_basis2.size() == m_rows &&
-            !basis_is_primal_feasible_(Ared, bred, red_basis2, l_eff, u_eff, opt_.tol)) {
+            !phase2_basis_primal_feasible(red_basis2)) {
             for (int j = 0; j < (int)n_orig_eff; ++j) {
                 if (std::find(red_basis2.begin(), red_basis2.end(), j) != red_basis2.end()) {
                     continue;
@@ -1032,7 +1081,7 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                     Eigen::FullPivLU<Eigen::MatrixXd> lu(Btest);
                     if (!(lu.rank() == m_rows && lu.isInvertible()))
                         continue;
-                    if (!basis_is_primal_feasible_(Ared, bred, cand, l_eff, u_eff, opt_.tol)) {
+                    if (!phase2_basis_primal_feasible(cand)) {
                         continue;
                     }
                     red_basis2 = std::move(cand);
@@ -1042,25 +1091,6 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                 if (improved)
                     break;
             }
-        }
-
-        // Phase 1 may finish with nonbasics at their upper bounds; seed
-        // phase 2 with those statuses so its starting point matches the
-        // feasible point found by phase 1 (native bounds).
-        std::optional<std::vector<LPBasisStatus>> phase2_seed_status;
-        if (v1.size() >= static_cast<Eigen::Index>(n_orig_eff) &&
-            static_cast<int>(n_orig_eff) == u_eff.size()) {
-            const int nred = static_cast<int>(n_orig_eff);
-            std::vector<LPBasisStatus> stv(nred, LPBasisStatus::AtLower);
-            for (int j = 0; j < nred; ++j) {
-                const bool near_u =
-                    std::isfinite(u_eff(j)) && std::abs(v1(j) - u_eff(j)) <= 10.0 * opt_.tol;
-                const bool near_l =
-                    std::isfinite(l_eff(j)) && std::abs(v1(j) - l_eff(j)) <= 10.0 * opt_.tol;
-                if (near_u && !near_l)
-                    stv[j] = LPBasisStatus::AtUpper;
-            }
-            phase2_seed_status = std::move(stv);
         }
 
         // Final Phase II on reduced problem (respect mode)
@@ -1082,18 +1112,25 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                         (v2.size() != n_eff ||
                          !primal_feasible_(Ared, bred, v2, l_eff, u_eff, opt_.tol));
                     if (status2 == LPSolution::Status::Singular ||
-                        status2 == LPSolution::Status::IterLimit || invalid_dual_optimum) {
+                        status2 == LPSolution::Status::IterLimit ||
+                        status2 == LPSolution::Status::NeedPhase1 ||
+                        status2 == LPSolution::Status::Infeasible || invalid_dual_optimum) {
                         std::vector<int> recovery_basis =
-                            static_cast<int>(red_basis_out.size()) == m_rows ? red_basis_out
-                                                                             : red_basis2;
+                            (status2 == LPSolution::Status::Infeasible || invalid_dual_optimum) &&
+                                    static_cast<int>(red_basis_out.size()) == m_rows
+                                ? red_basis_out
+                                : red_basis2;
                         const LPSolution::Status dual_status = status2;
                         std::tie(status2, v2, red_basis_out, it2, info2) =
-                            phase_(Ared, bred, cred, recovery_basis, l_eff, u_eff, std::nullopt);
+                            phase_(Ared, bred, cred, recovery_basis, l_eff, u_eff,
+                                   phase2_seed_status);
                         info2["phase2_mode"] = "primal";
                         info2["phase2_dual_recovery"] = "1";
                         info2["phase2_dual_recovery_status"] = to_string(dual_status);
                         if (invalid_dual_optimum)
                             info2["phase2_dual_recovery_reason"] = "invalid_returned_primal";
+                        else if (dual_status == LPSolution::Status::Infeasible)
+                            info2["phase2_dual_recovery_reason"] = "cross_check_infeasibility";
                     }
                     if (status2 == LPSolution::Status::Infeasible) {
                         auto it = info2.find("farkas_has_cert");
@@ -1136,6 +1173,23 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
             if (status2 == LPSolution::Status::NeedPhase1) {
                 status2 = LPSolution::Status::Singular;
                 info2["note"] = "reduced matrix cannot form a proper basis";
+            }
+        }
+
+        if (status2 == LPSolution::Status::NeedPhase1) {
+            RevisedSimplexOptions cold_primal_opt = opt_;
+            cold_primal_opt.mode = SimplexMode::Primal;
+            cold_primal_opt.disable_presolve = true;
+            RevisedSimplex cold_primal(cold_primal_opt);
+            LPSolution cold = cold_primal.solve(Ared, bred, cred, l_eff, u_eff);
+            if (cold.status == LPSolution::Status::Optimal && cold.x.size() == n_eff &&
+                primal_feasible_(Ared, bred, cold.x, l_eff, u_eff, opt_.tol)) {
+                status2 = cold.status;
+                v2 = cold.x;
+                red_basis_out = cold.basis;
+                info2 = cold.info;
+                info2["phase2_mode"] = "primal";
+                info2["phase2_cold_primal_recovery"] = "1";
             }
         }
 
