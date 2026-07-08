@@ -1,24 +1,145 @@
 # Dual engine: two-sided (native) bound support — known gap
 
-## Status
+## Status (updated: guarded sparse path recovered, native gate remains)
 
-Reverted from this session's working tree. `include/simplex/engine/simplex_dual.h`
-is back to its pre-session state: `choose_dual_leaving` only detects a basic
-variable going **below its lower bound** (`yB(i) < -tol`). It never detects a
-basic variable going **above its upper bound**, and can declare a
-primal-infeasible basis "optimal" when that happens.
+Current public-path status:
 
-Because of this gap, the drivers (`simplex_sparse_impl.h`,
-`simplex_dense_impl.h`) route any solve that might invoke the dual engine
-(`opt_.mode == Dual` or `Auto`) on a problem with finite upper bounds through
-the old standard-form reformulation instead of the new native-bounds path.
-Only `opt_.mode == Primal` uses native bounds when upper bounds are present
-(the primal engine's two-sided ratio test is verified correct — see below).
-This is implemented as `has_upper_bounds` + `opt_.mode != SimplexMode::Primal`
-in both drivers' `use_reformulation` gate.
+- The driver-level native-dual gate is still required:
+  `has_upper_bounds && opt_.mode != SimplexMode::Primal` must continue using
+  the bound reformulation instead of native two-sided dual handling.
+- The documented randomized 38x55 sparse LP (`rng = np.random.default_rng(99)`)
+  now solves correctly through the guarded sparse path. The sparse
+  reformulation can still fail internally with `Singular` on this instance,
+  so the sparse driver falls back to the dense implementation and annotates
+  the result with `sparse_dense_fallback=1`. Verified objective:
+  `-9.657217259529745` vs HiGHS `-9.657217259529757`.
+- Native dual two-sided bounds remain unsafe. A signed-row leaving-pivot
+  attempt removed the old no-pivot view-flip storm, but the native path still
+  fails on larger random LPs, so it stays fenced off.
+- A separate row-rank gap found by the small sparse random sweep at `seed=3`
+  is fixed: dependent equality rows are reduced before solve and the returned
+  solution is checked against the original system before accepting optimality.
+
+A second fix attempt (`normalize_basic_views` in
+`include/simplex/engine/simplex_dual.h`) replaced the first attempt described
+below. It **fixes the original hang/wrong-answer repro** — verified:
+`test_sparse_dual_native_bounds_handles_basic_upper_violation_without_presolve`
+and the pre-existing `test_sparse_dual_reformulation_validates_mapped_primal_before_accepting_optimal`
+both pass, no hang, correct `obj=-2.000434092862235`. All 7 tests in
+`test_bug001_bound_reformulation.py` pass.
+
+**But it introduces a new bug: cycling without progress on larger problems.**
+Confirmed on a randomized 38×55 sparse LP (`rng = np.random.default_rng(99)`,
+first trial of the stress-test loop in this doc's history — see repro below):
+the outer loop runs for the full `max_iters` budget, terminates cleanly at
+`IterLimit` (so it's not an infinite loop — `iters` does increment now, that
+part of the second attempt is correct), but **the basis never changes**
+across iterations. Verbose trace shows the identical `basis=[...]` array on
+every one of 30+ traced iterations, while `normalize_basic_views` reports
+"basic bound-view flips=N" (N between 4 and 27) on *every single iteration*.
+The same set of rows keeps flipping Lower↔Upper forever without ever reaching
+`choose_dual_leaving` / an actual pivot that changes the basis.
+
+Net effect: the LP that previously (pre-session baseline, pre-existing
+separate bug — see bottom section) at least returned `NeedPhase1` quickly now
+burns the full iteration budget and returns `IterLimit` instead — slower and
+still wrong, just wrong in a different way. Not safe to ship as-is; the
+`has_upper_bounds && opt_.mode != SimplexMode::Primal` reformulation-fallback
+gate in both drivers should **stay in place** until this is fixed.
+
+A third attempt changed native dual leaving-row selection so a basic variable
+above its upper bound is priced as an infeasible row with the dual row sign
+negated, and the leaving variable is put into the nonbasis at its upper bound
+after the pivot. This removes the `normalize_basic_views` no-pivot flip storm
+on the randomized 38x55 repro: the basis changes every iteration and there
+are no `"basic bound-view flips"` trace lines. However, that native path still
+does **not** solve the repro reliably; with a larger iteration budget it
+eventually returns `Singular` / `"dual: no eligible entering"` with a
+non-feasible returned vector, while HiGHS finds the optimum. Therefore the
+driver-level `has_upper_bounds && opt_.mode != SimplexMode::Primal`
+reformulation gate remains required for correctness.
 
 **This doc exists so a future session can pick up the fix without re-deriving
 the failure modes from scratch.**
+
+## Repro for the new cycling bug
+
+```python
+import numpy as np, scipy.sparse as sp
+import simplinho as sx
+
+rng = np.random.default_rng(99)
+m, n = rng.integers(15, 40), rng.integers(30, 80)   # first draw: m=38, n=55
+density = rng.uniform(0.2, 0.6)
+Ad = rng.normal(size=(m, n)) * (rng.uniform(size=(m, n)) < density)
+l = np.where(rng.uniform(size=n) < 0.3, rng.uniform(-3, 0, n), 0.0)
+u = l + rng.uniform(0.3, 4.0, n)
+free_mask = rng.uniform(size=n) < 0.1
+u[free_mask] = np.inf
+x0 = l + np.where(np.isfinite(u), (u - l), 2.0) * rng.uniform(0.1, 0.9, n)
+b = Ad @ x0
+c = rng.normal(size=n)
+
+o = sx.RevisedSimplexOptions()
+o.mode = sx.SimplexMode.Dual
+o.max_iters = 30       # small cap to inspect quickly; default 50000 just burns time
+o.verbose = True
+s = sx.RevisedSimplex(o).solve(sp.csc_matrix(Ad), b, c, l, u)
+print(s.status)        # IterLimit
+for ln in s.log.splitlines():
+    print(ln)           # every "[dual] iter=N basic bound-view flips=K" line
+                         # shows the SAME basis array, K in [4, 27], forever
+```
+
+Reference: `scipy.optimize.linprog(c, A_eq=Ad, b_eq=b, bounds=list(zip(l, u)),
+method="highs")` finds `obj=-9.657217259529757` on this instance — so it is a
+feasible, bounded LP; the dual engine should converge on it.
+
+### Likely cause
+
+`normalize_basic_views` recomputes `basic_above_range_rows(yB)` fresh each
+outer-loop pass using whatever `yB` was refreshed at the top of that pass. If
+the flip of a row's view causes `yB` (after refresh) to again read as
+"above range" for that same row — e.g. because the anchor-shift math has an
+off-by-range-sign error, or because `rebuild_nla()` + a stale `rhs_eff`
+combination doesn't actually move the basic value across the boundary the
+way a real pivot would — the row gets flagged and flipped again next
+iteration, forever. A genuine dual pivot (entering/leaving variable swap via
+`choose_dual_leaving` + BFRT) is required to actually change `xB`; a pure
+anchor-view flip only changes which bound a basic variable is *measured
+against* (`yB(i) := xB(i) - anchor`), it does not change `xB(i)` itself. So
+if the row was above range before the flip, it is very likely to look
+"above range" again immediately after — the flip alone doesn't fix
+infeasibility, only pivoting the row out of the basis does.
+
+This suggests the fundamental design gap: **`normalize_basic_views` treats
+"basic variable above upper bound" as something fixable by re-anchoring
+alone**, but re-anchoring a still-basic row doesn't change its numeric value
+— it only relabels which bound violation direction future iterations will
+report for it. The row still needs to actually **leave the basis** via a
+real dual pivot before the infeasibility is resolved. Whether the flip should
+happen at all before a pivot (vs. only as part of computing `w` for a
+*chosen* leaving row, as the first attempt below tried) is the crux to
+resolve.
+
+### What to check next
+
+- Instrument `basic_above_range_rows` to print `yB(i)` and `range` for one
+  specific row across consecutive iterations — confirm whether the same row
+  keeps reporting the same or a growing violation after each flip (would
+  confirm the flip is not moving `xB` at all, just toggling the label).
+- Compare against the first attempt's approach (below): that one flipped the
+  view **only for the chosen leaving row**, immediately followed by a real
+  pivot attempt in the same outer iteration (once the inner-loop-vs-iters bug
+  was fixed) — never flipping N rows speculatively before any pivot. The
+  new `normalize_basic_views` flips *all* above-range rows every iteration
+  before pricing even runs, which may be why it never reaches a pivot: by the
+  time flips are done, `yB` may already show a different set of rows over
+  range (rounding / recompute drift), restarting the cycle.
+- Consider bounding `normalize_basic_views` to fire at most once per outer
+  iteration for a given row-set fingerprint, and forcing a real
+  `choose_dual_leaving` + pivot attempt immediately after any flip round
+  (not just a `continue` back to the top).
 
 ## What already works (do not re-touch without reason)
 
@@ -90,7 +211,9 @@ basic variable can walk arbitrarily far above its upper bound during dual
 pivoting and the engine will never select it as a leaving row, eventually
 declaring optimality with a primal-infeasible basis.
 
-### Attempted fix and why it failed (this session)
+### First attempt and why it failed (superseded by the anchor-flip-based
+    `normalize_basic_views` approach above, which fixes the hang but has its
+    own cycling bug)
 
 The fix attempted was: build a `yB_infeas` vector that folds *both* violation
 kinds into "negative means infeasible" (matching what the pricers already

@@ -23,6 +23,33 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
         trace_line_("[solve] start m=" + std::to_string(A_in.rows()) + " n=" + std::to_string(n));
         trace_line_("[solve] disable_presolve=" + std::to_string(opt_.disable_presolve));
 
+        const RowRankReduction row_rank = dependent_row_reduction_(A_in, b_in, opt_.tol);
+        if (row_rank.needed) {
+            if (row_rank.inconsistent) {
+                return finalize_solution_(make_solution_(
+                    LPSolution::Status::Infeasible, Eigen::VectorXd::Zero(n),
+                    std::numeric_limits<double>::infinity(), {}, 0,
+                    {{"reason", "inconsistent_dependent_rows"},
+                     {"row_rank_reduction_original_m", std::to_string(row_rank.original_rows)},
+                     {"row_rank_reduction_rank", std::to_string(row_rank.rank)}}));
+            }
+            LPSolution reduced_sol =
+                solve_impl_(select_dense_rows_(A_in, row_rank.keep_rows),
+                            select_vector_rows_(b_in, row_rank.keep_rows), c_in, l_in, u_in,
+                            std::nullopt, nullptr);
+            if (reduced_sol.status == LPSolution::Status::Optimal &&
+                !primal_feasible_(A_in, b_in, reduced_sol.x, l_in, u_in, opt_.tol)) {
+                reduced_sol.status = LPSolution::Status::Infeasible;
+                reduced_sol.obj = std::numeric_limits<double>::infinity();
+                reduced_sol.info["reason"] = "dependent_row_solution_failed_original_check";
+            }
+            reduced_sol.info["row_rank_reduction"] = "1";
+            reduced_sol.info["row_rank_reduction_original_m"] =
+                std::to_string(row_rank.original_rows);
+            reduced_sol.info["row_rank_reduction_rank"] = std::to_string(row_rank.rank);
+            return reduced_sol;
+        }
+
         const auto sanitized_bounds = canonicalize_inactive_huge_bounds_(A_in, b_in, l_in, u_in);
         const Eigen::VectorXd& l_use = sanitized_bounds.l;
         const Eigen::VectorXd& u_use = sanitized_bounds.u;
@@ -80,13 +107,11 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
         // engines (anchored model below). The standard-form reformulation is
         // only needed for free variables (both bounds infinite), when
         // explicitly requested via opt_.native_bounds = false, or when the
-        // dual engine might run (mode Dual or Auto): the dual engine's
-        // leaving-variable selection is not yet upper-bound-aware (it can
-        // accept a basis with a basic variable above its upper bound as
-        // "optimal"), so any solve that could invoke it on a problem with
-        // finite upper bounds must go through the reformulation instead.
-        // Only Primal-forced solves use the native path when upper bounds
-        // are present.
+        // dual engine might run (mode Dual or Auto): native dual handling for
+        // two-sided bounds is still guarded by the reformulation path until
+        // its larger sparse-LP stability issues are resolved. Only
+        // Primal-forced solves use the native path when upper bounds are
+        // present.
         bool has_upper_bounds = false;
         for (int j = 0; j < n; ++j) {
             if (std::isfinite(u_use(j))) {
@@ -97,7 +122,8 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
         const bool use_reformulation =
             !is_nonnegative_standard &&
             (has_free_vars || !opt_.native_bounds ||
-             (opt_.mode != SimplexMode::Primal && has_upper_bounds));
+             (opt_.mode != SimplexMode::Primal && has_upper_bounds)) &&
+            !std::getenv("SIMPLINHO_FORCE_NATIVE_DUAL");
         if (use_reformulation) {
             struct ReformVar {
                 int y = -1;
@@ -317,7 +343,7 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                 : (opt_.mode == SimplexMode::Primal ? "primal" : "auto");
             auto solve_reformulated = [&](SimplexMode mode) {
                 RevisedSimplexOptions solve_opt = opt_;
-                solve_opt.mode = (mode == SimplexMode::Auto ? SimplexMode::Primal : mode);
+                solve_opt.mode = mode;
                 solve_opt.disable_presolve = true;
                 trace_line_("[solve_reformulated] disable_presolve=" +
                             std::to_string(solve_opt.disable_presolve));
@@ -346,7 +372,8 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                 std_sol = solve_reformulated(SimplexMode::Auto);
                 reformulated_retry_used = true;
             }
-            if (std_sol.status == LPSolution::Status::Singular &&
+            if ((std_sol.status == LPSolution::Status::Singular ||
+                 std_sol.status == LPSolution::Status::NeedPhase1) &&
                 (basis_std.has_value() || basis_state_std.has_value())) {
                 basis_std.reset();
                 basis_state_std.reset();
@@ -843,8 +870,11 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                 }
             }
 
+            const bool direct_dual_native_bounds =
+                opt_.mode == SimplexMode::Dual && allow_direct_dual && has_upper_bounds;
             if (st == LPSolution::Status::Optimal || st == LPSolution::Status::Unbounded ||
-                st == LPSolution::Status::IterLimit || st == LPSolution::Status::ObjectiveBound ||
+                (st == LPSolution::Status::IterLimit && !direct_dual_native_bounds) ||
+                st == LPSolution::Status::ObjectiveBound ||
                 (st == LPSolution::Status::Infeasible && !basis_guess_from_warm_start)) {
                 auto [z_full, obj_corr] = postsolve_primal(v2);
                 Eigen::VectorXd x_full = anchor + sign.cwiseProduct(z_full);
@@ -867,33 +897,45 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                 auto info = add_info(std::move(info2));
                 if (st == LPSolution::Status::Optimal &&
                     !primal_feasible_(A_in, b_in, x_full, l_in, u_in, opt_.tol)) {
-                    info["reason"] = "invalid_returned_primal";
-                    return finalize_solution_(attach_internal_basis_(
-                        make_solution_(LPSolution::Status::Singular, std::move(x_full), total_obj,
-                                       basis_full, it2, std::move(info)),
-                        red_basis2, internal_column_labels));
+                    if (direct_dual_native_bounds) {
+                        info["reason"] = "invalid_returned_primal";
+                        info2["reason"] = "invalid_returned_primal";
+                        info2["direct_phase2_status"] = to_string(st);
+                        info2["direct_phase2_recovery"] = "phase1";
+                    } else {
+                        info["reason"] = "invalid_returned_primal";
+                        return finalize_solution_(attach_internal_basis_(
+                            make_solution_(LPSolution::Status::Singular, std::move(x_full),
+                                           total_obj, basis_full, it2, std::move(info)),
+                            red_basis2, internal_column_labels));
+                    }
                 }
-                return finalize_solution_(attach_basis_state_(
-                    attach_mapped_primal_ray_(
-                        attach_postsolved_farkas_(
-                            attach_postsolved_row_duals_(
-                                attach_internal_tableau_(
-                                    make_solution_(st, std::move(x_full), total_obj, basis_full,
-                                                   it2, std::move(info), std::nullopt, std::nullopt,
-                                                   primal_ray_internal, has_primal_ray),
-                                    Ared, bred, cred, red_basis2, internal_column_labels,
-                                    internal_row_labels, opt_.tol, opt_.compute_tableau,
-                                    opt_.compute_reduced_costs),
+                if (!(st == LPSolution::Status::Optimal && direct_dual_native_bounds &&
+                      !primal_feasible_(A_in, b_in, x_full, l_in, u_in, opt_.tol))) {
+                    return finalize_solution_(attach_basis_state_(
+                        attach_mapped_primal_ray_(
+                            attach_postsolved_farkas_(
+                                attach_postsolved_row_duals_(
+                                    attach_internal_tableau_(
+                                        make_solution_(st, std::move(x_full), total_obj, basis_full,
+                                                       it2, std::move(info), std::nullopt,
+                                                       std::nullopt, primal_ray_internal,
+                                                       has_primal_ray),
+                                        Ared, bred, cred, red_basis2, internal_column_labels,
+                                        internal_row_labels, opt_.tol, opt_.compute_tableau,
+                                        opt_.compute_reduced_costs),
+                                    P, opt_.tol),
                                 P, opt_.tol),
-                            P, opt_.tol),
-                        col_orig_map, sign, A_model.cols(), opt_.tol),
-                    l_in, u_in, opt_.tol));
+                            col_orig_map, sign, A_model.cols(), opt_.tol),
+                        l_in, u_in, opt_.tol));
+                }
             }
             if (st == LPSolution::Status::Singular) {
-                auto info = add_info({});
-                return finalize_solution_(make_solution_(
-                    LPSolution::Status::Singular, Eigen::VectorXd::Zero(n),
-                    std::numeric_limits<double>::quiet_NaN(), {}, 0, std::move(info)));
+                info2["direct_phase2_status"] = to_string(st);
+                info2["direct_phase2_recovery"] = "phase1";
+            } else if (st == LPSolution::Status::IterLimit) {
+                info2["direct_phase2_status"] = to_string(st);
+                info2["direct_phase2_recovery"] = "phase1";
             }
         }
 
@@ -1035,6 +1077,24 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                 if (phase2_basis_quality.valid && phase2_basis_quality.dual_feasible) {
                     std::tie(status2, v2, red_basis_out, it2, info2) = dual_phase_(
                         Ared, bred, cred, red_basis2, l_eff, u_eff, phase2_seed_status);
+                    const bool invalid_dual_optimum =
+                        status2 == LPSolution::Status::Optimal &&
+                        (v2.size() != n_eff ||
+                         !primal_feasible_(Ared, bred, v2, l_eff, u_eff, opt_.tol));
+                    if (status2 == LPSolution::Status::Singular ||
+                        status2 == LPSolution::Status::IterLimit || invalid_dual_optimum) {
+                        std::vector<int> recovery_basis =
+                            static_cast<int>(red_basis_out.size()) == m_rows ? red_basis_out
+                                                                             : red_basis2;
+                        const LPSolution::Status dual_status = status2;
+                        std::tie(status2, v2, red_basis_out, it2, info2) =
+                            phase_(Ared, bred, cred, recovery_basis, l_eff, u_eff, std::nullopt);
+                        info2["phase2_mode"] = "primal";
+                        info2["phase2_dual_recovery"] = "1";
+                        info2["phase2_dual_recovery_status"] = to_string(dual_status);
+                        if (invalid_dual_optimum)
+                            info2["phase2_dual_recovery_reason"] = "invalid_returned_primal";
+                    }
                     if (status2 == LPSolution::Status::Infeasible) {
                         auto it = info2.find("farkas_has_cert");
                         if (it != info2.end() && it->second == "1") {
@@ -1184,4 +1244,3 @@ inline LPSolution RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const
                 col_orig_map, sign, A_model.cols(), opt_.tol),
             l_in, u_in, opt_.tol));
     }
-

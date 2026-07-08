@@ -296,11 +296,11 @@ template <class PrimalPricer> struct PrimalPricingBridge {
     void after_primal_pivot(int leaving_rel, int entering_abs, int old_abs,
                             const Eigen::VectorXd& pivot_column, double alpha, double step_size,
                             const MatrixLike& A, const std::vector<int>& N,
-                            double rc_improvement = 0.0) {
+                            double rc_improvement, bool is_degenerate) {
         pricer.update_after_primal_pivot(leaving_rel, entering_abs, old_abs, pivot_column, alpha,
                                          step_size, A, N);
 
-        dm.after_pivot(leaving_rel, entering_abs, alpha, rc_improvement, step_size);
+        dm.after_pivot(leaving_rel, entering_abs, alpha, rc_improvement, step_size, is_degenerate);
 
         if (pricer.needs_rebuild()) {
             pricer.clear_rebuild_flag();

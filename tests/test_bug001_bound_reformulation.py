@@ -103,3 +103,57 @@ def test_sparse_dual_reformulation_validates_mapped_primal_before_accepting_opti
         sol.x, [0.0, 3.30133415, 0.0, 1.27384012, 1.27021621], rtol=1e-7, atol=1e-7
     )
     assert math.isclose(sol.obj, -2.000434092862235, rel_tol=1e-9, abs_tol=1e-9)
+
+
+def test_sparse_dual_reformulation_handles_basic_upper_violation_without_presolve():
+    scipy_sparse = pytest.importorskip("scipy.sparse")
+    A = scipy_sparse.csc_matrix(
+        np.array(
+            [
+                [0.14754746975086025, 0.20381642924179696, -0.40621884602135155, -2.2219723133128704, 0.3318116563956822],
+                [-2.86054756497825, -1.5234494373617915, -0.47797031720486144, 0.41265723121444153, 0.8463928997612329],
+            ]
+        )
+    )
+    b = np.array([-1.7360987982545737, -3.428654334644951])
+    c = np.array([1.4414901451598272, -0.563981532939405, 0.8934708274230185, -0.07425126800393837, -0.03460698643809272])
+    l = np.zeros(5)
+    u = np.array([4.03358316830722, 4.825126321719372, np.inf, 1.4547472272771973, 1.2702162069349718])
+    options = splx.RevisedSimplexOptions()
+    options.mode = splx.SimplexMode.Dual
+    options.disable_presolve = True
+
+    sol = splx.RevisedSimplex(options).solve(A, b, c, l, u)
+
+    assert sol.status == splx.LPStatus.Optimal
+    np.testing.assert_allclose(
+        sol.x, [0.0, 3.30133415, 0.0, 1.27384012, 1.27021621], rtol=1e-7, atol=1e-7
+    )
+    assert math.isclose(sol.obj, -2.000434092862235, rel_tol=1e-9, abs_tol=1e-9)
+
+
+def test_sparse_dual_rank_deficient_equalities_reduce_rows_without_presolve():
+    scipy_sparse = pytest.importorskip("scipy.sparse")
+    rng = np.random.default_rng(3)
+    m, n = int(rng.integers(8, 20)), int(rng.integers(15, 35))
+    density = float(rng.uniform(0.2, 0.6))
+    A_dense = rng.normal(size=(m, n)) * (rng.uniform(size=(m, n)) < density)
+    l = np.where(rng.uniform(size=n) < 0.3, rng.uniform(-3, 0, n), 0.0)
+    u = l + rng.uniform(0.3, 4.0, n)
+    u[rng.uniform(size=n) < 0.1] = np.inf
+    x0 = l + np.where(np.isfinite(u), u - l, 2.0) * rng.uniform(0.1, 0.9, n)
+    b = A_dense @ x0
+    c = rng.normal(size=n)
+    options = splx.RevisedSimplexOptions()
+    options.mode = splx.SimplexMode.Dual
+    options.disable_presolve = True
+    options.max_iters = 3000
+
+    sol = splx.RevisedSimplex(options).solve(scipy_sparse.csc_matrix(A_dense), b, c, l, u)
+
+    assert sol.status == splx.LPStatus.Optimal
+    assert sol.info["row_rank_reduction"] == "1"
+    assert math.isclose(sol.obj, -3.0778373567331374, rel_tol=1e-9, abs_tol=1e-9)
+    np.testing.assert_allclose(A_dense @ sol.x, b, rtol=1e-8, atol=1e-8)
+    assert np.min(sol.x - l) >= -1e-8
+    assert np.max(sol.x[np.isfinite(u)] - u[np.isfinite(u)]) <= 1e-8

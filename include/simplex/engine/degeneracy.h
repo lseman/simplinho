@@ -316,22 +316,26 @@ class DegeneracyManager {
         // mapping.
     }
 
-    // Call right after pivot is applied
-    void after_pivot(int /*leaving_rel*/, int entering_abs, double step_alpha,
-                     double rc_improvement, double step_norm) {
+    // Call right after pivot is applied. `is_degenerate` should be the
+    // verdict already produced by `detect_degeneracy()` earlier in the same
+    // iteration (same step, same tolerance) — this method must not
+    // re-derive degeneracy from `step_alpha` against a different threshold
+    // (previously `dm_consts::kDegenerateAlphaTol`, which is ~100x tighter
+    // than the default `deg_step_tol`): for any step between the two
+    // thresholds, `detect_degeneracy` would bump `deg_streak_` while this
+    // method immediately reset it back to 0 on the same iteration, so the
+    // streak could never accumulate past `should_apply_perturbation()`'s
+    // threshold and anti-cycling perturbation would never engage.
+    void after_pivot(int /*leaving_rel*/, int entering_abs, double /*step_alpha*/,
+                     double rc_improvement, double step_norm, bool is_degenerate) {
         last_rc_impr_ = rc_improvement;
         last_step_norm_ = step_norm;
 
-        if (std::abs(step_alpha) <=
-            dm_consts::kDegenerateAlphaTol) {  // degenerate pivot
-            ++deg_streak_;
-            ++deg_total_;
+        if (is_degenerate) {
             push_repeat_(entering_abs);
             update_cycle_signal_();
         } else {
             ++successes_recent_;
-            deg_streak_ = 0;
-            cycling_len_ = 0;
             repeat_abs_block_.clear();
         }
         tune_thresholds_();

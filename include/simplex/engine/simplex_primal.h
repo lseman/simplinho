@@ -148,13 +148,155 @@ class RevisedSimplexPrimalEngine {
         }
     }
 
+    static bool clamp_basic_solution_to_bounds_(Eigen::VectorXd& xB, const std::vector<int>& basis,
+                                                const Eigen::VectorXd& l, const Eigen::VectorXd& u,
+                                                double tol) {
+        for (int i = 0; i < xB.size(); ++i) {
+            const int j = basis[i];
+            const double lo = (j >= 0 && j < l.size() && std::isfinite(l(j)))
+                                  ? l(j)
+                                  : -std::numeric_limits<double>::infinity();
+            const double hi = (j >= 0 && j < u.size() && std::isfinite(u(j)))
+                                  ? u(j)
+                                  : std::numeric_limits<double>::infinity();
+            if (xB(i) < lo - tol || xB(i) > hi + tol)
+                return false;
+            if (xB(i) < lo)
+                xB(i) = lo;
+            else if (xB(i) > hi)
+                xB(i) = hi;
+        }
+        return true;
+    }
+
+    struct ReducedCostView {
+        Eigen::VectorXd raw;
+        Eigen::VectorXd entering_measure;
+    };
+
+    struct IterationWork {
+        Eigen::VectorXd base_value;
+        Eigen::VectorXd base_cost;
+        Eigen::VectorXd work_dual;
+        Eigen::VectorXd reduced_cost;
+        Eigen::VectorXd entering_measure;
+        std::optional<int> entering_rel;
+        int entering_col = -1;
+        double entering_direction = 0.0;
+    };
+
+    static int nonbasic_move_(int j, const std::vector<char>& at_upper, const Eigen::VectorXd& l,
+                              const Eigen::VectorXd& u, double tol) {
+        const bool has_l = (j < l.size()) && std::isfinite(l(j));
+        const bool has_u = (j < u.size()) && std::isfinite(u(j));
+        if (has_l && has_u && (u(j) - l(j)) <= tol)
+            return 0;
+        if (at_upper[j])
+            return -1;
+        if (has_l)
+            return 1;
+        if (has_u)
+            return -1;
+        return 0;
+    }
+
     template <class MatrixType>
-    static RevisedSimplex::PhaseResult run(RevisedSimplex& self, const MatrixType& A,
-                                           const Eigen::VectorXd& b, const Eigen::VectorXd& c,
-                                           std::optional<std::vector<int>> basis_opt,
-                                           const Eigen::VectorXd& l, const Eigen::VectorXd& u,
-                                           std::optional<std::vector<LPBasisStatus>> warm_status =
-                                               std::nullopt) {
+    static ReducedCostView
+    compute_reduced_costs_(const MatrixType& A, const Eigen::VectorXd& c, const Eigen::VectorXd& y,
+                           const std::vector<int>& nonbasis, const std::vector<char>& at_upper,
+                           const Eigen::VectorXd& l, const Eigen::VectorXd& u, double tol) {
+        ReducedCostView out;
+        out.raw.resize(nonbasis.size());
+        out.entering_measure.resize(nonbasis.size());
+        Eigen::VectorXd aTy = A.transpose() * y;
+        for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k) {
+            const int j = nonbasis[k];
+            out.raw(k) = c(j) - aTy(j);
+            const int move = nonbasic_move_(j, at_upper, l, u, tol);
+            if (move == 0) {
+                const bool has_l = (j < l.size()) && std::isfinite(l(j));
+                const bool has_u = (j < u.size()) && std::isfinite(u(j));
+                const bool fixed = has_l && has_u && (u(j) - l(j)) <= tol;
+                out.entering_measure(k) = 0.0;
+                if (!fixed)
+                    out.entering_measure(k) = -std::abs(out.raw(k));
+            } else {
+                out.entering_measure(k) = static_cast<double>(move) * out.raw(k);
+            }
+        }
+        return out;
+    }
+
+    static std::optional<int> choose_dantzig_entering_(const Eigen::VectorXd& entering_measure,
+                                                       double tol) {
+        int idx = -1;
+        double best = 0.0;
+        for (int k = 0; k < entering_measure.size(); ++k) {
+            if (entering_measure(k) < -tol && (idx < 0 || entering_measure(k) < best)) {
+                best = entering_measure(k);
+                idx = k;
+            }
+        }
+        if (idx < 0)
+            return std::nullopt;
+        return idx;
+    }
+
+    static std::optional<int> choose_bland_entering_(const Eigen::VectorXd& entering_measure,
+                                                     double tol) {
+        for (int k = 0; k < entering_measure.size(); ++k) {
+            if (entering_measure(k) < -tol)
+                return k;
+        }
+        return std::nullopt;
+    }
+
+    static double entering_direction_(int entering_col, double reduced_cost,
+                                      const std::vector<char>& at_upper, const Eigen::VectorXd& l,
+                                      const Eigen::VectorXd& u, double tol) {
+        const int move = nonbasic_move_(entering_col, at_upper, l, u, tol);
+        if (move != 0)
+            return static_cast<double>(move);
+        const bool has_lower = (entering_col < l.size()) && std::isfinite(l(entering_col));
+        return (reduced_cost > 0.0 && !has_lower) ? -1.0 : 1.0;
+    }
+
+    template <class MatrixType>
+    static bool
+    exact_optimality_check_(RevisedSimplex& self, const MatrixType& A, const Eigen::VectorXd& b,
+                            const Eigen::VectorXd& c, const std::vector<int>& basis,
+                            const std::vector<int>& nonbasis, const std::vector<char>& at_upper,
+                            const Eigen::VectorXd& x, const Eigen::VectorXd& l,
+                            const Eigen::VectorXd& u, FTBasis& factor, std::string& reason) {
+        if (!RevisedSimplex::primal_feasible_(A, b, x, l, u, self.opt_.tol)) {
+            reason = "optimal_primal_check_failed";
+            return false;
+        }
+        Eigen::VectorXd cB(basis.size());
+        for (int i = 0; i < static_cast<int>(basis.size()); ++i)
+            cB(i) = c(basis[i]);
+        HVector y_hvec;
+        try {
+            y_hvec = factor.solve_BT(cB, FTBasis::TranKind::RowEp);
+        } catch (...) {
+            reason = "optimal_dual_check_solve_failed";
+            return false;
+        }
+        const ReducedCostView exact_rc =
+            compute_reduced_costs_(A, c, y_hvec.value, nonbasis, at_upper, l, u, self.opt_.tol);
+        if (choose_dantzig_entering_(exact_rc.entering_measure, self.opt_.tol)) {
+            reason = "optimal_dual_check_failed";
+            return false;
+        }
+        return true;
+    }
+
+    template <class MatrixType>
+    static RevisedSimplex::PhaseResult
+    run(RevisedSimplex& self, const MatrixType& A, const Eigen::VectorXd& b,
+        const Eigen::VectorXd& c, std::optional<std::vector<int>> basis_opt,
+        const Eigen::VectorXd& l, const Eigen::VectorXd& u,
+        std::optional<std::vector<LPBasisStatus>> warm_status = std::nullopt) {
         const int m = static_cast<int>(A.rows());
         const int n = static_cast<int>(A.cols());
         int iters = 0;
@@ -286,7 +428,8 @@ class RevisedSimplexPrimalEngine {
             nla_cfg.framework_switch_consecutive_ = self.opt_.framework_switch_consecutive;
             nla_cfg.allow_framework_switch_ = self.opt_.allow_framework_switch;
             if (self.opt_.price_strategy == "row_switch_col_switch")
-                nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::RowSwitchColSwitch;
+                nla_cfg.price_strategy_ =
+                    simplex::nla::NLAConfig::PriceStrategy::RowSwitchColSwitch;
             else if (self.opt_.price_strategy == "row_switch")
                 nla_cfg.price_strategy_ = simplex::nla::NLAConfig::PriceStrategy::RowSwitch;
             else
@@ -416,15 +559,53 @@ class RevisedSimplexPrimalEngine {
                 self.adaptive_pricer_.clear_rebuild_flag();
             }
         };
+        auto cleanup_primal_perturbations = [&](const char* reason) {
+            if (!costs_perturbed && !bounds_perturbed)
+                return false;
+            if (costs_perturbed) {
+                c_work = c;
+                costs_perturbed = false;
+            }
+            if (bounds_perturbed) {
+                l_work = l;
+                u_work = u;
+                bounds_perturbed = false;
+            }
+            xB_cache_valid = false;
+            self.trace_line_("[primal] iter=" + std::to_string(iters) +
+                             " cleanup true costs/bounds after " + std::string(reason));
+            rebuild_pricing();
+            return true;
+        };
+        auto finish_optimal = [&](const Eigen::VectorXd& xB_current) {
+            const auto sv = sigma_view();
+            Eigen::VectorXd x = self.assemble_primal_(n, basis, xB_current, l_work, u_work, &sv);
+            std::string exact_reason;
+            if (!exact_optimality_check_(self, A, b, c, basis, N, at_upper, x, l, u, read_basis(),
+                                         exact_reason)) {
+                return RevisedSimplex::PhaseResult{
+                    LPSolution::Status::NeedPhase1,
+                    Eigen::VectorXd::Zero(n),
+                    basis,
+                    iters,
+                    {{"reason", exact_reason.empty() ? "optimality_check_failed" : exact_reason}}};
+            }
+            self.trace_line_("[primal] optimal iter=" + std::to_string(iters) +
+                             " basis=" + self.format_basis_(basis));
+            self.remember_warm_state_(basis, nla);
+            return RevisedSimplex::PhaseResult{LPSolution::Status::Optimal, self.clip_small_(x),
+                                               basis, iters,
+                                               dm_stats_to_map(self.degen_.get_stats())};
+        };
 
         while (iters < self.opt_.max_iters) {
             ++iters;
 
-            Eigen::VectorXd xB;
+            IterationWork work;
             try {
                 if (!xB_cache_valid || xB_cache_age >= xB_max_age)
                     refresh_xB_cache();
-                xB = xB_cache;
+                work.base_value = xB_cache;
             } catch (...) {
                 if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
                     ++rebuild_attempts;
@@ -442,98 +623,48 @@ class RevisedSimplexPrimalEngine {
                         {{"where", "solve(B,b) repair failed"}}};
             }
 
-            // Two-sided primal feasibility of the basic solution.
-            {
-                bool infeasible = false;
-                for (int i = 0; i < m; ++i) {
-                    const int j = basis[i];
-                    const double lo = (j >= 0 && j < l_work.size() && std::isfinite(l_work(j)))
-                                          ? l_work(j)
-                                          : -std::numeric_limits<double>::infinity();
-                    const double hi = (j >= 0 && j < u_work.size() && std::isfinite(u_work(j)))
-                                          ? u_work(j)
-                                          : std::numeric_limits<double>::infinity();
-                    if (xB(i) < lo - self.opt_.tol || xB(i) > hi + self.opt_.tol) {
-                        infeasible = true;
-                        break;
-                    }
-                    // Clamp tolerance-level violations onto the bound.
-                    if (xB(i) < lo)
-                        xB(i) = lo;
-                    else if (xB(i) > hi)
-                        xB(i) = hi;
-                }
-                if (infeasible) {
-                    self.trace_line_("[primal] iter=" + std::to_string(iters) +
-                                     " infeasible basic vars, handing off to phase I");
-                    return {LPSolution::Status::NeedPhase1,
-                            Eigen::VectorXd::Zero(n),
-                            basis,
-                            iters,
-                            {{"reason", "negative_basic_vars"}}};
-                }
+            if (!clamp_basic_solution_to_bounds_(work.base_value, basis, l_work, u_work,
+                                                 self.opt_.tol)) {
+                self.trace_line_("[primal] iter=" + std::to_string(iters) +
+                                 " infeasible basic vars, handing off to phase I");
+                return {LPSolution::Status::NeedPhase1,
+                        Eigen::VectorXd::Zero(n),
+                        basis,
+                        iters,
+                        {{"reason", "negative_basic_vars"}}};
             }
 
-            Eigen::VectorXd cB(m);
+            work.base_cost.resize(m);
             for (int i = 0; i < m; ++i)
-                cB(i) = c_work(basis[i]);
+                work.base_cost(i) = c_work(basis[i]);
 
             HVector y_hvec;
             try {
-                y_hvec = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
+                y_hvec = read_basis().solve_BT(work.base_cost, FTBasis::TranKind::RowEp);
                 nla->update_ema_reach(y_hvec.count, m);
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after solve_BT failure");
                 refactor_basis();
                 xB_cache_valid = false;
-                y_hvec = read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
+                y_hvec = read_basis().solve_BT(work.base_cost, FTBasis::TranKind::RowEp);
                 nla->update_ema_reach(y_hvec.count, m);
                 rebuild_pricing();
             }
-            Eigen::VectorXd y = y_hvec;
-            Eigen::VectorXd aTy = A.transpose() * y;
-            Eigen::VectorXd rN(N.size());
-            Eigen::VectorXd rN_select(N.size());
-            for (int k = 0; k < (int)N.size(); ++k) {
-                const int j = N[k];
-                rN(k) = c_work(j) - aTy(j);
-                const bool has_l = (j < l_work.size()) && std::isfinite(l_work(j));
-                const bool has_u = (j < u_work.size()) && std::isfinite(u_work(j));
-                const bool fixed = has_l && has_u && (u_work(j) - l_work(j)) <= self.opt_.tol;
-                if (fixed) {
-                    rN_select(k) = 0.0; // fixed variables never enter
-                } else if (at_upper[j]) {
-                    // at upper: profitable to decrease when rc > 0
-                    rN_select(k) = -rN(k);
-                } else if (has_l) {
-                    // at lower: profitable to increase when rc < 0
-                    rN_select(k) = rN(k);
-                } else {
-                    // free at 0: profitable in either direction
-                    rN_select(k) = -std::abs(rN(k));
-                }
-            }
+            work.work_dual = y_hvec.value;
+            const ReducedCostView rc_view = compute_reduced_costs_(
+                A, c_work, work.work_dual, N, at_upper, l_work, u_work, self.opt_.tol);
+            work.reduced_cost = rc_view.raw;
+            work.entering_measure = rc_view.entering_measure;
 
-            std::optional<int> e_rel;
-
+            // CHUZC: choose the entering nonbasic column.
             if (self.opt_.bland) {
-                int idx = -1;
-                for (int k = 0; k < (int)N.size(); ++k)
-                    if (rN_select(k) < -self.opt_.tol) {
-                        idx = k;
-                        break;
-                    }
-                if (idx < 0) {
-                    const auto sv = sigma_view();
-                    Eigen::VectorXd x = self.assemble_primal_(n, basis, xB, l_work, u_work, &sv);
-                    self.trace_line_("[primal] optimal iter=" + std::to_string(iters) +
-                                     " basis=" + self.format_basis_(basis));
-                    self.remember_warm_state_(basis, nla);
-                    return {LPSolution::Status::Optimal, self.clip_small_(x), basis, iters,
-                            dm_stats_to_map(self.degen_.get_stats())};
+                work.entering_rel = choose_bland_entering_(work.entering_measure, self.opt_.tol);
+                if (!work.entering_rel) {
+                    if (cleanup_primal_perturbations("no entering column"))
+                        continue;
+                    return finish_optimal(work.base_value);
                 }
-                e_rel = idx;
             } else {
                 if (self.opt_.pricing_rule == "adaptive") {
                     double current_obj = 0.0;
@@ -543,7 +674,7 @@ class RevisedSimplexPrimalEngine {
                             const int j = basis[i];
                             if (j >= 0 && j < n) {
                                 inB[j] = 1;
-                                current_obj += c_work(j) * xB(i);
+                                current_obj += c_work(j) * work.base_value(i);
                             }
                         }
                         for (int j = 0; j < n; ++j) {
@@ -553,72 +684,64 @@ class RevisedSimplexPrimalEngine {
                                 c_work(j) * nonbasic_value_(j, l_work, u_work, at_upper[j]);
                         }
                     }
-                    e_rel = self.bridge_->choose_primal_entering(rN_select, N, self.opt_.tol, iters,
-                                                                 current_obj, read_basis(), A,
-                                                                 self.opt_.partial_pricing);
+                    work.entering_rel = self.bridge_->choose_primal_entering(
+                        work.entering_measure, N, self.opt_.tol, iters, current_obj, read_basis(),
+                        A, self.opt_.partial_pricing);
                 } else {
-                    int idx = -1;
-                    double best = 0.0;
-                    for (int k = 0; k < (int)N.size(); ++k)
-                        if (rN_select(k) < -self.opt_.tol) {
-                            if (idx < 0 || rN_select(k) < best) {
-                                best = rN_select(k);
-                                idx = k;
-                            }
-                        }
-                    if (idx >= 0)
-                        e_rel = idx;
+                    work.entering_rel =
+                        choose_dantzig_entering_(work.entering_measure, self.opt_.tol);
                 }
 
-                if (!e_rel) {
-                    const auto sv = sigma_view();
-                    Eigen::VectorXd x = self.assemble_primal_(n, basis, xB, l_work, u_work, &sv);
-                    self.trace_line_("[primal] optimal iter=" + std::to_string(iters) +
-                                     " basis=" + self.format_basis_(basis));
-                    self.remember_warm_state_(basis, nla);
-                    return {LPSolution::Status::Optimal, self.clip_small_(x), basis, iters,
-                            dm_stats_to_map(self.degen_.get_stats())};
+                if (!work.entering_rel) {
+                    if (cleanup_primal_perturbations("no entering column"))
+                        continue;
+                    return finish_optimal(work.base_value);
                 }
             }
 
-            const int idxN = *e_rel;
-            const int e = N[idxN];
-            const double rc_e = rN(idxN);
-            // Movement direction of the entering variable.
-            const double sigma = at_upper[e] ? -1.0 : ((rc_e > 0.0 && !(e < l_work.size() &&
-                                                                        std::isfinite(l_work(e))))
-                                                           ? -1.0
-                                                           : 1.0);
+            const int idxN = *work.entering_rel;
+            work.entering_col = N[idxN];
+            const double rc_e = work.reduced_cost(idxN);
+            work.entering_direction = entering_direction_(work.entering_col, rc_e, at_upper, l_work,
+                                                          u_work, self.opt_.tol);
 
+            // FTRAN: compute the pivotal column.
             HVector dB;
             try {
-                dB = read_basis().solve_B(A.col(e), FTBasis::TranKind::ColAq);
+                dB = read_basis().solve_B(A.col(work.entering_col), FTBasis::TranKind::ColAq);
                 nla->update_ema_reach(dB.count, m);
             } catch (...) {
                 refactor_basis();
                 xB_cache_valid = false;
-                dB = read_basis().solve_B(A.col(e), FTBasis::TranKind::ColAq);
+                dB = read_basis().solve_B(A.col(work.entering_col), FTBasis::TranKind::ColAq);
                 nla->update_ema_reach(dB.count, m);
                 rebuild_pricing();
             }
 
-            const RatioResult rt = ratio_test(xB, dB, sigma, basis, l_work, u_work,
-                                              self.opt_.ratio_delta, self.opt_.ratio_eta);
+            // CHUZR: choose the leaving basic row, allowing bound flips.
+            const RatioResult rt =
+                ratio_test(work.base_value, dB, work.entering_direction, basis, l_work, u_work,
+                           self.opt_.ratio_delta, self.opt_.ratio_eta);
 
             // Step allowed by the entering variable's own opposite bound.
-            const double l_e = (e < l_work.size()) ? l_work(e) : 0.0;
-            const double u_e = (e < u_work.size()) ? u_work(e) : presolve::inf();
+            const double l_e =
+                (work.entering_col < l_work.size()) ? l_work(work.entering_col) : 0.0;
+            const double u_e =
+                (work.entering_col < u_work.size()) ? u_work(work.entering_col) : presolve::inf();
             const double range_e = (std::isfinite(l_e) && std::isfinite(u_e))
                                        ? std::max(0.0, u_e - l_e)
                                        : std::numeric_limits<double>::infinity();
 
             const double step = std::min(rt.theta, range_e);
             if (!std::isfinite(step)) {
+                if (cleanup_primal_perturbations("unbounded step"))
+                    continue;
                 Eigen::VectorXd x =
                     Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
-                Eigen::VectorXd ray = unbounded_ray(e, sigma, dB.value);
+                Eigen::VectorXd ray =
+                    unbounded_ray(work.entering_col, work.entering_direction, dB.value);
                 self.trace_line_("[primal] unbounded iter=" + std::to_string(iters) +
-                                 " entering=" + std::to_string(e));
+                                 " entering=" + std::to_string(work.entering_col));
                 auto info = dm_stats_to_map(self.degen_.get_stats());
                 info["certificate"] = "primal_ray";
                 info["primal_ray_has_cert"] = "1";
@@ -630,12 +753,14 @@ class RevisedSimplexPrimalEngine {
 
             // ── Bound flip: entering variable hits its opposite bound first ──
             if (range_e < rt.theta - 1e-14) {
-                const double old_val = nonbasic_value_(e, l_work, u_work, at_upper[e]);
-                at_upper[e] = at_upper[e] ? 0 : 1;
-                const double new_val = nonbasic_value_(e, l_work, u_work, at_upper[e]);
+                const double old_val =
+                    nonbasic_value_(work.entering_col, l_work, u_work, at_upper[work.entering_col]);
+                at_upper[work.entering_col] = at_upper[work.entering_col] ? 0 : 1;
+                const double new_val =
+                    nonbasic_value_(work.entering_col, l_work, u_work, at_upper[work.entering_col]);
                 const double delta_x = new_val - old_val;
                 if (delta_x != 0.0) {
-                    axpy_col_(A, e, -delta_x, rhs_eff);
+                    axpy_col_(A, work.entering_col, -delta_x, rhs_eff);
                     if (xB_cache_valid && xB_cache_age < xB_max_age) {
                         xB_cache.noalias() -= delta_x * dB.value;
                         ++xB_cache_age;
@@ -645,18 +770,22 @@ class RevisedSimplexPrimalEngine {
                 }
                 (void)self.degen_.detect_degeneracy(step, self.opt_.deg_step_tol);
                 if (self.should_trace_iter_(iters)) {
-                    self.trace_line_("[primal] iter=" + std::to_string(iters) + " bound flip var=" +
-                                     std::to_string(e) + " step=" + std::to_string(step));
+                    self.trace_line_("[primal] iter=" + std::to_string(iters) +
+                                     " bound flip var=" + std::to_string(work.entering_col) +
+                                     " step=" + std::to_string(step));
                 }
                 continue;
             }
 
             if (!rt.row) {
+                if (cleanup_primal_perturbations("no leaving row"))
+                    continue;
                 Eigen::VectorXd x =
                     Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
-                Eigen::VectorXd ray = unbounded_ray(e, sigma, dB.value);
-                self.trace_line_("[primal] unbounded iter=" + std::to_string(iters) +
-                                 " entering=" + std::to_string(e) + " no leaving variable");
+                Eigen::VectorXd ray =
+                    unbounded_ray(work.entering_col, work.entering_direction, dB.value);
+                self.trace_line_("[primal] unbounded iter=" + std::to_string(iters) + " entering=" +
+                                 std::to_string(work.entering_col) + " no leaving variable");
                 auto info = dm_stats_to_map(self.degen_.get_stats());
                 info["certificate"] = "primal_ray";
                 info["primal_ray_has_cert"] = "1";
@@ -669,7 +798,7 @@ class RevisedSimplexPrimalEngine {
             const int r = *rt.row;
             const double alpha = dB(r);
             const int oldAbs = basis[r];
-            const int eAbs = e;
+            const int eAbs = work.entering_col;
             const auto basis_cycle = self.degen_.register_basis_change(basis, r, eAbs, iters);
             if (basis_cycle.repeated_basis) {
                 self.trace_line_(
@@ -698,7 +827,7 @@ class RevisedSimplexPrimalEngine {
                 // stays feasible without returning to Phase 1.
                 if (self.opt_.primal_simplex_bound_perturbation && !bounds_perturbed) {
                     bounds_perturbed = degeneracy_helpers::perturbBounds(
-                        xB, basis, l_work, u_work, self.rng_, self.opt_.tol,
+                        work.base_value, basis, l_work, u_work, self.rng_, self.opt_.tol,
                         self.opt_.primal_simplex_bound_perturbation_multiplier);
                     if (bounds_perturbed)
                         xB_cache_valid = false; // bounds changed, xB may shift
@@ -718,20 +847,23 @@ class RevisedSimplexPrimalEngine {
             }
 
             if (self.opt_.pricing_rule == "adaptive") {
-                const double rc_impr = -rN_select(idxN);
-                self.bridge_->after_primal_pivot(r, eAbs, oldAbs, dB, alpha, step, A, N, rc_impr);
+                const double rc_impr = -work.entering_measure(idxN);
+                self.bridge_->after_primal_pivot(r, eAbs, oldAbs, dB, alpha, step, A, N, rc_impr,
+                                                 is_degenerate);
             }
 
+            // UPDATE: apply the accepted basis change and maintain work arrays.
             // New value of the entering variable and exit value of the leaver.
-            const double enter_old_val = nonbasic_value_(e, l_work, u_work, at_upper[e]);
-            const double enter_new_val = enter_old_val + sigma * step;
+            const double enter_old_val =
+                nonbasic_value_(work.entering_col, l_work, u_work, at_upper[work.entering_col]);
+            const double enter_new_val = enter_old_val + work.entering_direction * step;
             const double leave_exit_val =
                 nonbasic_value_(oldAbs, l_work, u_work, rt.leaving_to_upper);
 
             if (self.should_trace_iter_(iters)) {
                 const auto sv = sigma_view();
                 const Eigen::VectorXd xcur =
-                    self.assemble_primal_(n, basis, xB, l_work, u_work, &sv);
+                    self.assemble_primal_(n, basis, work.base_value, l_work, u_work, &sv);
                 std::ostringstream oss;
                 oss << "[primal] iter=" << iters << " obj=" << c.dot(xcur) << " enter=" << eAbs
                     << " leave_row=" << r << " leave_var=" << oldAbs << " step=" << step
@@ -765,7 +897,7 @@ class RevisedSimplexPrimalEngine {
             // ── Incremental xB update (rank-1) ─────────────────────────────
             //   xB_new = xB_old − sigma·step·dB;  xB_new[r] = enter_new_val.
             if (xB_cache_valid && xB_cache_age < xB_max_age) {
-                xB_cache.noalias() -= (sigma * step) * dB.value;
+                xB_cache.noalias() -= (work.entering_direction * step) * dB.value;
                 xB_cache(r) = enter_new_val;
                 ++xB_cache_age;
             } else {
@@ -773,7 +905,7 @@ class RevisedSimplexPrimalEngine {
             }
 
             try {
-                update_basis(r, eAbs, A.col(e));
+                update_basis(r, eAbs, A.col(work.entering_col));
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");

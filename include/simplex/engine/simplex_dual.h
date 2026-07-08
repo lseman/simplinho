@@ -94,6 +94,21 @@ class RevisedSimplexDualEngine {
         }
     };
 
+    struct DualIterationWork {
+        Eigen::VectorXd base_value;
+        Eigen::VectorXd base_cost;
+        Eigen::VectorXd work_dual;
+        Eigen::VectorXd row_price;
+        Eigen::VectorXd reduced_cost;
+        HVector pivot_row;
+        HVector pivot_col;
+        int leaving_row = -1;
+        int leaving_sign = 1;
+        int entering_rel = -1;
+        int entering_col = -1;
+        double theta = std::numeric_limits<double>::infinity();
+    };
+
     static BoundView default_bound_view(int j, const Eigen::VectorXd& l, const Eigen::VectorXd& u) {
         const bool has_l = (j < l.size()) && std::isfinite(l(j));
         const bool has_u = (j < u.size()) && std::isfinite(u(j));
@@ -491,6 +506,27 @@ class RevisedSimplexDualEngine {
         return {best, std::max(0.0, best_ratio)};
     }
 
+    template <class MatrixType>
+    static Eigen::VectorXd compute_nonbasic_duals_(const MatrixType& Ahat,
+                                                   const std::vector<int>& nonbasis,
+                                                   const Eigen::VectorXd& ydual,
+                                                   const Eigen::VectorXd& chat) {
+        Eigen::VectorXd rN(nonbasis.size());
+        for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k) {
+            const int j = nonbasis[k];
+            rN(k) = chat(j) - column_dot(Ahat, j, ydual);
+        }
+        return rN;
+    }
+
+    static bool dual_feasible_nonbasics_(const Eigen::VectorXd& rN, double tol) {
+        for (int k = 0; k < rN.size(); ++k) {
+            if (rN(k) < -tol)
+                return false;
+        }
+        return true;
+    }
+
     static DualBFRTDecision dual_bfrt_decide(const RevisedSimplex& self, const Eigen::VectorXd& rN,
                                              const Eigen::VectorXd& pN, const std::vector<int>& N,
                                              const std::vector<BoundView>& view,
@@ -625,6 +661,72 @@ class RevisedSimplexDualEngine {
             view[j] = default_bound_view(j, l, u);
         const bool warm_views_provided =
             warm_status && warm_status->size() == static_cast<std::size_t>(n);
+
+        // ── HiGHS-style upfront cost perturbation ──────────────────────────
+        // HEkkDual::solve() (HEkkDual.cpp) perturbs costs unconditionally at
+        // the start of every dual-phase-2 solve (unless the incoming point
+        // is already near-optimal), rather than waiting for a reactive
+        // degeneracy streak to accumulate mid-loop (the only mechanism this
+        // engine had before). That matters here: this engine's above-upper
+        // leaving-row handling produces long runs of *interleaved* (not
+        // consecutive) degenerate pivots on harder LPs, which never trips
+        // the streak-based `should_apply_perturbation()` gate, so the
+        // engine can wander for tens of thousands of iterations before a
+        // numerically-blown-up ratio test declares a false Infeasible.
+        // Perturbing upfront (small, sign-matched to each column's active
+        // bound direction) breaks that degeneracy before it starts. Skipped
+        // when warm-starting in a BnB node context — those LPs are usually
+        // only a few pivots from optimal, and perturbing would just add a
+        // cleanup pass the objective-bound bailout makes irrelevant.
+        const bool suppress_upfront_perturbation =
+            self.opt_.dual_suppress_perturbation_when_warm &&
+            std::isfinite(self.opt_.objective_bound_internal);
+        bool costs_perturbed_upfront = false;
+        if (!suppress_upfront_perturbation && self.opt_.dual_simplex_cost_perturbation_multiplier > 0.0) {
+            double max_abs_cost = 0.0;
+            for (int j = 0; j < n; ++j) {
+                max_abs_cost = std::max(max_abs_cost, std::abs(c_work(j)));
+            }
+            if (max_abs_cost > 100.0) {
+                max_abs_cost = std::sqrt(std::sqrt(max_abs_cost));
+            }
+            int boxed_count = 0;
+            for (int j = 0; j < n; ++j) {
+                if (std::isfinite(l(j)) && std::isfinite(u(j))) {
+                    ++boxed_count;
+                }
+            }
+            if (n > 0 && static_cast<double>(boxed_count) / n < 0.01) {
+                max_abs_cost = std::min(max_abs_cost, 1.0);
+            }
+            const double perturbation_base =
+                self.opt_.dual_simplex_cost_perturbation_multiplier * 5e-7 * max_abs_cost;
+            if (perturbation_base > 0.0) {
+                std::uniform_real_distribution<double> pert01(0.0, 1.0);
+                for (int j = 0; j < n; ++j) {
+                    const bool has_l = std::isfinite(l(j));
+                    const bool has_u = std::isfinite(u(j));
+                    if (!has_l && !has_u) {
+                        continue;  // free — no perturb
+                    }
+                    if (has_l && has_u && std::abs(u(j) - l(j)) <= self.opt_.tol) {
+                        continue;  // fixed — no perturb
+                    }
+                    const double xpert =
+                        (1.0 + pert01(self.rng_)) * (std::abs(c_work(j)) + 1.0) * perturbation_base;
+                    if (has_l && has_u) {
+                        c_work(j) += (c_work(j) >= 0.0) ? xpert : -xpert;  // boxed
+                    } else if (has_u) {
+                        c_work(j) -= xpert;  // upper-only
+                    } else {
+                        c_work(j) += xpert;  // lower-only
+                    }
+                }
+                costs_perturbed_upfront = true;
+            }
+        }
+        costs_perturbed = costs_perturbed_upfront;
+
         self.bridge_.reset();
         DualAdaptivePricer dual_pricer(
             self.opt_.pricing_rule, self.opt_.devex_reset, self.opt_.adaptive_reset_freq,
@@ -901,6 +1003,84 @@ class RevisedSimplexDualEngine {
             return oss.str();
         };
 
+        auto exact_dual_optimality_check = [&](std::string& reason) {
+            Eigen::VectorXd true_chat(n);
+            for (int j = 0; j < n; ++j)
+                true_chat(j) = (view_sign(view[j]) > 0) ? c(j) : -c(j);
+            for (int j : basis) {
+                if (j >= 0 && j < n)
+                    true_chat(j) = c(j);
+            }
+
+            Eigen::VectorXd true_cB(m);
+            for (int i = 0; i < m; ++i)
+                true_cB(i) = true_chat(basis[i]);
+
+            HVector true_ydual_hvec;
+            try {
+                true_ydual_hvec = read_basis().solve_BT(true_cB, FTBasis::TranKind::RowEp);
+                nla->update_ema_reach(true_ydual_hvec.count, m);
+            } catch (...) {
+                reason = "optimal_dual_check_solve_failed";
+                return false;
+            }
+
+            const Eigen::VectorXd true_rN =
+                compute_nonbasic_duals_(Ahat, N, true_ydual_hvec.value, true_chat);
+            if (!dual_feasible_nonbasics_(true_rN, self.opt_.tol)) {
+                reason = "optimal_dual_check_failed";
+                return false;
+            }
+            return true;
+        };
+
+        auto finish_optimal = [&](const Eigen::VectorXd& yB_current) {
+            Eigen::VectorXd x =
+                assemble_transformed_primal(n, basis, yB_current.cwiseMax(0.0), l, u, view);
+            if (!RevisedSimplex::primal_feasible_(A, b, x, l, u, self.opt_.tol)) {
+                auto info_map = dm_stats_to_map(self.degen_.get_stats());
+                attach_dual_pricing_info(info_map);
+                info_map["reason"] = "optimal_primal_check_failed";
+                return RevisedSimplex::PhaseResult{LPSolution::Status::Singular, std::move(x),
+                                                   basis, iters, std::move(info_map)};
+            }
+            std::string exact_reason;
+            if (!exact_dual_optimality_check(exact_reason)) {
+                auto info_map = dm_stats_to_map(self.degen_.get_stats());
+                attach_dual_pricing_info(info_map);
+                info_map["reason"] =
+                    exact_reason.empty() ? "optimality_check_failed" : exact_reason;
+                return RevisedSimplex::PhaseResult{LPSolution::Status::NeedPhase1, std::move(x),
+                                                   basis, iters, std::move(info_map)};
+            }
+            auto info_map = dm_stats_to_map(self.degen_.get_stats());
+            attach_dual_pricing_info(info_map);
+            self.trace_line_("[dual] optimal iter=" + std::to_string(iters) +
+                             " basis=" + self.format_basis_(basis));
+            const auto dual_state = dual_pricer.export_state();
+            LPDualPricingWarmState pricing_state;
+            switch (dual_state.active_rule) {
+                case DualAdaptivePricer::Rule::SteepestEdge:
+                    pricing_state.active_rule = LPDualPricingWarmState::Rule::SteepestEdge;
+                    pricing_state.row_weights = dual_state.steepest.row_weights;
+                    break;
+                case DualAdaptivePricer::Rule::Devex:
+                    pricing_state.active_rule = LPDualPricingWarmState::Rule::Devex;
+                    pricing_state.row_weights = dual_state.devex.row_weights;
+                    break;
+                case DualAdaptivePricer::Rule::RowPricing:
+                    pricing_state.active_rule = LPDualPricingWarmState::Rule::RowPricing;
+                    pricing_state.row_weights = dual_state.row.row_weights;
+                    break;
+                case DualAdaptivePricer::Rule::MostInfeasible:
+                    pricing_state.active_rule = LPDualPricingWarmState::Rule::MostInfeasible;
+                    break;
+            }
+            self.remember_warm_state_(basis, nla, pricing_state);
+            return RevisedSimplex::PhaseResult{LPSolution::Status::Optimal, std::move(x), basis,
+                                               iters, std::move(info_map)};
+        };
+
         // ── Incremental primal-solution (yB) cache ────────────────────────────
         // Each outer iteration needs yB = B^{-1} rhs_eff. Recomputing it from
         // scratch costs one full BTRAN. Instead we maintain it with the rank-1
@@ -924,26 +1104,68 @@ class RevisedSimplexDualEngine {
         };
         refresh_yB_cache(); // prime the cache before the loop
 
+        // ── Two-sided basic-variable feasibility ───────────────────────────
+        // A basic variable's value in `yB` terms is always measured from its
+        // Lower bound (`view[basis[i]] == Lower` is an invariant enforced
+        // throughout — see the `for (int j : basis) view[j] = Lower;` blocks
+        // above). Feasibility is therefore two-sided:
+        //   0 <= yB(i) <= range(i),  range(i) = u(basis[i]) - l(basis[i]).
+        // `choose_dual_leaving` (in pricer.h, shared by all pricing rules)
+        // only ever checks `yB(i) < -tol`, i.e. it is blind to a basic
+        // variable that has walked above its upper bound. To reuse that
+        // machinery unmodified, `basic_leaving_infeasibility` builds a
+        // "folded" vector where an above-upper row `i` is remapped to
+        // `range(i) - yB(i) < 0` — the same shape of violation
+        // `choose_dual_leaving` already knows how to rank and select. The
+        // returned `sign[i]` records which physical bound row `i` violates
+        // (+1 below-lower, -1 above-upper) so every downstream step (pricing
+        // direction, ratio-test filter, post-pivot nonbasic bound) can un-fold
+        // it consistently.
+        auto basic_leaving_infeasibility = [&](const Eigen::VectorXd& yB_in,
+                                               std::vector<int>& sign_out) {
+            Eigen::VectorXd folded = yB_in;
+            sign_out.assign(static_cast<std::size_t>(m), 1);
+            for (int i = 0; i < m && i < yB_in.size(); ++i) {
+                const int j = basis[i];
+                if (j < 0 || j >= n || view[j] == BoundView::Fixed) {
+                    continue;
+                }
+                const double range = bound_range(j, l, u);
+                if (std::isfinite(range) && yB_in(i) > range + self.opt_.tol) {
+                    folded(i) = range - yB_in(i);
+                    sign_out[static_cast<std::size_t>(i)] = -1;
+                }
+            }
+            return folded;
+        };
+        auto basic_above_range_rows = [&](const Eigen::VectorXd& yB_in) {
+            std::vector<int> rows;
+            rows.reserve(static_cast<std::size_t>(m));
+            for (int i = 0; i < m && i < yB_in.size(); ++i) {
+                const int j = basis[i];
+                if (j < 0 || j >= n || view[j] == BoundView::Fixed) {
+                    continue;
+                }
+                const double range = bound_range(j, l, u);
+                if (std::isfinite(range) && yB_in(i) > range + self.opt_.tol) {
+                    rows.push_back(i);
+                }
+            }
+            return rows;
+        };
+
         while (iters < self.opt_.max_iters) {
             ++iters;
             int flips_this_iter = 0;
-            Eigen::VectorXd yB;
-            Eigen::VectorXd cB(m);
-            Eigen::VectorXd pN;
-            Eigen::VectorXd rN;
-            int r_leave = -1;
-            HVector w;
-            int e_rel = -1;
-            int eAbs = -1;
-            HVector s_enter;
-            double tau = std::numeric_limits<double>::infinity();
+            DualIterationWork work;
+            work.base_cost.resize(m);
 
             while (true) {
                 try {
                     // Use cached yB when valid; otherwise solve from scratch and prime cache.
                     if (!yB_cache_valid || yB_cache_age >= yB_max_age)
                         refresh_yB_cache();
-                    yB = yB_cache;
+                    work.base_value = yB_cache;
                 } catch (...) {
                     if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
                         ++rebuild_attempts;
@@ -965,12 +1187,12 @@ class RevisedSimplexDualEngine {
                 }
 
                 for (int i = 0; i < m; ++i)
-                    cB(i) = chat(basis[i]);
+                    work.base_cost(i) = chat(basis[i]);
                 if (!ydual_cached) {
                     try {
                         {
                             HVector ydual_hvec =
-                                read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
+                                read_basis().solve_BT(work.base_cost, FTBasis::TranKind::RowEp);
                             ydual = ydual_hvec.value;
                             nla->update_ema_reach(ydual_hvec.count, m);
                             ydual_cached = true;
@@ -985,15 +1207,17 @@ class RevisedSimplexDualEngine {
                         }
                         {
                             HVector ydual_hvec =
-                                read_basis().solve_BT(cB, FTBasis::TranKind::RowEp);
+                                read_basis().solve_BT(work.base_cost, FTBasis::TranKind::RowEp);
                             ydual = ydual_hvec.value;
                             nla->update_ema_reach(ydual_hvec.count, m);
                             ydual_cached = true;
                         }
                     }
                 }
+                work.work_dual = ydual;
 
-                if (!(warm_views_provided && iters == 1) && apply_views_to_nonbasics(ydual)) {
+                if (!(warm_views_provided && iters == 1) &&
+                    apply_views_to_nonbasics(work.work_dual)) {
                     rhs_eff = b - transformed_rhs(A, view, l, u);
                     yB_cache_valid = false; // rhs_eff recomputed from scratch
                     if (auto failed = rebuild_dual_pool(
@@ -1003,50 +1227,63 @@ class RevisedSimplexDualEngine {
                     continue;
                 }
 
+                std::vector<int> leaving_row_sign;
+                const Eigen::VectorXd yB_for_leaving =
+                    basic_leaving_infeasibility(work.base_value, leaving_row_sign);
+                // CHUZR: choose the leaving basic row from primal infeasibilities.
                 const auto leaving =
-                    dual_pricer.choose_dual_leaving(read_basis(), yB, self.opt_.tol);
-                r_leave = leaving.row;
-                if (r_leave < 0) {
-                    rN.resize(N.size());
-                    bool dual_feasible = true;
-                    for (int k = 0; k < (int)N.size(); ++k) {
-                        const int j = N[k];
-                        rN(k) = chat(j) - column_dot(Ahat, j, ydual);
-                        if (rN(k) < -self.opt_.tol)
-                            dual_feasible = false;
+                    dual_pricer.choose_dual_leaving(read_basis(), yB_for_leaving, self.opt_.tol);
+                work.leaving_row = leaving.row;
+                work.leaving_sign =
+                    (work.leaving_row >= 0 &&
+                     work.leaving_row < static_cast<int>(leaving_row_sign.size()))
+                        ? leaving_row_sign[static_cast<std::size_t>(work.leaving_row)]
+                        : 1;
+                if (work.leaving_row < 0) {
+                    work.reduced_cost = compute_nonbasic_duals_(Ahat, N, ydual, chat);
+                    bool dual_feasible =
+                        dual_feasible_nonbasics_(work.reduced_cost, self.opt_.tol);
+                    // HiGHS-style cleanup (HEkkDual::cleanup()): this
+                    // dual-feasibility check ran against perturbed costs, so
+                    // an apparent optimum here may be an artifact of the
+                    // perturbation, not a real one. Remove it and recheck
+                    // with the true costs before trusting the result; if it
+                    // no longer holds, fall through to another outer
+                    // iteration (now perturbation-free) instead of returning
+                    // early.
+                    if (dual_feasible && costs_perturbed) {
+                        c_work = c;
+                        for (int j = 0; j < n; ++j) {
+                            chat(j) = (view_sign(view[j]) > 0) ? c_work(j) : -c_work(j);
+                        }
+                        costs_perturbed = false;
+                        ydual_cached = false;
+                        {
+                            Eigen::VectorXd cB_clean(m);
+                            for (int i = 0; i < m; ++i)
+                                cB_clean(i) = chat(basis[i]);
+                            HVector ydual_hvec =
+                                read_basis().solve_BT(cB_clean, FTBasis::TranKind::RowEp);
+                            ydual = ydual_hvec.value;
+                            nla->update_ema_reach(ydual_hvec.count, m);
+                            ydual_cached = true;
+                        }
+                        work.reduced_cost = compute_nonbasic_duals_(Ahat, N, ydual, chat);
+                        dual_feasible =
+                            dual_feasible_nonbasics_(work.reduced_cost, self.opt_.tol);
+                        if (auto failed = rebuild_dual_pool(
+                                "dual pricing rebuild failed after cleanup", iters)) {
+                            return *failed;
+                        }
+                        if (!dual_feasible) {
+                            self.trace_line_(
+                                "[dual] iter=" + std::to_string(iters) +
+                                " cleanup: not optimal with true costs, continuing");
+                            continue;
+                        }
                     }
                     if (dual_feasible) {
-                        Eigen::VectorXd x =
-                            assemble_transformed_primal(n, basis, yB.cwiseMax(0.0), l, u, view);
-                        auto info_map = dm_stats_to_map(self.degen_.get_stats());
-                        attach_dual_pricing_info(info_map);
-                        self.trace_line_("[dual] optimal iter=" + std::to_string(iters) +
-                                         " basis=" + self.format_basis_(basis));
-                        const auto dual_state = dual_pricer.export_state();
-                        LPDualPricingWarmState pricing_state;
-                        switch (dual_state.active_rule) {
-                            case DualAdaptivePricer::Rule::SteepestEdge:
-                                pricing_state.active_rule =
-                                    LPDualPricingWarmState::Rule::SteepestEdge;
-                                pricing_state.row_weights = dual_state.steepest.row_weights;
-                                break;
-                            case DualAdaptivePricer::Rule::Devex:
-                                pricing_state.active_rule = LPDualPricingWarmState::Rule::Devex;
-                                pricing_state.row_weights = dual_state.devex.row_weights;
-                                break;
-                            case DualAdaptivePricer::Rule::RowPricing:
-                                pricing_state.active_rule =
-                                    LPDualPricingWarmState::Rule::RowPricing;
-                                pricing_state.row_weights = dual_state.row.row_weights;
-                                break;
-                            case DualAdaptivePricer::Rule::MostInfeasible:
-                                pricing_state.active_rule =
-                                    LPDualPricingWarmState::Rule::MostInfeasible;
-                                break;
-                        }
-                        self.remember_warm_state_(basis, nla, pricing_state);
-                        return {LPSolution::Status::Optimal, std::move(x), basis, iters,
-                                std::move(info_map)};
+                        return finish_optimal(work.base_value);
                     }
                     self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                      " primal-feasible but dual-infeasible");
@@ -1054,16 +1291,17 @@ class RevisedSimplexDualEngine {
                         cost_shift_phase1_used = true;
                         double max_violation = 0.0;
                         for (int k = 0; k < (int)N.size(); ++k) {
-                            if (rN(k) < -self.opt_.tol && -rN(k) > max_violation) {
-                                max_violation = -rN(k);
+                            if (work.reduced_cost(k) < -self.opt_.tol &&
+                                -work.reduced_cost(k) > max_violation) {
+                                max_violation = -work.reduced_cost(k);
                             }
                         }
                         if (max_violation > 0.0 && max_violation < 1e12) {
                             Eigen::VectorXd shift = Eigen::VectorXd::Zero(n);
                             for (int k = 0; k < (int)N.size(); ++k) {
-                                if (rN(k) < -self.opt_.tol) {
+                                if (work.reduced_cost(k) < -self.opt_.tol) {
                                     const int j = N[k];
-                                    shift(j) = -rN(k) * 1.5;
+                                    shift(j) = -work.reduced_cost(k) * 1.5;
                                 }
                             }
                             Eigen::VectorXd c_shifted = c_work + shift;
@@ -1098,10 +1336,23 @@ class RevisedSimplexDualEngine {
                             {{"reason", "dual_infeasible_at_primal_feasible"}}};
                 }
 
-                w = leaving.dual_row;
-                const double local_row_ep_density = vector_density(w, self.opt_.tol);
+                // `leaving.dual_row` is B^{-T}e_{r_leave} in the raw (unfolded)
+                // orientation. For an above-upper leaving row (leaving_sign<0)
+                // pricing must run in the folded orientation so the existing
+                // `pN(k) < -tol` candidate filter (below-lower convention)
+                // also selects the entering variables that would *decrease*
+                // an above-range basic value. Negate w for pricing only; the
+                // pivot/update math below (`pivot`, `alpha`, `z`) intentionally
+                // keeps using the raw, un-negated BTRAN quantities — see the
+                // comment at the pivot-apply site for why those must stay raw.
+                work.pivot_row = leaving.dual_row;
+                if (work.leaving_sign < 0) {
+                    work.pivot_row.value = -work.pivot_row.value;
+                }
+                const double local_row_ep_density = vector_density(work.pivot_row, self.opt_.tol);
                 DualPricingTelemetry::update_density(local_row_ep_density,
                                                      pricing_telemetry.row_ep_density);
+                // PRICE + CHUZC: price the pivot row and choose the entering column.
                 if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
                     const bool allow_runtime_switch =
                         self.opt_.dual_pricing == "switch" || self.opt_.dual_pricing == "col";
@@ -1115,24 +1366,29 @@ class RevisedSimplexDualEngine {
                         if (self.opt_.parallel_pricing_workers > 1 &&
                             static_cast<int>(N.size()) >=
                                 std::max(1, self.opt_.parallel_pricing_min_cols)) {
-                            compute_pricing_products_parallel(Ahat, N, w, ydual, chat, pN, rN,
-                                                              self.opt_.parallel_pricing_workers,
-                                                              self.opt_.parallel_pricing_min_cols);
+                            compute_pricing_products_parallel(
+                                Ahat, N, work.pivot_row, ydual, chat, work.row_price,
+                                work.reduced_cost, self.opt_.parallel_pricing_workers,
+                                self.opt_.parallel_pricing_min_cols);
                         } else {
-                            compute_pricing_products_by_column(Ahat, N, w, ydual, chat, pN, rN);
+                            compute_pricing_products_by_column(
+                                Ahat, N, work.pivot_row, ydual, chat, work.row_price,
+                                work.reduced_cost);
                         }
                     } else {
-                        compute_pricing_products(Ahat, *Ahat_row, N, w, ydual, chat, pN, rN);
+                        compute_pricing_products(Ahat, *Ahat_row, N, work.pivot_row, ydual, chat,
+                                                 work.row_price, work.reduced_cost);
                     }
                 } else {
                     pricing_telemetry.record_price_mode(true);
-                    compute_pricing_products(Ahat, N, w, ydual, chat, pN, rN);
+                    compute_pricing_products(Ahat, N, work.pivot_row, ydual, chat, work.row_price,
+                                             work.reduced_cost);
                 }
-                DualPricingTelemetry::update_density(vector_density(pN, self.opt_.tol),
+                DualPricingTelemetry::update_density(vector_density(work.row_price, self.opt_.tol),
                                                      pricing_telemetry.row_ap_density);
 
                 const DualBFRTDecision bfrt =
-                    dual_bfrt_decide(self, rN, pN, N, view, l, u,
+                    dual_bfrt_decide(self, work.reduced_cost, work.row_price, N, view, l, u,
                                      self.opt_.dual_allow_bound_flip
                                          ? (self.opt_.dual_flip_max_per_iter - flips_this_iter)
                                          : 0);
@@ -1207,22 +1463,25 @@ class RevisedSimplexDualEngine {
                     continue;
                 }
 
-                e_rel = *bfrt.pivot_rel;
-                eAbs = N[e_rel];
-                tau = bfrt.tau;
-                if (self.degen_.would_repeat_basis_change(basis, r_leave, eAbs)) {
+                work.entering_rel = *bfrt.pivot_rel;
+                work.entering_col = N[work.entering_rel];
+                work.theta = bfrt.tau;
+                if (self.degen_.would_repeat_basis_change(basis, work.leaving_row,
+                                                           work.entering_col)) {
                     int alt_rel = -1;
                     double alt_tau = std::numeric_limits<double>::infinity();
                     for (int k = 0; k < static_cast<int>(N.size()); ++k) {
-                        if (k == e_rel || !(pN(k) < -self.opt_.ratio_delta)) {
+                        if (k == work.entering_rel ||
+                            !(work.row_price(k) < -self.opt_.ratio_delta)) {
                             continue;
                         }
-                        const double candidate_tau = rN(k) / (-pN(k));
+                        const double candidate_tau = work.reduced_cost(k) / (-work.row_price(k));
                         if (!std::isfinite(candidate_tau) || candidate_tau < 0.0) {
                             continue;
                         }
                         const int candidate_abs = N[k];
-                        if (self.degen_.would_repeat_basis_change(basis, r_leave, candidate_abs)) {
+                        if (self.degen_.would_repeat_basis_change(basis, work.leaving_row,
+                                                                  candidate_abs)) {
                             continue;
                         }
                         if (candidate_tau < alt_tau - 1e-16 ||
@@ -1233,15 +1492,17 @@ class RevisedSimplexDualEngine {
                         }
                     }
                     if (alt_rel >= 0) {
-                        e_rel = alt_rel;
-                        eAbs = N[e_rel];
-                        tau = alt_tau;
+                        work.entering_rel = alt_rel;
+                        work.entering_col = N[work.entering_rel];
+                        work.theta = alt_tau;
                     }
                 }
+                // FTRAN: compute the pivotal column for the selected entering variable.
                 try {
                     {
-                        s_enter = read_basis().solve_B(Ahat.col(eAbs), FTBasis::TranKind::ColAq);
-                        nla->update_ema_reach(s_enter.count, m);
+                        work.pivot_col = read_basis().solve_B(Ahat.col(work.entering_col),
+                                                              FTBasis::TranKind::ColAq);
+                        nla->update_ema_reach(work.pivot_col.count, m);
                     }
                 } catch (...) {
                     if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
@@ -1262,13 +1523,13 @@ class RevisedSimplexDualEngine {
                             iters,
                             {{"where", "dual: solve(Bhat,a_e) repair failed"}}};
                 }
-                DualPricingTelemetry::update_density(vector_density(s_enter, self.opt_.tol),
+                DualPricingTelemetry::update_density(vector_density(work.pivot_col, self.opt_.tol),
                                                      pricing_telemetry.col_aq_density);
                 break;
             }
 
-            if (!std::isfinite(tau)) {
-                Eigen::VectorXd yF = w;
+            if (!std::isfinite(work.theta)) {
+                Eigen::VectorXd yF = work.pivot_row;
                 if (yF.dot(rhs_eff) >= 0)
                     yF = -yF;
 
@@ -1286,14 +1547,24 @@ class RevisedSimplexDualEngine {
                         std::move(info_map)};
             }
 
-            const bool is_degenerate = self.degen_.detect_degeneracy(tau, self.opt_.deg_step_tol);
-            const int oldAbs = basis[r_leave];
-            const auto basis_cycle = self.degen_.register_basis_change(basis, r_leave, eAbs, iters);
+            const bool is_degenerate =
+                self.degen_.detect_degeneracy(work.theta, self.opt_.deg_step_tol);
+            const int oldAbs = basis[work.leaving_row];
+            // A leaving row selected as below-lower (leaving_sign>0) exits to
+            // its Lower bound, matching the permanent Lower-view invariant it
+            // already had while basic — no view change needed. A leaving row
+            // selected as above-upper (leaving_sign<0) must instead exit to
+            // its Upper bound, since that's the bound it was violating.
+            const BoundView leaving_target_view =
+                (work.leaving_sign < 0) ? BoundView::Upper : BoundView::Lower;
+            const auto basis_cycle =
+                self.degen_.register_basis_change(basis, work.leaving_row, work.entering_col,
+                                                  iters);
             if (basis_cycle.repeated_basis) {
                 self.trace_line_(
                     "[dual] iter=" + std::to_string(iters) +
                     " repeated basis candidate leave_var=" + std::to_string(oldAbs) +
-                    " enter=" + std::to_string(eAbs) +
+                    " enter=" + std::to_string(work.entering_col) +
                     (basis_cycle.cycling_detected ? " cycle_detected=1" : " cycle_detected=0"));
             }
             // HiGHS-style: when warm-starting in a BNB context (signalled by
@@ -1321,7 +1592,15 @@ class RevisedSimplexDualEngine {
                     ydual_cached = false;
                 }
             } else {
-                if (costs_perturbed) {
+                // Only clear costs that this reactive branch itself applied.
+                // The upfront perturbation (costs_perturbed_upfront) is
+                // deliberately unconditional for the whole solve — HiGHS
+                // doesn't reactively clear it either; it survives until the
+                // explicit cleanup-before-Optimal step. Clearing it here on
+                // the very first non-degenerate pivot defeated its purpose:
+                // it never got a chance to prevent the *later* interleaved
+                // degeneracy this LP exhibits.
+                if (costs_perturbed && !costs_perturbed_upfront) {
                     c_work = c;
                     for (int j = 0; j < n; ++j) {
                         chat(j) = (view_sign(view[j]) > 0) ? c_work(j) : -c_work(j);
@@ -1331,33 +1610,82 @@ class RevisedSimplexDualEngine {
                 }
                 (void)self.degen_.reset_perturbation();
             }
-            self.degen_.after_pivot(r_leave, eAbs, tau, 0.0,
-                                    std::isfinite(tau) ? std::abs(tau) : 0.0);
+            self.degen_.after_pivot(
+                work.leaving_row, work.entering_col, work.theta, 0.0,
+                std::isfinite(work.theta) ? std::abs(work.theta) : 0.0, is_degenerate);
 
             if (self.should_trace_iter_(iters)) {
                 Eigen::VectorXd xcur =
-                    assemble_transformed_primal(n, basis, yB.cwiseMax(0.0), l, u, view);
+                    assemble_transformed_primal(n, basis, work.base_value, l, u, view);
                 std::ostringstream oss;
-                oss << "[dual] iter=" << iters << " obj=" << c.dot(xcur) << " leave_row=" << r_leave
-                    << " leave_var=" << oldAbs << " enter=" << eAbs << " tau=" << tau;
+                oss << "[dual] iter=" << iters << " obj=" << c.dot(xcur)
+                    << " leave_row=" << work.leaving_row << " leave_var=" << oldAbs
+                    << " enter=" << work.entering_col << " tau=" << work.theta
+                    << " leaving_sign=" << work.leaving_sign;
                 if (self.opt_.verbose_include_basis) {
                     oss << " basis_before=" << self.format_basis_(basis);
                 }
                 self.trace_line_(oss.str());
             }
 
-            HVector z = read_basis().solve_BT_unit(r_leave, FTBasis::TranKind::RowEp);
-            const double pivot = s_enter(r_leave);
-            const double alpha = rN(e_rel) / pivot;
+            // UPDATE: apply the accepted basis change and maintain work arrays.
+            // `pivot`/`z` intentionally use the raw (unflipped) BTRAN,
+            // independent of `leaving_sign`: `s_enter = B^{-1}Ahat.col(eAbs)`
+            // and `z = B^{-T}e_{r_leave}` are plain linear solves that never
+            // depended on the pricing-only `w` flip above, and the identity
+            // `alpha * (Ahat.col(k)'z) == rN_new(k) - rN(k)` that this dual
+            // update relies on to keep `rN` consistent holds only with the
+            // raw `z`/`pivot` — flipping them here (as an earlier attempt
+            // did) breaks that identity and corrupts `ydual`/`rN` on every
+            // above-upper pivot.
+            HVector z = read_basis().solve_BT_unit(work.leaving_row, FTBasis::TranKind::RowEp);
+            const double pivot = work.pivot_col(work.leaving_row);
+            const double alpha = work.reduced_cost(work.entering_rel) / pivot;
             ydual.noalias() += alpha * z.value;
             for (int k = 0; k < static_cast<int>(N.size()); ++k) {
-                if (k == e_rel)
+                if (k == work.entering_rel)
                     continue;
-                rN(k) -= alpha * column_dot(Ahat, N[k], z);
+                work.reduced_cost(k) -= alpha * column_dot(Ahat, N[k], z);
             }
-            basis[r_leave] = eAbs;
-            N[e_rel] = oldAbs;
-            rN(e_rel) = chat(oldAbs) - column_dot(Ahat, oldAbs, ydual);
+            basis[work.leaving_row] = work.entering_col;
+            N[work.entering_rel] = oldAbs;
+            // The leaving variable `oldAbs` was always viewed as Lower while
+            // basic (the basis-membership invariant). If it's exiting to
+            // Upper instead (leaving_sign<0), re-anchor it now: shift
+            // `rhs_eff` by the anchor delta and flip its `Ahat`/`chat` column
+            // sign, exactly like the nonbasic bound-flip machinery elsewhere
+            // in this loop. Must happen before the `rN(e_rel)` recompute
+            // below, which reads `Ahat.col(oldAbs)` under the new view.
+            if (leaving_target_view != BoundView::Lower) {
+                const double old_anchor = bound_anchor(BoundView::Lower, oldAbs, l, u);
+                view[oldAbs] = leaving_target_view;
+                const double new_anchor = bound_anchor(view[oldAbs], oldAbs, l, u);
+                const double delta_anchor = new_anchor - old_anchor;
+                if (delta_anchor != 0.0) {
+                    if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
+                        for (typename RevisedSimplex::SparseMatrix::InnerIterator it(A, oldAbs); it;
+                             ++it) {
+                            rhs_eff(it.row()) -= it.value() * delta_anchor;
+                        }
+                    } else {
+                        rhs_eff.noalias() -= A.col(oldAbs) * delta_anchor;
+                    }
+                }
+                // view_sign(Lower)=+1, view_sign(Upper)=-1: always flips here.
+                if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
+                    for (typename RevisedSimplex::SparseMatrix::InnerIterator it(Ahat, oldAbs); it;
+                         ++it) {
+                        it.valueRef() = -it.valueRef();
+                    }
+                    scale_rowwise_column(*Ahat_row, Ahat, oldAbs, -1.0);
+                } else {
+                    Ahat.col(oldAbs) = -Ahat.col(oldAbs);
+                }
+                chat(oldAbs) = -chat(oldAbs);
+            } else {
+                view[oldAbs] = BoundView::Lower;
+            }
+            work.reduced_cost(work.entering_rel) = chat(oldAbs) - column_dot(Ahat, oldAbs, ydual);
 
             // NLA framework switch check — rebuild if Devex weight errors accumulate
             if (nla->needs_framework_rebuild()) {
@@ -1375,7 +1703,7 @@ class RevisedSimplexDualEngine {
 
             bool backtracked_this_iter = false;
             try {
-                update_basis(r_leave, eAbs, Ahat.col(eAbs));
+                update_basis(work.leaving_row, work.entering_col, Ahat.col(work.entering_col));
             } catch (...) {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
@@ -1423,31 +1751,55 @@ class RevisedSimplexDualEngine {
             //   yB_new[r_leave] = tau_r
             // where tau_r = yB_old[r_leave] / pivot, pivot = s_enter[r_leave].
             // s_enter was B_old^{-1} a_e (computed before replace_column).
-            if (!backtracked_this_iter && yB_cache_valid) {
-                const double yb_pivot = s_enter(r_leave);
+            // This SMW shortcut assumes `rhs_eff` did NOT change this
+            // iteration (only the basis did) — true when the leaving var
+            // exits to Lower (leaving_sign>0). When it exits to Upper
+            // (leaving_sign<0) the anchor re-shift above already mutated
+            // `rhs_eff`, invalidating the premise; fall back to a full
+            // solve_B next time yB is needed instead of patching the
+            // formula for a case it wasn't derived for.
+            if (!backtracked_this_iter && yB_cache_valid && work.leaving_sign > 0) {
+                const double yb_pivot = work.pivot_col(work.leaving_row);
                 if (std::abs(yb_pivot) > 1e-14 && yB_cache_age < yB_max_age) {
-                    const double tau_r = yB_cache(r_leave) / yb_pivot;
-                    yB_cache.noalias() -= tau_r * s_enter.value;
-                    yB_cache(r_leave) = tau_r; // override (the -= above gives 0 here)
+                    const double tau_r = yB_cache(work.leaving_row) / yb_pivot;
+                    yB_cache.noalias() -= tau_r * work.pivot_col.value;
+                    yB_cache(work.leaving_row) = tau_r; // override (the -= above gives 0 here)
                     ++yB_cache_age;
                 } else {
                     yB_cache_valid = false; // pivot too small or cache aged out
                 }
+            } else if (!backtracked_this_iter) {
+                yB_cache_valid = false; // rhs_eff changed (leaving var re-anchored to Upper)
             }
 
-            dual_pricer.update_after_dual_pivot(r_leave, eAbs, oldAbs, s_enter, s_enter(r_leave),
-                                                Ahat, N, w, true);
-            // NLA Devex framework switch — pass weight error from pricer
-            if (dual_pricer.needs_rebuild() && nla->allow_framework_switch()) {
-                double w_err = dual_pricer.average_log_weight_error();
-                nla->record_framework_error(w_err);
-            }
-            if (dual_pricer.needs_rebuild()) {
+            if (work.leaving_sign > 0) {
+                dual_pricer.update_after_dual_pivot(
+                    work.leaving_row, work.entering_col, oldAbs, work.pivot_col,
+                    work.pivot_col(work.leaving_row), Ahat, N, work.pivot_row, true);
+                // NLA Devex framework switch — pass weight error from pricer
+                if (dual_pricer.needs_rebuild() && nla->allow_framework_switch()) {
+                    double w_err = dual_pricer.average_log_weight_error();
+                    nla->record_framework_error(w_err);
+                }
+                if (dual_pricer.needs_rebuild()) {
+                    if (auto failed = rebuild_dual_pool(
+                            "dual pricing rebuild failed after pivot update", iters)) {
+                        return *failed;
+                    }
+                    dual_pricer.clear_rebuild_flag();
+                }
+            } else {
+                // The incremental Devex/steepest-edge weight update above
+                // assumes the raw (unflipped) `w`/`dual_row` convention and a
+                // pool keyed against the pre-pivot `Ahat` column signs; for an
+                // above-upper leaving row both `w` and (potentially)
+                // `Ahat.col(oldAbs)` were flipped this iteration, so a full
+                // pool rebuild is used instead of threading that sign through
+                // the incremental update.
                 if (auto failed = rebuild_dual_pool(
-                        "dual pricing rebuild failed after pivot update", iters)) {
+                        "dual pricing rebuild failed after upper-bound pivot", iters)) {
                     return *failed;
                 }
-                dual_pricer.clear_rebuild_flag();
             }
             if (self.should_trace_iter_(iters) && self.opt_.verbose_include_basis) {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
@@ -1467,6 +1819,15 @@ class RevisedSimplexDualEngine {
                 if (!yB_cache_valid || yB_cache_age >= yB_max_age)
                     refresh_yB_cache();
                 const Eigen::VectorXd& yB_sub = yB_cache;
+
+                // PAMI sub-pivots only handle the below-lower case (matching
+                // the raw, unflipped choose_dual_leaving/update_after_dual_pivot
+                // calls below). If any row is above its range — whether from
+                // before this batch started or as a side effect of an earlier
+                // sub-pivot in it — bail out to the outer loop, which runs the
+                // full two-sided leaving-row logic.
+                if (!basic_above_range_rows(yB_sub).empty())
+                    break;
 
                 const auto sub_leaving =
                     dual_pricer.choose_dual_leaving(read_basis(), yB_sub, self.opt_.tol);
@@ -1574,8 +1935,10 @@ class RevisedSimplexDualEngine {
             if (std::isfinite(self.opt_.objective_bound_internal) &&
                 self.opt_.objective_bound_check_freq > 0 &&
                 (iters % self.opt_.objective_bound_check_freq) == 0) {
+                if (!yB_cache_valid || yB_cache_age >= yB_max_age)
+                    refresh_yB_cache();
                 Eigen::VectorXd x_check =
-                    assemble_transformed_primal(n, basis, yB.cwiseMax(0.0), l, u, view);
+                    assemble_transformed_primal(n, basis, yB_cache.cwiseMax(0.0), l, u, view);
                 const double obj_check = c.dot(x_check);
                 if (obj_check > self.opt_.objective_bound_internal) {
                     auto info_map = dm_stats_to_map(self.degen_.get_stats());

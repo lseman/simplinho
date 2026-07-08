@@ -324,6 +324,86 @@ class RevisedSimplex {
 
     static bool sparse_basis_has_full_rank_(const SparseMatrix& A, const std::vector<int>& basis);
 
+    struct RowRankReduction {
+        bool needed = false;
+        bool inconsistent = false;
+        int original_rows = 0;
+        int rank = 0;
+        std::vector<int> keep_rows;
+    };
+
+    static RowRankReduction dependent_row_reduction_(const Eigen::MatrixXd& A,
+                                                     const Eigen::VectorXd& b, double tol) {
+        RowRankReduction out;
+        out.original_rows = static_cast<int>(A.rows());
+        if (A.rows() == 0)
+            return out;
+
+        const double threshold = std::max(1e-12, tol * 100.0);
+        Eigen::FullPivLU<Eigen::MatrixXd> rank_lu(A);
+        rank_lu.setThreshold(threshold);
+        out.rank = rank_lu.rank();
+        if (out.rank >= A.rows())
+            return out;
+        out.needed = true;
+
+        Eigen::MatrixXd augmented(A.rows(), A.cols() + 1);
+        augmented.leftCols(A.cols()) = A;
+        augmented.col(A.cols()) = b;
+        Eigen::FullPivLU<Eigen::MatrixXd> aug_lu(augmented);
+        aug_lu.setThreshold(threshold);
+        if (aug_lu.rank() > out.rank) {
+            out.inconsistent = true;
+            return out;
+        }
+
+        Eigen::ColPivHouseholderQR<Eigen::MatrixXd> row_qr(A.transpose());
+        row_qr.setThreshold(threshold);
+        const int qr_rank = std::min<int>(row_qr.rank(), out.rank);
+        const Eigen::VectorXi perm = row_qr.colsPermutation().indices();
+        out.keep_rows.reserve(qr_rank);
+        for (int k = 0; k < qr_rank; ++k)
+            out.keep_rows.push_back(perm(k));
+        std::sort(out.keep_rows.begin(), out.keep_rows.end());
+        return out;
+    }
+
+    static Eigen::MatrixXd select_dense_rows_(const Eigen::MatrixXd& A,
+                                              const std::vector<int>& rows) {
+        Eigen::MatrixXd out(rows.size(), A.cols());
+        for (int ir = 0; ir < static_cast<int>(rows.size()); ++ir)
+            out.row(ir) = A.row(rows[ir]);
+        return out;
+    }
+
+    static Eigen::VectorXd select_vector_rows_(const Eigen::VectorXd& b,
+                                               const std::vector<int>& rows) {
+        Eigen::VectorXd out(rows.size());
+        for (int ir = 0; ir < static_cast<int>(rows.size()); ++ir)
+            out(ir) = b(rows[ir]);
+        return out;
+    }
+
+    static SparseMatrix select_sparse_rows_(const SparseMatrix& A, const std::vector<int>& rows) {
+        std::vector<int> old_to_new(A.rows(), -1);
+        for (int ir = 0; ir < static_cast<int>(rows.size()); ++ir)
+            old_to_new[rows[ir]] = ir;
+        std::vector<Eigen::Triplet<double>> trips;
+        trips.reserve(static_cast<std::size_t>(A.nonZeros()));
+        for (int j = 0; j < A.outerSize(); ++j) {
+            for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
+                const int nr = old_to_new[it.row()];
+                if (nr >= 0)
+                    trips.emplace_back(nr, j, it.value());
+            }
+        }
+        SparseMatrix out(static_cast<int>(rows.size()), A.cols());
+        if (!trips.empty())
+            out.setFromTriplets(trips.begin(), trips.end());
+        out.makeCompressed();
+        return out;
+    }
+
     static Eigen::VectorXd sparse_solveT_from_lu_(const SparseMatrix& B,
                                                   const Eigen::SparseLU<SparseMatrix>& lu_B,
                                                   const Eigen::VectorXd& c);

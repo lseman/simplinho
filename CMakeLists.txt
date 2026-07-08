@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 
+# force clang
+set(CMAKE_CXX_COMPILER "/data/toolchain/llvm/stage2-prof-use-lto/install/bin/clang++" CACHE STRING "C++ compiler" FORCE)
+
 project(simplinho VERSION 0.1 LANGUAGES CXX)
 
 # ==============================================================================
@@ -13,9 +16,6 @@ endif()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-
-# force clang
-set(CMAKE_CXX_COMPILER "/data/toolchain/llvm/stage2-prof-use-lto/install/bin/clang++" CACHE STRING "C++ compiler" FORCE)
 
 set(SIMPLEX_LOCAL_EIGEN_DIR "" CACHE PATH "Optional local Eigen checkout")
 set(SIMPLEX_LOCAL_PYBIND11_DIR "" CACHE PATH "Optional local pybind11 checkout")
