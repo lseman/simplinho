@@ -923,10 +923,18 @@ class FTBasis {
             config.force_eigen_sparse_lu = true;
         } else if (backend == "pf" || backend == "product_form") {
             config.use_product_form_updates = true;
+            config.update_method = SparseForrestTomlinLU::UpdateMethod::PF;
+        } else if (backend == "mpf" || backend == "middle_product_form") {
+            config.use_product_form_updates = false;
+            config.update_method = SparseForrestTomlinLU::UpdateMethod::MPF;
+        } else if (backend == "apf" || backend == "alternate_product_form") {
+            config.use_product_form_updates = false;
+            config.update_method = SparseForrestTomlinLU::UpdateMethod::APF;
         } else {
             // HiGHS' HFactor defaults to Forrest-Tomlin updates. Product form
             // remains available through basis_sparse_backend="pf".
             config.use_product_form_updates = false;
+            config.update_method = SparseForrestTomlinLU::UpdateMethod::FT;
         }
         return config;
     }

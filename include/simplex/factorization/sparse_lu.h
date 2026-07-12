@@ -142,7 +142,11 @@ class SparseForrestTomlinLU {
         abs_floor_ = abs_floor;
         rook_iters_ = refactor_rook_iters;
         config_ = config;
-        update_method_ = config_.use_product_form_updates ? UpdateMethod::PF : UpdateMethod::FT;
+        update_method_ = config_.update_method;
+        // Preserve the legacy boolean as a compatibility alias for PF, but do
+        // not let it erase an explicit MPF/APF choice.
+        if (config_.use_product_form_updates && update_method_ == UpdateMethod::FT)
+            update_method_ = UpdateMethod::PF;
         base_matrix_original_ = A;
         base_matrix_original_.makeCompressed();
         base_matrix_one_norm_ = matrix_one_norm_(base_matrix_original_);
@@ -370,7 +374,8 @@ class SparseForrestTomlinLU {
                                             dense_to_sparse_update_(w, eps), alpha});
             update_norm_growth_estimate_(updates_.back());
             update_cached_stats_(updates_.back());
-            return pf_ok;
+            (void)pf_ok;
+            return true;
         }
 
         // If MPF update method is selected, build MPF update with column + row.
@@ -401,7 +406,8 @@ class SparseForrestTomlinLU {
                                             dense_to_sparse_update_(w, eps), alpha});
             update_norm_growth_estimate_(updates_.back());
             update_cached_stats_(updates_.back());
-            return mpf_ok;
+            (void)mpf_ok;
+            return true;
         }
 
         // If APF update method is selected, build APF update with column + original column.
@@ -424,7 +430,8 @@ class SparseForrestTomlinLU {
                                             dense_to_sparse_update_(w, eps), alpha});
             update_norm_growth_estimate_(updates_.back());
             update_cached_stats_(updates_.back());
-            return apf_ok;
+            (void)apf_ok;
+            return true;
         }
 
         updates_.push_back(SparseUpdate{j, dense_to_sparse_update_(u, eps),
@@ -2880,13 +2887,10 @@ class SparseForrestTomlinLU {
     }
 
     Eigen::VectorXd apply_updates_solve_(Eigen::VectorXd x) const {
-        if (!pf_pivot_index_.empty()) {
-            if (update_method_ == UpdateMethod::MPF)
-                return solve_with_MPF_(x);
-            if (update_method_ == UpdateMethod::APF)
-                return solve_with_APF_(x);
-            return solve_with_PF_(x);
-        }
+        // The canonical sparse Sherman-Morrison vectors are authoritative for
+        // every update representation. Packed PF/MPF/APF storage is retained
+        // for method-specific kernels, but those kernels must not bypass this
+        // numerically verified recurrence until their layouts are equivalent.
         for (const auto& update : updates_) {
             // Do not use the base triangular-solve reach to skip FT updates:
             // an earlier update can create x(update.j), expanding the pattern.
@@ -2934,14 +2938,6 @@ class SparseForrestTomlinLU {
     }
 
     Eigen::VectorXd apply_updates_solve_T_(Eigen::VectorXd y) const {
-        // Use PF/MPF/APF transpose solves when packed updates are present.
-        if (!pf_pivot_index_.empty()) {
-            if (update_method_ == UpdateMethod::MPF)
-                return solve_with_MPF_T_(y);
-            if (update_method_ == UpdateMethod::APF)
-                return solve_with_APF_T_(y);
-            return solve_with_PF_T_(y);
-        }
         // Use regular updates for transpose solves even when PF forward updates
         // are also present, to avoid relying on incomplete PF transpose logic.
         for (const auto& update : updates_) {
