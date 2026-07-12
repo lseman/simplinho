@@ -538,9 +538,16 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
             }
 
             // CHUZR: choose the leaving basic row, allowing bound flips.
+            // HiGHS progressively rejects smaller pivotal entries as the update
+            // chain grows and numerical noise accumulates.
+            const int update_count = read_basis().update_count();
+            const double alpha_tol =
+                update_count < 10 ? std::max(self.opt_.ratio_delta, 1e-9)
+                : update_count < 20 ? std::max(self.opt_.ratio_delta, 1e-8)
+                                    : std::max(self.opt_.ratio_delta, 1e-7);
             const RatioResult rt =
                 ratio_test(work.base_value, dB, work.entering_direction, basis, l_work, u_work,
-                           self.opt_.ratio_delta, self.opt_.ratio_eta);
+                           alpha_tol, self.opt_.ratio_eta);
 
             // Step allowed by the entering variable's own opposite bound.
             const double l_e =
@@ -571,7 +578,10 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
             }
 
             // ── Bound flip: entering variable hits its opposite bound first ──
-            if (range_e < rt.theta - 1e-14) {
+            // Match HiGHS considerBoundSwap: only flip when the pivotal step
+            // would cross the opposite bound by more than primal feasibility
+            // tolerance. Near ties should pivot, avoiding flip/pivot chatter.
+            if (range_e + self.opt_.ratio_eta < rt.theta) {
                 const double old_val =
                     nonbasic_value_(work.entering_col, l_work, u_work, at_upper[work.entering_col]);
                 at_upper[work.entering_col] = at_upper[work.entering_col] ? 0 : 1;

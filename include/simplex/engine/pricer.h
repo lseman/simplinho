@@ -590,8 +590,9 @@ class DevexPricer {
     std::optional<int> choose_primal_entering(const Eigen::VectorXd& rcN, const std::vector<int>& N,
                                               double tol, bool partial_pricing = false) {
         ++iter_count_;
-        if (iter_count_ % reset_freq_ == 0) {
-            reset_weights_(N);
+        if (need_rebuild_ || iter_count_ % reset_freq_ == 0) {
+            initialize_weights_(N);
+            need_rebuild_ = false;
         }
 
         const int total_candidates = (int)N.size();
