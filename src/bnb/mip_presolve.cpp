@@ -785,282 +785,32 @@ inline std::pair<int, int> relax_huge_bounds(Problem* problem, double tol,
     return {relaxed_lower, relaxed_upper};
 }
 
-/// Coefficient strengthening (PaPILO style)
-/// Saturates coefficients for integer variables to improve LP relaxation quality
+/// Coefficient strengthening: DISABLED.
+///
+/// Two independent derivations (single-variable saturation, then a
+/// minimal-cover reduction restricted to pure 0/1 rows) were tried and both
+/// produced verified wrong answers on random knapsack instances -- e.g. row
+/// `3x0+10x1+8x2+13x3<=23` (all binary) strengthened to `3x0+8x1+8x2+8x3<=16`
+/// wrongly excludes the feasible/optimal point x0=x1=x2=1,x3=0 (original
+/// activity 21<=23, strengthened activity 19>16). The minimal-cover
+/// reduction must be applied as an additional cut derived from the cover,
+/// not as a wholesale replacement of the row's coefficients/rhs; getting
+/// that right needs a careful port of a reference implementation (e.g.
+/// HiGHS's HPresolve::strengthenInequalities) with row-by-row verification
+/// against a working solver, not a from-memory re-derivation. Left as a
+/// documented no-op rather than ship a silent wrong-answer generator in
+/// root presolve. See git history on this function for the two failed
+/// attempts if revisiting.
 inline std::pair<int, int> coefficient_strengthening(Problem* problem, const std::vector<Cut>& cuts,
                                                      double tol, int* tightened_bounds,
                                                      int* strengthened_coeffs) {
-    if (problem == nullptr || problem->base_constraints.empty())
+    (void)cuts;
+    (void)tol;
+    (void)tightened_bounds;
+    (void)strengthened_coeffs;
+    if (problem == nullptr)
         return {0, 0};
-
-    int strengthened = 0;
-    int tightened = 0;
-
-    // Compute data scale for numerical stability
-    double data_scale = 1.0;
-    if (problem->objective_coefficients.size() > 0) {
-        data_scale = std::max(data_scale, problem->objective_coefficients.cwiseAbs().maxCoeff());
-    }
-    for (const auto& row : problem->base_constraints) {
-        data_scale = std::max(data_scale, std::abs(row.rhs));
-        for (double value : row.values)
-            data_scale = std::max(data_scale, std::abs(value));
-    }
-    for (const auto& cut : cuts) {
-        data_scale = std::max(data_scale, std::abs(cut.rhs));
-        for (double value : cut.values)
-            data_scale = std::max(data_scale, std::abs(value));
-    }
-
-    const double huge_bound = 1e6 * data_scale;
-
-    // Build col_to_rows mapping for each variable
-    std::vector<std::vector<int>> col_to_rows(problem->lower_bounds.size());
-    for (int row_index = 0; row_index < static_cast<int>(problem->base_constraints.size());
-         ++row_index) {
-        const auto& row = problem->base_constraints[row_index];
-        for (int k = 0;
-             k < static_cast<int>(row.indices.size()) && k < static_cast<int>(row.values.size());
-             ++k) {
-            const int index = row.indices[k];
-            if (index < 0 || index >= static_cast<int>(col_to_rows.size()) ||
-                std::abs(row.values[k]) <= kCoeffTol) {
-                continue;
-            }
-            col_to_rows[index].push_back(row_index);
-        }
-    }
-
-    // For each integer variable, compute saturation bound
-    for (int j = 0; j < static_cast<int>(problem->lower_bounds.size()); ++j) {
-        if (problem->variable_types[j] == VariableType::Continuous)
-            continue;
-
-        const double lb = problem->lower_bounds[j];
-        const double ub = problem->upper_bounds[j];
-
-        // Skip if bounds are effectively infinite or already tight
-        if (std::isfinite(lb) && std::isfinite(ub) && std::abs(lb - ub) <= tol)
-            continue;
-
-        // Compute max activity contribution from this variable
-        double max_contrib = 0.0;
-        bool has_finite_lb = std::isfinite(lb);
-        bool has_finite_ub = std::isfinite(ub);
-
-        for (const auto& row : problem->base_constraints) {
-            const auto pos = find_row_coefficient_position(row, j);
-            if (!pos.has_value() || std::abs(row.values[*pos]) <= kCoeffTol)
-                continue;
-
-            const double coeff = row.values[*pos];
-            const double contrib = coeff * (has_finite_lb ? lb : (has_finite_ub ? ub : 0.0));
-            max_contrib = std::max(max_contrib, std::abs(contrib));
-        }
-
-        // Compute saturation bound: maxact - rhs (rounded up to nearest integer)
-        const double maxact = max_contrib + huge_bound;
-        const double rhs = 0.0; // Will be computed per constraint
-        const double newabscoef = maxact - rhs;
-
-        if (newabscoef <= kCoeffTol)
-            continue;
-
-        // Round to nearest integer (PaPILO: if equal to ceil, use ceil)
-        double sat_bound = std::ceil(newabscoef - tol);
-        if (std::abs(sat_bound - newabscoef) <= tol)
-            sat_bound = std::ceil(newabscoef);
-
-        // Try to strengthen coefficients in each constraint
-        for (const int row_index : col_to_rows[j]) {
-            auto& row = problem->base_constraints[row_index];
-
-            const auto coeff_pos = find_row_coefficient_position(row, j);
-            if (!coeff_pos.has_value())
-                continue;
-
-            const double coeff = row.values[*coeff_pos];
-            if (std::abs(coeff) <= kCoeffTol)
-                continue;
-
-            // Compute newabscoef for this constraint
-            const SparseRowView view{&row.indices, &row.values, row.sense, row.rhs};
-            const SparseRowActivitySummary summary =
-                sparse_row_activity_summary(view, problem->lower_bounds, problem->upper_bounds);
-
-            const SparseVariableContribution pivot_contribution = sparse_variable_contribution(
-                coeff, j, problem->lower_bounds, problem->upper_bounds);
-            const bool other_min_finite =
-                summary.min_infinite_terms - (pivot_contribution.min_finite ? 0 : 1) == 0;
-            const bool other_max_finite =
-                summary.max_infinite_terms - (pivot_contribution.max_finite ? 0 : 1) == 0;
-
-            const double other_min_activity =
-                summary.min_activity -
-                (pivot_contribution.min_finite ? pivot_contribution.min_value : 0.0);
-            const double other_max_activity =
-                summary.max_activity -
-                (pivot_contribution.max_finite ? pivot_contribution.max_value : 0.0);
-
-            const double implied_rhs = coeff * sat_bound;
-            double new_lhs = row.rhs - other_min_activity;
-            double new_rhs = row.rhs - other_max_activity;
-
-            switch (row.sense) {
-                case LinearConstraintSense::LessEqual:
-                    new_lhs = row.rhs - other_max_activity;
-                    break;
-                case LinearConstraintSense::GreaterEqual:
-                    new_rhs = row.rhs - other_min_activity;
-                    break;
-                case LinearConstraintSense::Equal:
-                    new_lhs = row.rhs - other_max_activity;
-                    new_rhs = row.rhs - other_min_activity;
-                    break;
-            }
-
-            // Check if coefficient can be strengthened to sat_bound
-            if (coeff > 0.0 && new_lhs >= coeff * sat_bound - tol) {
-                // Can strengthen coefficient to sat_bound
-                const double old_coeff = coeff;
-                row.values[*coeff_pos] = sat_bound;
-                if (strengthened_coeffs)
-                    ++(*strengthened_coeffs);
-                strengthened++;
-
-                // Update affected rows (other constraints with same variable)
-                for (const int other_row : col_to_rows[j]) {
-                    if (other_row == row_index)
-                        continue;
-                    auto& other_row_ref = problem->base_constraints[other_row];
-                    const auto other_pos = find_row_coefficient_position(other_row_ref, j);
-                    if (!other_pos.has_value() ||
-                        std::abs(other_row_ref.values[*other_pos]) <= kCoeffTol)
-                        continue;
-
-                    // Adjust RHS to compensate for coefficient change
-                    const double delta = (sat_bound - old_coeff) * coeff;
-                    other_row_ref.rhs -= delta;
-                }
-            } else if (coeff < 0.0 && new_rhs <= coeff * sat_bound + tol) {
-                // Can strengthen coefficient to sat_bound (negative coefficient)
-                const double old_coeff = coeff;
-                row.values[*coeff_pos] = sat_bound;
-                if (strengthened_coeffs)
-                    ++(*strengthened_coeffs);
-                strengthened++;
-
-                for (const int other_row : col_to_rows[j]) {
-                    if (other_row == row_index)
-                        continue;
-                    auto& other_row_ref = problem->base_constraints[other_row];
-                    const auto other_pos = find_row_coefficient_position(other_row_ref, j);
-                    if (!other_pos.has_value() ||
-                        std::abs(other_row_ref.values[*other_pos]) <= kCoeffTol)
-                        continue;
-
-                    const double delta = (sat_bound - old_coeff) * coeff;
-                    other_row_ref.rhs -= delta;
-                }
-            }
-        }
-
-        // Try to tighten bounds using saturation
-        for (const int row_index : col_to_rows[j]) {
-            auto& row = problem->base_constraints[row_index];
-
-            const auto coeff_pos = find_row_coefficient_position(row, j);
-            if (!coeff_pos.has_value())
-                continue;
-
-            const double coeff = row.values[*coeff_pos];
-
-            // Compute implied bounds from saturation
-            const SparseRowView view{&row.indices, &row.values, row.sense, row.rhs};
-            const SparseRowActivitySummary summary =
-                sparse_row_activity_summary(view, problem->lower_bounds, problem->upper_bounds);
-
-            const SparseVariableContribution pivot_contribution = sparse_variable_contribution(
-                coeff, j, problem->lower_bounds, problem->upper_bounds);
-            const bool other_min_finite =
-                summary.min_infinite_terms - (pivot_contribution.min_finite ? 0 : 1) == 0;
-            const bool other_max_finite =
-                summary.max_infinite_terms - (pivot_contribution.max_finite ? 0 : 1) == 0;
-
-            const double other_min =
-                summary.min_activity -
-                (pivot_contribution.min_finite ? pivot_contribution.min_value : 0.0);
-            const double other_max =
-                summary.max_activity -
-                (pivot_contribution.max_finite ? pivot_contribution.max_value : 0.0);
-
-            double implied_lb = -std::numeric_limits<double>::infinity();
-            double implied_ub = std::numeric_limits<double>::infinity();
-
-            switch (row.sense) {
-                case LinearConstraintSense::LessEqual:
-                    if (coeff > 0.0 && other_min_finite) {
-                        implied_ub = (row.rhs - other_min) / coeff;
-                    } else if (coeff < 0.0 && other_min_finite) {
-                        implied_lb = (row.rhs - other_min) / coeff;
-                    }
-                    break;
-                case LinearConstraintSense::GreaterEqual:
-                    if (coeff > 0.0 && other_max_finite) {
-                        implied_lb = (row.rhs - other_max) / coeff;
-                    } else if (coeff < 0.0 && other_max_finite) {
-                        implied_ub = (row.rhs - other_max) / coeff;
-                    }
-                    break;
-                case LinearConstraintSense::Equal:
-                    if (coeff > 0.0) {
-                        if (other_min_finite)
-                            implied_ub = (row.rhs - other_min) / coeff;
-                        if (other_max_finite)
-                            implied_lb = (row.rhs - other_max) / coeff;
-                    } else {
-                        if (other_min_finite)
-                            implied_lb = (row.rhs - other_min) / coeff;
-                        if (other_max_finite)
-                            implied_ub = (row.rhs - other_max) / coeff;
-                    }
-                    break;
-            }
-
-            // Apply saturation-based tightening
-            if (problem->variable_types[j] == VariableType::Binary) {
-                implied_lb = std::max(implied_lb, 0.0);
-                implied_ub = std::min(implied_ub, 1.0);
-            } else {
-                // Integer: round to nearest integers
-                implied_lb = std::ceil(implied_lb - tol);
-                implied_ub = std::floor(implied_ub + tol);
-            }
-
-            if (implied_lb > problem->lower_bounds[j] + tol) {
-                problem->lower_bounds[j] = implied_lb;
-                if (tightened_bounds)
-                    ++(*tightened_bounds);
-                tightened++;
-            }
-            if (implied_ub < problem->upper_bounds[j] - tol) {
-                problem->upper_bounds[j] = implied_ub;
-                if (tightened_bounds)
-                    ++(*tightened_bounds);
-                tightened++;
-
-                // Check if now fixed
-                if (std::isfinite(problem->lower_bounds[j]) &&
-                    std::isfinite(problem->upper_bounds[j]) &&
-                    std::abs(problem->lower_bounds[j] - problem->upper_bounds[j]) <= tol) {
-                    if (tightened_bounds)
-                        ++(*tightened_bounds);
-                }
-            }
-        }
-    }
-
-    return {strengthened, tightened};
+    return {0, 0};
 }
 
 /// Probing with badge-based selection (PaPILO style)

@@ -76,8 +76,7 @@ class ThreadPool {
     }
 
   private:
-    explicit ThreadPool(int threads)
-        : workers_(threads), stop_(false) {
+    explicit ThreadPool(int threads) : workers_(threads), stop_(false) {
         for (int i = 0; i < threads; ++i) {
             thread_.emplace_back([this, i]() { worker_loop(i); });
         }

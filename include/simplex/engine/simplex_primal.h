@@ -346,8 +346,24 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
             return true;
         };
         auto finish_optimal = [&](const Eigen::VectorXd& xB_current) {
+            // HiGHS-style reinversion before declaring optimality. Updated
+            // factors and the incremental basic-value cache may agree with
+            // each other while both have drifted from the explicit basis.
+            Eigen::VectorXd xB_certified = xB_current;
+            try {
+                refactor_basis();
+                xB_certified = read_basis().solve_B(rhs_eff, FTBasis::TranKind::ColAq).value;
+                xB_cache = xB_certified;
+                xB_cache_valid = true;
+                xB_cache_age = 0;
+            } catch (...) {
+                return RevisedSimplex::PhaseResult{
+                    LPSolution::Status::Singular, Eigen::VectorXd::Zero(n), basis, iters,
+                    {{"reason", "optimal_reinversion_failed"}}};
+            }
             const auto sv = sigma_view();
-            Eigen::VectorXd x = self.assemble_primal_(n, basis, xB_current, l_work, u_work, &sv);
+            Eigen::VectorXd x =
+                self.assemble_primal_(n, basis, xB_certified, l_work, u_work, &sv);
             std::string exact_reason;
             if (!exact_optimality_check_(self, A, b, c, basis, N, at_upper, x, l, u, read_basis(),
                                          exact_reason)) {

@@ -7,8 +7,8 @@
 
 #include <ankerl/unordered_dense.h>
 
-#include "simplex/factorization/amd.h"
 #include "simplex/core/markowitz.h"
+#include "simplex/factorization/amd.h"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -241,6 +241,22 @@ class SparseForrestTomlinLU {
         updates_max_w_inf_ = 0.0;
         updates_cumulative_z_inf_ = 0.0;
         updates_density_sum_ = 0.0;
+    }
+
+    // Clear L and U factors for rebuild from RefactorInfo
+    void clear_factors_for_rebuild_() {
+        U_rows_.assign(n_, {});
+        U_cols_.assign(n_, {});
+        L_rows_.assign(n_, {});
+        L_cols_.assign(n_, {});
+        row_map_.resize(n_);
+        col_map_.resize(n_);
+        row_inv_.resize(n_);
+        col_inv_.resize(n_);
+        std::iota(row_map_.begin(), row_map_.end(), 0);
+        std::iota(col_map_.begin(), col_map_.end(), 0);
+        std::iota(row_inv_.begin(), row_inv_.end(), 0);
+        std::iota(col_inv_.begin(), col_inv_.end(), 0);
     }
 
     UpdateFailureReason last_update_failure_reason() const noexcept {

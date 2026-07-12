@@ -67,8 +67,8 @@ class DualPricingOperations : public DualBoundModel {
     static void compute_pricing_products(const Eigen::MatrixXd& Ahat,
                                          const std::vector<int>& nonbasis,
                                          const Eigen::VectorXd& pivot_row,
-                                         const Eigen::VectorXd& dual,
-                                         const Eigen::VectorXd& costs, Eigen::VectorXd& row_price,
+                                         const Eigen::VectorXd& dual, const Eigen::VectorXd& costs,
+                                         Eigen::VectorXd& row_price,
                                          Eigen::VectorXd& reduced_cost) {
         row_price.resize(nonbasis.size());
         reduced_cost.resize(nonbasis.size());
@@ -84,8 +84,8 @@ class DualPricingOperations : public DualBoundModel {
                                          const SparseRowMatrix& row_matrix,
                                          const std::vector<int>& nonbasis,
                                          const Eigen::VectorXd& pivot_row,
-                                         const Eigen::VectorXd& dual,
-                                         const Eigen::VectorXd& costs, Eigen::VectorXd& row_price,
+                                         const Eigen::VectorXd& dual, const Eigen::VectorXd& costs,
+                                         Eigen::VectorXd& row_price,
                                          Eigen::VectorXd& reduced_cost) {
         row_price = Eigen::VectorXd::Zero(nonbasis.size());
         reduced_cost.resize(nonbasis.size());
@@ -111,8 +111,8 @@ class DualPricingOperations : public DualBoundModel {
     static void compute_pricing_products(const RevisedSimplex::SparseMatrix& Ahat,
                                          const SparseRowMatrix& row_matrix,
                                          const std::vector<int>& nonbasis, const HVector& pivot_row,
-                                         const Eigen::VectorXd& dual,
-                                         const Eigen::VectorXd& costs, Eigen::VectorXd& row_price,
+                                         const Eigen::VectorXd& dual, const Eigen::VectorXd& costs,
+                                         Eigen::VectorXd& row_price,
                                          Eigen::VectorXd& reduced_cost) {
         if (!pivot_row.has_pattern()) {
             compute_pricing_products(Ahat, row_matrix, nonbasis, pivot_row.value, dual, costs,
@@ -148,10 +148,11 @@ class DualPricingOperations : public DualBoundModel {
         }
     }
 
-    static void compute_pricing_products_by_column(
-        const RevisedSimplex::SparseMatrix& Ahat, const std::vector<int>& nonbasis,
-        const HVector& pivot_row, const Eigen::VectorXd& dual, const Eigen::VectorXd& costs,
-        Eigen::VectorXd& row_price, Eigen::VectorXd& reduced_cost) {
+    static void
+    compute_pricing_products_by_column(const RevisedSimplex::SparseMatrix& Ahat,
+                                       const std::vector<int>& nonbasis, const HVector& pivot_row,
+                                       const Eigen::VectorXd& dual, const Eigen::VectorXd& costs,
+                                       Eigen::VectorXd& row_price, Eigen::VectorXd& reduced_cost) {
         row_price.resize(nonbasis.size());
         reduced_cost.resize(nonbasis.size());
         for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k) {
