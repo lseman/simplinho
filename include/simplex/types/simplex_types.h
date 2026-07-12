@@ -160,7 +160,10 @@ struct RevisedSimplexOptions {
     int devex_reset = 100;
     std::string pricing_rule = "adaptive"; // or "devex" / "most_negative"
     int adaptive_reset_freq = 400;
-    bool partial_pricing = true;         // HiGHS-inspired partial pricing
+    // Full Devex pricing is the safe default. HiGHS hyper-pricing maintains a
+    // candidate heap plus an upper bound for every unscanned column; a rotating
+    // block without that certificate degrades pivot quality substantially.
+    bool partial_pricing = false;
     std::string dual_pricing = "switch"; // "row" | "col" | "switch" (HiGHS-inspired)
     int row_pricing_threshold = 40;      // switch if row density < this
     std::string primal_edge_weight_strategy =
