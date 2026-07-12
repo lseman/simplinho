@@ -1063,6 +1063,9 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                                        opt_.compute_tableau, opt_.compute_reduced_costs);
         if (sol.dual_values_internal.size() == m_in) {
             sol.dual_values = sol.dual_values_internal;
+            // Duals are computed in the sign-normalized row space; map them
+            // back to the caller's row orientation.
+            sol.dual_values.array() *= model_row_sign.array();
             sol.shadow_prices = sol.dual_values;
         }
         return finalize_solution_(attach_basis_state_(std::move(sol), l_in, u_in, opt_.tol));

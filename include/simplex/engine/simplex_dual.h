@@ -998,6 +998,37 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                 }
                 DualPricingTelemetry::update_density(vector_density(work.pivot_col, self.opt_.tol),
                                                      pricing_telemetry.col_aq_density);
+                // HiGHS reinvertOnNumericalTrouble: the pivot value is known
+                // from both the BTRAN'd pivot row (row_price at the entering
+                // column) and the FTRAN'd pivot column (at the leaving row).
+                // A large relative difference between the two means the
+                // factorization is drifting — reinvert now, before pivoting
+                // on a bad alpha. This check is essentially free.
+                {
+                    const double alpha_col = work.pivot_col(work.leaving_row);
+                    const double alpha_row =
+                        (work.entering_rel >= 0 &&
+                         work.entering_rel < static_cast<int>(work.row_price.size()))
+                            ? work.row_price(work.entering_rel)
+                            : alpha_col;
+                    const double min_abs = std::min(std::abs(alpha_col), std::abs(alpha_row));
+                    const double diff = std::abs(std::abs(alpha_col) - std::abs(alpha_row));
+                    if (min_abs > 0.0 && diff > 1e-7 * min_abs &&
+                        rebuild_attempts < self.opt_.max_basis_rebuilds) {
+                        ++rebuild_attempts;
+                        self.trace_line_("[dual] iter=" + std::to_string(iters) +
+                                         " refactor after alpha cross-check (col=" +
+                                         std::to_string(alpha_col) +
+                                         " row=" + std::to_string(alpha_row) + ")");
+                        refactor_basis();
+                        yB_cache_valid = false;
+                        if (auto failed = rebuild_dual_pool(
+                                "dual pricing rebuild failed after alpha cross-check", iters)) {
+                            return *failed;
+                        }
+                        continue;
+                    }
+                }
                 break;
             }
 
@@ -1175,6 +1206,21 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
             }
 
             bool backtracked_this_iter = false;
+            // FTRAN-DSE: tau = B^{-1} psi_r must come from the PRE-pivot
+            // factorization (HiGHS updateFtranDSE runs before updateFactor),
+            // so solve it before update_basis below. On failure the pricer
+            // falls back to its Devex-style weight bound.
+            std::optional<Eigen::VectorXd> ftran_dse;
+            if (work.leaving_sign > 0 && dual_pricer.wants_ftran_dse()) {
+                try {
+                    ftran_dse.emplace(
+                        read_basis()
+                            .solve_B(Eigen::VectorXd(work.pivot_row.value), FTBasis::TranKind::ColAq)
+                            .value);
+                } catch (...) {
+                    ftran_dse.reset();
+                }
+            }
             try {
                 update_basis(work.leaving_row, work.entering_col, Ahat.col(work.entering_col));
             } catch (...) {
@@ -1248,7 +1294,8 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
             if (work.leaving_sign > 0) {
                 dual_pricer.update_after_dual_pivot(
                     work.leaving_row, work.entering_col, oldAbs, work.pivot_col,
-                    work.pivot_col(work.leaving_row), Ahat, N, work.pivot_row, true);
+                    work.pivot_col(work.leaving_row), Ahat, N, work.pivot_row, true,
+                    ftran_dse ? &*ftran_dse : nullptr);
                 // NLA Devex framework switch — pass weight error from pricer
                 if (dual_pricer.needs_rebuild() && nla->allow_framework_switch()) {
                     double w_err = dual_pricer.average_log_weight_error();

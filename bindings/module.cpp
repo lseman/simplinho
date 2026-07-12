@@ -27,6 +27,7 @@ PYBIND11_MODULE(simplinho, m) {
 #endif
     bind_simplex_bindings(m);
     bind_model_bindings(m);
+    bind_sparse_lu_bindings(m);
 
     m.attr("SimplexModel") = m.attr("Model");
 }

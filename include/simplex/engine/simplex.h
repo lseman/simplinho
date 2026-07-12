@@ -1146,7 +1146,6 @@ class RevisedSimplex {
         warm_state->nla = nla;
         warm_state->dual_pricing_state = std::move(dual_pricing_state);
         solve_output_warm_state_ = std::move(warm_state);
-        solve_stats_.ft_updates = nla->factor().stats().eta_count;
     }
 
     template <typename Fn> void measure_pricing_build_(bool dual_pool, Fn&& builder) {
@@ -1317,6 +1316,7 @@ class RevisedSimplex {
         }
 
         bopt.ext_refactor_counter = &solve_stats_.refactorizations;
+        bopt.ext_ft_update_counter = &solve_stats_.ft_updates;
         bopt.ext_refactor_ns = &solve_stats_.lu_build_ns;
         bopt.ext_pivot_ns = &solve_stats_.pivot_ns;
         return bopt;

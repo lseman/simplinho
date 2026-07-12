@@ -14,6 +14,7 @@
 #include "bindings.h"
 #include "bindings_helpers.h"
 #include "simplex/engine/simplex.h"
+#include "simplex/factorization/sparse_lu.h"
 #include "solve_stats.h"
 
 namespace py = pybind11;
@@ -299,8 +300,7 @@ void bind_simplex_bindings(py::module_& m) {
         .def_readwrite("partial_pricing", &RevisedSimplexOptions::partial_pricing)
         .def_readwrite("dual_pricing", &RevisedSimplexOptions::dual_pricing)
         .def_readwrite("row_pricing_threshold", &RevisedSimplexOptions::row_pricing_threshold)
-        .def_readwrite("parallel_pricing_workers",
-                       &RevisedSimplexOptions::parallel_pricing_workers)
+        .def_readwrite("parallel_pricing_workers", &RevisedSimplexOptions::parallel_pricing_workers)
         .def_readwrite("parallel_pricing_min_cols",
                        &RevisedSimplexOptions::parallel_pricing_min_cols)
         .def_readwrite("dualization", &RevisedSimplexOptions::dualization)
@@ -395,3 +395,232 @@ void bind_simplex_bindings(py::module_& m) {
         py::arg("costs"), py::arg("multiplier") = 1e-8, py::arg("seed") = 13,
         "Apply small random perturbations to cost vector to break degeneracy");
 }
+
+namespace {
+
+void bind_sparse_forrest_tomlin_lu_bindings(py::module_& m) {
+    using SparseMat = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
+    using UpdateStats = SparseForrestTomlinLU::UpdateStats;
+    using UpdateFailureReason = SparseForrestTomlinLU::UpdateFailureReason;
+
+    py::enum_<UpdateFailureReason>(m, "SparseLUUpdateFailureReason")
+        .value("None", UpdateFailureReason::None)
+        .value("BadDimensions", UpdateFailureReason::BadDimensions)
+        .value("AlphaTooSmall", UpdateFailureReason::AlphaTooSmall)
+        .value("NonFiniteInput", UpdateFailureReason::NonFiniteInput);
+
+    py::enum_<SparseForrestTomlinLU::UpdateMethod>(m, "SparseLUUpdateMethod")
+        .value("FT", SparseForrestTomlinLU::UpdateMethod::FT)
+        .value("PF", SparseForrestTomlinLU::UpdateMethod::PF)
+        .value("MPF", SparseForrestTomlinLU::UpdateMethod::MPF)
+        .value("APF", SparseForrestTomlinLU::UpdateMethod::APF);
+
+    py::class_<UpdateStats>(m, "SparseLUUpdateStats")
+        .def_readonly("count", &UpdateStats::count)
+        .def_readonly("max_z_inf", &UpdateStats::max_z_inf)
+        .def_readonly("max_w_inf", &UpdateStats::max_w_inf)
+        .def_readonly("avg_z_density", &UpdateStats::avg_z_density)
+        .def_readonly("cumulative_z_inf", &UpdateStats::cumulative_z_inf)
+        .def_readonly("norm_growth_estimate", &UpdateStats::norm_growth_estimate);
+
+    py::class_<SparseForrestTomlinLU::Config>(m, "SparseLUConfig")
+        .def(py::init<>())
+        .def_readwrite("use_amd_ordering", &SparseForrestTomlinLU::Config::use_amd_ordering)
+        .def_readwrite("fallback_to_legacy_symbolic",
+                       &SparseForrestTomlinLU::Config::fallback_to_legacy_symbolic)
+        .def_readwrite("diagonal_equilibration",
+                       &SparseForrestTomlinLU::Config::diagonal_equilibration)
+        .def_readwrite("equilibration_passes", &SparseForrestTomlinLU::Config::equilibration_passes)
+        .def_readwrite("equilibration_floor", &SparseForrestTomlinLU::Config::equilibration_floor)
+        .def_readwrite("iterative_refinement", &SparseForrestTomlinLU::Config::iterative_refinement)
+        .def_readwrite("iterative_refinement_steps",
+                       &SparseForrestTomlinLU::Config::iterative_refinement_steps)
+        .def_readwrite("iterative_refinement_tol",
+                       &SparseForrestTomlinLU::Config::iterative_refinement_tol)
+        .def_readwrite("max_norm_growth_before_refactor",
+                       &SparseForrestTomlinLU::Config::max_norm_growth_before_refactor)
+        .def_readwrite("max_parallel_update_size",
+                       &SparseForrestTomlinLU::Config::max_parallel_update_size)
+        .def_readwrite("enable_hyper_sparse_rhs",
+                       &SparseForrestTomlinLU::Config::enable_hyper_sparse_rhs)
+        .def_readwrite("use_product_form_updates",
+                       &SparseForrestTomlinLU::Config::use_product_form_updates)
+        .def_readwrite("update_method", &SparseForrestTomlinLU::Config::update_method)
+        .def_readwrite("force_eigen_sparse_lu",
+                       &SparseForrestTomlinLU::Config::force_eigen_sparse_lu)
+        .def_readwrite("enable_solve_oracle", &SparseForrestTomlinLU::Config::enable_solve_oracle)
+        .def_readwrite("validate_solves", &SparseForrestTomlinLU::Config::validate_solves);
+
+    py::class_<SparseForrestTomlinLU>(m, "SparseForrestTomlinLU")
+        .def(py::init<>())
+        .def(
+            "factor",
+            [](SparseForrestTomlinLU& self, py::object A_obj, double pivot_rel, double abs_floor,
+               int refactor_rook_iters, py::object initial_row_perm_obj,
+               py::object initial_col_perm_obj) {
+                SparseMat A;
+                // Check if it's a scipy sparse matrix by looking for 'data' attribute
+                if (py::hasattr(A_obj, "data")) {
+                    // Convert from scipy csc/csr
+                    py::object csc =
+                        py::hasattr(A_obj, "tocsr") ? A_obj.attr("tocsr")() : A_obj.attr("tocsc")();
+                    py::object data = csc.attr("data");
+                    py::object indices = csc.attr("indices");
+                    py::object indptr = csc.attr("indptr");
+                    py::tuple shape = csc.attr("shape").cast<py::tuple>();
+                    int n_rows = (int)shape[0].cast<int>();
+                    int n_cols = (int)shape[1].cast<int>();
+                    A.resize(n_rows, n_cols);
+                    std::vector<Eigen::Triplet<double>> triplets;
+                    auto data_arr = data.cast<py::array_t<double>>();
+                    auto indices_arr = indices.cast<py::array_t<int>>();
+                    auto indptr_arr = indptr.cast<py::array_t<int>>();
+                    auto data_ptr = data_arr.template unchecked<1>();
+                    auto indices_ptr = indices_arr.template unchecked<1>();
+                    auto indptr_ptr = indptr_arr.template unchecked<1>();
+                    for (int col = 0; col < n_cols; ++col) {
+                        int start = indptr_ptr(col);
+                        int end = indptr_ptr(col + 1);
+                        for (int k = start; k < end; ++k) {
+                            int row = indices_ptr(k);
+                            double val = data_ptr(k);
+                            if (std::abs(val) > 1e-16)
+                                triplets.emplace_back(row, col, val);
+                        }
+                    }
+                    if (!triplets.empty())
+                        A.setFromTriplets(triplets.begin(), triplets.end());
+                    A.makeCompressed();
+                } else {
+                    A = py::cast<SparseMat>(A_obj);
+                }
+                std::vector<int> row_perm_vec;
+                std::vector<int> col_perm_vec;
+                std::vector<int>* row_perm = nullptr;
+                std::vector<int>* col_perm = nullptr;
+                if (!initial_row_perm_obj.is_none()) {
+                    row_perm_vec = initial_row_perm_obj.cast<std::vector<int>>();
+                    row_perm = &row_perm_vec;
+                }
+                if (!initial_col_perm_obj.is_none()) {
+                    col_perm_vec = initial_col_perm_obj.cast<std::vector<int>>();
+                    col_perm = &col_perm_vec;
+                }
+                self.factor(A, pivot_rel, abs_floor, refactor_rook_iters, 0, row_perm, col_perm);
+            },
+            py::arg("A"), py::arg("pivot_rel") = 1e-12, py::arg("abs_floor") = 1e-16,
+            py::arg("refactor_rook_iters") = 2, py::arg("initial_row_perm") = py::none(),
+            py::arg("initial_col_perm") = py::none(),
+            "Factorize square sparse matrix A into LU decomposition")
+        .def(
+            "factor_with_config",
+            [](SparseForrestTomlinLU& self, py::object A_obj, double pivot_rel, double abs_floor,
+               int refactor_rook_iters, py::object initial_row_perm_obj,
+               py::object initial_col_perm_obj, const SparseForrestTomlinLU::Config& config) {
+                SparseMat A;
+                // Check if it's a scipy sparse matrix by looking for 'data' attribute
+                if (py::hasattr(A_obj, "data")) {
+                    // Convert from scipy csc/csr
+                    py::object csc =
+                        py::hasattr(A_obj, "tocsr") ? A_obj.attr("tocsr")() : A_obj.attr("tocsc")();
+                    py::object data = csc.attr("data");
+                    py::object indices = csc.attr("indices");
+                    py::object indptr = csc.attr("indptr");
+                    py::tuple shape = csc.attr("shape").cast<py::tuple>();
+                    int n_rows = (int)shape[0].cast<int>();
+                    int n_cols = (int)shape[1].cast<int>();
+                    A.resize(n_rows, n_cols);
+                    std::vector<Eigen::Triplet<double>> triplets;
+                    auto data_arr = data.cast<py::array_t<double>>();
+                    auto indices_arr = indices.cast<py::array_t<int>>();
+                    auto indptr_arr = indptr.cast<py::array_t<int>>();
+                    auto data_ptr = data_arr.template unchecked<1>();
+                    auto indices_ptr = indices_arr.template unchecked<1>();
+                    auto indptr_ptr = indptr_arr.template unchecked<1>();
+                    for (int col = 0; col < n_cols; ++col) {
+                        int start = indptr_ptr(col);
+                        int end = indptr_ptr(col + 1);
+                        for (int k = start; k < end; ++k) {
+                            int row = indices_ptr(k);
+                            double val = data_ptr(k);
+                            if (std::abs(val) > 1e-16)
+                                triplets.emplace_back(row, col, val);
+                        }
+                    }
+                    if (!triplets.empty())
+                        A.setFromTriplets(triplets.begin(), triplets.end());
+                    A.makeCompressed();
+                } else {
+                    A = py::cast<SparseMat>(A_obj);
+                }
+                std::vector<int> row_perm_vec;
+                std::vector<int> col_perm_vec;
+                std::vector<int>* row_perm = nullptr;
+                std::vector<int>* col_perm = nullptr;
+                if (!initial_row_perm_obj.is_none()) {
+                    row_perm_vec = initial_row_perm_obj.cast<std::vector<int>>();
+                    row_perm = &row_perm_vec;
+                }
+                if (!initial_col_perm_obj.is_none()) {
+                    col_perm_vec = initial_col_perm_obj.cast<std::vector<int>>();
+                    col_perm = &col_perm_vec;
+                }
+                self.factor(A, pivot_rel, abs_floor, refactor_rook_iters, 0, row_perm, col_perm,
+                            config);
+            },
+            py::arg("A"), py::arg("pivot_rel") = 1e-12, py::arg("abs_floor") = 1e-16,
+            py::arg("refactor_rook_iters") = 2, py::arg("initial_row_perm") = py::none(),
+            py::arg("initial_col_perm") = py::none(), py::arg("config"), "Factorize with config")
+        .def("supports_inplace_updates", &SparseForrestTomlinLU::supports_inplace_updates)
+        .def("has_updates", &SparseForrestTomlinLU::has_updates)
+        .def("synthetic_clock_says_refactor", &SparseForrestTomlinLU::synthetic_clock_says_refactor)
+        .def("is_rank_deficient", &SparseForrestTomlinLU::is_rank_deficient)
+        .def("rank_deficiency", &SparseForrestTomlinLU::rank_deficiency)
+        .def("needs_refactor", &SparseForrestTomlinLU::needs_refactor)
+        .def("clear_updates", &SparseForrestTomlinLU::clear_updates)
+        .def(
+            "append_forrest_tomlin_update",
+            [](SparseForrestTomlinLU& self, int j, const Eigen::VectorXd& u,
+               const Eigen::VectorXd& z, const Eigen::VectorXd& w, double alpha,
+               double eps = 1e-14) {
+                return self.append_forrest_tomlin_update(j, u, z, w, alpha, eps);
+            },
+            py::arg("j"), py::arg("u"), py::arg("z"), py::arg("w"), py::arg("alpha"),
+            py::arg("eps") = 1e-14, "Append Forrest-Tomlin update")
+        .def("update_stats", &SparseForrestTomlinLU::update_stats, "Get update statistics")
+        .def("last_update_failure_reason", &SparseForrestTomlinLU::last_update_failure_reason)
+        .def("last_update_failure_reason_message",
+             &SparseForrestTomlinLU::last_update_failure_reason_message)
+        .def(
+            "solve",
+            [](const SparseForrestTomlinLU& self, const Eigen::VectorXd& b,
+               double expected_density) { return self.solve(b, expected_density); },
+            py::arg("b"), py::arg("expected_density") = 1.0, "Solve B*x = b")
+        .def(
+            "solveT",
+            [](const SparseForrestTomlinLU& self, const Eigen::VectorXd& c,
+               double expected_density) { return self.solveT(c, expected_density); },
+            py::arg("c"), py::arg("expected_density") = 1.0, "Solve B^T*y = c")
+        .def(
+            "solve_sparse",
+            [](const SparseForrestTomlinLU& self, const std::vector<int>& seed_idx,
+               const std::vector<double>& seed_val, double expected_density) {
+                return self.solve_sparse(seed_idx, seed_val, expected_density);
+            },
+            py::arg("seed_idx"), py::arg("seed_val"), py::arg("expected_density") = 0.0,
+            "Solve with sparse RHS")
+        .def(
+            "solveT_sparse",
+            [](const SparseForrestTomlinLU& self, const std::vector<int>& seed_idx,
+               const std::vector<double>& seed_val, double expected_density) {
+                return self.solveT_sparse(seed_idx, seed_val, expected_density);
+            },
+            py::arg("seed_idx"), py::arg("seed_val"), py::arg("expected_density") = 0.0,
+            "SolveT with sparse RHS")
+        .def("last_solve_reach_original", &SparseForrestTomlinLU::last_solve_reach_original)
+        .def("last_solve_pattern_valid", &SparseForrestTomlinLU::last_solve_pattern_valid);
+}
+
+} // namespace
+
+void bind_sparse_lu_bindings(py::module_& m) { bind_sparse_forrest_tomlin_lu_bindings(m); }

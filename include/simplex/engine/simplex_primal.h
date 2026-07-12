@@ -258,6 +258,8 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
 
         if (self.opt_.pricing_rule == "adaptive") {
             AdaptivePricer::PricingOptions popts;
+            popts.initial_strategy = AdaptivePricer::DEVEX;
+            popts.enable_adaptive_switching = false;
             popts.steepest_pool_max = 0;
             popts.steepest_reset_freq = self.opt_.adaptive_reset_freq;
             popts.devex_reset_freq = self.opt_.devex_reset;
@@ -665,8 +667,10 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
 
             if (self.opt_.pricing_rule == "adaptive") {
                 const double rc_impr = -work.entering_measure(idxN);
-                self.bridge_->after_primal_pivot(r, eAbs, oldAbs, dB, alpha, step, A, N, rc_impr,
-                                                 is_degenerate);
+                const HVector row_ep =
+                    read_basis().solve_BT_unit(r, FTBasis::TranKind::RowEp);
+                self.bridge_->after_primal_pivot(r, eAbs, oldAbs, dB, row_ep.value, alpha, step, A,
+                                                 basis, N, rc_impr, is_degenerate);
             }
 
             // UPDATE: apply the accepted basis change and maintain work arrays.

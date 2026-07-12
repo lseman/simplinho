@@ -133,8 +133,8 @@ struct RevisedSimplexOptions {
     int rng_seed = 13;
 
     // Basis / LU
-    int refactor_every = 64; // FT hard cap
-    int compress_every = 32; // FT soft cap
+    int refactor_every = 1024; // FT hard backstop; synthetic clock triggers first
+    int compress_every = 512;  // update-chain soft cap backstop
     double lu_pivot_rel = 1e-12;
     double lu_abs_floor = 1e-16;
     double alpha_tol = 1e-10;
@@ -142,7 +142,7 @@ struct RevisedSimplexOptions {
     double ft_multiplier_guard = 1e8;
     std::string basis_update = "hybrid"; // "forrest_tomlin" | "eta" | "hybrid"
     int ft_bandwidth_cap = 12;
-    double max_growth_tol = 1e3;
+    double max_growth_tol = 5e7;
     double min_dynamic_growth_tol = 500;
     double max_condition_estimate = 1e13;
     int basis_refinement_steps = 3;

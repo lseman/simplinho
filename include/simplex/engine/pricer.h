@@ -295,11 +295,12 @@ template <class PrimalPricer> struct PrimalPricingBridge {
 
     template <class MatrixLike>
     void after_primal_pivot(int leaving_rel, int entering_abs, int old_abs,
-                            const Eigen::VectorXd& pivot_column, double alpha, double step_size,
-                            const MatrixLike& A, const std::vector<int>& N,
+                            const Eigen::VectorXd& pivot_column, const Eigen::VectorXd& pivot_row,
+                            double alpha, double step_size, const MatrixLike& A,
+                            const std::vector<int>& basis, const std::vector<int>& N,
                             double rc_improvement, bool is_degenerate) {
-        pricer.update_after_primal_pivot(leaving_rel, entering_abs, old_abs, pivot_column, alpha,
-                                         step_size, A, N);
+        pricer.update_after_primal_pivot(leaving_rel, entering_abs, old_abs, pivot_column,
+                                         pivot_row, alpha, step_size, A, basis, N);
 
         dm.after_pivot(leaving_rel, entering_abs, alpha, rc_improvement, step_size, is_degenerate);
 
@@ -642,46 +643,36 @@ class DevexPricer {
 
     template <class MatrixLike>
     void update_after_primal_pivot(int leave_rel, int e_abs, int old_abs,
-                                   const Eigen::VectorXd& pivot_column, double alpha,
-                                   const MatrixLike& /*A*/, const std::vector<int>& N,
+                                   const Eigen::VectorXd& pivot_column,
+                                   const Eigen::VectorXd& pivot_row, double alpha,
+                                   const MatrixLike& A, const std::vector<int>& basis,
+                                   const std::vector<int>& N,
                                    bool /*insert_leaver_into_pool*/ = true) {
         if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol)
             return;
 
-        // Entering weight: keep bounded to avoid runaway (HiGHS style)
-        const double a2 = alpha * alpha;
-        set_weight_(e_abs, std::min(std::max(a2, 1e-4), 1e6));
-
-        // Update others (classic Devex-like) with error checking
-        if (leave_rel < pivot_column.size()) {
-            const double gamma_over_alpha = pivot_column(leave_rel) / alpha;
-            const double add = gamma_over_alpha * gamma_over_alpha;
-            for (int k = 0; k < (int)N.size(); ++k) {
-                const int j = N[k];
-                if (j == e_abs)
-                    continue;
-                double& w = weight_ref_(j);
-                const double old_w = w;
-                const double nw = w + add;
-                w = std::max(nw, threshold_ * w);
-                // NLA framework switch — track weight error
-                if (old_w > 0) {
-                    double nw_val = w;
-                    if (nw_val > 0 && nw_val != old_w)
-                        weight_error_sum_ += std::abs(std::log(nw_val / old_w));
-                }
-                // HiGHS-inspired: check for weight corruption
-                if (w < kMinWeightAcceptRatio * old_w && old_w > 0) {
-                    // Weight dropped too far - mark for rebuild
-                    need_rebuild_ = true;
-                }
-            }
+        double pivot_weight = reference_(e_abs);
+        const int num_row = std::min<int>(pivot_column.size(), basis.size());
+        for (int i = 0; i < num_row; ++i) {
+            const double value = reference_(basis[i]) * pivot_column(i);
+            pivot_weight += value * value;
         }
+        if (weight_for_(e_abs) > 3.0 * std::max(pivot_weight, 1e-30) &&
+            ++bad_weight_count_ > 3)
+            need_rebuild_ = true;
+        pivot_weight /= alpha * alpha;
 
-        // Ensure leaving has a slot
-        (void)old_abs;
-        if (!has_weight_(old_abs))
-            set_weight_(old_abs, 1.0);
+        for (const int j : N) {
+            if (j == e_abs)
+                continue;
+            const double tableau_alpha = A.col(j).dot(pivot_row);
+            const double candidate =
+                pivot_weight * tableau_alpha * tableau_alpha + reference_(j);
+            double& weight = weight_ref_(j);
+            weight = std::max(weight, candidate);
+        }
+        set_weight_(old_abs, std::max(1.0, pivot_weight));
+        set_weight_(e_abs, 1.0);
     }
 
     bool needs_rebuild() const { return need_rebuild_; }
@@ -708,17 +699,27 @@ class DevexPricer {
             return;
         weights_.resize(required_size, 1.0);
         weight_present_.resize(required_size, 0);
+        devex_index_.resize(required_size, 0);
     }
 
     void initialize_weights_(const std::vector<int>& N) {
         const int max_index = max_column_index_(N);
         weights_.assign(static_cast<size_t>(std::max(0, max_index) + 1), 1.0);
         weight_present_.assign(weights_.size(), 0);
+        devex_index_.assign(weights_.size(), 0);
         for (const int j : N) {
             if (j < 0)
                 continue;
             weight_present_[static_cast<size_t>(j)] = 1;
+            devex_index_[static_cast<size_t>(j)] = 1;
         }
+        bad_weight_count_ = 0;
+    }
+
+    double reference_(int j) const {
+        return j >= 0 && static_cast<size_t>(j) < devex_index_.size()
+                   ? static_cast<double>(devex_index_[static_cast<size_t>(j)])
+                   : 0.0;
     }
 
     bool has_weight_(int j) const {
@@ -771,6 +772,8 @@ class DevexPricer {
 
     std::vector<double> weights_;
     std::vector<char> weight_present_;
+    std::vector<char> devex_index_;
+    int bad_weight_count_{0};
     double threshold_{0.99};
     int reset_freq_{1000};
     int iter_count_{0};
@@ -791,17 +794,6 @@ class DualSteepestEdgePricer {
         std::vector<double> row_weights;
     };
 
-    struct DualEntry {
-        int jN;
-        Eigen::VectorXd w;  // approx B^{-T} a_j
-        double dual_weight; // ||w||^2
-    };
-
-    struct RowEntry {
-        HVector psi; // exact B^{-T} e_i for current basis row i
-        double weight = 1.0;
-    };
-
     struct LeavingChoice {
         int row = -1;
         HVector dual_row;
@@ -816,25 +808,14 @@ class DualSteepestEdgePricer {
 
     template <class BasisLike, class MatrixLike>
     void build_dual_pool(const BasisLike& B, const MatrixLike& A, const std::vector<int>& N) {
-        dual_pool_.clear();
-        dual_pos_.clear();
-        row_pool_.clear();
-        const int take = (pool_max_ > 0) ? std::min<int>(pool_max_, (int)N.size()) : (int)N.size();
-        dual_pool_.reserve(take);
-        for (int k = 0; k < take; ++k) {
-            const int j = N[k];
-            DualEntry e;
-            e.jN = j;
-            e.w = pricing_detail::solve_BT_column(B, A, j); // sparse-aware BTRAN of column
-            e.dual_weight = pricing_detail::edge_weight_from_direction(e.w, weight_strategy_);
-            dual_pos_[j] = (int)dual_pool_.size();
-            dual_pool_.push_back(std::move(e));
-        }
-        row_pool_.resize(A.rows());
-        for (int i = 0; i < A.rows(); ++i) {
-            row_pool_[i].psi = HVector();
-            row_pool_[i].weight = 1.0;
-        }
+        (void)B;
+        (void)N;
+        // HiGHS-style scalar DSE: only w_i = ||B^{-T} e_i||^2 is tracked, kept
+        // current with the Forrest-Goldfarb recurrence in
+        // update_after_dual_pivot. Unit weights are exact for a logical basis
+        // and the standard safe start otherwise (HEkkDual prefers switching to
+        // Devex over paying m BTRANs to make a non-logical start exact).
+        row_weights_.assign(static_cast<std::size_t>(A.rows()), 1.0);
         iter_count_ = 0;
         need_rebuild_ = false;
     }
@@ -859,165 +840,86 @@ class DualSteepestEdgePricer {
             const int i = (start + k) % m;
             if (yB(i) >= -tol)
                 continue;
-            double weight = 1.0;
-            if (i < (int)row_pool_.size())
-                weight = row_pool_[i].weight;
+            const double weight =
+                (i < (int)row_weights_.size()) ? row_weights_[i] : 1.0;
             const double infeas = -yB(i);
             const double score = (infeas * infeas) / weight;
             if (score > best_score) {
                 best_score = score;
                 best.row = i;
-                if (i < (int)row_pool_.size() && row_pool_[i].psi.has_pattern()) {
-                    best.dual_row = row_pool_[i].psi;
-                } else {
-                    best.dual_row = B.solve_BT_unit(i);
-                    pricing_detail::normalize_pattern(best.dual_row);
-                    weight = std::max(1.0, pricing_detail::edge_weight_from_direction(
-                                               best.dual_row, weight_strategy_));
-                }
                 best.weight = weight;
             }
+        }
+        // One BTRAN for the winner only (the old psi-pool variant solved a
+        // fresh BTRAN for every improving candidate in the scan).
+        if (best.row >= 0) {
+            best.dual_row = B.solve_BT_unit(best.row);
+            pricing_detail::normalize_pattern(best.dual_row);
         }
         return best;
     }
 
+    // Forrest-Goldfarb DSE weight update (HEkk::updateDualSteepestEdgeWeights):
+    //   w_r' = w_r / alpha^2,   Kai = -2 / alpha
+    //   w_i' = max(w_i + s_i * (w_r' * s_i + Kai * tau_i), 1e-4)   for s_i != 0
+    // where s = B^{-1} a_q (pivot column) and tau = B^{-1} psi_r is the
+    // FTRAN-DSE vector, both from the pre-pivot basis. When the caller cannot
+    // supply tau, fall back to the Devex-style lower bound
+    // w_i' = max(w_i, w_r' * s_i^2), which keeps weights sane without it.
     template <class MatrixLike>
-    void update_after_dual_pivot(int leave_rel, int e_abs, int old_abs, const HVector& s,
-                                 double alpha, const MatrixLike& A, const std::vector<int>& /*N*/,
-                                 const HVector& dual_row, bool insert_leaver_into_pool = true) {
+    void update_after_dual_pivot(int leave_rel, int /*e_abs*/, int /*old_abs*/, const HVector& s,
+                                 double alpha, const MatrixLike& /*A*/,
+                                 const std::vector<int>& /*N*/, const HVector& /*dual_row*/,
+                                 bool /*insert_leaver_into_pool*/ = true,
+                                 const Eigen::VectorXd* ftran_dse = nullptr) {
         if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol) {
             need_rebuild_ = true;
             return;
         }
-
-        if (A.size() == 0) {
-            // A mathematically correct DSE update needs psi_r = B^{-T} e_r
-            // from the pre-pivot basis.
+        if (leave_rel < 0 || leave_rel >= (int)row_weights_.size() || leave_rel >= s.size()) {
             need_rebuild_ = true;
             return;
         }
 
-        HVector psi_before = dual_row;
-        pricing_detail::normalize_pattern(psi_before);
-        if (leave_rel < 0 || leave_rel >= s.size()) {
-            need_rebuild_ = true;
-            return;
-        }
-
-        if (!row_pool_.empty()) {
-            if (leave_rel >= (int)row_pool_.size()) {
-                need_rebuild_ = true;
+        const double new_pivotal =
+            std::max(row_weights_[static_cast<std::size_t>(leave_rel)] / (alpha * alpha),
+                     kMinDseWeight);
+        const double kai = -2.0 / alpha;
+        const bool has_tau = ftran_dse != nullptr &&
+                             ftran_dse->size() >= static_cast<Eigen::Index>(row_weights_.size());
+        auto touch = [&](int i) {
+            if (i == leave_rel || i < 0 || i >= (int)row_weights_.size())
                 return;
-            }
-
-            auto update_row = [&](int i) {
-                if (i == leave_rel)
-                    return;
-                if (row_pool_[i].psi.has_pattern()) {
-                    const double coeff = s(i) / alpha;
-                    if (coeff != 0.0) {
-                        pricing_detail::subtract_scaled(row_pool_[i].psi, psi_before, coeff);
-                    }
-                    row_pool_[i].weight = std::max(1.0, pricing_detail::edge_weight_from_direction(
-                                                            row_pool_[i].psi, weight_strategy_));
-                }
-            };
-            if (s.has_pattern()) {
-                std::vector<char> seen(row_pool_.size(), 0);
-                for (int k = 0; k < s.count; ++k) {
-                    const int i = s.index[k];
-                    if (i < 0 || i >= (int)row_pool_.size() || seen[static_cast<std::size_t>(i)])
-                        continue;
-                    seen[static_cast<std::size_t>(i)] = 1;
-                    update_row(i);
-                }
+            const double si = s(i);
+            if (si == 0.0)
+                return;
+            double w = row_weights_[static_cast<std::size_t>(i)];
+            if (has_tau) {
+                w += si * (new_pivotal * si + kai * (*ftran_dse)(i));
             } else {
-                for (int i = 0; i < (int)row_pool_.size(); ++i)
-                    update_row(i);
+                w = std::max(w, new_pivotal * si * si);
             }
-            row_pool_[leave_rel].psi = pricing_detail::scaled_hvector(psi_before, 1.0 / alpha);
-            row_pool_[leave_rel].weight =
-                std::max(1.0, pricing_detail::edge_weight_from_direction(row_pool_[leave_rel].psi,
-                                                                         weight_strategy_));
-        }
-
-        Eigen::VectorXd e_r = Eigen::VectorXd::Zero(s.size());
-        if (leave_rel >= 0 && leave_rel < e_r.size())
-            e_r(leave_rel) = 1.0;
-        const HVector s_minus_er = pricing_detail::pivot_column_delta(s, leave_rel);
-        const double inv_alpha = 1.0 / alpha;
-
-        // Exact rank-one update for w_j = B^{-T} a_j under a primal pivot:
-        //   w'_j = w_j - psi_r * (((s - e_r)^T a_j) / alpha)
-        // where psi_r = B^{-T} e_r from the pre-pivot basis.
-        for (auto& E : dual_pool_) {
-            if (E.jN == e_abs)
-                continue;
-            const double beta = pricing_detail::column_dot(A, E.jN, s_minus_er) * inv_alpha;
-            if (beta != 0.0) {
-                const double old_weight = E.dual_weight;
-                pricing_detail::subtract_scaled(E.w, psi_before, beta);
-                const double new_weight = std::max(
-                    1.0, pricing_detail::edge_weight_from_direction(E.w, weight_strategy_));
-                const double log_error = pricing_detail::log_weight_error(new_weight, old_weight);
-                if (new_weight < old_weight) {
-                    average_log_low_weight_error_ =
-                        0.99 * average_log_low_weight_error_ + 0.01 * log_error;
-                } else {
-                    average_log_high_weight_error_ =
-                        0.99 * average_log_high_weight_error_ + 0.01 * log_error;
-                }
-                if (!pricing_detail::weight_log_error_ok(new_weight, old_weight,
-                                                         log_error_threshold_)) {
-                    need_rebuild_ = true;
-                } else {
-                    E.dual_weight = new_weight;
-                }
+            row_weights_[static_cast<std::size_t>(i)] = std::max(w, kMinDseWeight);
+        };
+        if (s.has_pattern()) {
+            // The HVector index list may contain duplicates; the update is
+            // additive, so guard against touching a row twice.
+            seen_scratch_.assign(row_weights_.size(), 0);
+            for (int k = 0; k < s.count; ++k) {
+                const int i = s.index[k];
+                if (i < 0 || i >= (int)row_weights_.size() || seen_scratch_[static_cast<std::size_t>(i)])
+                    continue;
+                seen_scratch_[static_cast<std::size_t>(i)] = 1;
+                touch(i);
             }
+        } else {
+            for (int i = 0; i < (int)row_weights_.size(); ++i)
+                touch(i);
         }
-
-        // Remove entering
-        if (auto itE = dual_pos_.find(e_abs); itE != dual_pos_.end()) {
-            const int idx = itE->second, last = (int)dual_pool_.size() - 1;
-            if (idx != last) {
-                dual_pos_[dual_pool_[last].jN] = idx;
-                std::swap(dual_pool_[idx], dual_pool_[last]);
-            }
-            dual_pool_.pop_back();
-            dual_pos_.erase(itE);
-        }
-
-        // Add leaving
-        if (insert_leaver_into_pool) {
-            DualEntry E;
-            E.jN = old_abs;
-            E.w = e_r;
-            const double beta_old = pricing_detail::column_dot(A, old_abs, s_minus_er) * inv_alpha;
-            if (beta_old != 0.0)
-                pricing_detail::subtract_scaled(E.w, psi_before, beta_old);
-            E.dual_weight =
-                std::max(1.0, pricing_detail::edge_weight_from_direction(E.w, weight_strategy_));
-
-            if (pool_max_ > 0 && (int)dual_pool_.size() >= pool_max_) {
-                int evict = 0;
-                double wmax = dual_pool_[0].dual_weight;
-                for (int i = 1; i < (int)dual_pool_.size(); ++i) {
-                    if (dual_pool_[i].dual_weight > wmax) {
-                        wmax = dual_pool_[i].dual_weight;
-                        evict = i;
-                    }
-                }
-                dual_pos_.erase(dual_pool_[evict].jN);
-                dual_pool_[evict] = std::move(E);
-                dual_pos_[dual_pool_[evict].jN] = evict;
-            } else {
-                dual_pos_[E.jN] = (int)dual_pool_.size();
-                dual_pool_.push_back(std::move(E));
-            }
-        }
+        row_weights_[static_cast<std::size_t>(leave_rel)] = new_pivotal;
 
         ++iter_count_;
-        if (iter_count_ >= reset_freq_)
+        if (reset_freq_ > 0 && iter_count_ >= reset_freq_)
             need_rebuild_ = true;
     }
 
@@ -1029,22 +931,17 @@ class DualSteepestEdgePricer {
     }
     WarmStartState export_state() const {
         WarmStartState out;
-        out.row_weights.reserve(row_pool_.size());
-        for (const auto& row : row_pool_) {
-            out.row_weights.push_back(row.weight);
-        }
+        out.row_weights = row_weights_;
         return out;
     }
     bool import_state(const WarmStartState& state, int rows) {
         if (rows < 0 || static_cast<int>(state.row_weights.size()) != rows) {
             return false;
         }
-        dual_pool_.clear();
-        dual_pos_.clear();
-        row_pool_.assign(static_cast<std::size_t>(rows), RowEntry{});
+        row_weights_.resize(static_cast<std::size_t>(rows));
         for (int i = 0; i < rows; ++i) {
-            row_pool_[static_cast<std::size_t>(i)].weight =
-                std::max(1.0, state.row_weights[static_cast<std::size_t>(i)]);
+            row_weights_[static_cast<std::size_t>(i)] =
+                std::max(kMinDseWeight, state.row_weights[static_cast<std::size_t>(i)]);
         }
         iter_count_ = 0;
         no_improvement_count_ = 0;
@@ -1057,9 +954,9 @@ class DualSteepestEdgePricer {
     }
 
   private:
-    std::vector<DualEntry> dual_pool_;
-    std::vector<RowEntry> row_pool_;
-    std::unordered_map<int, int> dual_pos_;
+    static constexpr double kMinDseWeight = 1e-4; // kMinDualSteepestEdgeWeight
+    std::vector<double> row_weights_;             // w_i = ||B^{-T} e_i||^2
+    std::vector<char> seen_scratch_;
     int pool_max_{0};
     int reset_freq_{1000};
     int iter_count_{0};
@@ -1538,14 +1435,21 @@ class DualAdaptivePricer {
         return {};
     }
 
+    // True when the active rule benefits from the FTRAN-DSE vector
+    // tau = B^{-1} psi_r (pre-pivot basis); the caller pays one extra FTRAN
+    // per pivot to keep the steepest-edge weights exact (HiGHS updateFtranDSE).
+    bool wants_ftran_dse() const { return active_rule_ == Rule::SteepestEdge; }
+
     template <class MatrixLike>
     void update_after_dual_pivot(int leave_rel, int e_abs, int old_abs, const HVector& s,
                                  double alpha, const MatrixLike& A, const std::vector<int>& N,
-                                 const HVector& dual_row, bool insert_leaver_into_pool = true) {
+                                 const HVector& dual_row, bool insert_leaver_into_pool = true,
+                                 const Eigen::VectorXd* ftran_dse = nullptr) {
         switch (active_rule_) {
             case Rule::SteepestEdge:
                 steepest_pricer_.update_after_dual_pivot(leave_rel, e_abs, old_abs, s, alpha, A, N,
-                                                         dual_row, insert_leaver_into_pool);
+                                                         dual_row, insert_leaver_into_pool,
+                                                         ftran_dse);
                 need_rebuild_ = steepest_pricer_.needs_rebuild();
                 if (!need_rebuild_ && steepest_pricer_.average_log_weight_error_sum() >
                                           dual_weight_log_error_threshold_) {
@@ -1787,13 +1691,14 @@ class AdaptivePricer {
 
     template <typename MatrixLike>
     void update_after_primal_pivot(int leaving_rel, int entering_abs, int old_abs,
-                                   const Eigen::VectorXd& pivot_column, double alpha,
+                                   const Eigen::VectorXd& pivot_column,
+                                   const Eigen::VectorXd& pivot_row, double alpha,
                                    double step_size, const MatrixLike& A,
-                                   const std::vector<int>& N) {
+                                   const std::vector<int>& basis, const std::vector<int>& N) {
         steepest_pricer_.update_after_primal_pivot(leaving_rel, entering_abs, old_abs, pivot_column,
                                                    alpha, A, N, true);
         devex_pricer_.update_after_primal_pivot(leaving_rel, entering_abs, old_abs, pivot_column,
-                                                alpha, A, N, true);
+                                                pivot_row, alpha, A, basis, N, true);
 
         if ((int)performance_history_.size() >= options_.performance_window)
             performance_history_.pop_front();

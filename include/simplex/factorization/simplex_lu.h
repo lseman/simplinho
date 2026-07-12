@@ -40,8 +40,11 @@ class FTBasis {
     using Permutation = Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int>;
 
     struct Options {
-        int refactor_every = 32;
-        int compress_every = 16;
+        // Hard backstops only — the synthetic reinversion clock (HiGHS
+        // economics: rebuild when update-chain solve cost exceeds build cost)
+        // is the primary refactor trigger. HiGHS's update limit is 5000.
+        int refactor_every = 1024;
+        int compress_every = 512;
         double pivot_rel = 1e-12;
         double abs_floor = 1e-16;
         double alpha_tol = 1e-10;
@@ -50,6 +53,14 @@ class FTBasis {
         double sparse_drop_tol = 0.0;
         std::string sparse_backend = "auto"; // "auto" | "pf" | "ft" | "eigen"
         bool sparse_equilibration = true;
+        // HiGHS-style: no per-solve residual validation — numerical trouble
+        // is caught by the engines' alpha cross-check at pivot time. The
+        // Eigen SparseLU oracle stays on: besides recovery it is the
+        // factor-time singularity detector (our Markowitz build "succeeds" on
+        // rank-deficient bases via logical injection, and the engines rely on
+        // the oracle's factorize failure to trigger early basis repair).
+        bool sparse_solve_oracle = true;
+        bool sparse_validate_solves = false;
         // HiGHS uses indexed vector loops well beyond the hyper-sparse regime.
         // Keep sparse RHS solves active up to this density so FTRAN/BTRAN can
         // preserve useful reach patterns for pricing.
@@ -59,7 +70,7 @@ class FTBasis {
         UpdateMode update_mode = UpdateMode::Hybrid;
 
         int ft_bandwidth_cap = 12;
-        double max_growth_tol = 1e3;
+        double max_growth_tol = 5e7;
         double min_dynamic_growth_tol = 500;
         double min_refactor_interval_fraction = 0.35;
         double max_condition_estimate = 1e13;
@@ -98,6 +109,7 @@ class FTBasis {
         // Options to avoid changing the public solve_B/solve_BT/replace_column
         // signatures. Ownership stays with the caller.
         int* ext_refactor_counter = nullptr;
+        int* ext_ft_update_counter = nullptr;
         std::uint64_t* ext_refactor_ns = nullptr;
         std::uint64_t* ext_pivot_ns = nullptr;
     };
@@ -902,6 +914,8 @@ class FTBasis {
         config.iterative_refinement_steps = std::max(1, opt_.refinement_steps);
         config.iterative_refinement_tol = opt_.residual_refactor_tol;
         config.max_norm_growth_before_refactor = std::max(1e4, opt_.max_growth_tol * 100.0);
+        config.enable_solve_oracle = opt_.sparse_solve_oracle;
+        config.validate_solves = opt_.sparse_validate_solves;
         std::string backend = opt_.sparse_backend;
         std::transform(backend.begin(), backend.end(), backend.begin(),
                        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
@@ -1077,25 +1091,20 @@ class FTBasis {
         const auto t0 = std::chrono::steady_clock::now();
         SparseMat B;
         sparse_build_B_(B);
-        compute_sparse_ordering_(B);
         const auto config = make_sparse_lu_config_();
 
-        if (sparse_ordering_cached_) {
-            Permutation row_perm(m_);
-            Permutation col_perm(m_);
-            for (int i = 0; i < m_; ++i) {
-                row_perm.indices()(i) = sparse_row_perm_[static_cast<size_t>(i)];
-                col_perm.indices()(i) = sparse_col_perm_[static_cast<size_t>(i)];
-            }
-
-            const SparseMat B_perm = row_perm * B * col_perm;
-
-            lu_sparse_.factor(B_perm, opt_.pivot_rel, opt_.abs_floor, std::min(opt_.rook_iters, 1),
-                              opt_.ft_bandwidth_cap, &sparse_row_perm_, &sparse_col_perm_, config);
-        } else {
-            lu_sparse_.factor(B, opt_.pivot_rel, opt_.abs_floor, opt_.rook_iters,
-                              opt_.ft_bandwidth_cap, nullptr, nullptr, config);
-        }
+        // The AMD pre-permutation fast path (factor row_perm*B*col_perm while
+        // passing the permutations as initial Pr/Pc) returned solutions in a
+        // wrong index order for every non-identity ordering: solve_B produced
+        // garbage xB, so any sparse solve whose first factorization had a
+        // non-trivial AMD ordering (e.g. every phase-2 start after phase 1)
+        // failed with NeedPhase1/Singular. No row/col direct-vs-inverse
+        // convention of the pre-permutation satisfies the solve contract, so
+        // the initial-permutation pathway of SparseForrestTomlinLU::factor is
+        // unusable as-is. Factor B directly — the Markowitz kernel performs
+        // its own fill-reducing pivoting.
+        lu_sparse_.factor(B, opt_.pivot_rel, opt_.abs_floor, opt_.rook_iters,
+                          opt_.ft_bandwidth_cap, nullptr, nullptr, config);
         current_refactor_every_ = opt_.refactor_every; // restore after any backtrack halving
         reset_update_state_();
         refresh_refactor_diagnostics_();
@@ -1548,6 +1557,10 @@ class FTBasis {
             return true;
         if (update_count_ >= adaptive_refactor_limit_())
             return true;
+        // HiGHS reinversion economics: rebuild once the update chain costs
+        // more per solve than a fresh factorization would.
+        if (A_is_sparse_ && lu_sparse_.synthetic_clock_says_refactor())
+            return true;
 
         const bool hard_guard =
             (stats_.max_eta_z_inf > opt_.eta_max_inf_norm) ||
@@ -1693,9 +1706,12 @@ class FTBasis {
             else
                 set_sparse_column_(j, new_col_dense);
             ++update_count_;
+            if (opt_.ext_ft_update_counter)
+                ++(*opt_.ext_ft_update_counter);
             refresh_stats_();
 
-            if (bad_factorization_column_residual_(j) || need_compress_())
+            if (bad_factorization_column_residual_(j) || need_compress_() ||
+                lu_sparse_.needs_refactor())
                 sparse_refactor_();
             report_pivot_telemetry();
             return;

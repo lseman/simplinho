@@ -78,6 +78,9 @@ class SparseForrestTomlinLU {
   public:
     using SparseMat = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
 
+    // Update method enum (Highs-style: FT, PF, MPF, APF).
+    enum class UpdateMethod { FT = 1, PF = 2, MPF = 3, APF = 4 };
+
     struct Config {
         bool use_amd_ordering{true};
         bool fallback_to_legacy_symbolic{true};
@@ -91,7 +94,15 @@ class SparseForrestTomlinLU {
         int max_parallel_update_size{64};
         bool enable_hyper_sparse_rhs{true};
         bool use_product_form_updates{true};
+        UpdateMethod update_method{UpdateMethod::FT}; // FT, PF, MPF, APF
         bool force_eigen_sparse_lu{false};
+        // Independent Eigen SparseLU factorization (plus its transpose) kept
+        // as a recovery oracle, and per-solve residual validation. Both are
+        // debugging/safety nets HiGHS does not pay for: it relies on the
+        // alpha cross-check at pivot time + adaptive Markowitz threshold.
+        // Demoted to debug options; off by default in solver pipeline.
+        bool enable_solve_oracle{false};
+        bool validate_solves{false};
     };
 
     struct UpdateStats {
@@ -195,6 +206,18 @@ class SparseForrestTomlinLU {
             //       for rows that were not yet processed (rank deficiency).
             complete_rank_deficient_basis_();
             build_solve_metadata_();
+            // Reinversion economics: price this build with HiGHS-style weights
+            // (~60 per factor entry + ~80 per row) and reset the solve clock.
+            {
+                std::size_t factor_entries = 0;
+                for (const auto& row : L_rows_)
+                    factor_entries += row.size();
+                for (const auto& row : U_rows_)
+                    factor_entries += row.size();
+                build_synthetic_tick_cost_ =
+                    static_cast<double>(factor_entries) * 60.0 + static_cast<double>(n_) * 80.0;
+                solve_synthetic_tick_ = 0.0;
+            }
             // Mark refactor cache as valid after successful factorization
             if (!refactor_info_.pivot_row.empty() && !use_fallback_sparse_lu_) {
                 refactor_info_.use = true;
@@ -203,7 +226,8 @@ class SparseForrestTomlinLU {
             // HiGHS certifies FTRAN/BTRAN results and reinverts on numerical
             // trouble; this oracle prevents an unchecked custom solve from
             // contaminating pivot selection.
-            prepare_sparse_lu_oracle_(base_matrix_original_);
+            if (config_.enable_solve_oracle)
+                prepare_sparse_lu_oracle_(base_matrix_original_);
         } catch (const std::runtime_error&) {
             activate_sparse_lu_fallback_(base_matrix_original_);
         }
@@ -213,6 +237,17 @@ class SparseForrestTomlinLU {
     bool supports_inplace_updates() const noexcept { return n_ > 0 && !use_fallback_sparse_lu_; }
 
     bool has_updates() const noexcept { return !updates_.empty(); }
+
+    // HiGHS-style reinversion clock: true when the synthetic work spent in
+    // solves and update application since the last build exceeds the build's
+    // own cost, so refactorizing is now cheaper than carrying the chain
+    // (kRebuildReasonSyntheticClockSaysInvert). The min-update guard mirrors
+    // kSyntheticTickReinversionMinUpdateCount.
+    bool synthetic_clock_says_refactor() const noexcept {
+        return build_synthetic_tick_cost_ > 0.0 &&
+               static_cast<int>(updates_.size()) >= kSyntheticTickMinUpdates_ &&
+               solve_synthetic_tick_ >= build_synthetic_tick_cost_;
+    }
 
     // P2-2: Return true if the factorization had rank deficiency.
     bool is_rank_deficient() const noexcept { return rank_deficiency_ < 0; }
@@ -338,6 +373,60 @@ class SparseForrestTomlinLU {
             return pf_ok;
         }
 
+        // If MPF update method is selected, build MPF update with column + row.
+        if (update_method_ == UpdateMethod::MPF) {
+            std::vector<int> col_idx;
+            std::vector<double> col_val;
+            col_idx.reserve(static_cast<size_t>(z.cwiseAbs().sum() / z.norm() + 1));
+            col_val.reserve(col_idx.size());
+            for (int i = 0; i < n_; ++i) {
+                if (i != j && std::abs(z(i)) > eps) {
+                    col_idx.push_back(i);
+                    col_val.push_back(z(i));
+                }
+            }
+            std::vector<int> row_idx;
+            std::vector<double> row_val;
+            row_idx.reserve(static_cast<size_t>(w.cwiseAbs().sum() / w.norm() + 1));
+            row_val.reserve(row_idx.size());
+            for (int i = 0; i < n_; ++i) {
+                if (std::abs(w(i)) > eps) {
+                    row_idx.push_back(i);
+                    row_val.push_back(w(i));
+                }
+            }
+            const bool mpf_ok = append_mpf_update(j, col_idx, col_val, alpha, row_idx, row_val);
+            updates_.push_back(SparseUpdate{j, dense_to_sparse_update_(u, eps),
+                                            dense_to_sparse_update_(z, eps),
+                                            dense_to_sparse_update_(w, eps), alpha});
+            update_norm_growth_estimate_(updates_.back());
+            update_cached_stats_(updates_.back());
+            return mpf_ok;
+        }
+
+        // If APF update method is selected, build APF update with column + original column.
+        // For APF, we need the original column; fall back to PF if not available.
+        if (update_method_ == UpdateMethod::APF) {
+            // APF requires original column data; for now use PF format for APF updates.
+            std::vector<int> col_idx;
+            std::vector<double> col_val;
+            col_idx.reserve(static_cast<size_t>(z.cwiseAbs().sum() / z.norm() + 1));
+            col_val.reserve(col_idx.size());
+            for (int i = 0; i < n_; ++i) {
+                if (i != j && std::abs(z(i)) > eps) {
+                    col_idx.push_back(i);
+                    col_val.push_back(z(i));
+                }
+            }
+            const bool apf_ok = append_pf_update(j, col_idx, col_val, alpha);
+            updates_.push_back(SparseUpdate{j, dense_to_sparse_update_(u, eps),
+                                            dense_to_sparse_update_(z, eps),
+                                            dense_to_sparse_update_(w, eps), alpha});
+            update_norm_growth_estimate_(updates_.back());
+            update_cached_stats_(updates_.back());
+            return apf_ok;
+        }
+
         updates_.push_back(SparseUpdate{j, dense_to_sparse_update_(u, eps),
                                         dense_to_sparse_update_(z, eps),
                                         dense_to_sparse_update_(w, eps), alpha});
@@ -421,8 +510,13 @@ class SparseForrestTomlinLU {
     bool pf_needs_refactor() const noexcept { return pf_total_fill_ > pf_merit_threshold_; }
 
     bool needs_refactor() const noexcept {
-        return !std::isfinite(norm_growth_estimate_) ||
-               norm_growth_estimate_ > config_.max_norm_growth_before_refactor;
+        if (!std::isfinite(norm_growth_estimate_) ||
+            norm_growth_estimate_ > config_.max_norm_growth_before_refactor)
+            return true;
+        // HiGHS-style synthetic clock check: refactor when solve work exceeds build work
+        if (synthetic_clock_says_refactor())
+            return true;
+        return false;
     }
 
     // expected_density: HiGHS-style EWMA of (count/n_) for this TRAN class.
@@ -553,7 +647,7 @@ class SparseForrestTomlinLU {
                     output_scratch_ = apply_updates_solve_(std::move(output_scratch_));
                     mark_output_scratch_dense_();
                 }
-                if (!validate_sparse_rhs_solution_(b, output_scratch_))
+                if (config_.validate_solves && !validate_sparse_rhs_solution_(b, output_scratch_))
                     throw std::runtime_error(
                         "SparseForrestTomlinLU: hyper-sparse RHS residual check failed");
                 Eigen::VectorXd x = output_scratch_;
@@ -573,6 +667,8 @@ class SparseForrestTomlinLU {
             }
         }
         hyper_solve_reach_valid_ = false;
+        // Dense-path solve work: every factor entry is touched once per stage.
+        solve_synthetic_tick_ += build_synthetic_tick_cost_ / 6.0;
         Eigen::VectorXd w = back_solve_U_(forward_solve_L_(Pb));
         Eigen::VectorXd x(n_);
         for (int i = 0; i < n_; ++i)
@@ -582,7 +678,7 @@ class SparseForrestTomlinLU {
             x = apply_updates_solve_(x);
         if (enable_refinement)
             x = iterative_refine_(b, x);
-        if (updates_.empty() && !validate_sparse_rhs_solution_(b, x)) {
+        if (config_.validate_solves && updates_.empty() && !validate_sparse_rhs_solution_(b, x)) {
             if (sparse_lu_oracle_ready_) {
                 x = fallback_sparse_lu_.solve(b);
                 if (fallback_sparse_lu_.info() != Eigen::Success ||
@@ -683,6 +779,8 @@ class SparseForrestTomlinLU {
             }
         }
         hyper_solve_reach_valid_ = false;
+        // Dense-path solve work: every factor entry is touched once per stage.
+        solve_synthetic_tick_ += build_synthetic_tick_cost_ / 6.0;
         Eigen::VectorXd s = back_solve_LT_(forward_solve_UT_(PcTc));
         Eigen::VectorXd y(n_);
         for (int i = 0; i < n_; ++i)
@@ -692,7 +790,8 @@ class SparseForrestTomlinLU {
             y = apply_updates_solve_T_(y);
         if (enable_refinement)
             y = iterative_refine_T_(c, y);
-        if (updates_.empty() && !validate_sparse_transpose_solution_(c, y)) {
+        if (config_.validate_solves && updates_.empty() &&
+            !validate_sparse_transpose_solution_(c, y)) {
             if (sparse_lu_oracle_ready_) {
                 y = fallback_sparse_lu_t_.solve(c);
                 if (fallback_sparse_lu_t_.info() != Eigen::Success ||
@@ -778,6 +877,9 @@ class SparseForrestTomlinLU {
         Eigen::VectorXd b = Eigen::VectorXd::Zero(n_);
         for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
             b(seed_idx[k]) = seed_val[k];
+        // Structural check, not a numeric net: the pattern-seeded solve is
+        // only valid when the seed pattern covered the true reach; always
+        // verify and fall back to the dense path when it did not.
         if (!validate_sparse_rhs_solution_(b, output_scratch_)) {
             last_solve_pattern_valid_ = false;
             // Reset scratches before delegating to the dense path.
@@ -1896,13 +1998,27 @@ class SparseForrestTomlinLU {
         }
     }
 
+    // Counting two-pass fill. Rows are visited in ascending physical order,
+    // so each column receives its entries already sorted by phys_row — no
+    // per-entry sorted insert (set_entry_ here was >50% of factorization
+    // time: the column view is rebuilt after every pivot).
     void rebuild_U_cols_() const {
         auto& cols = const_cast<std::vector<SparseRow>&>(U_cols_);
-        cols.assign(n_, {});
-        for (int phys_row = 0; phys_row < n_; ++phys_row) {
+        cols.resize(static_cast<std::size_t>(n_));
+        for (auto& col : cols)
+            col.clear();
+        auto& counts = const_cast<std::vector<int>&>(col_rebuild_count_scratch_);
+        counts.assign(static_cast<std::size_t>(n_), 0);
+        for (int phys_row = 0; phys_row < n_; ++phys_row)
             for (const auto& entry : U_rows_[phys_row])
-                set_entry_(cols[entry.idx], phys_row, entry.val);
-        }
+                ++counts[static_cast<std::size_t>(entry.idx)];
+        for (int c = 0; c < n_; ++c)
+            cols[static_cast<std::size_t>(c)].reserve(
+                static_cast<std::size_t>(counts[static_cast<std::size_t>(c)]));
+        for (int phys_row = 0; phys_row < n_; ++phys_row)
+            for (const auto& entry : U_rows_[phys_row])
+                cols[static_cast<std::size_t>(entry.idx)].push_back(
+                    IndexedValue{phys_row, entry.val});
         const_cast<bool&>(U_cols_dirty_) = false;
     }
 
@@ -1914,11 +2030,21 @@ class SparseForrestTomlinLU {
 
     void rebuild_L_cols_() const {
         auto& cols = const_cast<std::vector<SparseRow>&>(L_cols_);
-        cols.assign(n_, {});
-        for (int phys_row = 0; phys_row < n_; ++phys_row) {
+        cols.resize(static_cast<std::size_t>(n_));
+        for (auto& col : cols)
+            col.clear();
+        auto& counts = const_cast<std::vector<int>&>(col_rebuild_count_scratch_);
+        counts.assign(static_cast<std::size_t>(n_), 0);
+        for (int phys_row = 0; phys_row < n_; ++phys_row)
             for (const auto& entry : L_rows_[phys_row])
-                set_entry_(cols[entry.idx], phys_row, entry.val);
-        }
+                ++counts[static_cast<std::size_t>(entry.idx)];
+        for (int c = 0; c < n_; ++c)
+            cols[static_cast<std::size_t>(c)].reserve(
+                static_cast<std::size_t>(counts[static_cast<std::size_t>(c)]));
+        for (int phys_row = 0; phys_row < n_; ++phys_row)
+            for (const auto& entry : L_rows_[phys_row])
+                cols[static_cast<std::size_t>(entry.idx)].push_back(
+                    IndexedValue{phys_row, entry.val});
         const_cast<bool&>(L_cols_dirty_) = false;
     }
 
@@ -2014,6 +2140,14 @@ class SparseForrestTomlinLU {
         if (const auto hint = symbolic_hint_pivot_(k); hint.has_value())
             return *hint;
 
+        // HiGHS-style search limit: limit early search to 8 candidates
+        const int search_limit = std::min(static_cast<int>(row_degree_.size() - k), 8);
+        int search_count = 0;
+        long best_score = std::numeric_limits<long>::max();
+        double best_abs = -1.0;
+        int best_i = -1;
+        int best_j = -1;
+
         while (!row_candidate_heap_.empty()) {
             const RowCandidate candidate = row_candidate_heap_.top();
             row_candidate_heap_.pop();
@@ -2040,13 +2174,31 @@ class SparseForrestTomlinLU {
                 continue;
             }
 
+            search_count++;
+
             if (candidate.score <= kEarlyAcceptMarkowitzScore_ &&
                 row_candidate_best_abs_[candidate.row] >=
                     kEarlyAcceptPivotRatio_ * std::max(colmax, abs_floor_)) {
                 return {candidate.row, candidate.col};
             }
 
-            return {candidate.row, candidate.col};
+            // Track best candidate seen so far
+            if (candidate.score < best_score ||
+                (candidate.score == best_score && candidate.abs > best_abs)) {
+                best_score = candidate.score;
+                best_abs = candidate.abs;
+                best_i = candidate.row;
+                best_j = candidate.col;
+            }
+
+            // HiGHS-style early exit: if we've searched enough and found a decent pivot,
+            // accept it to avoid O(n^2) search
+            if (search_count >= search_limit && best_score < 1000000L)
+                break;
+        }
+
+        if (best_i >= 0 && best_j >= 0) {
+            return {best_i, best_j};
         }
 
         ensure_U_cols_ready_();
@@ -2368,6 +2520,7 @@ class SparseForrestTomlinLU {
 
         // Update synthetic tick with Highs-style weights
         synthetic_tick_ += count_pivot * 20 + count_entry * 10;
+        solve_synthetic_tick_ += count_pivot * 20 + count_entry * 10;
 
         // Solve with the collected list
         if (pivot_value == nullptr) {
@@ -2727,16 +2880,23 @@ class SparseForrestTomlinLU {
     }
 
     Eigen::VectorXd apply_updates_solve_(Eigen::VectorXd x) const {
-        if (!pf_pivot_index_.empty())
+        if (!pf_pivot_index_.empty()) {
+            if (update_method_ == UpdateMethod::MPF)
+                return solve_with_MPF_(x);
+            if (update_method_ == UpdateMethod::APF)
+                return solve_with_APF_(x);
             return solve_with_PF_(x);
+        }
         for (const auto& update : updates_) {
-            // If we have a valid hyper-sparse reach, skip updates where x(j) is
-            // guaranteed zero (j not in reach set).
-            if (hyper_solve_reach_valid_ && !reach_flag_scratch_[update.j])
-                continue;
+            // Do not use the base triangular-solve reach to skip FT updates:
+            // an earlier update can create x(update.j), expanding the pattern.
+            // HiGHS maintains the indexed-vector pattern after every update;
+            // applying the full sparse update chain is the correct equivalent.
             const double xj = x(update.j);
-            if (xj != 0.0)
+            if (xj != 0.0) {
                 update.z.axpy(x, -(xj / update.alpha));
+                solve_synthetic_tick_ += 10.0 * static_cast<double>(update.z.idx.size() + 1);
+            }
         }
         return x;
     }
@@ -2748,6 +2908,8 @@ class SparseForrestTomlinLU {
         const int num_updates = static_cast<int>(pf_pivot_index_.size());
         if (num_updates == 0)
             return x;
+        // HiGHS-style synthetic tick: pf_pivot_count * 20 + pf_start[pf_pivot_count] * 5
+        solve_synthetic_tick_ += num_updates * 20 + (pf_start_.empty() ? 0 : pf_start_.back()) * 5;
         for (int k = 0; k < num_updates; ++k) {
             const int pivot_row = pf_pivot_index_[k];
             const double pivot_val = pf_pivot_value_[k];
@@ -2772,26 +2934,23 @@ class SparseForrestTomlinLU {
     }
 
     Eigen::VectorXd apply_updates_solve_T_(Eigen::VectorXd y) const {
+        // Use PF/MPF/APF transpose solves when packed updates are present.
+        if (!pf_pivot_index_.empty()) {
+            if (update_method_ == UpdateMethod::MPF)
+                return solve_with_MPF_T_(y);
+            if (update_method_ == UpdateMethod::APF)
+                return solve_with_APF_T_(y);
+            return solve_with_PF_T_(y);
+        }
         // Use regular updates for transpose solves even when PF forward updates
         // are also present, to avoid relying on incomplete PF transpose logic.
         for (const auto& update : updates_) {
-            // For the transposed case, skip if none of u's support overlaps the
-            // reach set — u.dot(y) must be zero if all u(i) positions are outside
-            // the reach.
-            if (hyper_solve_reach_valid_) {
-                bool any_in_reach = false;
-                for (int k = 0; k < static_cast<int>(update.u.idx.size()); ++k) {
-                    if (reach_flag_scratch_[update.u.idx[k]]) {
-                        any_in_reach = true;
-                        break;
-                    }
-                }
-                if (!any_in_reach)
-                    continue;
-            }
             const double uy = update.u.dot(y);
-            if (uy != 0.0)
+            if (uy != 0.0) {
                 update.w.axpy(y, -(uy / update.alpha));
+                solve_synthetic_tick_ +=
+                    10.0 * static_cast<double>(update.u.idx.size() + update.w.idx.size() + 1);
+            }
         }
         return y;
     }
@@ -2805,6 +2964,15 @@ class SparseForrestTomlinLU {
         const int num_updates = static_cast<int>(pf_pivot_index_.size());
         if (num_updates == 0)
             return y;
+        // HiGHS-style synthetic tick for btranFT: rhs_synthetic_tick * 15 + pf_pivot_count * 10
+        int rhs_synthetic_tick = 0;
+        for (int k = 0; k < num_updates; ++k) {
+            const int start = pf_start_[k];
+            const int end =
+                (k + 1 < num_updates) ? pf_start_[k + 1] : static_cast<int>(pf_index_.size());
+            rhs_synthetic_tick += (end - start);
+        }
+        solve_synthetic_tick_ += rhs_synthetic_tick * 15 + num_updates * 10;
         // Apply in reverse order (reverse sweep matches transpose operation order)
         for (int k = num_updates - 1; k >= 0; --k) {
             const int pivot_row = pf_pivot_index_[k];
@@ -2829,6 +2997,81 @@ class SparseForrestTomlinLU {
         }
         return y;
     }
+
+    // Apply updates using Modified Product Form (MPF) storage.
+    // MPF stores: column entries, row entries with negated values, pivot_row, pivot_val.
+    Eigen::VectorXd solve_with_MPF_(Eigen::VectorXd x) const {
+        const int num_updates = static_cast<int>(pf_pivot_index_.size());
+        if (num_updates == 0)
+            return x;
+        // HiGHS-style synthetic tick
+        solve_synthetic_tick_ += num_updates * 20 + (pf_start_.empty() ? 0 : pf_start_.back()) * 5;
+        for (int k = 0; k < num_updates; ++k) {
+            const int pivot_row = pf_pivot_index_[k];
+            const double pivot_val = pf_pivot_value_[k];
+            if (std::abs(pivot_val) < kSparseTiny_)
+                continue;
+            const int start = pf_start_[k];
+            const int end =
+                (k + 1 < num_updates) ? pf_start_[k + 1] : static_cast<int>(pf_index_.size());
+            double xj = x(pivot_row);
+            if (std::abs(xj) < kSparseTiny_)
+                continue;
+            const double multiplier = xj / pivot_val;
+            x(pivot_row) = multiplier;
+            for (int p = start; p < end; ++p) {
+                const int row = pf_index_[p];
+                if (row != pivot_row) {
+                    x(row) -= multiplier * pf_value_[p];
+                }
+            }
+        }
+        return x;
+    }
+
+    // Transpose solve with Modified Product Form (MPF) updates.
+    Eigen::VectorXd solve_with_MPF_T_(Eigen::VectorXd y) const {
+        const int num_updates = static_cast<int>(pf_pivot_index_.size());
+        if (num_updates == 0)
+            return y;
+        int rhs_synthetic_tick = 0;
+        for (int k = 0; k < num_updates; ++k) {
+            const int start = pf_start_[k];
+            const int end =
+                (k + 1 < num_updates) ? pf_start_[k + 1] : static_cast<int>(pf_index_.size());
+            rhs_synthetic_tick += (end - start);
+        }
+        solve_synthetic_tick_ += rhs_synthetic_tick * 15 + num_updates * 10;
+        // Apply in reverse order
+        for (int k = num_updates - 1; k >= 0; --k) {
+            const int pivot_row = pf_pivot_index_[k];
+            const double pivot_val = pf_pivot_value_[k];
+            if (std::abs(pivot_val) < kSparseTiny_)
+                continue;
+            const int start = pf_start_[k];
+            const int end =
+                (k + 1 < num_updates) ? pf_start_[k + 1] : static_cast<int>(pf_index_.size());
+            double yp = y(pivot_row);
+            double correction = 0.0;
+            for (int p = start; p < end; ++p) {
+                const int row = pf_index_[p];
+                if (row != pivot_row) {
+                    correction += pf_value_[p] * y(row);
+                }
+            }
+            y(pivot_row) = (yp - correction) / pivot_val;
+        }
+        return y;
+    }
+
+    // Apply updates using Authenticated Product Form (APF) storage.
+    // APF stores: column entries, original column entries, pivot_row, pivot_val.
+    // For now, APF uses the same forward solve logic as PF.
+    Eigen::VectorXd solve_with_APF_(Eigen::VectorXd x) const { return solve_with_PF_(x); }
+
+    // Transpose solve with Authenticated Product Form (APF) updates.
+    // For now, APF uses the same transpose solve logic as PF.
+    Eigen::VectorXd solve_with_APF_T_(Eigen::VectorXd y) const { return solve_with_PF_T_(y); }
 
     bool validate_sparse_rhs_solution_(const Eigen::VectorXd& rhs, const Eigen::VectorXd& x) const {
         if (!x.array().isFinite().all())
@@ -2925,11 +3168,13 @@ class SparseForrestTomlinLU {
     }
 
     void update_norm_growth_estimate_(const SparseUpdate& update) {
-        const double denom = std::max({1.0, base_matrix_one_norm_, std::abs(update.alpha)});
-        const double proxy =
-            1.0 + std::min(1e3, (update.u.one_norm() + update.z.one_norm() + update.w.one_norm()) /
-                                    denom);
-        norm_growth_estimate_ *= proxy;
+        // A product of per-update 1-norm proxies grows exponentially even for
+        // perfectly stable pivots and forced a reinversion every ~3 updates.
+        // Track the worst Sherman-Morrison amplification instead: instability
+        // comes from a large transformed column relative to its pivot alpha.
+        const double pivot = std::max(std::abs(update.alpha), abs_floor_);
+        const double amplification = std::max(1.0, (1.0 + update.z.inf_norm()) / pivot);
+        norm_growth_estimate_ = std::max(norm_growth_estimate_, amplification);
     }
 
     void update_cached_stats_(const SparseUpdate& update) {
@@ -2968,6 +3213,7 @@ class SparseForrestTomlinLU {
     std::vector<bool> row_candidate_dirty_;
     std::vector<bool> col_candidate_dirty_;
     std::vector<int> dirty_cols_scratch_;
+    std::vector<int> col_rebuild_count_scratch_;
     std::vector<PatternSet> legacy_pattern_rows_scratch_;
     std::vector<PatternSet> legacy_pattern_cols_scratch_;
     std::vector<int> sym_row_map_scratch_;
@@ -2994,11 +3240,15 @@ class SparseForrestTomlinLU {
     // L_pivot_lookup_[pivot_index] = logical_position (inverse of L_pivot_index)
     // U_pivot_lookup_[pivot_index] = logical_position (inverse of U_pivot_index)
     std::vector<int> L_pivot_lookup_, U_pivot_lookup_;
-    // Update method enum (Highs-style: FT, PF, MPF, APF).
-    enum class UpdateMethod { FT = 1, PF = 2, MPF = 3, APF = 4 };
     UpdateMethod update_method_{UpdateMethod::FT};
     // Synthetic tick for timing model.
     mutable double synthetic_tick_{0.0};
+    // HiGHS-style reinversion economics: refactor when the synthetic work
+    // spent in solves/updates since the last build exceeds the build's own
+    // synthetic cost (HEkk kRebuildReasonSyntheticClockSaysInvert).
+    double build_synthetic_tick_cost_{0.0};
+    mutable double solve_synthetic_tick_{0.0};
+    static constexpr int kSyntheticTickMinUpdates_ = 50;
     std::vector<int> affected_rows_scratch_;
     // Elimination trees (Item 2): first/last column-structure entry per node.
     // l_etree_[j]  = min{i>j : L[i,j]!=0}  (-1 if none) — forward L solve
