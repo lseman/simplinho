@@ -257,8 +257,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         }
     }
     const bool use_reformulation = !is_nonnegative_standard &&
-                                   (has_free_vars || !opt_.native_bounds ||
-                                    (opt_.mode == SimplexMode::Dual && has_upper_bounds)) &&
+                                   (has_free_vars || !opt_.native_bounds) &&
                                    !std::getenv("SIMPLINHO_FORCE_NATIVE_DUAL");
     if (use_reformulation) {
         const bool cache_reuse = sparse_bound_only_cache_.same_problem(A_in, b_in, c_in) &&
@@ -1193,7 +1192,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                 std::tie(st, v2, red_basis2, it2, info2) = run_phase2_p(basis_guess);
             }
         } else {
-            if (allow_direct_primal) {
+            if (has_upper_bounds && allow_direct_dual) {
+                std::tie(st, v2, red_basis2, it2, info2) = run_phase2_d(basis_guess);
+                info2["auto_dual"] = "1";
+            } else if (allow_direct_primal) {
                 std::tie(st, v2, red_basis2, it2, info2) = run_phase2_p(basis_guess);
             }
             if (allow_direct_dual && st == LPSolution::Status::NeedPhase1 &&
@@ -1592,6 +1594,17 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             auto res = run_phase2_p(basis, ignore_seed_status);
             std::get<4>(res)["phase2_mode"] = "primal";
             return res;
+        }
+        if (has_upper_bounds) {
+            const auto quality =
+                evaluate_basis_quality_(Ared, bred, cred, basis, l_eff, u_eff, opt_.tol);
+            if (quality.valid && quality.dual_feasible) {
+                auto res = run_phase2_d(basis, ignore_seed_status);
+                std::get<4>(res)["phase2_mode"] = "dual";
+                std::get<4>(res)["auto_dual"] = "1";
+                if (std::get<0>(res) == LPSolution::Status::Optimal)
+                    return res;
+            }
         }
         auto res = run_phase2_p(basis, ignore_seed_status);
         std::get<4>(res)["phase2_mode"] = "primal";

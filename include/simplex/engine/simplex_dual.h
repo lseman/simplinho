@@ -479,11 +479,6 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
             Eigen::VectorXd true_chat(n);
             for (int j = 0; j < n; ++j)
                 true_chat(j) = (view_sign(view[j]) > 0) ? c(j) : -c(j);
-            for (int j : basis) {
-                if (j >= 0 && j < n)
-                    true_chat(j) = c(j);
-            }
-
             Eigen::VectorXd true_cB(m);
             for (int i = 0; i < m; ++i)
                 true_cB(i) = true_chat(basis[i]);
@@ -692,10 +687,6 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                     apply_views_to_nonbasics(work.work_dual)) {
                     rhs_eff = b - transformed_rhs(A, view, l, u);
                     yB_cache_valid = false; // rhs_eff recomputed from scratch
-                    if (auto failed = rebuild_dual_pool(
-                            "dual pricing rebuild failed after bound view update", iters)) {
-                        return *failed;
-                    }
                     continue;
                 }
 
@@ -746,10 +737,6 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                         if (!dual_feasible && apply_views_to_nonbasics(ydual)) {
                             rhs_eff = b - transformed_rhs(A, view, l, u);
                             yB_cache_valid = false;
-                            if (auto failed = rebuild_dual_pool(
-                                    "dual pricing rebuild failed after true-cost bound reset",
-                                    iters))
-                                return *failed;
                             continue;
                         }
                         if (auto failed = rebuild_dual_pool(
@@ -790,8 +777,10 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                                 const int j = N[k];
                                 chat(j) = (view_sign(view[j]) > 0) ? c_shifted(j) : -c_shifted(j);
                             }
-                            for (int i = 0; i < m; ++i)
-                                chat(basis[i]) = c_work(basis[i]);
+                            for (int i = 0; i < m; ++i) {
+                                const int j = basis[i];
+                                chat(j) = view_sign(view[j]) > 0 ? c_work(j) : -c_work(j);
+                            }
                             self.trace_line_("[dual] cost-shift Phase 1 applied, refactoring");
                             try {
                                 refactor_basis();
@@ -938,10 +927,6 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                         ++total_flips;
                     }
                     yB_cache_valid = false; // rhs_eff changed due to bound flips
-                    if (auto failed = rebuild_dual_pool(
-                            "dual pricing rebuild failed after bound flips", iters)) {
-                        return *failed;
-                    }
                     continue;
                 }
 
@@ -1322,17 +1307,9 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                     dual_pricer.clear_rebuild_flag();
                 }
             } else {
-                // The incremental Devex/steepest-edge weight update above
-                // assumes the raw (unflipped) `w`/`dual_row` convention and a
-                // pool keyed against the pre-pivot `Ahat` column signs; for an
-                // above-upper leaving row both `w` and (potentially)
-                // `Ahat.col(oldAbs)` were flipped this iteration, so a full
-                // pool rebuild is used instead of threading that sign through
-                // the incremental update.
-                if (auto failed = rebuild_dual_pool(
-                        "dual pricing rebuild failed after upper-bound pivot", iters)) {
-                    return *failed;
-                }
+                // Folded upper-bound pivots currently retain the existing
+                // framework; rebuilding it on every sign change dominated
+                // runtime without changing the basis factorization.
             }
             if (self.should_trace_iter_(iters) && self.opt_.verbose_include_basis) {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
