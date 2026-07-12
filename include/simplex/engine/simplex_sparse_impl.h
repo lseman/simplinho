@@ -1570,6 +1570,9 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                     std::get<4>(primal_res)["phase2_mode"] = "primal";
                     std::get<4>(primal_res)["phase2_dual_recovery"] = "1";
                     std::get<4>(primal_res)["phase2_dual_recovery_status"] = to_string(dual_status);
+                    if (const auto reason = std::get<4>(res).find("reason");
+                        reason != std::get<4>(res).end())
+                        std::get<4>(primal_res)["phase2_dual_recovery_detail"] = reason->second;
                     if (invalid_dual_optimum)
                         std::get<4>(primal_res)["phase2_dual_recovery_reason"] =
                             "invalid_returned_primal";

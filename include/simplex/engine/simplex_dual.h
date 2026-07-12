@@ -743,6 +743,15 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                         work.reduced_cost = compute_nonbasic_duals_(Ahat, N, ydual, chat);
                         dual_feasible =
                             dual_feasible_nonbasics_(work.reduced_cost, self.opt_.tol);
+                        if (!dual_feasible && apply_views_to_nonbasics(ydual)) {
+                            rhs_eff = b - transformed_rhs(A, view, l, u);
+                            yB_cache_valid = false;
+                            if (auto failed = rebuild_dual_pool(
+                                    "dual pricing rebuild failed after true-cost bound reset",
+                                    iters))
+                                return *failed;
+                            continue;
+                        }
                         if (auto failed = rebuild_dual_pool(
                                 "dual pricing rebuild failed after cleanup", iters)) {
                             return *failed;
@@ -1059,8 +1068,12 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
             // already had while basic — no view change needed. A leaving row
             // selected as above-upper (leaving_sign<0) must instead exit to
             // its Upper bound, since that's the bound it was violating.
+            const BoundView leaving_current_view = view[oldAbs];
             const BoundView leaving_target_view =
-                (work.leaving_sign < 0) ? BoundView::Upper : BoundView::Lower;
+                work.leaving_sign < 0
+                    ? (leaving_current_view == BoundView::Upper ? BoundView::Lower
+                                                               : BoundView::Upper)
+                    : leaving_current_view;
             const auto basis_cycle =
                 self.degen_.register_basis_change(basis, work.leaving_row, work.entering_col,
                                                   iters);
@@ -1160,8 +1173,8 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
             // sign, exactly like the nonbasic bound-flip machinery elsewhere
             // in this loop. Must happen before the `rN(e_rel)` recompute
             // below, which reads `Ahat.col(oldAbs)` under the new view.
-            if (leaving_target_view != BoundView::Lower) {
-                const double old_anchor = bound_anchor(BoundView::Lower, oldAbs, l, u);
+            if (leaving_target_view != leaving_current_view) {
+                const double old_anchor = bound_anchor(leaving_current_view, oldAbs, l, u);
                 view[oldAbs] = leaving_target_view;
                 const double new_anchor = bound_anchor(view[oldAbs], oldAbs, l, u);
                 const double delta_anchor = new_anchor - old_anchor;
@@ -1187,7 +1200,7 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                 }
                 chat(oldAbs) = -chat(oldAbs);
             } else {
-                view[oldAbs] = BoundView::Lower;
+                view[oldAbs] = leaving_current_view;
             }
             work.reduced_cost(work.entering_rel) = chat(oldAbs) - column_dot(Ahat, oldAbs, ydual);
 
