@@ -262,7 +262,9 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
             popts.enable_adaptive_switching = false;
             popts.steepest_pool_max = 0;
             popts.steepest_reset_freq = self.opt_.adaptive_reset_freq;
-            popts.devex_reset_freq = self.opt_.devex_reset;
+            popts.devex_reset_freq = self.opt_.devex_reset > 0
+                                            ? self.opt_.devex_reset
+                                            : (m <= 128 ? 100 : 1000);
             popts.primal_edge_weight_strategy = self.opt_.primal_edge_weight_strategy;
             popts.primal_weight_log_error_threshold =
                 self.opt_.primal_steepest_edge_weight_log_error_threshold;

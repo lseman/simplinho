@@ -157,7 +157,7 @@ struct RevisedSimplexOptions {
     double basis_sparse_rhs_density_threshold = 0.40;
 
     // Pricing
-    int devex_reset = 100;
+    int devex_reset = 0; // 0 = size-adaptive framework rebuild interval
     std::string pricing_rule = "adaptive"; // or "devex" / "most_negative"
     int adaptive_reset_freq = 400;
     // Full Devex pricing is the safe default. HiGHS hyper-pricing maintains a
