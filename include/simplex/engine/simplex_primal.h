@@ -208,6 +208,11 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
             auto fresh = std::make_shared<simplex::nla::SimplexNLA>();
             fresh->setup(A.rows(), 0.1, make_nla_config());
             if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
+                // HiGHS-style small-basis kernel crossover: keep matrix and
+                // pricing operations sparse, but use dense LU while the basis
+                // itself comfortably fits in cache. The custom sparse factor
+                // has substantially higher setup cost at this scale and is
+                // more sensitive to row-sign permutations during Phase I.
                 if (m <= 16) {
                     Eigen::MatrixXd B_dense(m, m);
                     for (int i = 0; i < m; ++i)
@@ -409,13 +414,41 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
 
             if (!clamp_basic_solution_to_bounds_(work.base_value, basis, l_work, u_work,
                                                  self.opt_.tol)) {
+                int bad_row = -1;
+                double bad_value = 0.0, bad_lo = 0.0, bad_hi = 0.0;
+                for (int i = 0; i < work.base_value.size(); ++i) {
+                    const int j = basis[i];
+                    const double lo = std::isfinite(l_work(j))
+                                          ? l_work(j)
+                                          : -std::numeric_limits<double>::infinity();
+                    const double hi = std::isfinite(u_work(j))
+                                          ? u_work(j)
+                                          : std::numeric_limits<double>::infinity();
+                    if (work.base_value(i) < lo - self.opt_.tol ||
+                        work.base_value(i) > hi + self.opt_.tol) {
+                        bad_row = i;
+                        bad_value = work.base_value(i);
+                        bad_lo = lo;
+                        bad_hi = hi;
+                        break;
+                    }
+                }
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " infeasible basic vars, handing off to phase I");
+                const int at_upper_count =
+                    static_cast<int>(std::count(at_upper.begin(), at_upper.end(), char{1}));
                 return {LPSolution::Status::NeedPhase1,
                         Eigen::VectorXd::Zero(n),
                         basis,
                         iters,
-                        {{"reason", "negative_basic_vars"}}};
+                        {{"reason", "negative_basic_vars"},
+                         {"bad_basis_row", std::to_string(bad_row)},
+                         {"bad_basis_var",
+                          bad_row >= 0 ? std::to_string(basis[bad_row]) : std::string("-1")},
+                         {"bad_basis_value", std::to_string(bad_value)},
+                         {"bad_basis_lower", std::to_string(bad_lo)},
+                         {"bad_basis_upper", std::to_string(bad_hi)},
+                         {"at_upper_count", std::to_string(at_upper_count)}}};
             }
 
             work.base_cost.resize(m);

@@ -246,11 +246,9 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     // Native-bounds path: bounded variables are handled directly by the
     // engines (anchored model below). The standard-form reformulation is only
     // needed for free variables (both bounds infinite), when explicitly
-    // requested via opt_.native_bounds = false, or when the dual engine might
-    // run (mode Dual or Auto): native dual handling for two-sided bounds is
-    // still guarded by the reformulation path until its larger sparse-LP
-    // stability issues are resolved. Only Primal-forced solves use the native
-    // path when upper bounds are present.
+    // requested via opt_.native_bounds = false, or when the dual engine is
+    // explicitly requested. Auto cold solves prefer native bounded primal,
+    // avoiding one extra row and slack per finite upper bound.
     bool has_upper_bounds = false;
     for (int j = 0; j < n; ++j) {
         if (std::isfinite(u_use(j))) {
@@ -260,7 +258,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     }
     const bool use_reformulation = !is_nonnegative_standard &&
                                    (has_free_vars || !opt_.native_bounds ||
-                                    (opt_.mode != SimplexMode::Primal && has_upper_bounds)) &&
+                                    (opt_.mode == SimplexMode::Dual && has_upper_bounds)) &&
                                    !std::getenv("SIMPLINHO_FORCE_NATIVE_DUAL");
     if (use_reformulation) {
         const bool cache_reuse = sparse_bound_only_cache_.same_problem(A_in, b_in, c_in) &&
@@ -844,6 +842,22 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         }
     }
 
+    // Keep one row orientation for crash, Phase I, Phase II and factorization.
+    // Equality rows with negative RHS are multiplied by -1 once here instead
+    // of only inside the auxiliary model.
+    Eigen::VectorXd model_row_sign = Eigen::VectorXd::Ones(m_in);
+    for (int i = 0; i < m_in; ++i) {
+        if (b_model(i) < 0.0) {
+            b_model(i) = -b_model(i);
+            model_row_sign(i) = -1.0;
+        }
+    }
+    if ((model_row_sign.array() < 0.0).any()) {
+        for (int j = 0; j < A_model.outerSize(); ++j)
+            for (SparseMatrix::InnerIterator it(A_model, j); it; ++it)
+                it.valueRef() *= model_row_sign(it.row());
+    }
+
     presolve::SparsePresolveResult sparse_pres;
     if (opt_.disable_presolve) {
         sparse_pres.reduced = {A_model, b_model, c_model, l_model, u_model};
@@ -860,6 +874,13 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         spopt.infeas_tol = opt_.tol;
         spopt.min_delta = std::max(opt_.tol * 10.0, 1e-12);
         spopt.max_passes = warm ? 2 : 4;
+        // Phase I currently starts structural variables at their original
+        // zero anchor. Passing tightened positive lower bounds only to Phase
+        // II changes bound space across the transition and invalidates the
+        // feasible basis. Keep presolve non-destructive until its bound shifts
+        // are included in Phase-I RHS construction and postsolve state.
+        spopt.enable_singleton_rows = false;
+        spopt.enable_activity_tightening = false;
         // HiGHS only enables model transformations that can be undone by its
         // postsolve stack. This presolver does not yet carry row/column scale
         // and RRQR recovery through every exit path, so keep the public solve
@@ -1271,10 +1292,46 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             make_solution_(LPSolution::Status::Infeasible, Eigen::VectorXd::Zero(n),
                            std::numeric_limits<double>::infinity(), {}, it1, std::move(info)));
     }
-
     // Preserve the Phase-I feasible point while removing artificials.  Each
     // replacement is a zero-step tableau pivot, as in HiGHS basis repair.
     {
+        auto cleanup_candidate_feasible = [&](const std::vector<int>& candidate) {
+            std::vector<char> in_basis(A1.cols(), 0);
+            for (int j : candidate)
+                in_basis[j] = 1;
+            Eigen::VectorXd rhs = b1;
+            for (int j = 0; j < static_cast<int>(n_orig_eff); ++j) {
+                if (in_basis[j])
+                    continue;
+                double value = l_phase1(j);
+                if (std::isfinite(u_phase1(j)) && v1.size() > j &&
+                    std::abs(v1(j) - u_phase1(j)) <= 10.0 * opt_.tol)
+                    value = u_phase1(j);
+                if (value != 0.0)
+                    for (SparseMatrix::InnerIterator it(A1, j); it; ++it)
+                        rhs(it.row()) -= it.value() * value;
+            }
+            const SparseMatrix B = sparse_basis_copy_(A1, candidate);
+            Eigen::SparseLU<SparseMatrix> test_lu;
+            test_lu.analyzePattern(B);
+            test_lu.factorize(B);
+            if (test_lu.info() != Eigen::Success)
+                return false;
+            const Eigen::VectorXd xb = test_lu.solve(rhs);
+            if (test_lu.info() != Eigen::Success || !xb.allFinite())
+                return false;
+            for (int k = 0; k < static_cast<int>(candidate.size()); ++k) {
+                const int j = candidate[k];
+                if (j >= static_cast<int>(n_orig_eff)) {
+                    if (std::abs(xb(k)) > opt_.tol)
+                        return false;
+                } else if (xb(k) < l_phase1(j) - opt_.tol ||
+                           xb(k) > u_phase1(j) + opt_.tol) {
+                    return false;
+                }
+            }
+            return true;
+        };
         std::vector<char> basic(A1.cols(), 0);
         for (int j : basis1_out)
             basic[j] = 1;
@@ -1294,6 +1351,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                     if (lu.info() != Eigen::Success || !d.allFinite() ||
                         std::abs(d(r)) <= opt_.alpha_tol)
                         continue;
+                    std::vector<int> candidate = basis1_out;
+                    candidate[r] = j;
+                    if (!cleanup_candidate_feasible(candidate))
+                        continue;
                     basic[basis1_out[r]] = 0;
                     basis1_out[r] = j;
                     basic[j] = 1;
@@ -1308,6 +1369,12 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                     LPSolution::Status::Singular, Eigen::VectorXd::Zero(n),
                     std::numeric_limits<double>::quiet_NaN(), {}, it1, std::move(info)));
             }
+        }
+        if (!cleanup_candidate_feasible(basis1_out)) {
+            auto info = add_sparse_info({{"reason", "phase1_cleanup_lost_feasibility"}});
+            return finalize_solution_(make_solution_(
+                LPSolution::Status::Singular, Eigen::VectorXd::Zero(n),
+                std::numeric_limits<double>::quiet_NaN(), {}, it1, std::move(info)));
         }
     }
 
@@ -1360,6 +1427,13 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         if (j < (int)n_orig_eff)
             red_basis2.push_back(j);
 
+    if ((int)red_basis2.size() == m_rows && !phase2_basis_primal_feasible(red_basis2)) {
+        auto info = add_sparse_info({{"reason", "phase1_basis_not_feasible_in_phase2_space"}});
+        return finalize_solution_(make_solution_(
+            LPSolution::Status::Singular, Eigen::VectorXd::Zero(n),
+            std::numeric_limits<double>::quiet_NaN(), red_basis2, it1, std::move(info)));
+    }
+
     if ((int)red_basis2.size() < m_rows) {
         std::vector<int> fallback_basis = red_basis2;
         for (int j = 0; j < (int)n_orig_eff; ++j) {
@@ -1386,11 +1460,17 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         }
     }
     if ((int)red_basis2.size() == m_rows) {
+        const bool phase2_start_primal_feasible = phase2_basis_primal_feasible(red_basis2);
         const BasisQuality phase2_start_quality =
             evaluate_basis_quality_(Ared, bred, cred, red_basis2, l_eff, u_eff, opt_.tol);
         const double solve_residual_guard = std::max(1e-7, 100.0 * opt_.tol);
-        if (!phase2_start_quality.valid || !std::isfinite(phase2_start_quality.solve_residual) ||
-            phase2_start_quality.solve_residual > solve_residual_guard) {
+        // evaluate_basis_quality_ assumes all nonbasics are at their lower
+        // bounds. It must not replace a basis already certified feasible with
+        // Phase-I's actual AtUpper statuses.
+        if (!phase2_start_primal_feasible &&
+            (!phase2_start_quality.valid ||
+             !std::isfinite(phase2_start_quality.solve_residual) ||
+             phase2_start_quality.solve_residual > solve_residual_guard)) {
             const CrashSelection repaired_phase2_start =
                 choose_initial_basis_(Ared, bred, cred, opt_, l_eff, u_eff, red_basis2);
             if (repaired_phase2_start.quality.valid &&
@@ -1524,7 +1604,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         std::tie(status2, v2, red_basis_out, it2, info2) = run_phase2_p(std::nullopt);
     }
 
-    if (phase2_result_needs_basis_repair(status2, v2)) {
+    const bool certified_phase2_seed =
+        static_cast<int>(red_basis2.size()) == m_rows && phase2_basis_primal_feasible(red_basis2);
+    if (phase2_result_needs_basis_repair(status2, v2) &&
+        !(status2 == LPSolution::Status::NeedPhase1 && certified_phase2_seed)) {
         const std::optional<std::vector<int>> seeded_repair_basis =
             ((int)red_basis2.size() == m_rows) ? std::optional<std::vector<int>>(red_basis2)
                                                : std::nullopt;

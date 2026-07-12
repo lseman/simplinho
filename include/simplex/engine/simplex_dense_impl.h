@@ -984,6 +984,12 @@ RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const Eigen::VectorXd& 
                 for (int j = 0; j < static_cast<int>(n_orig_eff); ++j) {
                     if (basic[j])
                         continue;
+                    // A zero artificial can only be replaced degenerately by
+                    // a nonbasic structural variable whose current move is
+                    // zero. Variables at their upper bound need a signed
+                    // bound-space pivot and must not be inserted as +A_j.
+                    if (v1.size() <= j || std::abs(v1(j) - l_phase1(j)) > 10.0 * opt_.tol)
+                        continue;
                     const Eigen::VectorXd d = lu.solve(A1.col(j));
                     if (!d.allFinite() || std::abs(d(r)) <= opt_.alpha_tol)
                         continue;

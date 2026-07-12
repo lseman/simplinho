@@ -199,6 +199,11 @@ class SparseForrestTomlinLU {
             if (!refactor_info_.pivot_row.empty() && !use_fallback_sparse_lu_) {
                 refactor_info_.use = true;
             }
+            // Keep an independent sparse factorization for residual recovery.
+            // HiGHS certifies FTRAN/BTRAN results and reinverts on numerical
+            // trouble; this oracle prevents an unchecked custom solve from
+            // contaminating pivot selection.
+            prepare_sparse_lu_oracle_(base_matrix_original_);
         } catch (const std::runtime_error&) {
             activate_sparse_lu_fallback_(base_matrix_original_);
         }
@@ -577,6 +582,17 @@ class SparseForrestTomlinLU {
             x = apply_updates_solve_(x);
         if (enable_refinement)
             x = iterative_refine_(b, x);
+        if (updates_.empty() && !validate_sparse_rhs_solution_(b, x)) {
+            if (sparse_lu_oracle_ready_) {
+                x = fallback_sparse_lu_.solve(b);
+                if (fallback_sparse_lu_.info() != Eigen::Success ||
+                    !validate_sparse_rhs_solution_(b, x))
+                    throw std::runtime_error(
+                        "SparseForrestTomlinLU: certified FTRAN recovery failed");
+            } else {
+                throw std::runtime_error("SparseForrestTomlinLU: FTRAN residual check failed");
+            }
+        }
         return x;
     }
 
@@ -676,6 +692,17 @@ class SparseForrestTomlinLU {
             y = apply_updates_solve_T_(y);
         if (enable_refinement)
             y = iterative_refine_T_(c, y);
+        if (updates_.empty() && !validate_sparse_transpose_solution_(c, y)) {
+            if (sparse_lu_oracle_ready_) {
+                y = fallback_sparse_lu_t_.solve(c);
+                if (fallback_sparse_lu_t_.info() != Eigen::Success ||
+                    !validate_sparse_transpose_solution_(c, y))
+                    throw std::runtime_error(
+                        "SparseForrestTomlinLU: certified BTRAN recovery failed");
+            } else {
+                throw std::runtime_error("SparseForrestTomlinLU: BTRAN residual check failed");
+            }
+        }
         return y;
     }
 
@@ -2241,7 +2268,7 @@ class SparseForrestTomlinLU {
         (void)injected;
     }
 
-    void activate_sparse_lu_fallback_(const SparseMat& A) {
+    void prepare_sparse_lu_oracle_(const SparseMat& A) {
         fallback_sparse_lu_.analyzePattern(A);
         fallback_sparse_lu_.factorize(A);
         if (fallback_sparse_lu_.info() != Eigen::Success)
@@ -2254,6 +2281,11 @@ class SparseForrestTomlinLU {
             throw std::runtime_error(
                 "SparseForrestTomlinLU: sparse transpose fallback factorization failed");
         }
+        sparse_lu_oracle_ready_ = true;
+    }
+
+    void activate_sparse_lu_fallback_(const SparseMat& A) {
+        prepare_sparse_lu_oracle_(A);
 
         use_fallback_sparse_lu_ = true;
     }
@@ -2807,6 +2839,16 @@ class SparseForrestTomlinLU {
                residual.lpNorm<Eigen::Infinity>() <= 1e-8 * max_rhs;
     }
 
+    bool validate_sparse_transpose_solution_(const Eigen::VectorXd& rhs,
+                                             const Eigen::VectorXd& x) const {
+        if (!x.array().isFinite().all())
+            return false;
+        const Eigen::VectorXd residual = rhs - base_matrix_original_.transpose() * x;
+        const double max_rhs = std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
+        return residual.array().isFinite().all() &&
+               residual.lpNorm<Eigen::Infinity>() <= 1e-8 * max_rhs;
+    }
+
     bool validate_sparse_transpose_rhs_solution_(const Eigen::VectorXd& rhs,
                                                  const Eigen::VectorXd& y) const {
         if (!y.array().isFinite().all())
@@ -3113,5 +3155,6 @@ class SparseForrestTomlinLU {
     std::vector<SparseRow> U_rows_, L_rows_, U_cols_, L_cols_;
     mutable bool U_cols_dirty_{false};
     mutable bool L_cols_dirty_{false};
+    bool sparse_lu_oracle_ready_{false};
     UpdateFailureReason last_update_failure_reason_{UpdateFailureReason::None};
 };
