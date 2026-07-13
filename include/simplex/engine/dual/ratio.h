@@ -22,10 +22,12 @@ class DualRatioTest : public BoundUtilities {
     };
 
     static DualChoose dual_harris_choose(const Eigen::VectorXd& rN, const Eigen::VectorXd& pN,
-                                         double delta, double eta) {
+                                         double delta, double eta,
+                                         double pivot_threshold = 0.0) {
+        const double eligibility = std::max(delta, pivot_threshold);
         std::vector<int> eligible;
         for (int k = 0; k < pN.size(); ++k)
-            if (pN(k) < -delta)
+            if (pN(k) < -eligibility)
                 eligible.push_back(k);
         if (eligible.empty())
             return {};
@@ -56,10 +58,14 @@ class DualRatioTest : public BoundUtilities {
         const RevisedSimplexOptions& options, const Eigen::VectorXd& rN,
         const Eigen::VectorXd& pN, const std::vector<int>& nonbasis,
         const std::vector<BoundView>& view, const Eigen::VectorXd& l, const Eigen::VectorXd& u,
-        double primal_delta, int max_flips) {
+        double primal_delta, int max_flips, int basis_update_count = 0) {
         DualBFRTDecision out;
-        const DualChoose harris =
-            dual_harris_choose(rN, pN, options.ratio_delta, options.ratio_eta);
+        const double pivot_threshold = basis_update_count < 10   ? 1e-9
+                                       : basis_update_count < 20 ? 3e-8
+                                                                 : 1e-6;
+        const double eligibility = std::max(options.ratio_delta, pivot_threshold);
+        const DualChoose harris = dual_harris_choose(
+            rN, pN, options.ratio_delta, options.ratio_eta, pivot_threshold);
         out.pivot_rel = harris.e_rel;
         out.tau = harris.tau;
         if (!harris.e_rel || !std::isfinite(harris.tau) || max_flips <= 0 ||
@@ -76,7 +82,7 @@ class DualRatioTest : public BoundUtilities {
         std::vector<Candidate> candidates;
         candidates.reserve(nonbasis.size());
         for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k) {
-            if (!(pN(k) < -options.ratio_delta))
+            if (!(pN(k) < -eligibility))
                 continue;
             const int j = nonbasis[k];
             if (view[j] == BoundView::Fixed)

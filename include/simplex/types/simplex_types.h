@@ -170,7 +170,9 @@ struct RevisedSimplexOptions {
         "dense_diagonal"; // "dense" | "diagonal" | "dense_diagonal"
     std::string dual_edge_weight_strategy =
         "dense_diagonal";           // "dense" | "diagonal" | "dense_diagonal"
-    int dual_flip_max_per_iter = 4; // avoid pathological flip storms
+    // 0 selects a dimension-adaptive BFRT budget (4 for small bases, 16 for
+    // larger ones); positive values force an explicit cap.
+    int dual_flip_max_per_iter = 0;
     double primal_steepest_edge_weight_log_error_threshold =
         1.3862943611198906; // log(4), equivalent to 25% acceptance
     double dual_steepest_edge_weight_log_error_threshold =
@@ -223,7 +225,7 @@ struct RevisedSimplexOptions {
     bool use_quadratic_warm_start_repair = false;
 
     // Algorithm selection/tuning
-    bool dual_allow_bound_flip = true;  // enable Beale bound-flipping
+    bool dual_allow_bound_flip = true;
     double dual_flip_pivot_tol = 1e-10; // |pN(e)| below this ⇒ consider flip
     double dual_flip_rc_tol = 1e-10;    // |rN(e)| “near dual-feasible”
 

@@ -451,6 +451,10 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
         int rebuild_attempts = 0;
         int backtrack_repairs = 0;
         int total_flips = 0;
+        const int adaptive_flip_budget =
+            self.opt_.dual_flip_max_per_iter > 0
+                ? self.opt_.dual_flip_max_per_iter
+                : (m >= 256 ? 16 : 4);
         DualPricingTelemetry pricing_telemetry;
         Eigen::VectorXd rhs_eff = b - transformed_rhs(A, view, l, u);
         bool ydual_cached = false;
@@ -881,8 +885,9 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                     dual_bfrt_decide(self.opt_, work.reduced_cost, work.row_price, N, view, l, u,
                                      -yB_for_leaving(work.leaving_row),
                                      self.opt_.dual_allow_bound_flip
-                                         ? (self.opt_.dual_flip_max_per_iter - flips_this_iter)
-                                         : 0);
+                                         ? (adaptive_flip_budget - flips_this_iter)
+                                         : 0,
+                                     read_basis().update_count());
                 if (!bfrt.pivot_rel) {
                     if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
                         ++rebuild_attempts;
@@ -912,6 +917,11 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                         }
                         self.trace_line_(oss.str());
                     }
+                    // Accumulate every anchor change and apply B^{-1} once,
+                    // matching HiGHS' BFRT-column update. The old path
+                    // restarted the outer loop and paid a fresh solve for the
+                    // complete RHS after every group of flips.
+                    Eigen::VectorXd flip_rhs = Eigen::VectorXd::Zero(m);
                     for (int rel_k : bfrt.flip_rels) {
                         const int j = N[rel_k];
                         const double old_anchor = bound_anchor(view[j], j, l, u);
@@ -924,11 +934,11 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                                                          RevisedSimplex::SparseMatrix>) {
                                 for (typename RevisedSimplex::SparseMatrix::InnerIterator it(A, j);
                                      it; ++it) {
-                                    rhs_eff(it.row()) -= it.value() * delta_anchor;
+                                    flip_rhs(it.row()) -= it.value() * delta_anchor;
                                 }
                             } else {
                                 const Eigen::VectorXd col_j = A.col(j);
-                                rhs_eff.noalias() -= col_j * delta_anchor;
+                                flip_rhs.noalias() -= col_j * delta_anchor;
                             }
                         }
                         if constexpr (std::is_same_v<MatrixType, RevisedSimplex::SparseMatrix>) {
@@ -943,11 +953,29 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                             scale_rowwise_column(*Ahat_row, Ahat, j, -1.0);
                         }
                         chat(j) = -chat(j);
+                        work.row_price(rel_k) = -work.row_price(rel_k);
+                        work.reduced_cost(rel_k) = -work.reduced_cost(rel_k);
                         ++flips_this_iter;
                         ++total_flips;
                     }
-                    yB_cache_valid = false; // rhs_eff changed due to bound flips
-                    continue;
+                    rhs_eff.noalias() += flip_rhs;
+                    try {
+                        HVector flip_col =
+                            read_basis().solve_B(flip_rhs, FTBasis::TranKind::ColAq);
+                        nla->update_ema_reach(flip_col.count, m);
+                        work.base_value.noalias() += flip_col.value;
+                        if (yB_cache_valid) {
+                            yB_cache.noalias() += flip_col.value;
+                            ++yB_cache_age;
+                        }
+                    } catch (...) {
+                        // The signed columns and RHS are already consistent;
+                        // restart with a fresh factorization/cache if the
+                        // incremental BFRT solve cannot be trusted.
+                        refactor_basis();
+                        yB_cache_valid = false;
+                        continue;
+                    }
                 }
 
                 work.entering_rel = *bfrt.pivot_rel;
@@ -1386,7 +1414,8 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
 
                 const DualBFRTDecision sub_bfrt = dual_bfrt_decide(
                     self.opt_, sub_rN, sub_pN, N, view, l, u, -yB_sub(sub_r),
-                    self.opt_.dual_allow_bound_flip ? self.opt_.dual_flip_max_per_iter : 0);
+                    self.opt_.dual_allow_bound_flip ? adaptive_flip_budget : 0,
+                    read_basis().update_count());
                 if (!sub_bfrt.pivot_rel || !sub_bfrt.flip_rels.empty())
                     break; // bound flip or no pivot: fall back to outer loop
 
