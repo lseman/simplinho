@@ -50,3 +50,4 @@ examples/
 third_party/
 build-simplex-only/
 eigen
+.logician/
