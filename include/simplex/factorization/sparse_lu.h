@@ -675,7 +675,11 @@ class SparseForrestTomlinLU {
         }
         hyper_solve_reach_valid_ = false;
         // Dense-path solve work: every factor entry is touched once per stage.
-        solve_synthetic_tick_ += build_synthetic_tick_cost_ / 6.0;
+        // The build clock prices factor creation at roughly 60 ticks per
+        // factor entry. A dense triangular solve touches each entry once, so
+        // charge about one tick per entry, not ten. The former /6 charge
+        // forced reinversion at the 50-update floor on virtually every run.
+        solve_synthetic_tick_ += build_synthetic_tick_cost_ / 60.0;
         Eigen::VectorXd w = back_solve_U_(forward_solve_L_(Pb));
         Eigen::VectorXd x(n_);
         for (int i = 0; i < n_; ++i)
@@ -787,7 +791,7 @@ class SparseForrestTomlinLU {
         }
         hyper_solve_reach_valid_ = false;
         // Dense-path solve work: every factor entry is touched once per stage.
-        solve_synthetic_tick_ += build_synthetic_tick_cost_ / 6.0;
+        solve_synthetic_tick_ += build_synthetic_tick_cost_ / 60.0;
         Eigen::VectorXd s = back_solve_LT_(forward_solve_UT_(PcTc));
         Eigen::VectorXd y(n_);
         for (int i = 0; i < n_; ++i)
@@ -3244,7 +3248,9 @@ class SparseForrestTomlinLU {
     // synthetic cost (HEkk kRebuildReasonSyntheticClockSaysInvert).
     double build_synthetic_tick_cost_{0.0};
     mutable double solve_synthetic_tick_{0.0};
-    static constexpr int kSyntheticTickMinUpdates_ = 50;
+    // Do not let the economic clock dominate before a useful update chain has
+    // formed. Numerical residual/growth guards remain active below this floor.
+    static constexpr int kSyntheticTickMinUpdates_ = 100;
     std::vector<int> affected_rows_scratch_;
     // Elimination trees (Item 2): first/last column-structure entry per node.
     // l_etree_[j]  = min{i>j : L[i,j]!=0}  (-1 if none) — forward L solve

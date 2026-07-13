@@ -1718,8 +1718,18 @@ class FTBasis {
                 ++(*opt_.ext_ft_update_counter);
             refresh_stats_();
 
-            if (bad_factorization_column_residual_(j) || need_compress_() ||
-                lu_sparse_.needs_refactor())
+            const bool bad_column_residual = bad_factorization_column_residual_(j);
+            const bool compression_due = need_compress_();
+            const bool sparse_lu_due = lu_sparse_.needs_refactor();
+            if (std::getenv("SIMPLINHO_TRACE_REFACTORS") &&
+                (bad_column_residual || compression_due || sparse_lu_due)) {
+                std::fprintf(stderr,
+                             "[refactor] updates=%d residual=%d compress=%d sparse_lu=%d "
+                             "column_residual=%.3e\n",
+                             update_count_, bad_column_residual, compression_due, sparse_lu_due,
+                             stats_.last_column_residual);
+            }
+            if (bad_column_residual || compression_due || sparse_lu_due)
                 sparse_refactor_();
             report_pivot_telemetry();
             return;
