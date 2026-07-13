@@ -16,6 +16,20 @@ The project is still compact and hackable: the simplex core lives under
 `include/simplex/`, the branch-and-bound layer under `include/bnb/`, and the
 Python bindings/modeling API under `bindings/`.
 
+## Component boundaries
+
+The build treats simplex and branch-and-bound as separate components:
+
+- `simplex_core` is the public, header-only LP dependency.
+- `simplinho` contains only the simplex runtime and simplex/model bindings.
+- `bnb::core` is an optional compiled library that links to `simplex_core`.
+- `simplinho_bnb` contains the optional BnB bindings and imports `simplinho`
+  when loaded.
+
+Enable the downstream component with `-DSIMPLEX_ENABLE_BNB=ON`. Consumers of
+the C++ MIP solver should include `<bnb/core.h>` and link `bnb::core`; the old
+`<simplex/bnb.h>` reverse-dependency shim has been removed.
+
 ## Overview
 
 `simplinho` is designed for experimentation with practical LP/MIP solver

@@ -21,8 +21,7 @@ import scipy.sparse as sp
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 requested_build = os.environ.get("SIMPLINHO_BUILD_DIR")
-build_dirs = ((requested_build,) if requested_build else
-              ("build-local", "build-local/build", "build", "build-verify"))
+build_dirs = (requested_build,) if requested_build else ("build",)
 for d in build_dirs:
     if not os.path.isabs(d):
         d = os.path.join(ROOT, d)
@@ -34,16 +33,21 @@ for d in build_dirs:
 import highspy
 import simplinho as splx
 
-
 # ---------------------------------------------------------------------------
 # Problem generators
 # ---------------------------------------------------------------------------
 
+
 def gen_sparse_eq(m, n, density, seed, finite_ub):
     """Equality-form LP: min c'x, [R | I] x = b, l <= x <= u, full row rank."""
     rng = np.random.default_rng(seed)
-    R = sp.random(m, n, density=density, random_state=rng,
-                  data_rvs=lambda k: rng.standard_normal(k))
+    R = sp.random(
+        m,
+        n,
+        density=density,
+        random_state=rng,
+        data_rvs=lambda k: rng.standard_normal(k),
+    )
     A = sp.hstack([R, sp.identity(m)], format="csc")
     ntot = n + m
     x0 = rng.random(ntot) * 2.0
@@ -63,6 +67,7 @@ def gen_sparse_eq(m, n, density, seed, finite_ub):
 # ---------------------------------------------------------------------------
 # Solvers
 # ---------------------------------------------------------------------------
+
 
 def solve_simplinho(A, b, c, l, u):
     opt = splx.RevisedSimplexOptions()
@@ -130,8 +135,8 @@ def solve_highs_mps(path):
     # LP relaxation: drop integrality.
     n = h.getNumCol()
     h.changeColsIntegrality(
-        n, np.arange(n, dtype=np.int32),
-        np.full(n, highspy.HighsVarType.kContinuous))
+        n, np.arange(n, dtype=np.int32), np.full(n, highspy.HighsVarType.kContinuous)
+    )
     t0 = time.perf_counter()
     h.run()
     dt = time.perf_counter() - t0
@@ -147,6 +152,7 @@ def solve_highs_mps(path):
 # ---------------------------------------------------------------------------
 # MPS -> simplinho Model (LP relaxation)
 # ---------------------------------------------------------------------------
+
 
 def parse_mps(path):
     rows, row_order, obj_row = {}, [], None
@@ -211,8 +217,7 @@ def solve_simplinho_mps(path):
     var = {}
     for name in col_order:
         lb, ub = bounds.get(name, [0.0, float("inf")])
-        var[name] = model.add_var(name=name, lb=lb, ub=ub,
-                                  obj=obj.get(name, 0.0))
+        var[name] = model.add_var(name=name, lb=lb, ub=ub, obj=obj.get(name, 0.0))
     for rname in row_order:
         expr = splx.LinearExpr()
         for vname in col_order:
@@ -221,7 +226,13 @@ def solve_simplinho_mps(path):
                 expr += coef * var[vname]
         rb = rhs.get(rname, 0.0)
         sense = rows[rname]
-        con = (expr == rb) if sense == "E" else (expr <= rb) if sense == "L" else (expr >= rb)
+        con = (
+            (expr == rb)
+            if sense == "E"
+            else (expr <= rb)
+            if sense == "L"
+            else (expr >= rb)
+        )
         model.add_constr(con, name=rname)
     model.minimize(sum(obj.get(n, 0.0) * var[n] for n in col_order))
     t0 = time.perf_counter()
@@ -246,6 +257,7 @@ def solve_simplinho_mps(path):
 # Driver
 # ---------------------------------------------------------------------------
 
+
 def rel_diff(a, b):
     return abs(a - b) / max(1.0, abs(a), abs(b))
 
@@ -262,30 +274,40 @@ def main():
     cases = []
     for m, n, dens in sizes:
         for finite_ub in (False, True):
-            tag = f"eq_{m}x{n+m}_d{dens}_{'ub' if finite_ub else 'inf'}"
-            cases.append((tag, gen_sparse_eq(m, n, dens, seed=m + n, finite_ub=finite_ub)))
+            tag = f"eq_{m}x{n + m}_d{dens}_{'ub' if finite_ub else 'inf'}"
+            cases.append((
+                tag,
+                gen_sparse_eq(m, n, dens, seed=m + n, finite_ub=finite_ub),
+            ))
 
-    hdr = (f"{'instance':30s} {'st_ok':5s} {'obj_ok':6s} "
-           f"{'t_splx':>8s} {'t_highs':>8s} {'ratio':>7s} "
-           f"{'it_splx':>7s} {'it_hi':>6s} {'refac':>5s} {'ft_up':>6s} "
-           f"{'lu%':>5s} {'pr%':>5s} {'pv%':>5s}")
+    hdr = (
+        f"{'instance':30s} {'st_ok':5s} {'obj_ok':6s} "
+        f"{'t_splx':>8s} {'t_highs':>8s} {'ratio':>7s} "
+        f"{'it_splx':>7s} {'it_hi':>6s} {'refac':>5s} {'ft_up':>6s} "
+        f"{'lu%':>5s} {'pr%':>5s} {'pv%':>5s}"
+    )
     print(hdr)
     print("-" * len(hdr))
 
     def report(tag, s, h):
         st_ok = ("Optimal" in s["status"]) == ("Optimal" in h["status"])
-        obj_ok = st_ok and ("Optimal" not in s["status"]
-                            or rel_diff(s["obj"], h["obj"]) < 1e-5)
+        obj_ok = st_ok and (
+            "Optimal" not in s["status"] or rel_diff(s["obj"], h["obj"]) < 1e-5
+        )
         ratio = s["time"] / max(h["time"], 1e-9)
-        print(f"{tag:30s} {str(st_ok):5s} {str(obj_ok):6s} "
-              f"{s['time']:8.3f} {h['time']:8.3f} {ratio:7.1f} "
-              f"{s['iters']:7d} {h['iters']:6d} {s.get('refactors', -1):5d} "
-              f"{s.get('ft_updates', -1):6d} "
-              f"{s.get('lu_pct', 0):5.1f} {s.get('price_pct', 0):5.1f} "
-              f"{s.get('pivot_pct', 0):5.1f}")
+        print(
+            f"{tag:30s} {str(st_ok):5s} {str(obj_ok):6s} "
+            f"{s['time']:8.3f} {h['time']:8.3f} {ratio:7.1f} "
+            f"{s['iters']:7d} {h['iters']:6d} {s.get('refactors', -1):5d} "
+            f"{s.get('ft_updates', -1):6d} "
+            f"{s.get('lu_pct', 0):5.1f} {s.get('price_pct', 0):5.1f} "
+            f"{s.get('pivot_pct', 0):5.1f}"
+        )
         if not obj_ok:
-            print(f"    !! splx: {s['status']} obj={s['obj']:.8g} | "
-                  f"highs: {h['status']} obj={h['obj']:.8g}")
+            print(
+                f"    !! splx: {s['status']} obj={s['obj']:.8g} | "
+                f"highs: {h['status']} obj={h['obj']:.8g}"
+            )
         return obj_ok
 
     all_ok = True

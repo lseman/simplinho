@@ -856,6 +856,26 @@ class DualSteepestEdgePricer {
         if (best.row >= 0) {
             best.dual_row = B.solve_BT_unit(best.row);
             pricing_detail::normalize_pattern(best.dual_row);
+            // HiGHS-style: psi_r is now exact, so correct the stored weight
+            // (||psi_r||^2 is invariant under the folded sign) and track how
+            // far the recurrence had drifted.
+            const double exact_w =
+                std::max(kMinDseWeight,
+                         pricing_detail::edge_weight_from_direction(
+                             best.dual_row.value, weight_strategy_));
+            if (best.row < (int)row_weights_.size()) {
+                const double stored = row_weights_[static_cast<std::size_t>(best.row)];
+                const double log_err = std::abs(std::log(exact_w / std::max(stored, 1e-300)));
+                if (exact_w < stored) {
+                    average_log_low_weight_error_ =
+                        0.99 * average_log_low_weight_error_ + 0.01 * log_err;
+                } else {
+                    average_log_high_weight_error_ =
+                        0.99 * average_log_high_weight_error_ + 0.01 * log_err;
+                }
+                row_weights_[static_cast<std::size_t>(best.row)] = exact_w;
+                best.weight = exact_w;
+            }
         }
         return best;
     }
@@ -867,14 +887,24 @@ class DualSteepestEdgePricer {
     // FTRAN-DSE vector, both from the pre-pivot basis. When the caller cannot
     // supply tau, fall back to the Devex-style lower bound
     // w_i' = max(w_i, w_r' * s_i^2), which keeps weights sane without it.
+    // leaving_sign: +1 for a below-lower leaving row, -1 for an above-upper
+    // (folded) one. The folded view negates the pivot row psi_r, so the
+    // caller's tau = B^{-1} psi~_r carries that sign. (s_i/alpha) and
+    // (s_i/alpha)^2 * w_r are flip-invariant; only the cross term
+    // -2 (s_i/alpha) tau_i is odd in the psi flip, so folding leaving_sign
+    // into Kai makes the update exact for both exit directions.
     template <class MatrixLike>
     void update_after_dual_pivot(int leave_rel, int /*e_abs*/, int /*old_abs*/, const HVector& s,
                                  double alpha, const MatrixLike& /*A*/,
                                  const std::vector<int>& /*N*/, const HVector& /*dual_row*/,
                                  bool /*insert_leaver_into_pool*/ = true,
-                                 const Eigen::VectorXd* ftran_dse = nullptr) {
+                                 const Eigen::VectorXd* ftran_dse = nullptr,
+                                 int leaving_sign = 1) {
         if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol) {
-            need_rebuild_ = true;
+            // Degenerate pivot: dividing by alpha would corrupt the weights.
+            // HiGHS skips the DSE update here rather than rebuilding — a full
+            // rebuild per degenerate pivot caused a rebuild every ~3 pivots
+            // on bounded LPs (~74% of runtime in pool builds).
             return;
         }
         if (leave_rel < 0 || leave_rel >= (int)row_weights_.size() || leave_rel >= s.size()) {
@@ -885,7 +915,7 @@ class DualSteepestEdgePricer {
         const double new_pivotal =
             std::max(row_weights_[static_cast<std::size_t>(leave_rel)] / (alpha * alpha),
                      kMinDseWeight);
-        const double kai = -2.0 / alpha;
+        const double kai = (leaving_sign < 0 ? 2.0 : -2.0) / alpha;
         const bool has_tau = ftran_dse != nullptr &&
                              ftran_dse->size() >= static_cast<Eigen::Index>(row_weights_.size());
         auto touch = [&](int i) {
@@ -956,7 +986,9 @@ class DualSteepestEdgePricer {
 
   private:
     static constexpr double kMinDseWeight = 1e-4; // kMinDualSteepestEdgeWeight
-    std::vector<double> row_weights_;             // w_i = ||B^{-T} e_i||^2
+    // mutable: choose_dual_leaving (const) corrects the chosen row's weight
+    // to its exact ||psi_r||^2 and tracks the recurrence drift.
+    mutable std::vector<double> row_weights_; // w_i = ||B^{-T} e_i||^2
     std::vector<char> seen_scratch_;
     int pool_max_{0};
     int reset_freq_{1000};
@@ -965,8 +997,8 @@ class DualSteepestEdgePricer {
     bool need_rebuild_{false};
     std::string weight_strategy_{"dense"};
     double log_error_threshold_{1.3862943611198906};
-    double average_log_low_weight_error_{0.0};
-    double average_log_high_weight_error_{0.0};
+    mutable double average_log_low_weight_error_{0.0};
+    mutable double average_log_high_weight_error_{0.0};
     // HiGHS-style anti-cycling for CHUZR (HEkkDualRHS::chooseNormal):
     // rotate the row-scan start each call so an exact tie between two rows'
     // merit scores doesn't deterministically pick the same row every time —
@@ -1046,7 +1078,8 @@ class DualDevexPricer {
                                  const std::vector<int>& /*N*/, const HVector& /*dual_row*/,
                                  bool /*insert_leaver_into_pool*/ = true) {
         if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol) {
-            need_rebuild_ = true;
+            // Skip rather than rebuild: a full framework rebuild per
+            // degenerate pivot dominated bounded-LP runtime.
             return;
         }
         if (leave_rel < 0 || leave_rel >= (int)row_weights_.size()) {
@@ -1098,7 +1131,7 @@ class DualDevexPricer {
         }
 
         ++iter_count_;
-        if (iter_count_ >= reset_freq_)
+        if (reset_freq_ > 0 && iter_count_ >= reset_freq_)
             need_rebuild_ = true;
     }
 
@@ -1170,8 +1203,13 @@ class DualRowPricer {
           weight_strategy_(std::move(weight_strategy)) {}
 
     template <class BasisLike, class MatrixLike>
-    void build_dual_pool(const BasisLike& B, const MatrixLike& A, const std::vector<int>& N) {
-        update_row_weights(B, A, N);
+    void build_dual_pool(const BasisLike& /*B*/, const MatrixLike& A,
+                         const std::vector<int>& /*N*/) {
+        // A framework rebuild must be O(m), not m BTRANs. Unit weights are
+        // exact for a logical basis and a safe Devex-style restart for a
+        // general basis; the accepted leaving row is corrected from its one
+        // exact BTRAN and subsequent pivots maintain the recurrence.
+        row_weights_.assign(static_cast<std::size_t>(A.rows()), 1.0);
         iter_count_ = 0;
         need_rebuild_ = false;
     }
@@ -1230,7 +1268,8 @@ class DualRowPricer {
                                  const std::vector<int>& /*N*/, const HVector& /*dual_row*/,
                                  bool /*insert_leaver_into_pool*/ = true) {
         ++iter_count_;
-        if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol || iter_count_ >= reset_freq_) {
+        if (std::abs(alpha) < dm_consts::kDegenerateAlphaTol ||
+            (reset_freq_ > 0 && iter_count_ >= reset_freq_)) {
             need_rebuild_ = true;
         }
     }
@@ -1330,7 +1369,10 @@ class DualAdaptivePricer {
 
     template <class BasisLike, class MatrixLike>
     void build_dual_pool(const BasisLike& B, const MatrixLike& A, const std::vector<int>& N) {
-        active_rule_ = select_rule_(A, N, A.rows());
+        if (!framework_initialized_) {
+            active_rule_ = select_rule_(A, N, A.rows());
+            framework_initialized_ = true;
+        }
         if (active_rule_ == Rule::SteepestEdge) {
             steepest_pricer_.clear_weight_error_stats();
             steepest_pricer_.build_dual_pool(B, A, N);
@@ -1445,12 +1487,15 @@ class DualAdaptivePricer {
     void update_after_dual_pivot(int leave_rel, int e_abs, int old_abs, const HVector& s,
                                  double alpha, const MatrixLike& A, const std::vector<int>& N,
                                  const HVector& dual_row, bool insert_leaver_into_pool = true,
-                                 const Eigen::VectorXd* ftran_dse = nullptr) {
+                                 const Eigen::VectorXd* ftran_dse = nullptr,
+                                 int leaving_sign = 1) {
         switch (active_rule_) {
             case Rule::SteepestEdge:
+                // Exact for both exit directions: leaving_sign folds the
+                // pivot-row flip into the DSE cross term.
                 steepest_pricer_.update_after_dual_pivot(leave_rel, e_abs, old_abs, s, alpha, A, N,
                                                          dual_row, insert_leaver_into_pool,
-                                                         ftran_dse);
+                                                         ftran_dse, leaving_sign);
                 need_rebuild_ = steepest_pricer_.needs_rebuild();
                 if (!need_rebuild_ && steepest_pricer_.average_log_weight_error_sum() >
                                           dual_weight_log_error_threshold_) {
@@ -1459,11 +1504,15 @@ class DualAdaptivePricer {
                 }
                 break;
             case Rule::Devex:
+                // Devex terms are all squared, so the folded pivot-row sign
+                // cancels; the update is valid for both exit directions.
                 devex_pricer_.update_after_dual_pivot(leave_rel, e_abs, old_abs, s, alpha, A, N,
                                                       dual_row, insert_leaver_into_pool);
                 need_rebuild_ = devex_pricer_.needs_rebuild();
                 break;
             case Rule::RowPricing:
+                if (leaving_sign < 0)
+                    break; // not verified sign-safe under the folded view; keep stale
                 row_pricer_.update_after_dual_pivot(leave_rel, e_abs, old_abs, s, alpha, A, N,
                                                     dual_row, insert_leaver_into_pool);
                 need_rebuild_ = row_pricer_.needs_rebuild();
@@ -1513,6 +1562,7 @@ class DualAdaptivePricer {
 
     bool import_state(const WarmStartState& state, int rows) {
         active_rule_ = state.active_rule;
+        framework_initialized_ = true;
         bool ok = false;
         switch (active_rule_) {
             case Rule::SteepestEdge:
@@ -1562,23 +1612,25 @@ class DualAdaptivePricer {
         if (dual_pricing_preference_ == "row")
             return Rule::RowPricing;
         if (dual_pricing_preference_ == "switch") {
-            if (row_pricing_is_beneficial(A, N)) {
-                return Rule::RowPricing;
+            // HiGHS defaults to dual steepest edge for CHUZR weights on every
+            // problem size; with scalar Forrest-Goldfarb weights the DSE
+            // upkeep is O(nnz(pivot col)) per pivot plus one FTRAN, so the
+            // old row-pricing/Devex size gates no longer pay. Row pricing
+            // remains reachable via dual_pricing="row".
+            if (warm_start_near_optimal_ && warm_start_near_optimal_nonlogical_basis_) {
+                return Rule::Devex; // HEkkDual: near-optimal non-logical start
             }
-            return Rule::Devex;
+            return Rule::SteepestEdge;
         }
         if (requested_rule_ == "devex")
             return Rule::Devex;
         if (requested_rule_ == "most_negative")
             return Rule::MostInfeasible;
         if (requested_rule_ == "adaptive") {
-            if (row_pricing_is_beneficial(A, N)) {
-                return Rule::RowPricing;
-            }
             if (warm_start_near_optimal_ && warm_start_near_optimal_nonlogical_basis_) {
                 return Rule::Devex;
             }
-            return (basis_rows > 256) ? Rule::Devex : Rule::SteepestEdge;
+            return Rule::SteepestEdge;
         }
         return Rule::SteepestEdge;
     }
@@ -1589,6 +1641,7 @@ class DualAdaptivePricer {
     int row_pricing_threshold_{10};
     Rule active_rule_{Rule::SteepestEdge};
     bool need_rebuild_{false};
+    bool framework_initialized_{false};
     bool warm_start_near_optimal_{false};
     bool warm_start_near_optimal_nonlogical_basis_{false};
     DualSteepestEdgePricer steepest_pricer_;

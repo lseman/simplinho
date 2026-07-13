@@ -22,9 +22,6 @@ PYBIND11_MODULE(simplinho, m) {
     m.attr("__git_describe__") = SIMPLEX_GIT_DESCRIBE;
     m.attr("__git_branch__") = SIMPLEX_GIT_BRANCH;
 
-#ifdef SIMPLEX_ENABLE_BNB
-    bind_bnb_bindings(m);
-#endif
     bind_simplex_bindings(m);
     bind_model_bindings(m);
     bind_sparse_lu_bindings(m);

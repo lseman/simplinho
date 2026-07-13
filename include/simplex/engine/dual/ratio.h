@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../../extern/pdqsort/pdqsort.h"
+#include "extern/pdqsort/pdqsort.h"
 #include "simplex/engine/common/utils.h"
 #include "simplex/types/simplex_types.h"
 

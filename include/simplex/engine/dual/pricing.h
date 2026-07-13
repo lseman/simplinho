@@ -80,6 +80,15 @@ class DualPricingOperations : public DualBoundModel {
         }
     }
 
+    static void compute_row_price(const Eigen::MatrixXd& Ahat,
+                                  const std::vector<int>& nonbasis,
+                                  const Eigen::VectorXd& pivot_row,
+                                  Eigen::VectorXd& row_price) {
+        row_price.resize(nonbasis.size());
+        for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k)
+            row_price(k) = pivot_row.dot(Ahat.col(nonbasis[k]));
+    }
+
     static void compute_pricing_products(const RevisedSimplex::SparseMatrix& Ahat,
                                          const SparseRowMatrix& row_matrix,
                                          const std::vector<int>& nonbasis,
@@ -104,6 +113,39 @@ class DualPricingOperations : public DualBoundModel {
                     continue;
                 row_price(rel) += wi * it.value();
                 reduced_cost(rel) -= yi * it.value();
+            }
+        }
+    }
+
+    static void compute_row_price(const RevisedSimplex::SparseMatrix& Ahat,
+                                  const SparseRowMatrix& row_matrix,
+                                  const std::vector<int>& nonbasis,
+                                  const HVector& pivot_row,
+                                  Eigen::VectorXd& row_price) {
+        if (!pivot_row.has_pattern()) {
+            row_price.resize(nonbasis.size());
+            for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k) {
+                double price = 0.0;
+                for (RevisedSimplex::SparseMatrix::InnerIterator it(Ahat, nonbasis[k]); it; ++it)
+                    price += pivot_row.value(it.row()) * it.value();
+                row_price(k) = price;
+            }
+            return;
+        }
+        row_price = Eigen::VectorXd::Zero(nonbasis.size());
+        thread_local SparsePricingWorkspace workspace;
+        workspace.prepare(Ahat.cols(), nonbasis);
+        for (int k = 0; k < pivot_row.count; ++k) {
+            const int row = pivot_row.index[k];
+            if (row < 0 || row >= row_matrix.rows())
+                continue;
+            const double value = pivot_row.value(row);
+            if (value == 0.0)
+                continue;
+            for (SparseRowMatrix::InnerIterator it(row_matrix, row); it; ++it) {
+                const int rel = workspace.lookup(it.col());
+                if (rel >= 0)
+                    row_price(rel) += value * it.value();
             }
         }
     }
@@ -165,6 +207,19 @@ class DualPricingOperations : public DualBoundModel {
             }
             row_price(k) = price;
             reduced_cost(k) = cost;
+        }
+    }
+
+    static void compute_row_price_by_column(const RevisedSimplex::SparseMatrix& Ahat,
+                                            const std::vector<int>& nonbasis,
+                                            const HVector& pivot_row,
+                                            Eigen::VectorXd& row_price) {
+        row_price.resize(nonbasis.size());
+        for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k) {
+            double price = 0.0;
+            for (RevisedSimplex::SparseMatrix::InnerIterator it(Ahat, nonbasis[k]); it; ++it)
+                price += it.value() * pivot_row(it.row());
+            row_price(k) = price;
         }
     }
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../../extern/pdqsort/pdqsort.h"
+#include "extern/pdqsort/pdqsort.h"
 #include "simplex/engine/dual/pricing.h"
 #include <algorithm>
 #include <future>
@@ -371,7 +371,11 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
         if (!reused_warm_state) {
             try {
                 read_basis().refactor();
+                self.runtime_state_.mark_rebuilt();
+                self.runtime_state_.validity.has_basis = true;
             } catch (const std::exception& e) {
+                self.runtime_state_.request_rebuild(
+                    simplex::engine::RebuildReason::SingularBasis);
                 return {LPSolution::Status::Singular,
                         Eigen::VectorXd::Zero(n),
                         basis,
@@ -382,11 +386,20 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
 
         auto rebuild_dual_pool = [&](const char* where,
                                      int iter) -> std::optional<RevisedSimplex::PhaseResult> {
+            if (std::getenv("SIMPLINHO_TRACE_POOL_REBUILDS"))
+                std::fprintf(stderr, "[poolrebuild] iter=%d where=%s\n", iter, where);
             try {
                 self.measure_pricing_build_(
                     true, [&]() { dual_pricer.build_dual_pool(read_basis(), Ahat, N); });
+                if (std::getenv("SIMPLINHO_TRACE_POOL_REBUILDS"))
+                    std::fprintf(stderr, "[poolrebuild] strategy=%s\n",
+                                 dual_pricer.current_strategy_name());
+                self.runtime_state_.validity.has_pricing_weights = true;
                 return std::nullopt;
             } catch (const std::exception& e) {
+                self.runtime_state_.validity.has_pricing_weights = false;
+                self.runtime_state_.request_rebuild(
+                    simplex::engine::RebuildReason::PricingFailure);
                 std::unordered_map<std::string, std::string> info{
                     {"where", where},
                     {"what", e.what()},
@@ -461,6 +474,13 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                 self.solve_stats_.dual_row_ep_density = pricing_telemetry.row_ep_density;
                 self.solve_stats_.dual_row_ap_density = pricing_telemetry.row_ap_density;
                 self.solve_stats_.dual_col_aq_density = pricing_telemetry.col_aq_density;
+                auto& density = self.runtime_state_.density;
+                density.row_ep = simplex::engine::DensityHistory::update(
+                    density.row_ep, pricing_telemetry.row_ep_density);
+                density.row_ap = simplex::engine::DensityHistory::update(
+                    density.row_ap, pricing_telemetry.row_ap_density);
+                density.col_aq = simplex::engine::DensityHistory::update(
+                    density.col_aq, pricing_telemetry.col_aq_density);
             };
 
         auto serialize_vec = [](const Eigen::VectorXd& v) {
@@ -1209,7 +1229,7 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
             // so solve it before update_basis below. On failure the pricer
             // falls back to its Devex-style weight bound.
             std::optional<Eigen::VectorXd> ftran_dse;
-            if (work.leaving_sign > 0 && dual_pricer.wants_ftran_dse()) {
+            if (dual_pricer.wants_ftran_dse()) {
                 try {
                     ftran_dse.emplace(
                         read_basis()
@@ -1289,11 +1309,15 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                 yB_cache_valid = false; // rhs_eff changed (leaving var re-anchored to Upper)
             }
 
-            if (work.leaving_sign > 0) {
+            {
+                // Both exit directions use the incremental weight update:
+                // leaving_sign folds the pivot-row sign flip of the folded
+                // (above-upper) view into the DSE cross term, so no pool
+                // rebuild is needed on upper-bound pivots.
                 dual_pricer.update_after_dual_pivot(
                     work.leaving_row, work.entering_col, oldAbs, work.pivot_col,
                     work.pivot_col(work.leaving_row), Ahat, N, work.pivot_row, true,
-                    ftran_dse ? &*ftran_dse : nullptr);
+                    ftran_dse ? &*ftran_dse : nullptr, work.leaving_sign);
                 // NLA Devex framework switch — pass weight error from pricer
                 if (dual_pricer.needs_rebuild() && nla->allow_framework_switch()) {
                     double w_err = dual_pricer.average_log_weight_error();
@@ -1306,10 +1330,6 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                     }
                     dual_pricer.clear_rebuild_flag();
                 }
-            } else {
-                // Folded upper-bound pivots currently retain the existing
-                // framework; rebuilding it on every sign change dominated
-                // runtime without changing the basis factorization.
             }
             if (self.should_trace_iter_(iters) && self.opt_.verbose_include_basis) {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +

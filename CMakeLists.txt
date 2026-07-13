@@ -186,19 +186,17 @@ find_package(Threads REQUIRED)
 # Sources
 # ==============================================================================
 
-set(SIMPLINHO_BINDING_SOURCES
+set(SIMPLEX_BINDING_SOURCES
     bindings/model_bindings.cpp
     bindings/module.cpp
     bindings/simplex_bindings.cpp
 )
 
-set(SIMPLINHO_EXTRA_SOURCES "")
-
 # NLA layer — HiGHS HSimplexNla equivalent (ftran/btran chain, PF, SimplexIterate)
-list(APPEND SIMPLINHO_EXTRA_SOURCES src/nla/simplex_nla.cpp)
+set(SIMPLEX_RUNTIME_SOURCES src/nla/simplex_nla.cpp)
 
 if(SIMPLEX_ENABLE_BNB)
-    list(APPEND SIMPLINHO_EXTRA_SOURCES
+    set(BNB_SOURCES
         src/bnb/async_heuristic_manager.cpp
         src/bnb/branching.cpp
         src/bnb/conflict_engine.cpp
@@ -208,7 +206,6 @@ if(SIMPLEX_ENABLE_BNB)
         src/bnb/heuristic.cpp
         src/bnb/mip_presolve.cpp
     )
-    list(APPEND SIMPLINHO_BINDING_SOURCES bindings/bnb_bindings.cpp)
 endif()
 
 # ==============================================================================
@@ -220,6 +217,7 @@ add_library(simplex_core INTERFACE)
 target_compile_features(simplex_core INTERFACE cxx_std_23)
 
 target_include_directories(simplex_core INTERFACE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/solvers"
     "${ankerl_unordered_dense_SOURCE_DIR}/include"
@@ -230,16 +228,11 @@ target_compile_definitions(simplex_core INTERFACE
     SIMPLEX_GIT_DESCRIBE="${SIMPLEX_GIT_DESCRIBE}"
     SIMPLEX_GIT_BRANCH="${SIMPLEX_GIT_BRANCH}"
     _GLIBCXX_USE_TBB_PAR_BACKEND=0
-    $<$<BOOL:${SIMPLEX_ENABLE_BNB}>:SIMPLEX_ENABLE_BNB>
 )
 
 target_link_libraries(simplex_core INTERFACE
     Eigen3::Eigen
 )
-
-if(SIMPLEX_ENABLE_BNB)
-    target_link_libraries(simplex_core INTERFACE STDEXEC::stdexec)
-endif()
 
 simplinho_apply_perf_flags(simplex_core)
 
@@ -255,12 +248,12 @@ if(SIMPLEX_ENABLE_PCH)
 endif()
 
 # ==============================================================================
-# Python extension module
+# Simplex runtime and Python extension
 # ==============================================================================
 
 pybind11_add_module(simplinho
-    ${SIMPLINHO_BINDING_SOURCES}
-    ${SIMPLINHO_EXTRA_SOURCES}
+    ${SIMPLEX_BINDING_SOURCES}
+    ${SIMPLEX_RUNTIME_SOURCES}
 )
 
 target_compile_features(simplinho PRIVATE cxx_std_23)
@@ -279,6 +272,34 @@ if(SIMPLEX_ENABLE_UNITY_BUILD)
 endif()
 
 simplinho_apply_module_link_flags(simplinho)
+
+# ==============================================================================
+# Branch-and-bound library and Python extension
+#
+# BnB is a downstream consumer of simplex.  Nothing on the simplex side links
+# to this target or sees its compile definitions.
+# ==============================================================================
+
+if(SIMPLEX_ENABLE_BNB)
+    add_library(bnb_core STATIC ${BNB_SOURCES})
+    add_library(bnb::core ALIAS bnb_core)
+    target_compile_features(bnb_core PUBLIC cxx_std_23)
+    target_include_directories(bnb_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_definitions(bnb_core PUBLIC
+        $<$<BOOL:${BNB_PROFILE_TIMERS}>:BNB_PROFILE_TIMERS>
+        $<$<BOOL:${SIMPLEX_BNB_DEBUG_LOCKS}>:SIMPLEX_BNB_DEBUG_LOCKS>
+        $<$<BOOL:${SIMPLEX_BNB_DEBUG_TIMING}>:SIMPLEX_BNB_DEBUG_TIMING>
+    )
+    target_link_libraries(bnb_core PUBLIC simplex_core STDEXEC::stdexec Threads::Threads)
+
+    pybind11_add_module(simplinho_bnb
+        bindings/bnb_module.cpp
+        bindings/bnb_bindings.cpp
+    )
+    target_compile_features(simplinho_bnb PRIVATE cxx_std_23)
+    target_link_libraries(simplinho_bnb PRIVATE bnb::core pybind11::module)
+    simplinho_apply_module_link_flags(simplinho_bnb)
+endif()
 
 message(STATUS "simplinho build configured with ccache=${SIMPLEX_ENABLE_CCACHE}, "
     "PCH=${SIMPLEX_ENABLE_PCH}, unity=${SIMPLEX_ENABLE_UNITY_BUILD}, "

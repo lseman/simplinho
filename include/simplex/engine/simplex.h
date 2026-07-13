@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "simplex/engine/degeneracy.h"    // DegeneracyManager + perturbation helpers
+#include "simplex/engine/runtime_state.h"
 #include "simplex/presolve/presolver.h"     // presolve::LP, Presolver
 #include "simplex/engine/pricer.h"        // pricing + degeneracy helpers
 #include "simplex/factorization/simplex_lu.h"    // FTBasis implementation (solve_B, solve_BT, replace_column, refactor)
@@ -1060,6 +1061,7 @@ class RevisedSimplex {
                       const LPBasis* basis_state_opt) {
         current_timing_ = RevisedSimplexTiming{};
         solve_stats_ = LPSolveStats{};
+        runtime_state_ = simplex::engine::SimplexRuntimeState{};
         current_matrix_signature_ = matrix_signature;
         current_matrix_rows_ = rows;
         current_matrix_cols_ = cols;
@@ -1976,6 +1978,7 @@ class RevisedSimplex {
     mutable int solve_depth_ = 0;
     RevisedSimplexTiming current_timing_;
     mutable LPSolveStats solve_stats_;
+    simplex::engine::SimplexRuntimeState runtime_state_;
 };
 
 #include "simplex/engine/simplex_dense_impl.h"
