@@ -262,6 +262,23 @@ def rel_diff(a, b):
     return abs(a - b) / max(1.0, abs(a), abs(b))
 
 
+def status_class(status):
+    """Normalize solver-specific status strings without merging failure modes."""
+    value = str(status).lower().replace("_", " ")
+    for canonical in (
+        "infeasible or unbounded",
+        "optimal",
+        "infeasible",
+        "unbounded",
+        "iteration limit",
+        "objective bound",
+        "singular",
+    ):
+        if canonical in value:
+            return canonical
+    return value.strip()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
@@ -290,9 +307,9 @@ def main():
     print("-" * len(hdr))
 
     def report(tag, s, h):
-        st_ok = ("Optimal" in s["status"]) == ("Optimal" in h["status"])
+        st_ok = status_class(s["status"]) == status_class(h["status"])
         obj_ok = st_ok and (
-            "Optimal" not in s["status"] or rel_diff(s["obj"], h["obj"]) < 1e-5
+            status_class(s["status"]) != "optimal" or rel_diff(s["obj"], h["obj"]) < 1e-5
         )
         ratio = s["time"] / max(h["time"], 1e-9)
         print(
