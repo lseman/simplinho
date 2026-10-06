@@ -213,7 +213,11 @@ inline SolveStats build_solve_stats(const LPSolution& sol) {
     stats.dual_row_ep_density = sol.solve_stats.dual_row_ep_density;
     stats.dual_row_ap_density = sol.solve_stats.dual_row_ap_density;
     stats.dual_col_aq_density = sol.solve_stats.dual_col_aq_density;
+    stats.ftran_calls = sol.solve_stats.ftran_calls;
+    stats.btran_calls = sol.solve_stats.btran_calls;
     stats.lu_build_ns = sol.solve_stats.lu_build_ns;
+    stats.ftran_ns = sol.solve_stats.ftran_ns;
+    stats.btran_ns = sol.solve_stats.btran_ns;
     stats.pricing_build_ns = sol.solve_stats.pricing_build_ns;
     stats.pivot_ns = sol.solve_stats.pivot_ns;
     stats.presolve_actions = find_info_int(sol.info, "presolve_actions");

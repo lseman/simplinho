@@ -76,7 +76,9 @@ def solve_simplinho(A, b, c, l, u):
     sol = solver.solve(sp.csc_matrix(A), b, c, l, u)
     dt = time.perf_counter() - t0
     st = sol.stats
-    total_ns = max(st.lu_build_ns + st.pricing_build_ns + st.pivot_ns, 1)
+    total_ns = max(
+        st.lu_build_ns + st.ftran_ns + st.btran_ns + st.pricing_build_ns + st.pivot_ns, 1
+    )
     return {
         "status": str(sol.status).split(".")[-1],
         "obj": sol.obj,
@@ -85,6 +87,8 @@ def solve_simplinho(A, b, c, l, u):
         "refactors": st.refactorizations,
         "ft_updates": st.ft_updates,
         "lu_pct": 100.0 * st.lu_build_ns / total_ns,
+        "ftran_pct": 100.0 * st.ftran_ns / total_ns,
+        "btran_pct": 100.0 * st.btran_ns / total_ns,
         "price_pct": 100.0 * st.pricing_build_ns / total_ns,
         "pivot_pct": 100.0 * st.pivot_ns / total_ns,
     }
@@ -239,7 +243,11 @@ def solve_simplinho_mps(path):
     sol = model.solve()
     dt = time.perf_counter() - t0
     st = sol.stats
-    total_ns = max(st.lu_build_ns + st.pricing_build_ns + st.pivot_ns, 1) if st else 1
+    total_ns = (
+        max(st.lu_build_ns + st.ftran_ns + st.btran_ns + st.pricing_build_ns + st.pivot_ns, 1)
+        if st
+        else 1
+    )
     return {
         "status": str(sol.status).split(".")[-1],
         "obj": sol.obj,
@@ -248,6 +256,8 @@ def solve_simplinho_mps(path):
         "refactors": st.refactorizations if st else -1,
         "ft_updates": st.ft_updates if st else -1,
         "lu_pct": 100.0 * st.lu_build_ns / total_ns if st else 0.0,
+        "ftran_pct": 100.0 * st.ftran_ns / total_ns if st else 0.0,
+        "btran_pct": 100.0 * st.btran_ns / total_ns if st else 0.0,
         "price_pct": 100.0 * st.pricing_build_ns / total_ns if st else 0.0,
         "pivot_pct": 100.0 * st.pivot_ns / total_ns if st else 0.0,
     }
@@ -301,7 +311,7 @@ def main():
         f"{'instance':30s} {'st_ok':5s} {'obj_ok':6s} "
         f"{'t_splx':>8s} {'t_highs':>8s} {'ratio':>7s} "
         f"{'it_splx':>7s} {'it_hi':>6s} {'refac':>5s} {'ft_up':>6s} "
-        f"{'lu%':>5s} {'pr%':>5s} {'pv%':>5s}"
+        f"{'lu%':>5s} {'ft%':>5s} {'bt%':>5s} {'pr%':>5s} {'pv%':>5s}"
     )
     print(hdr)
     print("-" * len(hdr))
@@ -317,7 +327,8 @@ def main():
             f"{s['time']:8.3f} {h['time']:8.3f} {ratio:7.1f} "
             f"{s['iters']:7d} {h['iters']:6d} {s.get('refactors', -1):5d} "
             f"{s.get('ft_updates', -1):6d} "
-            f"{s.get('lu_pct', 0):5.1f} {s.get('price_pct', 0):5.1f} "
+            f"{s.get('lu_pct', 0):5.1f} {s.get('ftran_pct', 0):5.1f} "
+            f"{s.get('btran_pct', 0):5.1f} {s.get('price_pct', 0):5.1f} "
             f"{s.get('pivot_pct', 0):5.1f}"
         )
         if not obj_ok:

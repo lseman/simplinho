@@ -64,8 +64,12 @@ void bind_solve_stats_type(py::module_& m) {
                                [](const SolveStats& self) { return self.dual_row_ap_density; })
         .def_property_readonly("dual_col_aq_density",
                                [](const SolveStats& self) { return self.dual_col_aq_density; })
+        .def_property_readonly("ftran_calls", [](const SolveStats& self) { return self.ftran_calls; })
+        .def_property_readonly("btran_calls", [](const SolveStats& self) { return self.btran_calls; })
         .def_property_readonly("lu_build_ns",
                                [](const SolveStats& self) { return self.lu_build_ns; })
+        .def_property_readonly("ftran_ns", [](const SolveStats& self) { return self.ftran_ns; })
+        .def_property_readonly("btran_ns", [](const SolveStats& self) { return self.btran_ns; })
         .def_property_readonly("pricing_build_ns",
                                [](const SolveStats& self) { return self.pricing_build_ns; })
         .def_property_readonly("pivot_ns", [](const SolveStats& self) { return self.pivot_ns; })
@@ -320,6 +324,7 @@ void bind_simplex_bindings(py::module_& m) {
                        &RevisedSimplexOptions::primal_simplex_cost_perturbation_multiplier)
         .def_readwrite("dual_simplex_cost_perturbation_multiplier",
                        &RevisedSimplexOptions::dual_simplex_cost_perturbation_multiplier)
+        .def_readwrite("dual_pami_rows", &RevisedSimplexOptions::dual_pami_rows)
         .def_readwrite("dual_warm_start_near_optimal",
                        &RevisedSimplexOptions::dual_warm_start_near_optimal)
         .def_readwrite("max_basis_rebuilds", &RevisedSimplexOptions::max_basis_rebuilds)
@@ -616,7 +621,11 @@ void bind_sparse_forrest_tomlin_lu_bindings(py::module_& m) {
             py::arg("seed_idx"), py::arg("seed_val"), py::arg("expected_density") = 0.0,
             "SolveT with sparse RHS")
         .def("last_solve_reach_original", &SparseForrestTomlinLU::last_solve_reach_original)
-        .def("last_solve_pattern_valid", &SparseForrestTomlinLU::last_solve_pattern_valid);
+        .def("last_solve_pattern_valid", &SparseForrestTomlinLU::last_solve_pattern_valid)
+        .def("ftran_sparse_reach_failures",
+             &SparseForrestTomlinLU::ftran_sparse_reach_failures)
+        .def("btran_sparse_reach_failures",
+             &SparseForrestTomlinLU::btran_sparse_reach_failures);
 }
 
 } // namespace

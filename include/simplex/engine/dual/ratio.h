@@ -21,6 +21,20 @@ class DualRatioTest : public BoundUtilities {
         std::vector<int> flip_rels;
     };
 
+    struct DualBFRTWorkspace {
+        struct Candidate {
+            int rel;
+            double alpha;
+            double dual;
+            double range;
+        };
+
+        std::vector<Candidate> candidates;
+        std::vector<unsigned char> selected;
+        std::vector<int> group_indices;
+        std::vector<std::pair<int, int>> group_ranges;
+    };
+
     static DualChoose dual_harris_choose(const Eigen::VectorXd& rN, const Eigen::VectorXd& pN,
                                          double delta, double eta,
                                          double pivot_threshold = 0.0) {
@@ -53,12 +67,15 @@ class DualRatioTest : public BoundUtilities {
         return {best, std::max(0.0, rN(best) / -pN(best))};
     }
 
-    static DualBFRTDecision dual_bfrt_decide(
+    static void dual_bfrt_decide(
         const RevisedSimplexOptions& options, const Eigen::VectorXd& rN,
         const Eigen::VectorXd& pN, const std::vector<int>& nonbasis,
         const std::vector<BoundView>& view, const Eigen::VectorXd& l, const Eigen::VectorXd& u,
-        double primal_delta, int max_flips, int basis_update_count = 0) {
-        DualBFRTDecision out;
+        double primal_delta, int max_flips, int basis_update_count, DualBFRTWorkspace& workspace,
+        DualBFRTDecision& out) {
+        out.pivot_rel.reset();
+        out.tau = std::numeric_limits<double>::infinity();
+        out.flip_rels.clear();
         const double pivot_threshold = basis_update_count < 10   ? 1e-9
                                        : basis_update_count < 20 ? 3e-8
                                                                  : 1e-6;
@@ -69,16 +86,11 @@ class DualRatioTest : public BoundUtilities {
         out.tau = harris.tau;
         if (!harris.e_rel || !std::isfinite(harris.tau) || max_flips <= 0 ||
             !(primal_delta > options.tol)) {
-            return out;
+            return;
         }
 
-        struct Candidate {
-            int rel;
-            double alpha;
-            double dual;
-            double range;
-        };
-        std::vector<Candidate> candidates;
+        auto& candidates = workspace.candidates;
+        candidates.clear();
         candidates.reserve(nonbasis.size());
         for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k) {
             if (!(pN(k) < -eligibility))
@@ -92,30 +104,36 @@ class DualRatioTest : public BoundUtilities {
                 candidates.push_back({k, alpha, dual, bound_range(j, l, u)});
         }
         if (candidates.empty())
-            return out;
+            return;
 
         const double dual_tol = std::max(options.tol, options.ratio_eta);
-        std::vector<char> selected(candidates.size(), 0);
-        std::vector<std::vector<int>> groups;
+        auto& selected = workspace.selected;
+        selected.assign(candidates.size(), 0);
+        auto& group_indices = workspace.group_indices;
+        auto& group_ranges = workspace.group_ranges;
+        group_indices.clear();
+        group_ranges.clear();
+        group_indices.reserve(candidates.size());
+        group_ranges.reserve(candidates.size());
         double total_change = 0.0;
         double select_theta = std::numeric_limits<double>::infinity();
-        for (const Candidate& candidate : candidates)
+        for (const auto& candidate : candidates)
             select_theta =
                 std::min(select_theta, (candidate.dual + dual_tol) / candidate.alpha);
 
-        while (groups.size() < candidates.size() && std::isfinite(select_theta)) {
-            std::vector<int> group;
+        while (group_indices.size() < candidates.size() && std::isfinite(select_theta)) {
+            const int group_begin = static_cast<int>(group_indices.size());
             double next_theta = std::numeric_limits<double>::infinity();
             for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
                 if (selected[i])
                     continue;
-                const Candidate& candidate = candidates[i];
+                const auto& candidate = candidates[i];
                 const double tight_limit = select_theta * candidate.alpha;
                 const double roundoff =
                     1e-14 * (1.0 + std::abs(candidate.dual) + std::abs(tight_limit));
                 if (candidate.dual <= tight_limit + roundoff) {
                     selected[i] = 1;
-                    group.push_back(i);
+                    group_indices.push_back(i);
                     total_change = std::isfinite(candidate.range)
                                        ? total_change +
                                              candidate.alpha * std::max(0.0, candidate.range)
@@ -125,29 +143,34 @@ class DualRatioTest : public BoundUtilities {
                         std::min(next_theta, (candidate.dual + dual_tol) / candidate.alpha);
                 }
             }
-            if (group.empty())
+            const int group_end = static_cast<int>(group_indices.size());
+            if (group_begin == group_end)
                 break;
-            pdqsort(group.begin(), group.end(),
+            pdqsort(group_indices.begin() + group_begin, group_indices.begin() + group_end,
                     [&](int a, int b) { return candidates[a].rel < candidates[b].rel; });
-            groups.push_back(std::move(group));
+            group_ranges.emplace_back(group_begin, group_end);
             if (total_change >= primal_delta)
                 break;
             select_theta = next_theta;
         }
-        if (groups.empty())
-            return out;
+        if (group_ranges.empty())
+            return;
 
         double max_alpha = 0.0;
-        for (const auto& group : groups)
-            for (int i : group)
+        for (const auto [begin, end] : group_ranges)
+            for (int pos = begin; pos < end; ++pos) {
+                const int i = group_indices[pos];
                 max_alpha = std::max(max_alpha, candidates[i].alpha);
+            }
         const double alpha_threshold = std::min(0.1 * max_alpha, 1.0);
 
-        int pivot_group = static_cast<int>(groups.size()) - 1;
-        int pivot_index = groups.back().front();
-        for (int g = static_cast<int>(groups.size()) - 1; g >= 0; --g) {
-            int best = groups[g].front();
-            for (int i : groups[g]) {
+        int pivot_group = static_cast<int>(group_ranges.size()) - 1;
+        int pivot_index = group_indices[group_ranges.back().first];
+        for (int g = static_cast<int>(group_ranges.size()) - 1; g >= 0; --g) {
+            const auto [begin, end] = group_ranges[g];
+            int best = group_indices[begin];
+            for (int pos = begin; pos < end; ++pos) {
+                const int i = group_indices[pos];
                 if (candidates[i].alpha > candidates[best].alpha + 1e-16 ||
                     (std::abs(candidates[i].alpha - candidates[best].alpha) <= 1e-16 &&
                      candidates[i].rel < candidates[best].rel)) {
@@ -161,19 +184,24 @@ class DualRatioTest : public BoundUtilities {
             }
         }
 
-        std::vector<int> flips;
+        auto& flips = out.flip_rels;
+        flips.reserve(candidates.size());
         for (int g = 0; g < pivot_group; ++g)
-            for (int i : groups[g])
+            for (int pos = group_ranges[g].first; pos < group_ranges[g].second; ++pos) {
+                const int i = group_indices[pos];
                 if (std::isfinite(candidates[i].range) && candidates[i].range > options.tol)
                     flips.push_back(candidates[i].rel);
+            }
 
-        const Candidate& pivot = candidates[pivot_index];
+        const auto& pivot = candidates[pivot_index];
         const double theta = pivot.dual / pivot.alpha;
         if (theta > 0.0) {
-            for (int i : groups[pivot_group]) {
+            const auto [begin, end] = group_ranges[pivot_group];
+            for (int pos = begin; pos < end; ++pos) {
+                const int i = group_indices[pos];
                 if (i == pivot_index)
                     continue;
-                const Candidate& candidate = candidates[i];
+                const auto& candidate = candidates[i];
                 const double new_dual = candidate.dual - theta * candidate.alpha;
                 if (new_dual < -dual_tol && std::isfinite(candidate.range) &&
                     candidate.range > options.tol) {
@@ -183,14 +211,14 @@ class DualRatioTest : public BoundUtilities {
         }
         if (theta <= 0.0)
             flips.clear();
-        if (static_cast<int>(flips.size()) > max_flips)
-            return out;
+        if (static_cast<int>(flips.size()) > max_flips) {
+            flips.clear();
+            return;
+        }
 
         pdqsort(flips.begin(), flips.end());
         out.pivot_rel = pivot.rel;
         out.tau = theta;
-        out.flip_rels = std::move(flips);
-        return out;
     }
 };
 

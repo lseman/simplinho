@@ -65,3 +65,39 @@ def test_sparse_lu_update_chain_matches_dense_reference():
         rtol=2e-11,
         atol=2e-11,
     )
+
+
+def test_mixed_hyper_dense_triangular_stages_clear_reach_marks():
+    # Regression for stale reach marks when a hyper-sparse first triangular
+    # stage switched to a dense second stage. The next sparse RHS used to skip
+    # nodes visited by the previous solve and relied on residual fallback.
+    basis = np.array(
+        [
+            [1.5167, -0.3224, 0.0, 0.0, 0.0],
+            [-0.6365, 1.9531, 0.0, 0.0, -0.3166],
+            [0.0, 0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.5420, 1.5420, 0.0],
+            [0.0, 0.0, -1.5259, 0.0, 2.5259],
+        ]
+    )
+    config = splx.SparseLUConfig()
+    config.iterative_refinement = False
+    config.enable_solve_oracle = False
+
+    factor = splx.SparseForrestTomlinLU()
+    factor.factor_with_config(sp.csc_matrix(basis), config=config)
+
+    for transpose in (False, True):
+        matrix = basis.T if transpose else basis
+        solve = factor.solveT_sparse if transpose else factor.solve_sparse
+        for column in range(basis.shape[0]):
+            rhs = np.eye(basis.shape[0])[:, column]
+            np.testing.assert_allclose(
+                solve([column], [1.0], 0.0),
+                np.linalg.solve(matrix, rhs),
+                rtol=2e-11,
+                atol=2e-11,
+            )
+
+    assert factor.ftran_sparse_reach_failures() == 0
+    assert factor.btran_sparse_reach_failures() == 0

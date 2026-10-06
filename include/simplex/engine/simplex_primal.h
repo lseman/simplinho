@@ -248,10 +248,14 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
             }
             return nla->factor();
         };
-        auto update_basis = [&](int row, int entering_col, const auto& entering_vector) {
+        auto update_basis_with_transforms = [&](int row, int entering_col,
+                                                const auto& entering_vector,
+                                                const Eigen::VectorXd& transformed_new_col,
+                                                const Eigen::VectorXd& transformed_pivot_row) {
             if (!nla.unique())
                 nla = build_nla();
-            nla->update_basis(row, entering_col, entering_vector);
+            nla->update_basis_with_transforms(row, entering_col, entering_vector,
+                                              transformed_new_col, transformed_pivot_row);
         };
         self.degen_.start_basis_history(basis);
         self.trace_line_("[primal] start basis=" + self.format_basis_(basis));
@@ -675,10 +679,10 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
                 (void)self.degen_.reset_perturbation();
             }
 
+            const HVector row_ep =
+                read_basis().solve_BT_unit(r, FTBasis::TranKind::RowEp);
             if (self.opt_.pricing_rule == "adaptive") {
                 const double rc_impr = -work.entering_measure(idxN);
-                const HVector row_ep =
-                    read_basis().solve_BT_unit(r, FTBasis::TranKind::RowEp);
                 self.bridge_->after_primal_pivot(r, eAbs, oldAbs, dB, row_ep.value, alpha, step, A,
                                                  basis, N, rc_impr, is_degenerate);
             }
@@ -736,7 +740,8 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
             }
 
             try {
-                update_basis(r, eAbs, A.col(work.entering_col));
+                update_basis_with_transforms(r, eAbs, A.col(work.entering_col), dB.value,
+                                             row_ep.value);
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");

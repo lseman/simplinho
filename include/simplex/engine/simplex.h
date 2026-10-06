@@ -1319,7 +1319,11 @@ class RevisedSimplex {
 
         bopt.ext_refactor_counter = &solve_stats_.refactorizations;
         bopt.ext_ft_update_counter = &solve_stats_.ft_updates;
+        bopt.ext_ftran_counter = &solve_stats_.ftran_calls;
+        bopt.ext_btran_counter = &solve_stats_.btran_calls;
         bopt.ext_refactor_ns = &solve_stats_.lu_build_ns;
+        bopt.ext_ftran_ns = &solve_stats_.ftran_ns;
+        bopt.ext_btran_ns = &solve_stats_.btran_ns;
         bopt.ext_pivot_ns = &solve_stats_.pivot_ns;
         return bopt;
     }

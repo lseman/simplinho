@@ -151,6 +151,12 @@ class SparseForrestTomlinLU {
         base_matrix_original_.makeCompressed();
         base_matrix_one_norm_ = matrix_one_norm_(base_matrix_original_);
         use_fallback_sparse_lu_ = false;
+        ftran_sparse_reach_trusted_ = true;
+        btran_sparse_reach_trusted_ = true;
+        ftran_sparse_solve_count_ = 0;
+        btran_sparse_solve_count_ = 0;
+        ftran_sparse_reach_failures_ = 0;
+        btran_sparse_reach_failures_ = 0;
         row_scale_.assign(n_, 1.0);
         col_scale_.assign(n_, 1.0);
         norm_growth_estimate_ = 1.0;
@@ -574,6 +580,12 @@ class SparseForrestTomlinLU {
     }
 
     bool last_solve_pattern_valid() const noexcept { return last_solve_pattern_valid_; }
+    std::uint64_t ftran_sparse_reach_failures() const noexcept {
+        return ftran_sparse_reach_failures_;
+    }
+    std::uint64_t btran_sparse_reach_failures() const noexcept {
+        return btran_sparse_reach_failures_;
+    }
 
   private:
     // FTRAN B*x = b. HiGHS-style per-stage gating:
@@ -644,8 +656,8 @@ class SparseForrestTomlinLU {
                     // promote sparse_l_scratch_ to a dense buffer for back_solve_U_,
                     // then clear it at L-reach positions afterwards.
                     Eigen::VectorXd w = back_solve_U_(sparse_l_scratch_);
+                    clear_reach_flags_scratch_(&l_reach_seeds_scratch_);
                     clear_scratch_at_indices_(sparse_l_scratch_, l_reach_seeds_scratch_);
-                    reach_scratch_.clear();
                     hyper_solve_reach_valid_ = false;
                     for (int i = 0; i < n_; ++i)
                         output_scratch_(Pc_[i]) = w(i);
@@ -768,8 +780,8 @@ class SparseForrestTomlinLU {
                     clear_scratch_at_indices_(sparse_u_scratch_, l_reach_seeds_scratch_);
                 } else {
                     Eigen::VectorXd s = back_solve_LT_(sparse_u_scratch_);
+                    clear_reach_flags_scratch_(&l_reach_seeds_scratch_);
                     clear_scratch_at_indices_(sparse_u_scratch_, l_reach_seeds_scratch_);
-                    reach_scratch_.clear();
                     hyper_solve_reach_valid_ = false;
                     for (int i = 0; i < n_; ++i)
                         output_scratch_(Pr_[i]) = s(i);
@@ -844,6 +856,15 @@ class SparseForrestTomlinLU {
                 b(seed_idx[k]) = seed_val[k];
             return solve_impl_(b, enable_refinement, expected_density);
         }
+        if (!ftran_sparse_reach_trusted_) {
+            Eigen::VectorXd b = Eigen::VectorXd::Zero(n_);
+            for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
+                b(seed_idx[k]) = seed_val[k];
+            // A failed reach certificate means this factorization's etree
+            // metadata is not safe for all RHS patterns. Avoid repeatedly
+            // speculating down the same bad path until the next refactor.
+            return solve_impl_(b, enable_refinement, 1.0);
+        }
         if (permuted_rhs_scratch_.size() < static_cast<Eigen::Index>(n_))
             permuted_rhs_scratch_.resize(n_);
         permuted_rhs_scratch_.setZero();
@@ -879,8 +900,8 @@ class SparseForrestTomlinLU {
             clear_scratch_at_indices_(sparse_l_scratch_, l_reach_seeds_scratch_);
         } else {
             Eigen::VectorXd w = back_solve_U_(sparse_l_scratch_);
+            clear_reach_flags_scratch_(&l_reach_seeds_scratch_);
             clear_scratch_at_indices_(sparse_l_scratch_, l_reach_seeds_scratch_);
-            reach_scratch_.clear();
             for (int i = 0; i < n_; ++i)
                 output_scratch_(Pc_[i]) = w(i);
             apply_col_unscaling_(output_scratch_);
@@ -894,18 +915,28 @@ class SparseForrestTomlinLU {
             apply_updates_solve_(output_scratch_);
             mark_output_scratch_dense_();
         }
-        Eigen::VectorXd b = Eigen::VectorXd::Zero(n_);
-        for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
-            b(seed_idx[k]) = seed_val[k];
-        // Structural check, not a numeric net: the pattern-seeded solve is
-        // only valid when the seed pattern covered the true reach; always
-        // verify and fall back to the dense path when it did not.
-        if (!validate_sparse_rhs_solution_(b, output_scratch_)) {
-            last_solve_pattern_valid_ = false;
-            // Reset scratches before delegating to the dense path.
-            clear_scratch_at_indices_(output_scratch_, last_solve_reach_original_);
-            last_solve_reach_original_.clear();
-            return solve_impl_(b, enable_refinement, expected_density);
+        if (should_certify_sparse_rhs_solve_(false)) {
+            Eigen::VectorXd b = Eigen::VectorXd::Zero(n_);
+            for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
+                b(seed_idx[k]) = seed_val[k];
+            if (!validate_sparse_rhs_solution_(b, output_scratch_)) {
+                if (std::getenv("SIMPLINHO_TRACE_SPARSE_REACH")) {
+                    const Eigen::VectorXd residual = b - multiply_current_matrix_(output_scratch_);
+                    std::fprintf(stderr,
+                                 "[sparse-reach] FTRAN failure updates=%zu rhs_nz=%zu reach=%zu "
+                                 "residual=%.3e\n",
+                                 updates_.size(), seed_idx.size(),
+                                 last_solve_reach_original_.size(),
+                                 residual.lpNorm<Eigen::Infinity>());
+                }
+                ++ftran_sparse_reach_failures_;
+                ftran_sparse_reach_trusted_ = false;
+                last_solve_pattern_valid_ = false;
+                // Reset scratches before delegating to the dense path.
+                clear_scratch_at_indices_(output_scratch_, last_solve_reach_original_);
+                last_solve_reach_original_.clear();
+                return solve_impl_(b, enable_refinement, expected_density);
+            }
         }
         (void)enable_refinement;
         last_solve_pattern_valid_ = pattern_preserved;
@@ -922,6 +953,12 @@ class SparseForrestTomlinLU {
             for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
                 c(seed_idx[k]) = seed_val[k];
             return solveT_impl_(c, enable_refinement, expected_density);
+        }
+        if (!btran_sparse_reach_trusted_) {
+            Eigen::VectorXd c = Eigen::VectorXd::Zero(n_);
+            for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
+                c(seed_idx[k]) = seed_val[k];
+            return solveT_impl_(c, enable_refinement, 1.0);
         }
         if (permuted_transpose_rhs_scratch_.size() < static_cast<Eigen::Index>(n_))
             permuted_transpose_rhs_scratch_.resize(n_);
@@ -959,8 +996,8 @@ class SparseForrestTomlinLU {
             clear_scratch_at_indices_(sparse_u_scratch_, l_reach_seeds_scratch_);
         } else {
             Eigen::VectorXd s = back_solve_LT_(sparse_u_scratch_);
+            clear_reach_flags_scratch_(&l_reach_seeds_scratch_);
             clear_scratch_at_indices_(sparse_u_scratch_, l_reach_seeds_scratch_);
-            reach_scratch_.clear();
             for (int i = 0; i < n_; ++i)
                 output_scratch_(Pr_[i]) = s(i);
             apply_row_unscaling_(output_scratch_);
@@ -974,14 +1011,27 @@ class SparseForrestTomlinLU {
             apply_updates_solve_T_(output_scratch_);
             mark_output_scratch_dense_();
         }
-        Eigen::VectorXd c = Eigen::VectorXd::Zero(n_);
-        for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
-            c(seed_idx[k]) = seed_val[k];
-        if (!validate_sparse_transpose_rhs_solution_(c, output_scratch_)) {
-            last_solve_pattern_valid_ = false;
-            clear_scratch_at_indices_(output_scratch_, last_solve_reach_original_);
-            last_solve_reach_original_.clear();
-            return solveT_impl_(c, enable_refinement, expected_density);
+        if (should_certify_sparse_rhs_solve_(true)) {
+            Eigen::VectorXd c = Eigen::VectorXd::Zero(n_);
+            for (int k = 0; k < static_cast<int>(seed_idx.size()); ++k)
+                c(seed_idx[k]) = seed_val[k];
+            if (!validate_sparse_transpose_rhs_solution_(c, output_scratch_)) {
+                if (std::getenv("SIMPLINHO_TRACE_SPARSE_REACH")) {
+                    const Eigen::VectorXd residual = c - multiply_current_matrix_T_(output_scratch_);
+                    std::fprintf(stderr,
+                                 "[sparse-reach] BTRAN failure updates=%zu rhs_nz=%zu reach=%zu "
+                                 "residual=%.3e\n",
+                                 updates_.size(), seed_idx.size(),
+                                 last_solve_reach_original_.size(),
+                                 residual.lpNorm<Eigen::Infinity>());
+                }
+                ++btran_sparse_reach_failures_;
+                btran_sparse_reach_trusted_ = false;
+                last_solve_pattern_valid_ = false;
+                clear_scratch_at_indices_(output_scratch_, last_solve_reach_original_);
+                last_solve_reach_original_.clear();
+                return solveT_impl_(c, enable_refinement, expected_density);
+            }
         }
         (void)enable_refinement;
         last_solve_pattern_valid_ = pattern_preserved;
@@ -3110,6 +3160,16 @@ class SparseForrestTomlinLU {
                residual.lpNorm<Eigen::Infinity>() <= 1e-8 * max_rhs;
     }
 
+    bool should_certify_sparse_rhs_solve_(bool transpose) const noexcept {
+        std::uint64_t& count =
+            transpose ? btran_sparse_solve_count_ : ftran_sparse_solve_count_;
+        ++count;
+        if (config_.validate_solves || needs_refactor())
+            return true;
+        constexpr std::uint64_t kCertificationFrequency = 64;
+        return count <= 2 || count % kCertificationFrequency == 0;
+    }
+
     Eigen::VectorXd multiply_current_matrix_(const Eigen::VectorXd& x) const {
         Eigen::VectorXd out = base_matrix_original_ * x;
         for (const auto& update : updates_) {
@@ -3295,6 +3355,12 @@ class SparseForrestTomlinLU {
     // Original-space row pattern of the last sparse-path solve (HVector source).
     mutable std::vector<int> last_solve_reach_original_;
     mutable bool last_solve_pattern_valid_{false};
+    mutable bool ftran_sparse_reach_trusted_{true};
+    mutable bool btran_sparse_reach_trusted_{true};
+    mutable std::uint64_t ftran_sparse_solve_count_{0};
+    mutable std::uint64_t btran_sparse_solve_count_{0};
+    mutable std::uint64_t ftran_sparse_reach_failures_{0};
+    mutable std::uint64_t btran_sparse_reach_failures_{0};
     std::vector<SparseUpdate> updates_;
 
     // Product Form (PF) update structures — Highs-style for multiple update methods.

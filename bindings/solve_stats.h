@@ -31,7 +31,11 @@ struct SolveStats {
     double dual_row_ep_density = 0.0;
     double dual_row_ap_density = 0.0;
     double dual_col_aq_density = 0.0;
+    int ftran_calls = 0;
+    int btran_calls = 0;
     std::uint64_t lu_build_ns = 0;
+    std::uint64_t ftran_ns = 0;
+    std::uint64_t btran_ns = 0;
     std::uint64_t pricing_build_ns = 0;
     std::uint64_t pivot_ns = 0;
     std::optional<int> phase1_iterations;
@@ -87,7 +91,11 @@ struct SolveStats {
         out["dual_row_ep_density"] = dual_row_ep_density;
         out["dual_row_ap_density"] = dual_row_ap_density;
         out["dual_col_aq_density"] = dual_col_aq_density;
+        out["ftran_calls"] = ftran_calls;
+        out["btran_calls"] = btran_calls;
         out["lu_build_ns"] = lu_build_ns;
+        out["ftran_ns"] = ftran_ns;
+        out["btran_ns"] = btran_ns;
         out["pricing_build_ns"] = pricing_build_ns;
         out["pivot_ns"] = pivot_ns;
         out["phase1_iterations"] = phase1_iterations ? py::cast(*phase1_iterations) : py::none();

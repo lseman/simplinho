@@ -74,7 +74,7 @@ class DualPricingOperations : public DualBoundModel {
         reduced_cost.resize(nonbasis.size());
         for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k) {
             const int j = nonbasis[k];
-            const Eigen::VectorXd column = Ahat.col(j);
+            const auto column = Ahat.col(j);
             row_price(k) = pivot_row.dot(column);
             reduced_cost(k) = costs(j) - column.dot(dual);
         }

@@ -110,7 +110,11 @@ class FTBasis {
         // signatures. Ownership stays with the caller.
         int* ext_refactor_counter = nullptr;
         int* ext_ft_update_counter = nullptr;
+        int* ext_ftran_counter = nullptr;
+        int* ext_btran_counter = nullptr;
         std::uint64_t* ext_refactor_ns = nullptr;
+        std::uint64_t* ext_ftran_ns = nullptr;
+        std::uint64_t* ext_btran_ns = nullptr;
         std::uint64_t* ext_pivot_ns = nullptr;
     };
 
@@ -132,6 +136,27 @@ class FTBasis {
                 if (std::abs(z(i)) > eps)
                     ++nnz;
             return static_cast<double>(nnz) / static_cast<double>(z.size());
+        }
+    };
+
+    struct ScopedSolveTelemetry {
+        int* counter;
+        std::uint64_t* total_ns;
+        std::chrono::steady_clock::time_point started{std::chrono::steady_clock::now()};
+
+        ScopedSolveTelemetry(int* counter_in, std::uint64_t* total_ns_in)
+            : counter(counter_in), total_ns(total_ns_in) {
+            if (counter)
+                ++(*counter);
+        }
+
+        ~ScopedSolveTelemetry() {
+            if (total_ns) {
+                *total_ns += static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - started)
+                        .count());
+            }
         }
     };
 
@@ -282,6 +307,7 @@ class FTBasis {
             throw std::invalid_argument("FTBasis::solve_B size mismatch");
 
         auto* self = const_cast<FTBasis*>(this);
+        ScopedSolveTelemetry telemetry(self->opt_.ext_ftran_counter, self->opt_.ext_ftran_ns);
         const double expected = density_tracker_.expected(kind);
         auto do_solve = [&]() {
             Eigen::VectorXd x = self->solve_B_fast_(b, expected);
@@ -318,6 +344,7 @@ class FTBasis {
             return solve_B(b.value, kind);
 
         auto* self = const_cast<FTBasis*>(this);
+        ScopedSolveTelemetry telemetry(self->opt_.ext_ftran_counter, self->opt_.ext_ftran_ns);
         auto [seed_idx, seed_val] = hvector_to_seed_data_(b);
         const double rhs_density =
             m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;
@@ -357,6 +384,7 @@ class FTBasis {
         if (b_sparse.rows() != m_ || b_sparse.cols() != 1)
             throw std::invalid_argument("FTBasis::solve_B sparse size mismatch");
         auto* self = const_cast<FTBasis*>(this);
+        ScopedSolveTelemetry telemetry(self->opt_.ext_ftran_counter, self->opt_.ext_ftran_ns);
         auto [seed_idx, seed_val] = sparse_vector_to_seed_data_(b_sparse.derived());
         const double rhs_density =
             m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;
@@ -398,6 +426,7 @@ class FTBasis {
             throw std::invalid_argument("FTBasis::solve_BT size mismatch");
 
         auto* self = const_cast<FTBasis*>(this);
+        ScopedSolveTelemetry telemetry(self->opt_.ext_btran_counter, self->opt_.ext_btran_ns);
         const double expected = density_tracker_.expected(kind);
         auto do_solve = [&]() {
             Eigen::VectorXd y = self->solve_BT_fast_(c, expected);
@@ -434,6 +463,7 @@ class FTBasis {
             return solve_BT(c.value, kind);
 
         auto* self = const_cast<FTBasis*>(this);
+        ScopedSolveTelemetry telemetry(self->opt_.ext_btran_counter, self->opt_.ext_btran_ns);
         auto [seed_idx, seed_val] = hvector_to_seed_data_(c);
         const double rhs_density =
             m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;
@@ -479,6 +509,7 @@ class FTBasis {
             return solve_B(e, kind);
         }
         auto* self = const_cast<FTBasis*>(this);
+        ScopedSolveTelemetry telemetry(self->opt_.ext_ftran_counter, self->opt_.ext_ftran_ns);
         static const std::vector<double> one_val{1.0};
         std::vector<int> seed{i};
         const double expected = density_tracker_.expected(kind);
@@ -507,6 +538,7 @@ class FTBasis {
             return solve_BT(e, kind);
         }
         auto* self = const_cast<FTBasis*>(this);
+        ScopedSolveTelemetry telemetry(self->opt_.ext_btran_counter, self->opt_.ext_btran_ns);
         static const std::vector<double> one_val{1.0};
         std::vector<int> seed{i};
         const double expected = density_tracker_.expected(kind);
@@ -532,6 +564,7 @@ class FTBasis {
         if (c_sparse.rows() != m_ || c_sparse.cols() != 1)
             throw std::invalid_argument("FTBasis::solve_BT sparse size mismatch");
         auto* self = const_cast<FTBasis*>(this);
+        ScopedSolveTelemetry telemetry(self->opt_.ext_btran_counter, self->opt_.ext_btran_ns);
         auto [seed_idx, seed_val] = sparse_vector_to_seed_data_(c_sparse.derived());
         const double rhs_density =
             m_ > 0 ? static_cast<double>(seed_idx.size()) / static_cast<double>(m_) : 0.0;

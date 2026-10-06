@@ -49,7 +49,11 @@ struct LPSolveStats {
     double dual_row_ep_density = 0.0;   // running density of BTRAN pivotal rows
     double dual_row_ap_density = 0.0;   // running density of priced tableau rows
     double dual_col_aq_density = 0.0;   // running density of FTRAN pivotal columns
+    int ftran_calls = 0;
+    int btran_calls = 0;
     std::uint64_t lu_build_ns = 0;      // cumulative time in refactor calls
+    std::uint64_t ftran_ns = 0;         // cumulative time in B^-1 solves
+    std::uint64_t btran_ns = 0;         // cumulative time in B^-T solves
     std::uint64_t pricing_build_ns = 0; // cumulative time in build_*_pool calls
     std::uint64_t pivot_ns = 0;         // cumulative time in basis update / pivot maintenance
 };
