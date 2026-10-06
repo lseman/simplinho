@@ -11,7 +11,7 @@
 #include <optional>
 #include <vector>
 
-#include "bnb/search.h"
+#include "bnb/search/search.h"
 
 namespace simplex::bnb::detail {
 

@@ -1,7 +1,7 @@
 #pragma once
 
 #include <Eigen/Dense>
-#include "../../extern/pdqsort/pdqsort.h"
+#include "../../../extern/pdqsort/pdqsort.h"
 
 #include <algorithm>
 #include <cmath>
@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include "bnb/search.h"
+#include "bnb/search/search.h"
 
 namespace simplex::bnb::detail {
 

@@ -1,4 +1,4 @@
-#include "bnb/heuristic.h"
+#include "bnb/heuristics/heuristic.h"
 
 #include <algorithm>
 #include <cmath>

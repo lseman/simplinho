@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../extern/pdqsort/pdqsort.h"
+#include "../../../extern/pdqsort/pdqsort.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -26,21 +26,22 @@
 #include <utility>
 #include <vector>
 
-#include "bnb/async_heuristic_manager.h"
-#include "bnb/branching.h"
-#include "bnb/conflict_engine.h"
-#include "bnb/core_types.h"
-#include "bnb/cuts.h"
-#include "bnb/heuristic.h"
+#include "bnb/heuristics/async_heuristic_manager.h"
+#include "bnb/search/branching.h"
+#include "bnb/conflict/conflict_engine.h"
+#include "bnb/core/core_types.h"
+#include "bnb/cuts/cuts.h"
+#include "bnb/heuristics/heuristic.h"
 // #include "bnb/node_pool.h"
-#include "bnb/parallel.h"
-#include "bnb/search_coordinator.h"
+#include "bnb/parallel/parallel.h"
+#include "bnb/search/search_coordinator.h"
 
 namespace simplex::bnb {
 
 class Solver {
     friend class AsyncHeuristicManager;
     friend class ConflictEngine;
+    friend class Manager;
 
   public:
     explicit Solver(Problem problem, Options options = {}, std::vector<Cut> initial_cuts = {})
@@ -4641,6 +4642,6 @@ class Solver {
     mutable std::mutex node_timing_log_mutex_;
 };
 
-#include "bnb/async_heuristic_manager.tpp"
+#include "bnb/heuristics/async_heuristic_manager.tpp"
 
 } // namespace simplex::bnb

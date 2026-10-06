@@ -239,6 +239,16 @@ class SimplexNLA {
         sync_update_stats_();
     }
 
+    template <class ColT>
+    void update_basis_with_transforms(int j, int entering_col, ColT&& new_col,
+                                      const Eigen::VectorXd& transformed_new_col,
+                                      const Eigen::VectorXd& transformed_pivot_row) {
+        factor().replace_column_with_transforms(
+            j, entering_col, std::forward<ColT>(new_col), transformed_new_col,
+            transformed_pivot_row);
+        sync_update_stats_();
+    }
+
     // Full refactor
     void invert() {
         factor().refactor();

@@ -594,6 +594,25 @@ class FTBasis {
         replace_column_impl_(j, entering_col, sparse_vector_to_dense_(sparse, m_), &sparse_copy);
     }
 
+    template <typename Derived>
+    void replace_column_with_transforms(int j, int entering_col,
+                                        const Eigen::SparseMatrixBase<Derived>& new_col_sparse,
+                                        const Eigen::VectorXd& transformed_new_col,
+                                        const Eigen::VectorXd& transformed_pivot_row) {
+        const auto& sparse = new_col_sparse.derived();
+        const SparseMat sparse_copy = sparse;
+        replace_column_impl_(j, entering_col, sparse_vector_to_dense_(sparse, m_), &sparse_copy,
+                             &transformed_new_col, &transformed_pivot_row);
+    }
+
+    void replace_column_with_transforms(int j, int entering_col,
+                                        const Eigen::VectorXd& new_col_dense,
+                                        const Eigen::VectorXd& transformed_new_col,
+                                        const Eigen::VectorXd& transformed_pivot_row) {
+        replace_column_impl_(j, entering_col, new_col_dense, nullptr, &transformed_new_col,
+                             &transformed_pivot_row);
+    }
+
     void refactor() {
         if (A_is_sparse_)
             sparse_refactor_();
@@ -919,7 +938,14 @@ class FTBasis {
         std::string backend = opt_.sparse_backend;
         std::transform(backend.begin(), backend.end(), backend.begin(),
                        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-        if (backend == "eigen" || backend == "sparse_lu") {
+        if (backend == "eigen" || backend == "sparse_lu" ||
+            (backend == "auto" && m_ >= 256)) {
+            // The custom Markowitz build maintains mutable row/column views
+            // and is competitive on small bases, but its rebuild cost scales
+            // poorly once the basis reaches a few hundred rows. Eigen's
+            // SparseLU is substantially faster there; column-replacement
+            // updates remain in our independent FT chain, so choosing Eigen
+            // changes only the base inversion kernel.
             config.force_eigen_sparse_lu = true;
         } else if (backend == "pf" || backend == "product_form") {
             config.use_product_form_updates = true;
@@ -932,7 +958,8 @@ class FTBasis {
             config.update_method = SparseForrestTomlinLU::UpdateMethod::APF;
         } else {
             // HiGHS' HFactor defaults to Forrest-Tomlin updates. Product form
-            // remains available through basis_sparse_backend="pf".
+            // remains available through basis_sparse_backend="pf". Small
+            // "auto" bases also stay on this custom path.
             config.use_product_form_updates = false;
             config.update_method = SparseForrestTomlinLU::UpdateMethod::FT;
         }
@@ -1623,7 +1650,9 @@ class FTBasis {
     // ----------------------------
     void replace_column_impl_(int j, std::optional<int> entering_col,
                               const Eigen::VectorXd& new_col_dense,
-                              const SparseMat* new_col_sparse = nullptr) {
+                              const SparseMat* new_col_sparse = nullptr,
+                              const Eigen::VectorXd* transformed_new_col = nullptr,
+                              const Eigen::VectorXd* transformed_pivot_row = nullptr) {
         const auto t0 = std::chrono::steady_clock::now();
         auto report_pivot_telemetry = [&]() noexcept {
             if (opt_.ext_pivot_ns) {
@@ -1637,6 +1666,11 @@ class FTBasis {
             throw std::out_of_range("FTBasis::replace_column bad j");
         if (new_col_dense.size() != m_)
             throw std::invalid_argument("FTBasis::replace_column size mismatch");
+        if ((transformed_new_col == nullptr) != (transformed_pivot_row == nullptr) ||
+            (transformed_new_col != nullptr &&
+             (transformed_new_col->size() != m_ || transformed_pivot_row->size() != m_))) {
+            throw std::invalid_argument("FTBasis::replace_column transform size mismatch");
+        }
 
         last_update_diagnostic_.clear();
         const std::optional<int> pending_basis = entering_col;
@@ -1669,17 +1703,28 @@ class FTBasis {
             Eigen::VectorXd z, w;
             double alpha = 0.0;
 
-            try {
-                z = fast_solve_B_(u);
-                w = fast_solve_BT_(unit_basis_vector_(j));
-                alpha = 1.0 + z(j);
-            } catch (...) {
-                if (new_col_sparse)
-                    set_sparse_column_(j, *new_col_sparse);
-                else
-                    set_sparse_column_(j, new_col_dense);
-                sparse_refactor_();
-                return;
+            if (transformed_new_col != nullptr) {
+                // The simplex pivot already computed B^{-1}a_q and
+                // B^{-T}e_j. Reuse them instead of paying for two duplicate
+                // triangular solves merely to construct the FT update:
+                // z = B^{-1}(a_q - B e_j) = B^{-1}a_q - e_j.
+                z = *transformed_new_col;
+                z(j) -= 1.0;
+                w = *transformed_pivot_row;
+                alpha = (*transformed_new_col)(j);
+            } else {
+                try {
+                    z = fast_solve_B_(u);
+                    w = fast_solve_BT_(unit_basis_vector_(j));
+                    alpha = 1.0 + z(j);
+                } catch (...) {
+                    if (new_col_sparse)
+                        set_sparse_column_(j, *new_col_sparse);
+                    else
+                        set_sparse_column_(j, new_col_dense);
+                    sparse_refactor_();
+                    return;
+                }
             }
 
             const bool unstable = (!std::isfinite(alpha)) || (std::abs(alpha) < alpha_floor) ||
@@ -1742,14 +1787,23 @@ class FTBasis {
         Eigen::VectorXd z, w;
         double alpha = 0.0;
 
-        try {
-            z = fast_solve_B_(u);
-            w = fast_solve_BT_(unit_basis_vector_(j));
-            alpha = 1.0 + z(j);
-        } catch (...) {
-            set_dense_basis_column_(j, new_col_dense);
-            dense_refactor_();
-            return;
+        if (transformed_new_col != nullptr) {
+            // The simplex pivot already computed B^-1 a_q and B^-T e_j.
+            // Convert the former to B^-1(a_q - B e_j) for the FT update.
+            z = *transformed_new_col;
+            z(j) -= 1.0;
+            w = *transformed_pivot_row;
+            alpha = (*transformed_new_col)(j);
+        } else {
+            try {
+                z = fast_solve_B_(u);
+                w = fast_solve_BT_(unit_basis_vector_(j));
+                alpha = 1.0 + z(j);
+            } catch (...) {
+                set_dense_basis_column_(j, new_col_dense);
+                dense_refactor_();
+                return;
+            }
         }
 
         const bool allow_ft_mode = opt_.update_mode == Options::UpdateMode::ForrestTomlin ||

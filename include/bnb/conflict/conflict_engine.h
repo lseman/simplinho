@@ -5,8 +5,8 @@
 
 #include <Eigen/Dense>
 
-#include "bnb/conflict_graph.h"
-#include "bnb/core_types.h"
+#include "bnb/conflict/conflict_graph.h"
+#include "bnb/core/core_types.h"
 
 namespace simplex::bnb {
 class Solver;

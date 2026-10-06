@@ -6,7 +6,7 @@
 #include <optional>
 #include <vector>
 
-#include "bnb/diving.h"
+#include "bnb/heuristics/diving.h"
 
 namespace simplex::bnb::detail {
 

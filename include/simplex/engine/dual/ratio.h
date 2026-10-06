@@ -25,21 +25,20 @@ class DualRatioTest : public BoundUtilities {
                                          double delta, double eta,
                                          double pivot_threshold = 0.0) {
         const double eligibility = std::max(delta, pivot_threshold);
-        std::vector<int> eligible;
-        for (int k = 0; k < pN.size(); ++k)
-            if (pN(k) < -eligibility)
-                eligible.push_back(k);
-        if (eligible.empty())
-            return {};
-
         double tau_star = std::numeric_limits<double>::infinity();
-        for (int k : eligible)
-            tau_star = std::min(tau_star, rN(k) / -pN(k));
+        for (int k = 0; k < pN.size(); ++k) {
+            if (pN(k) < -eligibility)
+                tau_star = std::min(tau_star, rN(k) / -pN(k));
+        }
+        if (!std::isfinite(tau_star))
+            return {};
         const double window = std::max(eta, eta * std::abs(tau_star));
 
         int best = -1;
         double best_pivot = 0.0;
-        for (int k : eligible) {
+        for (int k = 0; k < pN.size(); ++k) {
+            if (!(pN(k) < -eligibility))
+                continue;
             if (rN(k) / -pN(k) > tau_star + window)
                 continue;
             const double pivot = std::abs(pN(k));

@@ -7,8 +7,8 @@
 #include <utility>
 #include <vector>
 
-#include "bnb/conflict_graph.h"
-#include "bnb/search.h"
+#include "bnb/conflict/conflict_graph.h"
+#include "bnb/search/search.h"
 
 namespace simplex::bnb::detail {
 

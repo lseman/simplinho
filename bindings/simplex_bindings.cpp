@@ -459,11 +459,10 @@ void bind_sparse_forrest_tomlin_lu_bindings(py::module_& m) {
                int refactor_rook_iters, py::object initial_row_perm_obj,
                py::object initial_col_perm_obj) {
                 SparseMat A;
-                // Check if it's a scipy sparse matrix by looking for 'data' attribute
+                // Normalize scipy sparse inputs to CSC: the loop below walks
+                // indptr by column, which is not valid for CSR storage.
                 if (py::hasattr(A_obj, "data")) {
-                    // Convert from scipy csc/csr
-                    py::object csc =
-                        py::hasattr(A_obj, "tocsr") ? A_obj.attr("tocsr")() : A_obj.attr("tocsc")();
+                    py::object csc = A_obj.attr("tocsc")();
                     py::object data = csc.attr("data");
                     py::object indices = csc.attr("indices");
                     py::object indptr = csc.attr("indptr");
@@ -518,11 +517,10 @@ void bind_sparse_forrest_tomlin_lu_bindings(py::module_& m) {
                int refactor_rook_iters, py::object initial_row_perm_obj,
                py::object initial_col_perm_obj, const SparseForrestTomlinLU::Config& config) {
                 SparseMat A;
-                // Check if it's a scipy sparse matrix by looking for 'data' attribute
+                // Normalize scipy sparse inputs to CSC: the loop below walks
+                // indptr by column, which is not valid for CSR storage.
                 if (py::hasattr(A_obj, "data")) {
-                    // Convert from scipy csc/csr
-                    py::object csc =
-                        py::hasattr(A_obj, "tocsr") ? A_obj.attr("tocsr")() : A_obj.attr("tocsc")();
+                    py::object csc = A_obj.attr("tocsc")();
                     py::object data = csc.attr("data");
                     py::object indices = csc.attr("indices");
                     py::object indptr = csc.attr("indptr");

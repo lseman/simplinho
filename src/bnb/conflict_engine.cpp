@@ -1,5 +1,5 @@
-#include "bnb/conflict_engine.h"
-#include "bnb/core.h"
+#include "bnb/conflict/conflict_engine.h"
+#include "bnb/core/core.h"
 
 #include <algorithm>
 #include <cmath>

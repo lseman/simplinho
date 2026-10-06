@@ -1,5 +1,5 @@
-#include "bnb/mip_presolve.h"
-#include "bnb/conflict_graph.h"
+#include "bnb/presolve/mip_presolve.h"
+#include "bnb/conflict/conflict_graph.h"
 
 #include <algorithm>
 #include <cmath>

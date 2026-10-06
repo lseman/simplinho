@@ -12,7 +12,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "bnb/conflict_graph.h"
+#include "bnb/conflict/conflict_graph.h"
 #include "bnb/types.h"
 
 namespace simplex::bnb::detail {

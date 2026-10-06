@@ -391,10 +391,11 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
                                                dm_stats_to_map(self.degen_.get_stats())};
         };
 
+        IterationWork work;
+        work.base_cost.resize(m);
         while (iters < self.opt_.max_iters) {
             ++iters;
 
-            IterationWork work;
             try {
                 if (!xB_cache_valid || xB_cache_age >= xB_max_age)
                     refresh_xB_cache();
@@ -416,8 +417,15 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
                         {{"where", "solve(B,b) repair failed"}}};
             }
 
+            // The Harris ratio test admits violations up to ratio_eta when it
+            // chooses a numerically stronger pivot from the relaxed blocking
+            // set. Use the same feasibility tolerance when consuming that
+            // iterate; testing against the tighter optimality tolerance made
+            // accepted Harris pivots spuriously abandon primal Phase I.
+            const double primal_feasibility_tolerance =
+                std::max(self.opt_.tol, self.opt_.ratio_eta);
             if (!clamp_basic_solution_to_bounds_(work.base_value, basis, l_work, u_work,
-                                                 self.opt_.tol)) {
+                                                 primal_feasibility_tolerance)) {
                 int bad_row = -1;
                 double bad_value = 0.0, bad_lo = 0.0, bad_hi = 0.0;
                 for (int i = 0; i < work.base_value.size(); ++i) {
@@ -455,7 +463,6 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
                          {"at_upper_count", std::to_string(at_upper_count)}}};
             }
 
-            work.base_cost.resize(m);
             for (int i = 0; i < m; ++i)
                 work.base_cost(i) = c_work(basis[i]);
 
@@ -473,10 +480,12 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
                 rebuild_pricing();
             }
             work.work_dual = y_hvec.value;
-            const ReducedCostView rc_view = compute_reduced_costs_(
-                A, c_work, work.work_dual, N, at_upper, l_work, u_work, self.opt_.tol);
-            work.reduced_cost = rc_view.raw;
-            work.entering_measure = rc_view.entering_measure;
+            ReducedCostView rc_view{std::move(work.reduced_cost),
+                                    std::move(work.entering_measure)};
+            compute_reduced_costs_(A, c_work, work.work_dual, N, at_upper, l_work, u_work,
+                                   self.opt_.tol, rc_view);
+            work.reduced_cost = std::move(rc_view.raw);
+            work.entering_measure = std::move(rc_view.entering_measure);
 
             // CHUZC: choose the entering nonbasic column.
             if (self.opt_.bland) {
@@ -489,22 +498,11 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
             } else {
                 if (self.opt_.pricing_rule == "adaptive") {
                     double current_obj = 0.0;
-                    {
-                        std::vector<char> inB(n, 0);
-                        for (int i = 0; i < (int)basis.size(); ++i) {
-                            const int j = basis[i];
-                            if (j >= 0 && j < n) {
-                                inB[j] = 1;
-                                current_obj += c_work(j) * work.base_value(i);
-                            }
-                        }
-                        for (int j = 0; j < n; ++j) {
-                            if (inB[j])
-                                continue;
-                            current_obj +=
-                                c_work(j) * nonbasic_value_(j, l_work, u_work, at_upper[j]);
-                        }
-                    }
+                    for (int i = 0; i < static_cast<int>(basis.size()); ++i)
+                        current_obj += c_work(basis[i]) * work.base_value(i);
+                    for (int j : N)
+                        current_obj +=
+                            c_work(j) * nonbasic_value_(j, l_work, u_work, at_upper[j]);
                     work.entering_rel = self.bridge_->choose_primal_entering(
                         work.entering_measure, N, self.opt_.tol, iters, current_obj, read_basis(),
                         A, self.opt_.partial_pricing);

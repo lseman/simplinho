@@ -1,5 +1,5 @@
-#include "bnb/async_heuristic_manager.h"
-#include "bnb/core.h"
+#include "bnb/heuristics/async_heuristic_manager.h"
+#include "bnb/core/core.h"
 
 #include <algorithm>
 #include <chrono>

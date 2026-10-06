@@ -1,4 +1,4 @@
-#include "bnb/branching.h"
+#include "bnb/search/branching.h"
 
 #include <algorithm>
 #include <cmath>
@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 
-#include "bnb/parallel.h"
+#include "bnb/parallel/parallel.h"
 
 namespace simplex::bnb::detail {
 namespace {

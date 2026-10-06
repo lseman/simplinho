@@ -3,7 +3,7 @@
 #include <sstream>
 
 #include "bnb_bindings.h"
-#include "bnb/core.h"
+#include "bnb/core/core.h"
 
 namespace py = pybind11;
 namespace simplex_bnb = simplex::bnb;

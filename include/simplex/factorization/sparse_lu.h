@@ -238,7 +238,11 @@ class SparseForrestTomlinLU {
         clear_updates();
     }
 
-    bool supports_inplace_updates() const noexcept { return n_ > 0 && !use_fallback_sparse_lu_; }
+    // Column-replacement updates are represented independently of the base
+    // factorization, so they can also sit on top of the Eigen SparseLU recovery
+    // backend. This lets callers use Eigen for fast base inversions without
+    // paying for a complete refactor after every simplex pivot.
+    bool supports_inplace_updates() const noexcept { return n_ > 0; }
 
     bool has_updates() const noexcept { return !updates_.empty(); }
 
@@ -371,7 +375,7 @@ class SparseForrestTomlinLU {
             // packed updates for forward solves.
             updates_.push_back(SparseUpdate{j, dense_to_sparse_update_(u, eps),
                                             dense_to_sparse_update_(z, eps),
-                                            dense_to_sparse_update_(w, eps), alpha});
+                                            dense_to_sparse_update_(w, eps), alpha, 1.0 / alpha});
             update_norm_growth_estimate_(updates_.back());
             update_cached_stats_(updates_.back());
             (void)pf_ok;
@@ -403,7 +407,7 @@ class SparseForrestTomlinLU {
             const bool mpf_ok = append_mpf_update(j, col_idx, col_val, alpha, row_idx, row_val);
             updates_.push_back(SparseUpdate{j, dense_to_sparse_update_(u, eps),
                                             dense_to_sparse_update_(z, eps),
-                                            dense_to_sparse_update_(w, eps), alpha});
+                                            dense_to_sparse_update_(w, eps), alpha, 1.0 / alpha});
             update_norm_growth_estimate_(updates_.back());
             update_cached_stats_(updates_.back());
             (void)mpf_ok;
@@ -427,7 +431,7 @@ class SparseForrestTomlinLU {
             const bool apf_ok = append_pf_update(j, col_idx, col_val, alpha);
             updates_.push_back(SparseUpdate{j, dense_to_sparse_update_(u, eps),
                                             dense_to_sparse_update_(z, eps),
-                                            dense_to_sparse_update_(w, eps), alpha});
+                                            dense_to_sparse_update_(w, eps), alpha, 1.0 / alpha});
             update_norm_growth_estimate_(updates_.back());
             update_cached_stats_(updates_.back());
             (void)apf_ok;
@@ -436,7 +440,7 @@ class SparseForrestTomlinLU {
 
         updates_.push_back(SparseUpdate{j, dense_to_sparse_update_(u, eps),
                                         dense_to_sparse_update_(z, eps),
-                                        dense_to_sparse_update_(w, eps), alpha});
+                                        dense_to_sparse_update_(w, eps), alpha, 1.0 / alpha});
         update_norm_growth_estimate_(updates_.back());
         update_cached_stats_(updates_.back());
         return true;
@@ -590,6 +594,8 @@ class SparseForrestTomlinLU {
             Eigen::VectorXd x = fallback_sparse_lu_.solve(b);
             if (!x.array().isFinite().all())
                 throw std::runtime_error("SparseForrestTomlinLU: fallback solve failed");
+            if (!updates_.empty())
+                apply_updates_solve_(x);
             if (enable_refinement)
                 x = iterative_refine_(b, x);
             return x;
@@ -651,7 +657,7 @@ class SparseForrestTomlinLU {
                         last_solve_reach_original_[i] = i;
                 }
                 if (!updates_.empty()) {
-                    output_scratch_ = apply_updates_solve_(std::move(output_scratch_));
+                    apply_updates_solve_(output_scratch_);
                     mark_output_scratch_dense_();
                 }
                 if (config_.validate_solves && !validate_sparse_rhs_solution_(b, output_scratch_))
@@ -686,7 +692,7 @@ class SparseForrestTomlinLU {
             x(Pc_[i]) = w(i);
         apply_col_unscaling_(x);
         if (!updates_.empty())
-            x = apply_updates_solve_(x);
+            apply_updates_solve_(x);
         if (enable_refinement)
             x = iterative_refine_(b, x);
         if (config_.validate_solves && updates_.empty() && !validate_sparse_rhs_solution_(b, x)) {
@@ -719,6 +725,8 @@ class SparseForrestTomlinLU {
             Eigen::VectorXd y = fallback_sparse_lu_t_.solve(c);
             if (!y.array().isFinite().all())
                 throw std::runtime_error("SparseForrestTomlinLU: fallback transpose solve failed");
+            if (!updates_.empty())
+                apply_updates_solve_T_(y);
             if (enable_refinement)
                 y = iterative_refine_T_(c, y);
             return y;
@@ -771,10 +779,11 @@ class SparseForrestTomlinLU {
                         last_solve_reach_original_[i] = i;
                 }
                 if (!updates_.empty()) {
-                    output_scratch_ = apply_updates_solve_T_(std::move(output_scratch_));
+                    apply_updates_solve_T_(output_scratch_);
                     mark_output_scratch_dense_();
                 }
-                if (!validate_sparse_transpose_rhs_solution_(c, output_scratch_))
+                if (config_.validate_solves &&
+                    !validate_sparse_transpose_rhs_solution_(c, output_scratch_))
                     throw std::runtime_error(
                         "SparseForrestTomlinLU: hyper-sparse RHS transpose residual check failed");
                 Eigen::VectorXd y = output_scratch_;
@@ -798,7 +807,7 @@ class SparseForrestTomlinLU {
             y(Pr_[i]) = s(i);
         apply_row_unscaling_(y);
         if (!updates_.empty())
-            y = apply_updates_solve_T_(y);
+            apply_updates_solve_T_(y);
         if (enable_refinement)
             y = iterative_refine_T_(c, y);
         if (config_.validate_solves && updates_.empty() &&
@@ -882,7 +891,7 @@ class SparseForrestTomlinLU {
         hyper_solve_reach_valid_ = pattern_via_reach;
         const bool pattern_preserved = pattern_via_reach && updates_.empty();
         if (!updates_.empty()) {
-            output_scratch_ = apply_updates_solve_(std::move(output_scratch_));
+            apply_updates_solve_(output_scratch_);
             mark_output_scratch_dense_();
         }
         Eigen::VectorXd b = Eigen::VectorXd::Zero(n_);
@@ -962,7 +971,7 @@ class SparseForrestTomlinLU {
         hyper_solve_reach_valid_ = pattern_via_reach;
         const bool pattern_preserved = pattern_via_reach && updates_.empty();
         if (!updates_.empty()) {
-            output_scratch_ = apply_updates_solve_T_(std::move(output_scratch_));
+            apply_updates_solve_T_(output_scratch_);
             mark_output_scratch_dense_();
         }
         Eigen::VectorXd c = Eigen::VectorXd::Zero(n_);
@@ -1044,6 +1053,7 @@ class SparseForrestTomlinLU {
         SparseUpdateVector z;
         SparseUpdateVector w;
         double alpha{0.0};
+        double inv_alpha{0.0};
     };
 
     struct RowCandidate {
@@ -2890,7 +2900,7 @@ class SparseForrestTomlinLU {
         }
     }
 
-    Eigen::VectorXd apply_updates_solve_(Eigen::VectorXd x) const {
+    void apply_updates_solve_(Eigen::VectorXd& x) const {
         // The canonical sparse Sherman-Morrison vectors are authoritative for
         // every update representation. Packed PF/MPF/APF storage is retained
         // for method-specific kernels, but those kernels must not bypass this
@@ -2902,11 +2912,10 @@ class SparseForrestTomlinLU {
             // applying the full sparse update chain is the correct equivalent.
             const double xj = x(update.j);
             if (xj != 0.0) {
-                update.z.axpy(x, -(xj / update.alpha));
+                update.z.axpy(x, -xj * update.inv_alpha);
                 solve_synthetic_tick_ += 10.0 * static_cast<double>(update.z.idx.size() + 1);
             }
         }
-        return x;
     }
 
     // Apply updates using Product Form (PF) storage.
@@ -2941,18 +2950,17 @@ class SparseForrestTomlinLU {
         return x;
     }
 
-    Eigen::VectorXd apply_updates_solve_T_(Eigen::VectorXd y) const {
+    void apply_updates_solve_T_(Eigen::VectorXd& y) const {
         // Use regular updates for transpose solves even when PF forward updates
         // are also present, to avoid relying on incomplete PF transpose logic.
         for (const auto& update : updates_) {
             const double uy = update.u.dot(y);
             if (uy != 0.0) {
-                update.w.axpy(y, -(uy / update.alpha));
+                update.w.axpy(y, -uy * update.inv_alpha);
                 solve_synthetic_tick_ +=
                     10.0 * static_cast<double>(update.u.idx.size() + update.w.idx.size() + 1);
             }
         }
-        return y;
     }
 
     // Transpose solve with Product Form updates.

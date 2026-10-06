@@ -2,6 +2,8 @@
 
 #include "simplex/engine/common/utils.h"
 
+#include <span>
+
 namespace simplex::engine {
 
 class PrimalPivotSelection : public BoundUtilities {
@@ -132,9 +134,10 @@ class PrimalPivotSelection : public BoundUtilities {
         double alphaTol = delta;      // delta is the degeneracy tolerance, used as alphaTol
         double primal_feas_tol = eta; // eta is used as feasibility tolerance for relaxation
         if (dB.has_pattern()) {
-            std::vector<int> rows(dB.index.begin(), dB.index.begin() + dB.count);
-            return ratio_test_highs_style_(xB, dB.value, sigma, rows, basis, l, u, alphaTol,
-                                           primal_feas_tol);
+            const auto rows = std::span<const int>(dB.index.data(),
+                                                   static_cast<std::size_t>(dB.count));
+            return ratio_test_highs_style_(xB, dB.value, sigma, rows, basis, l, u,
+                                           alphaTol, primal_feas_tol);
         }
         return ratio_test_highs_style_(xB, dB.value, sigma,
                                        AllRows{static_cast<int>(dB.value.size())}, basis, l, u,
@@ -162,17 +165,21 @@ class PrimalPivotSelection : public BoundUtilities {
     }
 
     template <class MatrixType>
-    static ReducedCostView
-    compute_reduced_costs_(const MatrixType& A, const Eigen::VectorXd& c, const Eigen::VectorXd& y,
-                           const std::vector<int>& nonbasis, const std::vector<char>& at_upper,
-                           const Eigen::VectorXd& l, const Eigen::VectorXd& u, double tol) {
-        ReducedCostView out;
+    static void compute_reduced_costs_(const MatrixType& A, const Eigen::VectorXd& c,
+                                       const Eigen::VectorXd& y,
+                                       const std::vector<int>& nonbasis,
+                                       const std::vector<char>& at_upper,
+                                       const Eigen::VectorXd& l, const Eigen::VectorXd& u,
+                                       double tol, ReducedCostView& out) {
         out.raw.resize(nonbasis.size());
         out.entering_measure.resize(nonbasis.size());
-        const Eigen::VectorXd aTy = A.transpose() * y;
         for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k) {
             const int j = nonbasis[k];
-            out.raw(k) = c(j) - aTy(j);
+            // Revised simplex only needs reduced costs for nonbasic columns.
+            // A full A^T y product also prices every basic column and allocates
+            // an n-vector on each iteration. CSC column dots preserve sparsity
+            // and avoid both costs.
+            out.raw(k) = c(j) - A.col(j).dot(y);
             const int move = nonbasic_move_(j, at_upper, l, u, tol);
             if (move == 0) {
                 const bool fixed = j < l.size() && j < u.size() && std::isfinite(l(j)) &&
@@ -182,6 +189,15 @@ class PrimalPivotSelection : public BoundUtilities {
                 out.entering_measure(k) = move * out.raw(k);
             }
         }
+    }
+
+    template <class MatrixType>
+    static ReducedCostView
+    compute_reduced_costs_(const MatrixType& A, const Eigen::VectorXd& c, const Eigen::VectorXd& y,
+                           const std::vector<int>& nonbasis, const std::vector<char>& at_upper,
+                           const Eigen::VectorXd& l, const Eigen::VectorXd& u, double tol) {
+        ReducedCostView out;
+        compute_reduced_costs_(A, c, y, nonbasis, at_upper, l, u, tol, out);
         return out;
     }
 

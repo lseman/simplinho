@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "bnb/cuts.h"
+#include "bnb/cuts/cuts.h"
 
 namespace simplex::bnb::presolve {
 

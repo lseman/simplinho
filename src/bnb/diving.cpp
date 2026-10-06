@@ -1,4 +1,4 @@
-#include "bnb/diving.h"
+#include "bnb/heuristics/diving.h"
 
 #include <algorithm>
 #include <cmath>

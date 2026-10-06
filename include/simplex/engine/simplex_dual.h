@@ -313,10 +313,14 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
             }
             return nla->factor();
         };
-        auto update_basis = [&](int row, int entering_col, const auto& entering_vector) {
+        auto update_basis_with_transforms = [&](int row, int entering_col,
+                                                const auto& entering_vector,
+                                                const Eigen::VectorXd& transformed_new_col,
+                                                const Eigen::VectorXd& transformed_pivot_row) {
             if (!nla.unique())
                 nla = rebuild_nla();
-            nla->update_basis(row, entering_col, entering_vector);
+            nla->update_basis_with_transforms(row, entering_col, entering_vector,
+                                              transformed_new_col, transformed_pivot_row);
         };
         self.degen_.start_basis_history(basis);
 
@@ -613,8 +617,9 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
         // direction, ratio-test filter, post-pivot nonbasic bound) can un-fold
         // it consistently.
         auto basic_leaving_infeasibility = [&](const Eigen::VectorXd& yB_in,
+                                               Eigen::VectorXd& folded,
                                                std::vector<int>& sign_out) {
-            Eigen::VectorXd folded = yB_in;
+            folded = yB_in;
             sign_out.assign(static_cast<std::size_t>(m), 1);
             for (int i = 0; i < m && i < yB_in.size(); ++i) {
                 const int j = basis[i];
@@ -627,7 +632,6 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                     sign_out[static_cast<std::size_t>(i)] = -1;
                 }
             }
-            return folded;
         };
         auto basic_above_range_rows = [&](const Eigen::VectorXd& yB_in) {
             std::vector<int> rows;
@@ -645,11 +649,15 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
             return rows;
         };
 
+        DualIterationWork work;
+        work.base_cost.resize(m);
+        Eigen::VectorXd yB_for_leaving;
+        std::vector<int> leaving_row_sign;
+        leaving_row_sign.reserve(static_cast<std::size_t>(m));
+
         while (iters < self.opt_.max_iters) {
             ++iters;
             int flips_this_iter = 0;
-            DualIterationWork work;
-            work.base_cost.resize(m);
 
             while (true) {
                 try {
@@ -714,9 +722,8 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                     continue;
                 }
 
-                std::vector<int> leaving_row_sign;
-                const Eigen::VectorXd yB_for_leaving =
-                    basic_leaving_infeasibility(work.base_value, leaving_row_sign);
+                basic_leaving_infeasibility(work.base_value, yB_for_leaving,
+                                             leaving_row_sign);
                 // CHUZR: choose the leaving basic row from primal infeasibilities.
                 const auto leaving =
                     dual_pricer.choose_dual_leaving(read_basis(), yB_for_leaving, self.opt_.tol);
@@ -1188,7 +1195,10 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
             // raw `z`/`pivot` — flipping them here (as an earlier attempt
             // did) breaks that identity and corrupts `ydual`/`rN` on every
             // above-upper pivot.
-            HVector z = read_basis().solve_BT_unit(work.leaving_row, FTBasis::TranKind::RowEp);
+            HVector z = work.pivot_row;
+            if (work.leaving_sign < 0)
+                z.value = -z.value;
+            nla->update_ema_reach(z.count, m);
             const double pivot = work.pivot_col(work.leaving_row);
             const double alpha = work.reduced_cost(work.entering_rel) / pivot;
             ydual.noalias() += alpha * z.value;
@@ -1268,7 +1278,9 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                 }
             }
             try {
-                update_basis(work.leaving_row, work.entering_col, Ahat.col(work.entering_col));
+                update_basis_with_transforms(work.leaving_row, work.entering_col,
+                                             Ahat.col(work.entering_col), work.pivot_col.value,
+                                             work.leaving_sign < 0 ? -z.value : z.value);
             } catch (...) {
                 self.trace_line_("[dual] iter=" + std::to_string(iters) +
                                  " refactor after replace_column failure");
@@ -1438,7 +1450,7 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
 
                 // Apply the sub-pivot dual update
                 {
-                    HVector sub_z = read_basis().solve_BT_unit(sub_r, FTBasis::TranKind::RowEp);
+                    HVector sub_z = sub_w;
                     nla->update_ema_reach(sub_z.count, m);
                     const double sub_pivot = sub_s(sub_r);
                     const double sub_alpha = sub_rN(sub_e_rel) / sub_pivot;
@@ -1455,7 +1467,8 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                 ydual_cached = false;
 
                 try {
-                    update_basis(sub_r, sub_eAbs, Ahat.col(sub_eAbs));
+                    update_basis_with_transforms(sub_r, sub_eAbs, Ahat.col(sub_eAbs), sub_s.value,
+                                                 sub_w.value);
                 } catch (...) {
                     refactor_basis();
                     yB_cache_valid = false;

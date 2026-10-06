@@ -1,8 +1,8 @@
-#include "bnb/cuts.h"
-#include "bnb/lock_debug.h"
+#include "bnb/cuts/cuts.h"
+#include "bnb/parallel/lock_debug.h"
 
-#include "bnb/implications.h"
-#include "bnb/parallel.h"
+#include "bnb/conflict/implications.h"
+#include "bnb/parallel/parallel.h"
 
 #include <algorithm>
 #include <array>

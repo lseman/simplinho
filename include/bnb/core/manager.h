@@ -1,6 +1,6 @@
 #pragma once
 
-#include "bnb/core.h"
+#include "bnb/core/core.h"
 
 namespace simplex::bnb {
 
