@@ -25,6 +25,83 @@ def test_sparse_update_method_preserves_solution(method):
     assert np.max(np.abs(np.asarray(A @ solution.x).ravel() - b)) < 1e-6
 
 
+def test_primal_pricing_keeps_linear_solve_work_per_iteration():
+    """Inactive pricing frameworks and exact repricing must stay off the hot path."""
+    rng = np.random.default_rng(91)
+    rows, structural = 30, 60
+    R = sp.random(
+        rows,
+        structural,
+        density=0.1,
+        random_state=rng,
+        data_rvs=lambda size: rng.standard_normal(size),
+        format="csc",
+    )
+    A = sp.hstack([R, sp.eye(rows, format="csc")], format="csc")
+    x_feasible = rng.random(A.shape[1]) * 2.0
+    b = np.asarray(A @ x_feasible).ravel()
+
+    # c = A.T @ y + s with s > 0 makes this nonnegative equality-form LP
+    # bounded while still requiring enough pivots to exercise pricing rebuilds.
+    y = rng.standard_normal(rows)
+    c = np.asarray(A.T @ y).ravel() + rng.random(A.shape[1]) * 0.9 + 0.1
+
+    options = splx.RevisedSimplexOptions()
+    options.mode = splx.SimplexMode.Primal
+    options.disable_presolve = True
+    solution = splx.RevisedSimplex(options).solve(
+        A,
+        b,
+        c,
+        np.zeros(A.shape[1]),
+        np.full(A.shape[1], np.inf),
+    )
+
+    assert "Optimal" in str(solution.status)
+    assert np.max(np.abs(np.asarray(A @ solution.x).ravel() - b)) < 1e-7
+    assert solution.stats.iterations >= 20
+    # A primal pivot needs one FTRAN for its pivotal column and one BTRAN for
+    # its pivotal row. Allow a small fixed margin for startup/certification.
+    assert solution.stats.ftran_calls <= solution.stats.iterations + 8
+    assert solution.stats.btran_calls <= solution.stats.iterations + 8
+
+
+def test_dual_dse_stays_stable_and_uses_sparse_price_support():
+    rng = np.random.default_rng(900)
+    rows, structural = 300, 600
+    R = sp.random(
+        rows,
+        structural,
+        density=0.02,
+        random_state=rng,
+        data_rvs=lambda size: rng.standard_normal(size),
+        format="csc",
+    )
+    A = sp.hstack([R, sp.eye(rows, format="csc")], format="csc")
+    x_feasible = rng.random(A.shape[1]) * 2.0
+    b = np.asarray(A @ x_feasible).ravel()
+    c = rng.standard_normal(A.shape[1])
+
+    options = splx.RevisedSimplexOptions()
+    options.mode = splx.SimplexMode.Dual
+    options.disable_presolve = True
+    options.parallel_pricing_workers = 2
+    options.parallel_pricing_min_cols = 1
+    solution = splx.RevisedSimplex(options).solve(
+        A,
+        b,
+        c,
+        np.zeros(A.shape[1]),
+        np.full(A.shape[1], 5.0),
+    )
+
+    assert "Optimal" in str(solution.status)
+    assert np.max(np.abs(np.asarray(A @ solution.x).ravel() - b)) < 1e-7
+    assert solution.stats.raw_info["dual_pricing"] == "dual_steepest_edge"
+    assert solution.stats.dual_row_price_calls > 0
+    assert solution.stats.iterations < 800
+
+
 def test_sparse_lu_update_chain_matches_dense_reference():
     rng = np.random.default_rng(23)
     size = 18

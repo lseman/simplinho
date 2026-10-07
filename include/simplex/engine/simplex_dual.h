@@ -22,6 +22,7 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
         Eigen::VectorXd work_dual;
         Eigen::VectorXd row_price;
         Eigen::VectorXd reduced_cost;
+        std::vector<int> price_candidates;
         HVector pivot_row;
         HVector pivot_col;
         HVector flip_rhs;
@@ -332,15 +333,7 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
 
         auto apply_views_to_nonbasics = [&](const Eigen::VectorXd& ydual) {
             bool changed = false;
-            std::vector<char> inB(n, 0);
-            for (int j : basis)
-                if (j >= 0 && j < n)
-                    inB[j] = 1;
-
-            for (int j = 0; j < n; ++j) {
-                if (inB[j])
-                    continue;
-
+            for (const int j : N) {
                 const double raw_rc = c_work(j) - column_dot(A, j, ydual);
                 const bool has_l = (j < l.size()) && std::isfinite(l(j));
                 const bool has_u = (j < u.size()) && std::isfinite(u(j));
@@ -394,13 +387,18 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
             }
         }
 
-        auto rebuild_dual_pool = [&](const char* where,
-                                     int iter) -> std::optional<RevisedSimplex::PhaseResult> {
+        auto rebuild_dual_pool = [&](const char* where, int iter,
+                                     bool exact_weights = false)
+            -> std::optional<RevisedSimplex::PhaseResult> {
             if (std::getenv("SIMPLINHO_TRACE_POOL_REBUILDS"))
                 std::fprintf(stderr, "[poolrebuild] iter=%d where=%s\n", iter, where);
             try {
-                self.measure_pricing_build_(
-                    true, [&]() { dual_pricer.build_dual_pool(read_basis(), Ahat, N); });
+                self.measure_pricing_build_(true, [&]() {
+                    if (exact_weights)
+                        dual_pricer.rebuild_exact_dual_pool(read_basis(), Ahat, N);
+                    else
+                        dual_pricer.build_dual_pool(read_basis(), Ahat, N);
+                });
                 if (std::getenv("SIMPLINHO_TRACE_POOL_REBUILDS"))
                     std::fprintf(stderr, "[poolrebuild] strategy=%s\n",
                                  dual_pricer.current_strategy_name());
@@ -468,6 +466,10 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
         DualPricingTelemetry pricing_telemetry;
         Eigen::VectorXd rhs_eff = b - transformed_rhs(A, view, l, u);
         bool ydual_cached = false;
+        bool reduced_cost_cached = false;
+        int reduced_cost_cache_age = 0;
+        constexpr int reduced_cost_cache_max_age = 128;
+        bool views_reconciled = !warm_views_provided;
         Eigen::VectorXd ydual;
 
         auto attach_dual_pricing_info =
@@ -668,6 +670,7 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
         while (iters < self.opt_.max_iters) {
             ++iters;
             int flips_this_iter = 0;
+            const std::vector<int>* priced_candidates = nullptr;
 
             while (true) {
                 try {
@@ -697,6 +700,10 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
 
                 for (int i = 0; i < m; ++i)
                     work.base_cost(i) = chat(basis[i]);
+                if (reduced_cost_cache_age >= reduced_cost_cache_max_age) {
+                    ydual_cached = false;
+                    reduced_cost_cached = false;
+                }
                 if (!ydual_cached) {
                     try {
                         {
@@ -724,12 +731,22 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                     }
                 }
                 work.work_dual = ydual;
-
-                if (!(warm_views_provided && iters == 1) &&
-                    apply_views_to_nonbasics(work.work_dual)) {
-                    rhs_eff = b - transformed_rhs(A, view, l, u);
-                    yB_cache_valid = false; // rhs_eff recomputed from scratch
-                    continue;
+                if (!reduced_cost_cached) {
+                    work.reduced_cost = compute_nonbasic_duals_(Ahat, N, ydual, chat);
+                    reduced_cost_cached = true;
+                    reduced_cost_cache_age = 0;
+                }
+                // Respect a supplied warm bound view for the first dual
+                // iteration, then reconcile it once. Ordinary pivots and BFRT
+                // flips maintain the view/RC invariant incrementally.
+                if (!views_reconciled) {
+                    views_reconciled = true;
+                    if (apply_views_to_nonbasics(work.work_dual)) {
+                        rhs_eff = b - transformed_rhs(A, view, l, u);
+                        yB_cache_valid = false;
+                        reduced_cost_cached = false;
+                        continue;
+                    }
                 }
 
                 basic_leaving_infeasibility(work.base_value, yB_for_leaving,
@@ -744,7 +761,6 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                         ? leaving_row_sign[static_cast<std::size_t>(work.leaving_row)]
                         : 1;
                 if (work.leaving_row < 0) {
-                    work.reduced_cost = compute_nonbasic_duals_(Ahat, N, ydual, chat);
                     bool dual_feasible =
                         dual_feasible_nonbasics_(work.reduced_cost, self.opt_.tol);
                     // HiGHS-style cleanup (HEkkDual::cleanup()): this
@@ -762,6 +778,7 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                         }
                         costs_perturbed = false;
                         ydual_cached = false;
+                        reduced_cost_cached = false;
                         {
                             Eigen::VectorXd cB_clean(m);
                             for (int i = 0; i < m; ++i)
@@ -773,11 +790,14 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                             ydual_cached = true;
                         }
                         work.reduced_cost = compute_nonbasic_duals_(Ahat, N, ydual, chat);
+                        reduced_cost_cached = true;
+                        reduced_cost_cache_age = 0;
                         dual_feasible =
                             dual_feasible_nonbasics_(work.reduced_cost, self.opt_.tol);
                         if (!dual_feasible && apply_views_to_nonbasics(ydual)) {
                             rhs_eff = b - transformed_rhs(A, view, l, u);
                             yB_cache_valid = false;
+                            reduced_cost_cached = false;
                             continue;
                         }
                         if (auto failed = rebuild_dual_pool(
@@ -822,6 +842,7 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                                 const int j = basis[i];
                                 chat(j) = view_sign(view[j]) > 0 ? c_work(j) : -c_work(j);
                             }
+                            reduced_cost_cached = false;
                             self.trace_line_("[dual] cost-shift Phase 1 applied, refactoring");
                             try {
                                 refactor_basis();
@@ -874,28 +895,35 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                                                           local_row_ep_density > 0.10)));
                     pricing_telemetry.record_price_mode(use_column_price);
                     if (use_column_price) {
-                        if (self.opt_.parallel_pricing_workers > 1 &&
-                            static_cast<int>(N.size()) >=
-                                std::max(1, self.opt_.parallel_pricing_min_cols)) {
-                            compute_pricing_products_parallel(
-                                Ahat, N, work.pivot_row, ydual, chat, work.row_price,
-                                work.reduced_cost, self.opt_.parallel_pricing_workers,
-                                self.opt_.parallel_pricing_min_cols);
-                        } else {
-                            compute_pricing_products_by_column(
-                                Ahat, N, work.pivot_row, ydual, chat, work.row_price,
-                                work.reduced_cost);
-                        }
+                        compute_row_price_parallel(
+                            Ahat, N, work.pivot_row, work.row_price,
+                            self.opt_.parallel_pricing_workers,
+                            self.opt_.parallel_pricing_min_cols);
+                        work.price_candidates.clear();
+                        work.price_candidates.reserve(N.size());
+                        for (int k = 0; k < static_cast<int>(N.size()); ++k)
+                            if (work.row_price(k) != 0.0)
+                                work.price_candidates.push_back(k);
                     } else {
-                        compute_pricing_products(Ahat, *Ahat_row, N, work.pivot_row, ydual, chat,
-                                                 work.row_price, work.reduced_cost);
+                        compute_row_price(Ahat, *Ahat_row, N, work.pivot_row, work.row_price,
+                                          &work.price_candidates);
                     }
+                    // The sparse row/column product visited every structural
+                    // nonzero that can contribute to A_N^T pi. Unlisted
+                    // columns therefore have a certified zero pivot-row
+                    // coefficient and cannot enter the ratio test.
+                    priced_candidates = &work.price_candidates;
                 } else {
                     pricing_telemetry.record_price_mode(true);
-                    compute_pricing_products(Ahat, N, work.pivot_row, ydual, chat, work.row_price,
-                                             work.reduced_cost);
+                    compute_row_price(Ahat, N, work.pivot_row.value, work.row_price);
+                    priced_candidates = nullptr;
                 }
-                DualPricingTelemetry::update_density(vector_density(work.row_price, self.opt_.tol),
+                const double local_row_ap_density =
+                    priced_candidates
+                        ? static_cast<double>(priced_candidates->size()) /
+                              std::max<std::size_t>(1, N.size())
+                        : vector_density(work.row_price, self.opt_.tol);
+                DualPricingTelemetry::update_density(local_row_ap_density,
                                                      pricing_telemetry.row_ap_density);
 
                 dual_bfrt_decide(self.opt_, work.reduced_cost, work.row_price, N, view, l, u,
@@ -904,7 +932,7 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                                      ? (adaptive_flip_budget - flips_this_iter)
                                      : 0,
                                  read_basis().update_count(), work.bfrt_workspace,
-                                 work.bfrt_decision);
+                                 work.bfrt_decision, priced_candidates);
                 const DualBFRTDecision& bfrt = work.bfrt_decision;
                 if (!bfrt.pivot_rel) {
                     if (rebuild_attempts < self.opt_.max_basis_rebuilds) {
@@ -1031,19 +1059,19 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                                                            work.entering_col)) {
                     int alt_rel = -1;
                     double alt_tau = std::numeric_limits<double>::infinity();
-                    for (int k = 0; k < static_cast<int>(N.size()); ++k) {
+                    auto consider_alternative = [&](int k) {
                         if (k == work.entering_rel ||
                             !(work.row_price(k) < -self.opt_.ratio_delta)) {
-                            continue;
+                            return;
                         }
                         const double candidate_tau = work.reduced_cost(k) / (-work.row_price(k));
                         if (!std::isfinite(candidate_tau) || candidate_tau < 0.0) {
-                            continue;
+                            return;
                         }
                         const int candidate_abs = N[k];
                         if (self.degen_.would_repeat_basis_change(basis, work.leaving_row,
                                                                   candidate_abs)) {
-                            continue;
+                            return;
                         }
                         if (candidate_tau < alt_tau - 1e-16 ||
                             (std::abs(candidate_tau - alt_tau) <= 1e-16 &&
@@ -1051,6 +1079,13 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                             alt_rel = k;
                             alt_tau = candidate_tau;
                         }
+                    };
+                    if (priced_candidates) {
+                        for (const int k : *priced_candidates)
+                            consider_alternative(k);
+                    } else {
+                        for (int k = 0; k < static_cast<int>(N.size()); ++k)
+                            consider_alternative(k);
                     }
                     if (alt_rel >= 0) {
                         work.entering_rel = alt_rel;
@@ -1186,6 +1221,7 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                     }
                     costs_perturbed = true;
                     ydual_cached = false;
+                    reduced_cost_cached = false;
                 }
             } else {
                 // Only clear costs that this reactive branch itself applied.
@@ -1203,6 +1239,7 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                     }
                     costs_perturbed = false;
                     ydual_cached = false;
+                    reduced_cost_cached = false;
                 }
                 (void)self.degen_.reset_perturbation();
             }
@@ -1247,10 +1284,17 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
             // Reuse that priced row instead of repeating one sparse column
             // dot product for every nonbasic variable here.
             const double raw_row_sign = static_cast<double>(work.leaving_sign);
-            for (int k = 0; k < static_cast<int>(N.size()); ++k) {
+            auto update_reduced_cost = [&](int k) {
                 if (k == work.entering_rel)
-                    continue;
+                    return;
                 work.reduced_cost(k) -= alpha * raw_row_sign * work.row_price(k);
+            };
+            if (priced_candidates) {
+                for (const int k : *priced_candidates)
+                    update_reduced_cost(k);
+            } else {
+                for (int k = 0; k < static_cast<int>(N.size()); ++k)
+                    update_reduced_cost(k);
             }
             basis[work.leaving_row] = work.entering_col;
             N[work.entering_rel] = oldAbs;
@@ -1291,6 +1335,7 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                 view[oldAbs] = leaving_current_view;
             }
             work.reduced_cost(work.entering_rel) = chat(oldAbs) - column_dot(Ahat, oldAbs, ydual);
+            ++reduced_cost_cache_age;
 
             // NLA framework switch check — rebuild if Devex weight errors accumulate
             if (nla->needs_framework_rebuild()) {
@@ -1347,10 +1392,11 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                             N.push_back(j);
 
                     ydual_cached = false;
+                    reduced_cost_cached = false;
                     yB_cache_valid = false; // basis and rhs_eff both changed
                     rhs_eff = b - transformed_rhs(A, view, l, u);
                     if (auto failed = rebuild_dual_pool(
-                            "dual pricing rebuild failed after backtrack", iters)) {
+                            "dual pricing rebuild failed after backtrack", iters, true)) {
                         return *failed;
                     }
                     backtracked_this_iter = true;
@@ -1511,6 +1557,7 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
                 basis[sub_r] = sub_eAbs;
                 N[sub_e_rel] = sub_oldAbs;
                 ydual_cached = false;
+                reduced_cost_cached = false;
 
                 try {
                     update_basis_with_transforms(sub_r, sub_eAbs, Ahat.col(sub_eAbs), sub_s.value,

@@ -53,6 +53,21 @@ inline double edge_weight_from_direction(const Eigen::VectorXd& direction,
     return dense_weight;
 }
 
+// Dual steepest-edge weights are ||B^-T e_i||^2.  Unlike a primal entering
+// direction, the dual row already includes every component of the edge, so
+// adding a separate unit component biases even a logical basis from 1 to 2.
+inline double dual_edge_weight_from_direction(const Eigen::VectorXd& direction,
+                                              const std::string& strategy) {
+    const double dense_weight = direction.squaredNorm();
+    if (strategy == "diagonal") {
+        return direction.cwiseAbs().sum();
+    }
+    if (strategy == "dense_diagonal" || strategy == "hybrid") {
+        return 0.5 * (dense_weight + direction.cwiseAbs().sum());
+    }
+    return dense_weight;
+}
+
 // Column FTRAN/BTRAN that preserves sparsity when A is a CSC sparse matrix.
 // Dense A paths fall through to the generic solve_B/solve_BT with a dense column.
 template <class BasisLike, class MatrixLike>
@@ -816,9 +831,29 @@ class DualSteepestEdgePricer {
         // update_after_dual_pivot. Unit weights are exact for a logical basis
         // and the standard safe start otherwise (HEkkDual prefers switching to
         // Devex over paying m BTRANs to make a non-logical start exact).
-        row_weights_.assign(static_cast<std::size_t>(A.rows()), 1.0);
+        // Refactorization and cost cleanup do not change the basis, so the
+        // maintained weights remain valid. Resetting them to one here turns a
+        // non-logical basis into a false DSE framework.
+        if (row_weights_.size() != static_cast<std::size_t>(A.rows()))
+            row_weights_.assign(static_cast<std::size_t>(A.rows()), 1.0);
         iter_count_ = 0;
         need_rebuild_ = false;
+    }
+
+    template <class BasisLike, class MatrixLike>
+    void build_exact_dual_pool(const BasisLike& B, const MatrixLike& A,
+                               const std::vector<int>& N) {
+        (void)N;
+        row_weights_.resize(static_cast<std::size_t>(A.rows()));
+        for (int i = 0; i < A.rows(); ++i) {
+            const HVector psi = B.solve_BT_unit(i);
+            row_weights_[static_cast<std::size_t>(i)] =
+                std::max(kMinDseWeight, pricing_detail::dual_edge_weight_from_direction(
+                                                psi.value, weight_strategy_));
+        }
+        iter_count_ = 0;
+        need_rebuild_ = false;
+        clear_weight_error_stats();
     }
 
     template <class BasisLike>
@@ -861,7 +896,7 @@ class DualSteepestEdgePricer {
             // far the recurrence had drifted.
             const double exact_w =
                 std::max(kMinDseWeight,
-                         pricing_detail::edge_weight_from_direction(
+                         pricing_detail::dual_edge_weight_from_direction(
                              best.dual_row.value, weight_strategy_));
             if (best.row < (int)row_weights_.size()) {
                 const double stored = row_weights_[static_cast<std::size_t>(best.row)];
@@ -1244,7 +1279,8 @@ class DualRowPricer {
             // Always compute the dual row for the leaving row
             best.dual_row = B.solve_BT_unit(best.row);
             best.weight = std::max(
-                1.0, pricing_detail::edge_weight_from_direction(best.dual_row, weight_strategy_));
+                1.0,
+                pricing_detail::dual_edge_weight_from_direction(best.dual_row, weight_strategy_));
         }
 
         return best;
@@ -1257,7 +1293,8 @@ class DualRowPricer {
         for (int i = 0; i < A.rows(); ++i) {
             const Eigen::VectorXd psi_i = B_inv.solve_BT_unit(i);
             row_weights_[i] =
-                std::max(1.0, pricing_detail::edge_weight_from_direction(psi_i, weight_strategy_));
+                std::max(1.0,
+                         pricing_detail::dual_edge_weight_from_direction(psi_i, weight_strategy_));
         }
         iter_count_ = 0;
     }
@@ -1359,23 +1396,33 @@ class DualAdaptivePricer {
         : requested_rule_(std::move(pricing_rule)), partial_pricing_enabled_(partial_pricing),
           dual_pricing_preference_(std::move(dual_pricing)),
           row_pricing_threshold_(row_pricing_threshold),
-          steepest_pricer_(0, steepest_reset_frequency, dual_edge_weight_strategy,
+          // Exact DSE weights are maintained and checked incrementally. A
+          // periodic unit-weight reset on a non-logical basis destroys that
+          // framework, so only explicit numerical-error recovery may rebuild
+          // it. Keep the constructor argument for primal/API compatibility.
+          steepest_pricer_(0, 0, dual_edge_weight_strategy,
                            dual_weight_log_error_threshold),
           devex_pricer_(0.99, devex_reset_frequency),
           row_pricer_(devex_reset_frequency, row_pricing_threshold, dual_edge_weight_strategy),
           dual_weight_log_error_threshold_(dual_weight_log_error_threshold),
           warm_start_near_optimal_(warm_start_near_optimal),
-          warm_start_near_optimal_nonlogical_basis_(warm_start_near_optimal_nonlogical_basis) {}
+          warm_start_near_optimal_nonlogical_basis_(warm_start_near_optimal_nonlogical_basis) {
+        (void)steepest_reset_frequency;
+    }
 
     template <class BasisLike, class MatrixLike>
     void build_dual_pool(const BasisLike& B, const MatrixLike& A, const std::vector<int>& N) {
+        const bool initializing = !framework_initialized_;
         if (!framework_initialized_) {
             active_rule_ = select_rule_(A, N, A.rows());
             framework_initialized_ = true;
         }
         if (active_rule_ == Rule::SteepestEdge) {
             steepest_pricer_.clear_weight_error_stats();
-            steepest_pricer_.build_dual_pool(B, A, N);
+            if (initializing && warm_start_near_optimal_nonlogical_basis_)
+                steepest_pricer_.build_exact_dual_pool(B, A, N);
+            else
+                steepest_pricer_.build_dual_pool(B, A, N);
             devex_pricer_.clear_rebuild_flag();
             row_pricer_.clear_rebuild_flag();
         } else if (active_rule_ == Rule::Devex) {
@@ -1391,6 +1438,16 @@ class DualAdaptivePricer {
             devex_pricer_.clear_rebuild_flag();
             row_pricer_.clear_rebuild_flag();
         }
+        need_rebuild_ = false;
+    }
+
+    template <class BasisLike, class MatrixLike>
+    void rebuild_exact_dual_pool(const BasisLike& B, const MatrixLike& A,
+                                 const std::vector<int>& N) {
+        if (active_rule_ == Rule::SteepestEdge)
+            steepest_pricer_.build_exact_dual_pool(B, A, N);
+        else
+            build_dual_pool(B, A, N);
         need_rebuild_ = false;
     }
 
@@ -1722,12 +1779,26 @@ class AdaptivePricer {
         return std::nullopt;
     }
 
-    // Build pools for all (cheap; preserves API)
+    // Build only the active pricing framework.  In particular, a Devex solve
+    // must not build the steepest-edge pool: that pool stores B^-1 a_j for
+    // every nonbasic column, so constructing it costs one FTRAN per column
+    // even though Devex never reads it.  A strategy change calls this method
+    // again after updating current_strategy_, which lazily initializes the
+    // newly selected framework.
     template <typename BasisLike, typename MatrixLike>
     void build_primal_pools(const BasisLike& basis, const MatrixLike& A,
                             const std::vector<int>& N) {
-        steepest_pricer_.build_primal_pool(basis, A, N);
-        devex_pricer_.build_primal_pool(basis, A, N);
+        switch (current_strategy_) {
+            case STEEPEST_EDGE:
+                steepest_pricer_.build_primal_pool(basis, A, N);
+                break;
+            case DEVEX:
+                devex_pricer_.build_primal_pool(basis, A, N);
+                break;
+            case PARTIAL_PRICING:
+            case MOST_NEGATIVE:
+                break;
+        }
     }
 
     bool apply_preferred_strategy(std::optional<PricingStrategy> preferred_strategy) {
@@ -1746,13 +1817,23 @@ class AdaptivePricer {
     template <typename MatrixLike>
     void update_after_primal_pivot(int leaving_rel, int entering_abs, int old_abs,
                                    const Eigen::VectorXd& pivot_column,
-                                   const Eigen::VectorXd& pivot_row, double alpha,
-                                   double step_size, const MatrixLike& A,
-                                   const std::vector<int>& basis, const std::vector<int>& N) {
-        steepest_pricer_.update_after_primal_pivot(leaving_rel, entering_abs, old_abs, pivot_column,
-                                                   alpha, A, N, true);
-        devex_pricer_.update_after_primal_pivot(leaving_rel, entering_abs, old_abs, pivot_column,
-                                                pivot_row, alpha, A, basis, N, true);
+                                   const Eigen::VectorXd& pivot_row, double alpha, double step_size,
+                                   const MatrixLike& A, const std::vector<int>& basis,
+                                   const std::vector<int>& N) {
+        switch (current_strategy_) {
+            case STEEPEST_EDGE:
+                steepest_pricer_.update_after_primal_pivot(leaving_rel, entering_abs, old_abs,
+                                                           pivot_column, alpha, A, N, true);
+                break;
+            case DEVEX:
+                devex_pricer_.update_after_primal_pivot(leaving_rel, entering_abs, old_abs,
+                                                        pivot_column, pivot_row, alpha, A, basis, N,
+                                                        true);
+                break;
+            case PARTIAL_PRICING:
+            case MOST_NEGATIVE:
+                break;
+        }
 
         if ((int)performance_history_.size() >= options_.performance_window)
             performance_history_.pop_front();

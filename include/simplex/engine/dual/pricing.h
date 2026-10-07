@@ -3,6 +3,8 @@
 #include "simplex/core/thread_pool.h"
 #include "simplex/engine/dual/bounds.h"
 
+#include <numeric>
+
 namespace simplex::engine {
 
 class DualPricingOperations : public DualBoundModel {
@@ -11,6 +13,8 @@ class DualPricingOperations : public DualBoundModel {
         std::vector<int> rel_of_col;
         std::vector<unsigned int> marks;
         unsigned int stamp = 1;
+        std::vector<unsigned int> rel_marks;
+        unsigned int rel_stamp = 1;
 
         void prepare(int num_cols, const std::vector<int>& nonbasis) {
             if (static_cast<int>(rel_of_col.size()) < num_cols) {
@@ -34,6 +38,23 @@ class DualPricingOperations : public DualBoundModel {
             return col >= 0 && col < static_cast<int>(marks.size()) && marks[col] == stamp
                        ? rel_of_col[col]
                        : -1;
+        }
+
+        void begin_rel_pattern(int size) {
+            if (static_cast<int>(rel_marks.size()) < size)
+                rel_marks.resize(size, 0);
+            if (++rel_stamp == 0) {
+                std::fill(rel_marks.begin(), rel_marks.end(), 0);
+                rel_stamp = 1;
+            }
+        }
+
+        bool mark_rel(int rel) {
+            if (rel < 0 || rel >= static_cast<int>(rel_marks.size()) ||
+                rel_marks[static_cast<std::size_t>(rel)] == rel_stamp)
+                return false;
+            rel_marks[static_cast<std::size_t>(rel)] = rel_stamp;
+            return true;
         }
     };
 
@@ -121,9 +142,14 @@ class DualPricingOperations : public DualBoundModel {
                                   const SparseRowMatrix& row_matrix,
                                   const std::vector<int>& nonbasis,
                                   const HVector& pivot_row,
-                                  Eigen::VectorXd& row_price) {
+                                  Eigen::VectorXd& row_price,
+                                  std::vector<int>* candidate_rels = nullptr) {
         if (!pivot_row.has_pattern()) {
             row_price.resize(nonbasis.size());
+            if (candidate_rels) {
+                candidate_rels->resize(nonbasis.size());
+                std::iota(candidate_rels->begin(), candidate_rels->end(), 0);
+            }
             for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k) {
                 double price = 0.0;
                 for (RevisedSimplex::SparseMatrix::InnerIterator it(Ahat, nonbasis[k]); it; ++it)
@@ -132,9 +158,14 @@ class DualPricingOperations : public DualBoundModel {
             }
             return;
         }
-        row_price = Eigen::VectorXd::Zero(nonbasis.size());
+        row_price.resize(nonbasis.size());
         thread_local SparsePricingWorkspace workspace;
         workspace.prepare(Ahat.cols(), nonbasis);
+        workspace.begin_rel_pattern(static_cast<int>(nonbasis.size()));
+        if (candidate_rels) {
+            candidate_rels->clear();
+            candidate_rels->reserve(static_cast<std::size_t>(pivot_row.count) * 4);
+        }
         for (int k = 0; k < pivot_row.count; ++k) {
             const int row = pivot_row.index[k];
             if (row < 0 || row >= row_matrix.rows())
@@ -144,8 +175,14 @@ class DualPricingOperations : public DualBoundModel {
                 continue;
             for (SparseRowMatrix::InnerIterator it(row_matrix, row); it; ++it) {
                 const int rel = workspace.lookup(it.col());
-                if (rel >= 0)
+                if (rel >= 0) {
+                    if (workspace.mark_rel(rel)) {
+                        row_price(rel) = 0.0;
+                        if (candidate_rels)
+                            candidate_rels->push_back(rel);
+                    }
                     row_price(rel) += value * it.value();
+                }
             }
         }
     }
@@ -221,6 +258,32 @@ class DualPricingOperations : public DualBoundModel {
                 price += it.value() * pivot_row(it.row());
             row_price(k) = price;
         }
+    }
+
+    static void compute_row_price_parallel(const RevisedSimplex::SparseMatrix& Ahat,
+                                           const std::vector<int>& nonbasis,
+                                           const HVector& pivot_row,
+                                           Eigen::VectorXd& row_price, int workers,
+                                           int min_cols) {
+        const int total = static_cast<int>(nonbasis.size());
+        workers = std::max(1, workers);
+        if (workers <= 1 || total < std::max(1, min_cols)) {
+            compute_row_price_by_column(Ahat, nonbasis, pivot_row, row_price);
+            return;
+        }
+        row_price.resize(total);
+        const int worker_count = std::min(workers, total);
+        auto worker_fn = [&](int tid) {
+            const int begin = tid * total / worker_count;
+            const int end = (tid + 1) * total / worker_count;
+            for (int k = begin; k < end; ++k) {
+                double price = 0.0;
+                for (RevisedSimplex::SparseMatrix::InnerIterator it(Ahat, nonbasis[k]); it; ++it)
+                    price += it.value() * pivot_row(it.row());
+                row_price(k) = price;
+            }
+        };
+        ThreadPool::instance().submit(worker_count, std::move(worker_fn));
     }
 
     static void compute_pricing_products_parallel(

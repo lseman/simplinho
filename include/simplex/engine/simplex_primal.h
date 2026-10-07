@@ -312,6 +312,8 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
         };
 
         int rebuild_attempts = 0;
+        IterationWork work;
+        work.base_cost.resize(m);
 
         // ── Incremental xB (primal basic solution) cache ─────────────────────
         // Avoids re-solving B·xB = rhs_eff from scratch each iteration. After a
@@ -333,6 +335,51 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
         };
         refresh_xB_cache(); // prime before the loop
 
+        // Maintain y = B^-T c_B and reduced costs across ordinary pivots.
+        // With z = B^-T e_r and theta = r_e / (e_r^T B^-1 a_e),
+        //
+        //   y_new   = y + theta z
+        //   r_j_new = r_j - theta a_j^T z.
+        //
+        // Recomputing y and every reduced cost at the top of every iteration
+        // used a second BTRAN per pivot.  Refresh periodically, and whenever
+        // costs or recovery logic invalidate the recurrence, to bound
+        // floating-point drift.
+        Eigen::VectorXd reduced_cost_by_col = Eigen::VectorXd::Zero(n);
+        bool dual_cache_valid = false;
+        int dual_cache_age = 0;
+        constexpr int dual_cache_max_age = 128;
+        auto refresh_dual_cache = [&]() {
+            for (int i = 0; i < m; ++i)
+                work.base_cost(i) = c_work(basis[i]);
+            HVector y_hvec = read_basis().solve_BT(work.base_cost, FTBasis::TranKind::RowEp);
+            work.work_dual = y_hvec.value;
+            nla->update_ema_reach(y_hvec.count, m);
+            for (int j : basis)
+                reduced_cost_by_col(j) = 0.0;
+            for (int j : N)
+                reduced_cost_by_col(j) = c_work(j) - A.col(j).dot(work.work_dual);
+            dual_cache_valid = true;
+            dual_cache_age = 0;
+        };
+        auto load_reduced_cost_view = [&]() {
+            work.reduced_cost.resize(N.size());
+            work.entering_measure.resize(N.size());
+            for (int k = 0; k < static_cast<int>(N.size()); ++k) {
+                const int j = N[k];
+                const double raw = reduced_cost_by_col(j);
+                work.reduced_cost(k) = raw;
+                const int move = nonbasic_move_(j, at_upper, l_work, u_work, self.opt_.tol);
+                if (move == 0) {
+                    const bool fixed = std::isfinite(l_work(j)) && std::isfinite(u_work(j)) &&
+                                       u_work(j) - l_work(j) <= self.opt_.tol;
+                    work.entering_measure(k) = fixed ? 0.0 : -std::abs(raw);
+                } else {
+                    work.entering_measure(k) = move * raw;
+                }
+            }
+        };
+
         auto rebuild_pricing = [&]() {
             if (self.opt_.pricing_rule == "adaptive") {
                 self.measure_pricing_build_(
@@ -346,6 +393,7 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
             if (costs_perturbed) {
                 c_work = c;
                 costs_perturbed = false;
+                dual_cache_valid = false;
             }
             if (bounds_perturbed) {
                 l_work = l;
@@ -395,8 +443,6 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
                                                dm_stats_to_map(self.degen_.get_stats())};
         };
 
-        IterationWork work;
-        work.base_cost.resize(m);
         while (iters < self.opt_.max_iters) {
             ++iters;
 
@@ -467,29 +513,19 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
                          {"at_upper_count", std::to_string(at_upper_count)}}};
             }
 
-            for (int i = 0; i < m; ++i)
-                work.base_cost(i) = c_work(basis[i]);
-
-            HVector y_hvec;
             try {
-                y_hvec = read_basis().solve_BT(work.base_cost, FTBasis::TranKind::RowEp);
-                nla->update_ema_reach(y_hvec.count, m);
+                if (!dual_cache_valid || dual_cache_age >= dual_cache_max_age)
+                    refresh_dual_cache();
             } catch (...) {
                 self.trace_line_("[primal] iter=" + std::to_string(iters) +
                                  " refactor after solve_BT failure");
                 refactor_basis();
                 xB_cache_valid = false;
-                y_hvec = read_basis().solve_BT(work.base_cost, FTBasis::TranKind::RowEp);
-                nla->update_ema_reach(y_hvec.count, m);
+                dual_cache_valid = false;
+                refresh_dual_cache();
                 rebuild_pricing();
             }
-            work.work_dual = y_hvec.value;
-            ReducedCostView rc_view{std::move(work.reduced_cost),
-                                    std::move(work.entering_measure)};
-            compute_reduced_costs_(A, c_work, work.work_dual, N, at_upper, l_work, u_work,
-                                   self.opt_.tol, rc_view);
-            work.reduced_cost = std::move(rc_view.raw);
-            work.entering_measure = std::move(rc_view.entering_measure);
+            load_reduced_cost_view();
 
             // CHUZC: choose the entering nonbasic column.
             if (self.opt_.bland) {
@@ -654,6 +690,7 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
                     degeneracy_helpers::perturbCosts(c_work, self.rng_, rel_multiplier);
                     degeneracy_helpers::perturbCostsAbsolute(c_work, self.rng_, abs_multiplier);
                     costs_perturbed = true;
+                    dual_cache_valid = false;
                 }
                 // Bound perturbation (HiGHS-style): shift bounds that are
                 // violated by the current basic solution outward so the iterate
@@ -669,6 +706,7 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
                 if (costs_perturbed) {
                     c_work = c;
                     costs_perturbed = false;
+                    dual_cache_valid = false;
                 }
                 if (bounds_perturbed) {
                     l_work = l;
@@ -685,6 +723,16 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
                 const double rc_impr = -work.entering_measure(idxN);
                 self.bridge_->after_primal_pivot(r, eAbs, oldAbs, dB, row_ep.value, alpha, step, A,
                                                  basis, N, rc_impr, is_degenerate);
+            }
+
+            if (dual_cache_valid) {
+                const double theta = rc_e / alpha;
+                work.work_dual.noalias() += theta * row_ep.value;
+                for (const int j : N)
+                    reduced_cost_by_col(j) -= theta * A.col(j).dot(row_ep.value);
+                reduced_cost_by_col(eAbs) = 0.0;
+                reduced_cost_by_col(oldAbs) = c_work(oldAbs) - A.col(oldAbs).dot(work.work_dual);
+                ++dual_cache_age;
             }
 
             // UPDATE: apply the accepted basis change and maintain work arrays.
@@ -725,6 +773,7 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
                 refactor_basis();
                 nla->clear_framework_rebuild();
                 xB_cache_valid = false;
+                dual_cache_valid = false;
                 rebuild_pricing();
                 continue;
             }
@@ -747,6 +796,7 @@ class RevisedSimplexPrimalEngine : public simplex::engine::PrimalPivotSelection,
                                  " refactor after replace_column failure");
                 refactor_basis();
                 xB_cache_valid = false;
+                dual_cache_valid = false;
                 rebuild_pricing();
             }
 

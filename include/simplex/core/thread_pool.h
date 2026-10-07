@@ -44,24 +44,27 @@ class ThreadPool {
             buckets[i % thread_count()].push_back(i);
         }
 
-        // Launch one task per worker that has work.
-        std::atomic<int> done{0};
+        // Count before launching: workers may finish as soon as their queue is
+        // notified, so the barrier counter must be fully initialized first.
         int active = 0;
+        for (int t = 0; t < thread_count(); ++t) {
+            if (!buckets[t].empty())
+                ++active;
+        }
+        std::atomic<int> done{active};
+
+        // Launch one task per worker that has work.
         for (int t = 0; t < thread_count(); ++t) {
             if (buckets[t].empty())
                 continue;
-            ++active;
-            workers_[t].push([this, bucket = std::move(buckets[t]), &worker, &done, &active]() {
+            workers_[t].push([this, bucket = std::move(buckets[t]), &worker, &done]() {
                 for (int idx : bucket)
                     worker(idx);
                 if (done.fetch_sub(1, std::memory_order_acq_rel) == 1)
                     barrier_cv_.notify_all();
             });
+            workers_[t].notify_one();
         }
-
-        // If only one worker had tasks, it ran inline above — done already reached 0.
-        if (active <= 1 && done.load(std::memory_order_acquire) == 0)
-            return;
 
         // Wait for all workers to finish.
         std::unique_lock<std::mutex> lock(barrier_mutex_);

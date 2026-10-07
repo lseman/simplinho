@@ -37,31 +37,42 @@ class DualRatioTest : public BoundUtilities {
 
     static DualChoose dual_harris_choose(const Eigen::VectorXd& rN, const Eigen::VectorXd& pN,
                                          double delta, double eta,
-                                         double pivot_threshold = 0.0) {
+                                         double pivot_threshold = 0.0,
+                                         const std::vector<int>* candidate_rels = nullptr) {
         const double eligibility = std::max(delta, pivot_threshold);
         double tau_star = std::numeric_limits<double>::infinity();
-        for (int k = 0; k < pN.size(); ++k) {
+        auto scan = [&](auto&& visit) {
+            if (candidate_rels) {
+                for (const int k : *candidate_rels)
+                    if (k >= 0 && k < pN.size())
+                        visit(k);
+            } else {
+                for (int k = 0; k < pN.size(); ++k)
+                    visit(k);
+            }
+        };
+        scan([&](int k) {
             if (pN(k) < -eligibility)
                 tau_star = std::min(tau_star, rN(k) / -pN(k));
-        }
+        });
         if (!std::isfinite(tau_star))
             return {};
         const double window = std::max(eta, eta * std::abs(tau_star));
 
         int best = -1;
         double best_pivot = 0.0;
-        for (int k = 0; k < pN.size(); ++k) {
+        scan([&](int k) {
             if (!(pN(k) < -eligibility))
-                continue;
+                return;
             if (rN(k) / -pN(k) > tau_star + window)
-                continue;
+                return;
             const double pivot = std::abs(pN(k));
             if (best < 0 || pivot > best_pivot + 1e-16 ||
                 (std::abs(pivot - best_pivot) <= 1e-16 && k < best)) {
                 best = k;
                 best_pivot = pivot;
             }
-        }
+        });
         if (best < 0)
             return {};
         return {best, std::max(0.0, rN(best) / -pN(best))};
@@ -72,7 +83,7 @@ class DualRatioTest : public BoundUtilities {
         const Eigen::VectorXd& pN, const std::vector<int>& nonbasis,
         const std::vector<BoundView>& view, const Eigen::VectorXd& l, const Eigen::VectorXd& u,
         double primal_delta, int max_flips, int basis_update_count, DualBFRTWorkspace& workspace,
-        DualBFRTDecision& out) {
+        DualBFRTDecision& out, const std::vector<int>* candidate_rels = nullptr) {
         out.pivot_rel.reset();
         out.tau = std::numeric_limits<double>::infinity();
         out.flip_rels.clear();
@@ -81,7 +92,7 @@ class DualRatioTest : public BoundUtilities {
                                                                  : 1e-6;
         const double eligibility = std::max(options.ratio_delta, pivot_threshold);
         const DualChoose harris = dual_harris_choose(
-            rN, pN, options.ratio_delta, options.ratio_eta, pivot_threshold);
+            rN, pN, options.ratio_delta, options.ratio_eta, pivot_threshold, candidate_rels);
         out.pivot_rel = harris.e_rel;
         out.tau = harris.tau;
         if (!harris.e_rel || !std::isfinite(harris.tau) || max_flips <= 0 ||
@@ -91,17 +102,26 @@ class DualRatioTest : public BoundUtilities {
 
         auto& candidates = workspace.candidates;
         candidates.clear();
-        candidates.reserve(nonbasis.size());
-        for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k) {
+        candidates.reserve(candidate_rels ? candidate_rels->size() : nonbasis.size());
+        auto add_candidate = [&](int k) {
+            if (k < 0 || k >= static_cast<int>(nonbasis.size()))
+                return;
             if (!(pN(k) < -eligibility))
-                continue;
+                return;
             const int j = nonbasis[k];
             if (view[j] == BoundView::Fixed)
-                continue;
+                return;
             const double alpha = -pN(k);
             const double dual = std::max(0.0, rN(k));
             if (std::isfinite(alpha) && std::isfinite(dual))
                 candidates.push_back({k, alpha, dual, bound_range(j, l, u)});
+        };
+        if (candidate_rels) {
+            for (const int k : *candidate_rels)
+                add_candidate(k);
+        } else {
+            for (int k = 0; k < static_cast<int>(nonbasis.size()); ++k)
+                add_candidate(k);
         }
         if (candidates.empty())
             return;

@@ -172,8 +172,10 @@ struct RevisedSimplexOptions {
     int row_pricing_threshold = 40;      // switch if row density < this
     std::string primal_edge_weight_strategy =
         "dense_diagonal"; // "dense" | "diagonal" | "dense_diagonal"
+    // Exact DSE uses ||B^-T e_i||^2. Approximate diagonal/hybrid weights are
+    // available explicitly, but do not satisfy the Forrest-Goldfarb update.
     std::string dual_edge_weight_strategy =
-        "dense_diagonal";           // "dense" | "diagonal" | "dense_diagonal"
+        "dense";                    // "dense" | "diagonal" | "dense_diagonal"
     // 0 selects a dimension-adaptive BFRT budget (4 for small bases, 16 for
     // larger ones); positive values force an explicit cap.
     int dual_flip_max_per_iter = 0;
