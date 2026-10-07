@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 
 #include "bnb_bindings.h"
+#include "bindings.h"
 
 #ifndef SIMPLEX_PROJECT_VERSION
 #    define SIMPLEX_PROJECT_VERSION "unknown"
@@ -15,4 +16,7 @@ PYBIND11_MODULE(simplinho_bnb, module) {
     module.doc() = "Branch-and-bound bindings built on top of simplinho";
     module.attr("__version__") = SIMPLEX_PROJECT_VERSION;
     bind_bnb_bindings(module);
+#ifdef SIMPLEX_ENABLE_BNB
+    bind_bnb_branching_policy(module);
+#endif
 }

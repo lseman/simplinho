@@ -199,9 +199,11 @@ if(SIMPLEX_ENABLE_BNB)
     set(BNB_SOURCES
         src/bnb/async_heuristic_manager.cpp
         src/bnb/branching.cpp
+        src/bnb/branching_policy.cpp
         src/bnb/conflict_engine.cpp
         src/bnb/core.cpp
         src/bnb/cuts.cpp
+        src/bnb/default_branching_policy.cpp
         src/bnb/diving.cpp
         src/bnb/heuristic.cpp
         src/bnb/mip_presolve.cpp
@@ -264,6 +266,11 @@ target_link_libraries(simplinho PRIVATE
     Threads::Threads
 )
 
+if(SIMPLEX_ENABLE_BNB)
+    target_compile_definitions(simplinho PUBLIC SIMPLEX_ENABLE_BNB)
+    target_link_libraries(simplinho PRIVATE bnb::core)
+endif()
+
 if(SIMPLEX_ENABLE_UNITY_BUILD)
     set_target_properties(simplinho PROPERTIES
         UNITY_BUILD ON
@@ -295,8 +302,10 @@ if(SIMPLEX_ENABLE_BNB)
     pybind11_add_module(simplinho_bnb
         bindings/bnb_module.cpp
         bindings/bnb_bindings.cpp
+        bindings/bnb_branching_policy_bindings.cpp
     )
     target_compile_features(simplinho_bnb PRIVATE cxx_std_23)
+    target_compile_definitions(simplinho_bnb PUBLIC SIMPLEX_ENABLE_BNB)
     target_link_libraries(simplinho_bnb PRIVATE bnb::core pybind11::module)
     simplinho_apply_module_link_flags(simplinho_bnb)
 endif()

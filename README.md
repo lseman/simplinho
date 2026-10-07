@@ -4,16 +4,41 @@
 
 # simplinho
 
-`simplinho` is an experimental C++23 revised-simplex solver with Python
-bindings. It is designed for fast repeated bounded LP solves, warm starts,
+[![PyPI version](https://img.shields.io/pypi/v/simplinho.svg)](https://pypi.org/project/simplinho/)
+[![Python](https://img.shields.io/pypi/pyversions/simplinho.svg)](https://pypi.org/project/simplinho/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://isocpp.org/)
+
+`simplinho` (v0.1.0) is an experimental C++23 revised-simplex LP solver with
+Python bindings. It targets fast repeated bounded LP solves, warm starts,
 transparent numerical diagnostics, and research on practical simplex methods.
 
-The optional branch-and-bound solver is a separate downstream component. It
-depends on the simplex library; the simplex library never depends on BnB.
+The optional branch-and-bound (BnB) solver is a separate downstream component.
+It depends on the simplex library; the simplex library never depends on BnB.
 
 > [!NOTE]
 > This is research software. The public API, numerical policies, and packaging
 > may change while the solver is under active development.
+
+## Installation
+
+**From PyPI** (recommended for most users):
+
+```bash
+pip install simplinho
+```
+
+Pre-built wheels target CPython 3.10–3.13 on x86_64 Linux.
+
+**From source** (requires a C++23 compiler and CMake 3.16+):
+
+```bash
+pip install . --no-build-isolation
+# or with an editable install:
+pip install -e . --no-build-isolation
+```
+
+See the [Build](#build) section for CMake-level control.
 
 ## Highlights
 
@@ -52,16 +77,36 @@ include `<bnb/core.h>` and link `bnb::core`. The former
 
 ## Build
 
+`simplinho` uses [scikit-build-core](https://scikit-build-core.readthedocs.io/) as
+its Python build backend, which delegates to CMake for the native compilation.
+
 ### Requirements
 
 - CMake 3.16+
-- a C++23 compiler
-- Python 3.14 development files for the current CMake configuration
+- a C++23-capable compiler (GCC 14+, Clang 18+, or MSVC 19.40+)
+- Python 3.10+ development files
+- Eigen 3 (system package or auto-downloaded)
+- pybind11 (system package or auto-downloaded)
+- `ankerl::unordered_dense` (auto-downloaded)
 
-CMake obtains Eigen, pybind11, and `ankerl::unordered_dense` when local copies
-are not configured. BnB builds additionally obtain `stdexec`.
+CMake obtains Eigen, pybind11, and `ankerl::unordered_dense` from CPM when local
+copies are not configured. BnB builds additionally obtain `stdexec`.
 
-### Simplex only
+### Install via pip (source build)
+
+```bash
+pip install . --no-build-isolation
+```
+
+CMake options can be passed through environment variables:
+
+```bash
+SCIKIT_BUILD_ENABLE_BNB=ON pip install . --no-build-isolation
+```
+
+### CMake-level build
+
+#### Simplex only
 
 ```bash
 cmake -S . -B build-local \
@@ -70,7 +115,7 @@ cmake -S . -B build-local \
 cmake --build build-local -j
 ```
 
-### Simplex and BnB
+#### Simplex and BnB
 
 ```bash
 cmake -S . -B build-local \
@@ -168,6 +213,23 @@ The simplex module intentionally exposes LP solving only. MIP orchestration is
 owned by the separate BnB component and should not be added back to the
 `simplinho` module through conditional bindings.
 
+## Examples
+
+MPS benchmark files and a Python runner are in `examples/`:
+
+| File | Description |
+| --- | --- |
+| `enlight8.mps` | Medium-size LP (ENLIGHT family) |
+| `gen-ip002.mps` | Integer-program instance |
+| `runner.py` | Script to load MPS, solve, and print results |
+| `node_timing3.csv` | Benchmark timing data |
+
+Run the runner after building:
+
+```bash
+SIMPLINHO_BUILD_DIR="$PWD/build-local" python examples/runner.py
+```
+
 ## Solver outputs
 
 `LPSolution` exposes:
@@ -199,8 +261,8 @@ Important policies include:
 - synthetic-work reinversion with residual and growth safeguards
 - cost perturbation cleanup before declaring optimality
 
-The local HiGHS source under `third_party/highs-source/` is a design and
-benchmark reference, not a linked runtime dependency of `simplex_core`.
+The reference sources under `third_party/` (HiGHS, Cgl, PaPILO, SCIP) are design
+and benchmark references, not linked runtime dependencies of `simplex_core`.
 
 ## Testing and benchmarking
 
@@ -240,12 +302,19 @@ include/simplex/        simplex API and implementation
   presolve/             LP presolve and postsolve data
   types/                public options and result types
 include/bnb/            independent branch-and-bound component
-src/nla/                compiled simplex NLA implementation
-src/bnb/                compiled BnB implementation
+src/                    compiled NLA and BnB implementation
 bindings/               separate simplex and BnB Python entry points
 tests/                  correctness and HiGHS parity benchmarks
-third_party/highs-source/ local algorithm/reference source tree
+extern/pdqsort/         single-header sort library (external dependency)
+solvers/                [git submodule] interior-point and QP solvers
+papers/                 research notes and reference papers
+third_party/            algorithm reference sources (HiGHS, Cgl, PaPILO, SCIP)
+examples/               MPS benchmark files and runner script
 ```
+
+`solvers/` is a separate repository ([lseman/solvers](https://github.com/lseman/solvers))
+cloned as a git submodule; it contains interior-point and quadratic-programming
+solvers unrelated to the simplex core.
 
 ## Development principles
 
@@ -257,4 +326,8 @@ third_party/highs-source/ local algorithm/reference source tree
 
 ## License
 
-See [LICENSE](LICENSE).
+`simplinho` is released under the [MIT License](LICENSE).
+
+The `solvers/` submodule carries its own license (see [solvers/LICENSE](solvers/LICENSE)).
+
+Reference sources in `third_party/` retain their original licenses.

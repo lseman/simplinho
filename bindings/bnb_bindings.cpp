@@ -22,10 +22,10 @@ using MIPTreeNodeStatus = simplex_bnb::TreeNodeStatus;
 } // namespace
 
 void bind_bnb_bindings(py::module_& m) {
-    py::enum_<VarType>(m, "VarType")
-        .value("Continuous", VarType::Continuous)
-        .value("Integer", VarType::Integer)
-        .value("Binary", VarType::Binary);
+    // Re-export enums from simplinho (they are already registered there).
+    // This avoids "type already registered" errors when both modules are
+    // loaded in the same process.
+    py::object simplex_mod = m.attr("simplex");
 
     py::enum_<MIPStatus>(m, "MIPStatus")
         .value("Optimal", MIPStatus::Optimal)
@@ -184,6 +184,8 @@ void bind_bnb_bindings(py::module_& m) {
                        &BranchAndBoundOptions::max_conflict_cuts_per_round)
         .def_readwrite("max_cuts_per_type", &BranchAndBoundOptions::max_cuts_per_type)
         .def_readwrite("cut_max_parallelism", &BranchAndBoundOptions::cut_max_parallelism)
+        .def_readwrite("use_cut_selection_bandit",
+                       &BranchAndBoundOptions::use_cut_selection_bandit)
         .def_readwrite("use_lp_reoptimization_profile",
                        &BranchAndBoundOptions::use_lp_reoptimization_profile)
         .def_readwrite("use_quadratic_warm_start_repair",

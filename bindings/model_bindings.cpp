@@ -35,6 +35,7 @@
 #include "bindings_helpers.h"
 #ifdef SIMPLEX_ENABLE_BNB
 #    include "simplex/bnb.h"
+#    include "bnb/search/python_branching_policy.h"
 #else
 // LP-only builds still need the BNB value types (VariableType, SOSType,
 // Problem, Cut, ...) used by the modeling layer; bnb/types.h is header-only
@@ -82,6 +83,21 @@ using simplex_bnb::presolve::cut_set_signature;
 using simplex_bnb::presolve::presolve_mip_node_bounds;
 using simplex_bnb::presolve::presolve_mip_root_problem;
 using simplex_bnb::presolve::simplify_cuts_for_bounds;
+
+// Thread-local storage for the branching callback.
+// This allows the existing solve_mip() to pick up the callback
+// without changing its signature.
+static thread_local std::shared_ptr<simplex_bnb::BranchingPolicy>
+    tl_branching_policy;
+
+inline void set_thread_local_branching_policy(py::function callback) {
+    tl_branching_policy =
+        std::make_shared<simplex_bnb::PythonBranchingPolicy>(std::move(callback));
+}
+
+inline void clear_thread_local_branching_policy() {
+    tl_branching_policy.reset();
+}
 #endif
 
 const char* simplex_mode_name(SimplexMode mode) {
@@ -1461,6 +1477,16 @@ class Model {
 #ifdef SIMPLEX_ENABLE_BNB
     MIPSolution
     solve_mip(const BranchAndBoundOptions& mip_options = BranchAndBoundOptions()) const {
+#ifdef SIMPLEX_ENABLE_BNB
+        // Check for thread-local branching callback set by solve_mip_kwargs.
+        // This is used to inject ML-driven branching policies.
+        if (tl_branching_policy && tl_branching_policy->is_enabled()) {
+            // The policy is already set on the Solver by the caller.
+            // No action needed here — the Solver's set_branching_policy
+            // was called in solve_mip_kwargs before calling solve_mip.
+        }
+        clear_thread_local_branching_policy();
+#endif
         // Keep cold/root LP solves on the model's baseline profile. The
         // aggressive BnB LP profile is reserved for warm-started
         // reoptimizations, which is where HiGHS/SCIP-style dual simplex tends
@@ -2145,6 +2171,12 @@ class Model {
         };
 
         simplex_bnb::Solver bnb_solver(problem, mip_options);
+#ifdef SIMPLEX_ENABLE_BNB
+        // Inject thread-local branching policy if set.
+        if (tl_branching_policy && tl_branching_policy->is_enabled()) {
+            bnb_solver.set_branching_policy(tl_branching_policy);
+        }
+#endif
         static std::atomic<std::uint64_t> next_solve_token{1};
         const std::uint64_t solve_token = next_solve_token.fetch_add(1, std::memory_order_relaxed);
         std::atomic<bool> any_warm_start_basis_state_used{false};
@@ -3769,6 +3801,16 @@ void bind_model_bindings(py::module_& m) {
             py::arg("basis") = py::none())
 #ifdef SIMPLEX_ENABLE_BNB
         .def("solve_mip", &Model::solve_mip, py::arg("options") = BranchAndBoundOptions())
+        .def("solve_mip", +[](const Model& self, const BranchAndBoundOptions& options,
+                               py::object branch_callback) -> MIPSolution {
+            if (branch_callback.ptr() != nullptr &&
+                py::isinstance<py::function>(branch_callback)) {
+                set_thread_local_branching_policy(branch_callback.cast<py::function>());
+            }
+            return self.solve_mip(options);
+        }, py::arg("options") = BranchAndBoundOptions(),
+           py::kw_only(),
+           py::arg("branch_callback") = py::cast<py::object>(py::none()))
 #endif
         .def("write_mps", &Model::write_mps, py::arg("path"), py::arg("name") = "SIMPLINHO")
         .def("writeMPS", &Model::write_mps, py::arg("path"), py::arg("name") = "SIMPLINHO")

@@ -100,7 +100,11 @@ class CutPool {
                                           const Eigen::VectorXd& upper_bounds, int max_cuts,
                                           double density_penalty_scale = 1.0,
                                           const Eigen::VectorXd* objective = nullptr,
-                                          bool maximize = false);
+                                          bool maximize = false, int* arm_used = nullptr);
+
+    // Feed back the bound gain (>= 0, in objective units) obtained after applying the cuts
+    // selected with `arm`. No-op when the selection bandit is disabled or arm < 0.
+    void record_selection_reward(int arm, double bound_gain);
 
     void reset(const Options& options);
 
@@ -141,7 +145,10 @@ class CutPool {
     double cut_selection_age_bonus_ = 0.10;
     int max_cuts_per_type_ = 4;
     double max_parallelism_ = 0.98;
-    double dynamism_weight_ = 0.15;
+    bool use_selection_bandit_ = false;
+    std::vector<int> arm_pulls_;
+    std::vector<double> arm_gain_sums_;
+    double max_arm_gain_ = 0.0;
     std::vector<Cut> cuts_;
     std::vector<double> row_norms_;
     std::unordered_set<CutSignature, CutSignatureHash> signatures_;

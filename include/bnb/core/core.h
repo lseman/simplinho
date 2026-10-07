@@ -28,6 +28,7 @@
 
 #include "bnb/heuristics/async_heuristic_manager.h"
 #include "bnb/search/branching.h"
+#include "bnb/search/branching_policy.h"
 #include "bnb/conflict/conflict_engine.h"
 #include "bnb/core/core_types.h"
 #include "bnb/cuts/cuts.h"
@@ -74,6 +75,17 @@ class Solver {
 
     bool maximize() const noexcept { return problem_.maximize; }
     double objective_constant() const noexcept { return problem_.objective_constant; }
+
+    /// Set the external branching policy for this solve.
+    /// Can be called before solve() or on a cloned solver.
+    void set_branching_policy(std::shared_ptr<BranchingPolicy> policy) {
+        branching_policy_ = std::move(policy);
+    }
+
+    /// Access branching policy telemetry (const).
+    const CallbackTelemetry& branching_telemetry() const {
+        return branching_telemetry_;
+    }
 
     template <typename RelaxationSolver> SolveResult solve(RelaxationSolver&& relaxation_solver) {
         reset_state_();
@@ -804,6 +816,22 @@ class Solver {
         const double scale = std::max(1.0, std::abs(incumbent));
         const double slack = std::max(options_.mip_abs_gap, options_.mip_rel_gap * scale);
         return problem_.maximize ? (incumbent + slack) : (incumbent - slack);
+    }
+
+    void record_cut_selection_reward_(int arm, double objective_before,
+                                      const RelaxationSolution& relaxation) {
+        if (arm < 0)
+            return;
+        if (relaxation.status == RelaxationStatus::Infeasible) {
+            // Cuts closed the node: credit the arm with the best gain seen so far.
+            cut_pool_.record_selection_reward(arm, std::numeric_limits<double>::infinity());
+            return;
+        }
+        if (relaxation.status != RelaxationStatus::Optimal)
+            return;
+        const double gain = problem_.maximize ? objective_before - relaxation.objective
+                                              : relaxation.objective - objective_before;
+        cut_pool_.record_selection_reward(arm, gain);
     }
 
     bool bound_prunes_(double candidate, double incumbent) const {
@@ -3421,10 +3449,11 @@ class Solver {
                     }
 
                     const auto phase_selection_start = SteadyClock::now();
+                    int selection_arm = -1;
                     selected = cut_pool_.select_violated_cuts(
                         relaxation.primal, node.lower_bounds, node.upper_bounds,
                         root_cuts_added_per_round, 1.0, &problem_.objective_coefficients,
-                        problem_.maximize);
+                        problem_.maximize, &selection_arm);
                     timing.root_cut_selection_wall_ns +=
                         elapsed_ns_(phase_selection_start, SteadyClock::now());
                     timing.root_cuts_selected += static_cast<int>(selected.size());
@@ -3453,10 +3482,13 @@ class Solver {
                         any_cuts_applied = true;
                         re_solved_with_cuts = true;
                         pending_bound_tightening_resolve = false;
+                        const double objective_before_cuts = relaxation.objective;
                         const auto resolve_start = SteadyClock::now();
                         relaxation = current_relaxation(node);
                         timing.root_cut_resolve_wall_ns +=
                             elapsed_ns_(resolve_start, SteadyClock::now());
+                        record_cut_selection_reward_(selection_arm, objective_before_cuts,
+                                                     relaxation);
                         timing.final_relaxation_objective = relaxation.objective;
                         node.basis = relaxation.basis;
                         if (relaxation.status == RelaxationStatus::Optimal)
@@ -3639,10 +3671,11 @@ class Solver {
                     }
 
                     const auto selection_start = SteadyClock::now();
+                    int selection_arm = -1;
                     std::vector<Cut> selected = cut_pool_.select_violated_cuts(
                         relaxation.primal, node.lower_bounds, node.upper_bounds,
                         node_effective_options.max_cuts_added_per_round, 1.6,
-                        &problem_.objective_coefficients, problem_.maximize);
+                        &problem_.objective_coefficients, problem_.maximize, &selection_arm);
                     timing.node_cut_selection_wall_ns +=
                         elapsed_ns_(selection_start, SteadyClock::now());
                     timing.node_cuts_selected += static_cast<int>(selected.size());
@@ -3669,10 +3702,13 @@ class Solver {
                     if (added_count > 0) {
                         any_cuts_applied = true;
                         pending_bound_tightening_resolve = false;
+                        const double objective_before_cuts = relaxation.objective;
                         const auto resolve_start = SteadyClock::now();
                         relaxation = solve_relaxation_with_cuts(node, local_cuts);
                         timing.node_cut_resolve_wall_ns +=
                             elapsed_ns_(resolve_start, SteadyClock::now());
+                        record_cut_selection_reward_(selection_arm, objective_before_cuts,
+                                                     relaxation);
                         timing.final_relaxation_objective = relaxation.objective;
                         node.basis = relaxation.basis;
                         note_lp_work_(relaxation);
@@ -4177,12 +4213,22 @@ class Solver {
         const bool branch_on_sos = sos_decision.variable >= 0;
         const Options branching_effective_options = adaptive_branching_options_(
             effective_options_for_bound_(relaxation.objective), relaxation);
+
+        // Build observations for external branching policy.
+        BranchingObservations branching_obs = build_observations(
+            node, relaxation, fractional, local_pseudocosts,
+            node.depth == 0,
+            node_count_,
+            has_incumbent_ ? incumbent_objective_ : std::numeric_limits<double>::infinity(),
+            problem_.maximize);
+
         detail::BranchDecision decision =
             branch_on_sos
                 ? std::move(sos_decision)
                 : detail::choose_branching_variable(
                       node, relaxation, fractional, branching_effective_options, problem_.maximize,
-                      local_pseudocosts, parallel_task_dispatcher_.get(), node_relaxation_solver);
+                      local_pseudocosts, parallel_task_dispatcher_.get(), node_relaxation_solver,
+                      branching_policy_.get(), branching_obs);
         if (branch_on_sos) {
             const LPBasis* basis = node.basis ? &*node.basis : nullptr;
             decision.down_child.relaxation =
@@ -4535,6 +4581,7 @@ class Solver {
 
     Problem problem_;
     Options options_;
+    std::shared_ptr<BranchingPolicy> branching_policy_;
     // Objective lattice: when true, every feasible objective value lies on
     // {objective_constant + k * objective_round_step_}, enabling dual-bound
     // rounding in round_objective_bound_. Set once in the constructor.
@@ -4631,6 +4678,8 @@ class Solver {
     double last_logged_incumbent_ = std::numeric_limits<double>::quiet_NaN();
     double last_logged_gap_ = std::numeric_limits<double>::quiet_NaN();
     std::vector<Cut> initial_cuts_;
+    // Branching policy telemetry (accumulated during solve).
+    CallbackTelemetry branching_telemetry_;
     mutable std::once_flag conflict_graph_once_;
     mutable std::unique_ptr<detail::ConflictGraph> conflict_graph_cache_;
     mutable std::mutex tree_mutex_;

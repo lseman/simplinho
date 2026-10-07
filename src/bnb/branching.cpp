@@ -1,6 +1,7 @@
 #include "bnb/search/branching.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <optional>
@@ -8,6 +9,7 @@
 #include <vector>
 
 #include "bnb/parallel/parallel.h"
+#include "bnb/search/branching_policy.h"
 
 namespace simplex::bnb::detail {
 namespace {
@@ -776,6 +778,46 @@ BranchDecision choose_branching_variable(const ActiveNode& node,
         options.strong_branching_max_depth, options.strong_branching_lp_iter_limit,
         effective_parallel_workers, maximize, options.feasibility_tol, options.integrality_tol,
         pseudocosts, parallel_dispatcher, relaxation_solver);
+}
+
+// ── Policy-aware overload ──
+
+BranchDecision choose_branching_variable(
+    const ActiveNode& node,
+    const RelaxationSolution& relaxation,
+    const std::vector<FractionalCandidate>& fractional,
+    const Options& options,
+    bool maximize,
+    std::vector<PseudoCost>& pseudocosts,
+    ParallelDispatcher* parallel_dispatcher,
+    const RelaxationSolveCallback& relaxation_solver,
+    const BranchingPolicy* policy,
+    const BranchingObservations& obs) {
+
+    // Try external policy first if available and enabled.
+    if (policy != nullptr && policy->is_enabled()) {
+        BranchDecisionPython python_dec = policy->decide(obs, fractional);
+
+        // If policy returned an empty decision (variable < 0), fall back.
+        if (python_dec.variable >= 0) {
+            return convert_python_decision(
+                python_dec, fractional, node, maximize);
+        }
+    }
+
+    // No policy or policy deferred — use existing free-function logic.
+    return choose_branching_variable(
+        node, relaxation, fractional, options, maximize,
+        pseudocosts, parallel_dispatcher, relaxation_solver);
+}
+
+BranchDecisionPython make_python_decision(
+    int variable, double down, double up) {
+    BranchDecisionPython dec;
+    dec.variable = variable;
+    dec.down_bound = down;
+    dec.up_bound = up;
+    return dec;
 }
 
 } // namespace simplex::bnb::detail

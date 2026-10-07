@@ -228,6 +228,9 @@ struct Options {
     int max_conflict_age = 10;
     int max_cuts_per_type = 12;
     double cut_max_parallelism = 0.98;
+    // Pick the cut-scoring weight vector per selection round with UCB1, rewarded by the
+    // bound improvement of the following LP resolve. Off = fixed default weights.
+    bool use_cut_selection_bandit = false;
     bool use_dual_proof_cuts = true;
     bool use_lp_reoptimization_profile = true;
     bool use_quadratic_warm_start_repair = false;

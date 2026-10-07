@@ -3,10 +3,12 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <vector>
 
 #include "bnb/heuristics/diving.h"
+#include "bnb/search/branching_policy.h"
 
 namespace simplex::bnb::detail {
 
@@ -111,6 +113,26 @@ BranchDecision choose_branching_variable(const ActiveNode& node,
                                          std::vector<PseudoCost>& pseudocosts,
                                          ParallelDispatcher* parallel_dispatcher,
                                          const RelaxationSolveCallback& relaxation_solver);
+
+/// Policy-aware overload.
+/// If policy is non-null and enabled, its decide() is called with the
+/// observation batch. An empty decision (variable < 0) falls back to
+/// the existing free-function branching logic.
+BranchDecision choose_branching_variable(
+    const ActiveNode& node,
+    const RelaxationSolution& relaxation,
+    const std::vector<FractionalCandidate>& fractional,
+    const Options& options,
+    bool maximize,
+    std::vector<PseudoCost>& pseudocosts,
+    ParallelDispatcher* parallel_dispatcher,
+    const RelaxationSolveCallback& relaxation_solver,
+    const BranchingPolicy* policy,
+    const BranchingObservations& obs);
+
+/// Forward-declare BranchDecisionPython for the convert function.
+BranchDecisionPython make_python_decision(
+    int variable, double down, double up);
 
 BranchDecision choose_sos_branching_constraint(const ActiveNode& node,
                                                const Eigen::VectorXd& primal,

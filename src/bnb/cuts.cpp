@@ -3064,8 +3064,8 @@ CutPool::CutPool(const Options& options)
     : max_pool_size_(options.max_cut_pool_size), min_violation_(options.min_cut_violation),
       max_age_(options.max_cut_age), cut_age_decay_(options.cut_age_decay),
       cut_selection_age_bonus_(options.cut_selection_age_bonus),
-      max_cuts_per_type_(options.max_cuts_per_type), max_parallelism_(options.cut_max_parallelism) {
-}
+      max_cuts_per_type_(options.max_cuts_per_type), max_parallelism_(options.cut_max_parallelism),
+      use_selection_bandit_(options.use_cut_selection_bandit) {}
 
 void CutPool::reset(const Options& options) {
     const std::lock_guard<std::shared_mutex> lock(cuts_mutex_);
@@ -3076,6 +3076,10 @@ void CutPool::reset(const Options& options) {
     cut_selection_age_bonus_ = options.cut_selection_age_bonus;
     max_cuts_per_type_ = options.max_cuts_per_type;
     max_parallelism_ = options.cut_max_parallelism;
+    use_selection_bandit_ = options.use_cut_selection_bandit;
+    arm_pulls_.clear();
+    arm_gain_sums_.clear();
+    max_arm_gain_ = 0.0;
     cuts_.clear();
     row_norms_.clear();
     signatures_.clear();
@@ -3258,11 +3262,59 @@ std::vector<Cut> CutPool::snapshot_propagation_cuts(const Problem& problem, int 
     return snapshot;
 }
 
+namespace {
+
+// Weights of the greedy cut-selection score. Arm 0 is the hand-tuned default; the others
+// emphasise one family of measures (cf. Turner et al., "Adaptive Cut Selection in MILP").
+struct CutScoreWeights {
+    double active_efficacy;
+    double highs_active;
+    double efficacy;
+    double orthogonality;
+    double age;
+    double density;
+    double strength;
+    double dynamism;
+    double fractional;
+    double obj_parallelism;
+};
+
+constexpr std::array<CutScoreWeights, 5> kCutScoreArms = {{
+    // default
+    {0.25, 0.12, 0.10, 0.18, 0.10, 0.08, 0.08, 0.15, 0.04, 0.15},
+    // efficacy-heavy
+    {0.40, 0.05, 0.20, 0.18, 0.05, 0.04, 0.05, 0.10, 0.03, 0.05},
+    // objective-parallel
+    {0.20, 0.05, 0.08, 0.15, 0.05, 0.04, 0.05, 0.08, 0.03, 0.40},
+    // sparse / cheap LP
+    {0.15, 0.30, 0.05, 0.18, 0.08, 0.25, 0.05, 0.05, 0.04, 0.08},
+    // diversity
+    {0.20, 0.08, 0.08, 0.40, 0.08, 0.06, 0.05, 0.08, 0.04, 0.10},
+}};
+
+} // namespace
+
+void CutPool::record_selection_reward(int arm, double bound_gain) {
+    if (arm < 0 || std::isnan(bound_gain))
+        return;
+    const std::lock_guard<std::shared_mutex> lock(cuts_mutex_);
+    if (!use_selection_bandit_ || arm >= static_cast<int>(arm_gain_sums_.size()))
+        return;
+    // +inf means the cuts proved the node infeasible: count it as the best gain seen.
+    const double gain = std::isinf(bound_gain) && bound_gain > 0.0 ? max_arm_gain_
+                                                                    : std::max(0.0, bound_gain);
+    if (!std::isfinite(gain))
+        return;
+    arm_gain_sums_[arm] += gain;
+    max_arm_gain_ = std::max(max_arm_gain_, gain);
+}
+
 std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
                                                const Eigen::VectorXd& lower_bounds,
                                                const Eigen::VectorXd& upper_bounds, int max_cuts,
                                                double density_penalty_scale,
-                                               const Eigen::VectorXd* objective, bool maximize) {
+                                               const Eigen::VectorXd* objective, bool maximize,
+                                               int* arm_used) {
     detail::TimingTrace timing_trace("cutpool_select_violated_cuts");
     detail::LockTrace lock_trace("cuts_mutex_");
     std::unique_lock<std::shared_mutex> lock(cuts_mutex_);
@@ -3384,6 +3436,41 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         return lhs_score > rhs_score;
     });
 
+    // UCB1 over kCutScoreArms; rewards are bound gains normalised by the largest gain seen.
+    int arm = 0;
+    if (use_selection_bandit_) {
+        const int num_arms = static_cast<int>(kCutScoreArms.size());
+        if (arm_pulls_.empty()) {
+            arm_pulls_.assign(num_arms, 0);
+            arm_gain_sums_.assign(num_arms, 0.0);
+        }
+        int total_pulls = 0;
+        arm = -1;
+        for (int a = 0; a < num_arms; ++a) {
+            total_pulls += arm_pulls_[a];
+            if (arm < 0 && arm_pulls_[a] == 0)
+                arm = a;
+        }
+        if (arm < 0) {
+            const double scale = max_arm_gain_ > 0.0 ? max_arm_gain_ : 1.0;
+            double best_index = -std::numeric_limits<double>::infinity();
+            for (int a = 0; a < num_arms; ++a) {
+                const double pulls = static_cast<double>(arm_pulls_[a]);
+                const double index =
+                    arm_gain_sums_[a] / (pulls * scale) +
+                    std::sqrt(2.0 * std::log(static_cast<double>(total_pulls)) / pulls);
+                if (index > best_index) {
+                    best_index = index;
+                    arm = a;
+                }
+            }
+        }
+        ++arm_pulls_[arm];
+        if (arm_used != nullptr)
+            *arm_used = arm;
+    }
+    const CutScoreWeights& w = kCutScoreArms[arm];
+
     std::vector<Cut> selected;
     std::vector<int> selected_indices;
     std::unordered_map<std::string, int> local_type_counts;
@@ -3417,11 +3504,15 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
             if (max_parallelism > selection_parallelism_limit)
                 continue;
 
-            double score = 0.25 * candidate.active_efficacy + 0.12 * candidate.highs_active_score +
-                           0.10 * candidate.efficacy + 0.18 * (1.0 - max_parallelism) +
-                           0.10 * candidate.age_bonus + 0.08 * candidate.density_adjusted_efficacy +
-                           0.08 * candidate.strength + dynamism_weight_ * candidate.dynamism +
-                           0.04 * candidate.fractional_focus + 0.15 * candidate.obj_parallelism;
+            double score = w.active_efficacy * candidate.active_efficacy +
+                           w.highs_active * candidate.highs_active_score +
+                           w.efficacy * candidate.efficacy +
+                           w.orthogonality * (1.0 - max_parallelism) +
+                           w.age * candidate.age_bonus +
+                           w.density * candidate.density_adjusted_efficacy +
+                           w.strength * candidate.strength + w.dynamism * candidate.dynamism +
+                           w.fractional * candidate.fractional_focus +
+                           w.obj_parallelism * candidate.obj_parallelism;
             if (candidate.marginal) {
                 score +=
                     0.06 * candidate.density_adjusted_efficacy + 0.04 * candidate.fractional_focus;
