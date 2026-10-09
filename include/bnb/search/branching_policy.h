@@ -35,6 +35,8 @@ struct BranchingObservations {
     int    depth = 0;
     double node_bound = 0.0;
     double lp_objective = 0.0;
+    Eigen::VectorXd lower_bounds;
+    Eigen::VectorXd upper_bounds;
     bool   is_root = false;
     bool   maximize = true;
 
@@ -46,21 +48,13 @@ struct BranchingObservations {
     int    n_nodes_explored = 0;
     double incumbent = std::numeric_limits<double>::infinity();
 
-    // ── Pseudocost data (empty at root, populated after first branching) ──
+    // ── Candidate-aligned pseudocost data (empty at root) ──
     struct PseudoEntry {
         double up_score = 0.0;
         double down_score = 0.0;
         int    samples = 0;
     };
     std::vector<PseudoEntry> pseudocost;
-};
-
-/// Decision returned by an external branching policy to the C++ solver.
-struct BranchDecisionPython {
-    int    variable = -1;             // actual variable index (not list index)
-    double down_bound = std::numeric_limits<double>::quiet_NaN(); // new upper bound for down child
-    double up_bound = std::numeric_limits<double>::quiet_NaN();   // new lower bound for up child
-    double score = 0.0;               // optional ML confidence score
 };
 
 /// Abstract branching policy interface.
@@ -71,12 +65,11 @@ public:
 
     /// Decide which variable to branch on given the current observation batch.
     ///
-    /// @param obs       Batched observation data (zero-copy views).
+    /// @param obs       Batched, solver-owned observation data.
     /// @param fractional Raw FractionalCandidate list (for converting the decision).
-    /// @return A BranchDecisionPython describing the policy's choice, or a fallback
-    ///         decision if the policy defers.
+    /// @return The chosen variable index, or std::nullopt to defer.
     [[nodiscard]]
-    virtual BranchDecisionPython decide(
+    virtual std::optional<int> choose_variable(
         const BranchingObservations& obs,
         const std::vector<detail::FractionalCandidate>& fractional) const = 0;
 
@@ -104,18 +97,11 @@ BranchingObservations build_observations(
     double incumbent,
     bool maximize);
 
-/// Build BranchDecisionPython from a variable index and bounds.
-BranchDecisionPython build_python_decision(
-    int variable_index,
-    double down_ub,
-    double up_lb);
-
-/// Convert a BranchDecisionPython back to the internal BranchDecision.
-/// Falls back to most-fractional if the variable is not in fractional.
-detail::BranchDecision convert_python_decision(
-    const BranchDecisionPython& python_dec,
+/// Convert an external variable choice to the internal branch representation.
+/// Returns an empty decision if the variable is not a fractional candidate.
+detail::BranchDecision convert_policy_variable(
+    int variable,
     const std::vector<detail::FractionalCandidate>& fractional,
-    const detail::ActiveNode& node,
-    bool maximize);
+    const detail::ActiveNode& node);
 
 } // namespace simplex::bnb

@@ -496,12 +496,15 @@ class RevisedSimplex {
     basis_columns_from_basis_state_(const LPBasis& basis_state, int expected_rows) {
         if (!basis_state.basis_columns.empty()) {
             bool ordered_matches_status = true;
+            std::vector<char> seen(basis_state.column_status.size(), 0);
             for (int j : basis_state.basis_columns) {
                 if (j < 0 || j >= static_cast<int>(basis_state.column_status.size()) ||
-                    basis_state.column_status[j] != LPBasisStatus::Basic) {
+                    basis_state.column_status[j] != LPBasisStatus::Basic ||
+                    seen[static_cast<std::size_t>(j)] != 0) {
                     ordered_matches_status = false;
                     break;
                 }
+                seen[static_cast<std::size_t>(j)] = 1;
             }
             if (ordered_matches_status &&
                 (expected_rows < 0 ||
@@ -625,6 +628,17 @@ class RevisedSimplex {
         if (!basis_state.basis_columns.empty() &&
             static_cast<int>(basis_state.basis_columns.size()) != rows) {
             return false;
+        }
+        if (!basis_state.basis_columns.empty()) {
+            std::vector<char> seen(static_cast<std::size_t>(cols), 0);
+            for (const int column : basis_state.basis_columns) {
+                if (column < 0 || column >= cols || seen[static_cast<std::size_t>(column)] != 0 ||
+                    basis_state.column_status[static_cast<std::size_t>(column)] !=
+                        LPBasisStatus::Basic) {
+                    return false;
+                }
+                seen[static_cast<std::size_t>(column)] = 1;
+            }
         }
         return basic_count == rows;
     }

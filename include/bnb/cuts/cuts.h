@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "bnb/conflict/conflict_graph.h"
+#include "bnb/cuts/cut_selection_policy.h"
 #include "bnb/types.h"
 
 namespace simplex::bnb::detail {
@@ -100,7 +101,10 @@ class CutPool {
                                           const Eigen::VectorXd& upper_bounds, int max_cuts,
                                           double density_penalty_scale = 1.0,
                                           const Eigen::VectorXd* objective = nullptr,
-                                          bool maximize = false, int* arm_used = nullptr);
+                                          bool maximize = false, int* arm_used = nullptr,
+                                          const CutSelectionPolicy* policy = nullptr,
+                                          int node_id = -1, int depth = 0, int round = 0,
+                                          bool is_root = false);
 
     // Feed back the bound gain (>= 0, in objective units) obtained after applying the cuts
     // selected with `arm`. No-op when the selection bandit is disabled or arm < 0.

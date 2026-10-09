@@ -130,10 +130,6 @@ BranchDecision choose_branching_variable(
     const BranchingPolicy* policy,
     const BranchingObservations& obs);
 
-/// Forward-declare BranchDecisionPython for the convert function.
-BranchDecisionPython make_python_decision(
-    int variable, double down, double up);
-
 BranchDecision choose_sos_branching_constraint(const ActiveNode& node,
                                                const Eigen::VectorXd& primal,
                                                const std::vector<SOSConstraint>& sos_constraints,

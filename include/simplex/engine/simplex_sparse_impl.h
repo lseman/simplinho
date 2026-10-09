@@ -79,6 +79,52 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     trace_line_("[solve] sparse start m=" + std::to_string(m_in) + " n=" + std::to_string(n));
     trace_line_("[solve] sparse disable_presolve=" + std::to_string(opt_.disable_presolve));
 
+    // Eigen::SparseLU does not accept a 0x0 basis matrix.  A row-free LP is a
+    // separable bound problem, so solve it directly (as the dense path does)
+    // and retain complete basis/tableau metadata for BnB warm starts.
+    if (m_in == 0) {
+        Eigen::VectorXd x = Eigen::VectorXd::Zero(n);
+        bool bounded = true;
+        for (int j = 0; j < n; ++j) {
+            if (c_in(j) > opt_.tol) {
+                if (!std::isfinite(l_in(j))) {
+                    bounded = false;
+                    break;
+                }
+                x(j) = l_in(j);
+            } else if (c_in(j) < -opt_.tol) {
+                if (!std::isfinite(u_in(j))) {
+                    bounded = false;
+                    break;
+                }
+                x(j) = u_in(j);
+            } else if (std::isfinite(l_in(j))) {
+                x(j) = l_in(j);
+            } else if (std::isfinite(u_in(j))) {
+                x(j) = u_in(j);
+            }
+        }
+        if (!bounded) {
+            return finalize_solution_(make_solution_(
+                LPSolution::Status::Unbounded,
+                Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN()),
+                -std::numeric_limits<double>::infinity(), {}, 0,
+                {{"sparse_bound_only_fast_path", "unbounded"}}));
+        }
+
+        std::vector<int> col_orig_map(static_cast<std::size_t>(n));
+        std::iota(col_orig_map.begin(), col_orig_map.end(), 0);
+        LPSolution sol = make_solution_(LPSolution::Status::Optimal, std::move(x), 0.0, {}, 0,
+                                        {{"sparse_bound_only_fast_path", "1"}});
+        sol.obj = c_in.dot(sol.x);
+        sol = attach_internal_tableau_(std::move(sol), A_in, b_in, c_in, {},
+                                       make_internal_column_labels_(col_orig_map), {}, opt_.tol,
+                                       opt_.compute_tableau, opt_.compute_reduced_costs);
+        sol.dual_values = Eigen::VectorXd::Zero(0);
+        sol.shadow_prices = sol.dual_values;
+        return finalize_solution_(attach_basis_state_(std::move(sol), l_in, u_in, opt_.tol, 0));
+    }
+
     const RowRankReduction row_rank =
         dependent_row_reduction_(Eigen::MatrixXd(A_in), b_in, opt_.tol);
     if (row_rank.needed) {
@@ -880,6 +926,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         // are included in Phase-I RHS construction and postsolve state.
         spopt.enable_singleton_rows = false;
         spopt.enable_activity_tightening = false;
+        spopt.enable_zero_columns = false;
         // HiGHS only enables model transformations that can be undone by its
         // postsolve stack. This presolver does not yet carry row/column scale
         // and RRQR recovery through every exit path, so keep the public solve

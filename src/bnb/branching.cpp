@@ -796,12 +796,12 @@ BranchDecision choose_branching_variable(
 
     // Try external policy first if available and enabled.
     if (policy != nullptr && policy->is_enabled()) {
-        BranchDecisionPython python_dec = policy->decide(obs, fractional);
-
-        // If policy returned an empty decision (variable < 0), fall back.
-        if (python_dec.variable >= 0) {
-            return convert_python_decision(
-                python_dec, fractional, node, maximize);
+        const std::optional<int> variable = policy->choose_variable(obs, fractional);
+        if (variable.has_value()) {
+            BranchDecision decision = convert_policy_variable(*variable, fractional, node);
+            if (decision.variable >= 0) {
+                return decision;
+            }
         }
     }
 
@@ -809,15 +809,6 @@ BranchDecision choose_branching_variable(
     return choose_branching_variable(
         node, relaxation, fractional, options, maximize,
         pseudocosts, parallel_dispatcher, relaxation_solver);
-}
-
-BranchDecisionPython make_python_decision(
-    int variable, double down, double up) {
-    BranchDecisionPython dec;
-    dec.variable = variable;
-    dec.down_bound = down;
-    dec.up_bound = up;
-    return dec;
 }
 
 } // namespace simplex::bnb::detail

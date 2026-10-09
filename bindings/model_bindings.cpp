@@ -1,5 +1,6 @@
 #include <Eigen/Dense>
 #include <pybind11/eigen.h>
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -84,20 +85,76 @@ using simplex_bnb::presolve::presolve_mip_node_bounds;
 using simplex_bnb::presolve::presolve_mip_root_problem;
 using simplex_bnb::presolve::simplify_cuts_for_bounds;
 
-// Thread-local storage for the branching callback.
-// This allows the existing solve_mip() to pick up the callback
-// without changing its signature.
-static thread_local std::shared_ptr<simplex_bnb::BranchingPolicy>
-    tl_branching_policy;
-
-inline void set_thread_local_branching_policy(py::function callback) {
-    tl_branching_policy =
-        std::make_shared<simplex_bnb::PythonBranchingPolicy>(std::move(callback));
+template <typename T>
+py::array_t<T> copy_to_numpy(const std::vector<T>& values) {
+    py::array_t<T> out(values.size());
+    std::copy(values.begin(), values.end(), out.mutable_data());
+    return out;
 }
 
-inline void clear_thread_local_branching_policy() {
-    tl_branching_policy.reset();
-}
+class PythonCutSelectionPolicy final : public simplex_bnb::CutSelectionPolicy {
+  public:
+    explicit PythonCutSelectionPolicy(py::function callback) : callback_(std::move(callback)) {}
+
+    std::optional<std::vector<double>>
+    score(const simplex_bnb::CutSelectionObservations& obs) const override {
+        py::gil_scoped_acquire acquire;
+        py::dict data;
+        data["pool_indices"] = copy_to_numpy(obs.pool_indices);
+        data["violation"] = copy_to_numpy(obs.violation);
+        data["efficacy"] = copy_to_numpy(obs.efficacy);
+        data["active_efficacy"] = copy_to_numpy(obs.active_efficacy);
+        data["density_adjusted_efficacy"] =
+            copy_to_numpy(obs.density_adjusted_efficacy);
+        data["dynamism"] = copy_to_numpy(obs.dynamism);
+        data["fractional_focus"] = copy_to_numpy(obs.fractional_focus);
+        data["objective_parallelism"] = copy_to_numpy(obs.objective_parallelism);
+        data["strength"] = copy_to_numpy(obs.strength);
+        data["age"] = copy_to_numpy(obs.age);
+        data["times_used"] = copy_to_numpy(obs.times_used);
+        data["nnz"] = copy_to_numpy(obs.nnz);
+        data["cut_type"] = py::cast(obs.cut_type);
+        data["rhs"] = copy_to_numpy(obs.rhs);
+        data["sense"] = copy_to_numpy(obs.sense);
+        data["row_starts"] = copy_to_numpy(obs.row_starts);
+        data["column_indices"] = copy_to_numpy(obs.column_indices);
+        data["coefficients"] = copy_to_numpy(obs.coefficients);
+        data["node_id"] = obs.node_id;
+        data["depth"] = obs.depth;
+        data["round"] = obs.round;
+        data["max_cuts"] = obs.max_cuts;
+        data["is_root"] = obs.is_root;
+
+        py::object result;
+        try {
+            result = callback_(data);
+        } catch (py::error_already_set& error) {
+            error.restore();
+            PyErr_Clear();
+            return std::nullopt;
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+        if (result.is_none()) {
+            return std::nullopt;
+        }
+
+        auto array = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(result);
+        if (!array || array.ndim() != 1) {
+            return std::nullopt;
+        }
+        const auto view = array.unchecked<1>();
+        std::vector<double> scores(static_cast<std::size_t>(view.shape(0)));
+        for (py::ssize_t i = 0; i < view.shape(0); ++i) {
+            scores[static_cast<std::size_t>(i)] = view(i);
+        }
+        return scores;
+    }
+
+  private:
+    py::function callback_;
+};
+
 #endif
 
 const char* simplex_mode_name(SimplexMode mode) {
@@ -421,7 +478,27 @@ bool basis_matches_dimensions(const LPBasis& basis, int columns, int rows) {
         if (status == LPBasisStatus::Basic)
             ++basic_count;
     }
-    return basic_count == rows;
+    if (basic_count != rows) {
+        return false;
+    }
+
+    // basis_columns is optional, but when present it is the ordered basis used
+    // directly by FTBasis.  A stale or duplicated entry must not be accepted
+    // merely because column_status has the right number of basic columns.
+    if (!basis.basis_columns.empty()) {
+        if (basis.basis_columns.size() != static_cast<std::size_t>(rows)) {
+            return false;
+        }
+        std::vector<char> seen(static_cast<std::size_t>(columns), 0);
+        for (const int column : basis.basis_columns) {
+            if (column < 0 || column >= columns || seen[static_cast<std::size_t>(column)] != 0 ||
+                basis.column_status[static_cast<std::size_t>(column)] != LPBasisStatus::Basic) {
+                return false;
+            }
+            seen[static_cast<std::size_t>(column)] = 1;
+        }
+    }
+    return true;
 }
 
 std::optional<LPBasis> try_extend_basis(const LPBasis& basis, int total_vars, int rows) {
@@ -1476,17 +1553,11 @@ class Model {
 
 #ifdef SIMPLEX_ENABLE_BNB
     MIPSolution
-    solve_mip(const BranchAndBoundOptions& mip_options = BranchAndBoundOptions()) const {
-#ifdef SIMPLEX_ENABLE_BNB
-        // Check for thread-local branching callback set by solve_mip_kwargs.
-        // This is used to inject ML-driven branching policies.
-        if (tl_branching_policy && tl_branching_policy->is_enabled()) {
-            // The policy is already set on the Solver by the caller.
-            // No action needed here — the Solver's set_branching_policy
-            // was called in solve_mip_kwargs before calling solve_mip.
-        }
-        clear_thread_local_branching_policy();
-#endif
+    solve_mip(
+        const BranchAndBoundOptions& mip_options = BranchAndBoundOptions(),
+        const std::shared_ptr<simplex_bnb::BranchingPolicy>& branching_policy = nullptr,
+        const std::shared_ptr<simplex_bnb::CutSelectionPolicy>& cut_selection_policy = nullptr)
+        const {
         // Keep cold/root LP solves on the model's baseline profile. The
         // aggressive BnB LP profile is reserved for warm-started
         // reoptimizations, which is where HiGHS/SCIP-style dual simplex tends
@@ -1831,6 +1902,14 @@ class Model {
                         return std::nullopt;
                     }
                     throw;
+                } catch (const std::invalid_argument& err) {
+                    // A basis is only a performance hint.  Reject malformed or
+                    // stale ordered basis data and let the caller retry cold.
+                    const std::string_view msg(err.what());
+                    if (msg.find("FTBasis: basis ") != std::string_view::npos) {
+                        return std::nullopt;
+                    }
+                    throw;
                 }
             }
 
@@ -1977,6 +2056,12 @@ class Model {
                                 attempt = solver.solve(node_data.A_sparse, node_data.b, node_data.c,
                                                        solve_l, solve_u, *basis_guess);
                             } catch (const std::runtime_error&) {
+                                attempt.reset();
+                            } catch (const std::invalid_argument& err) {
+                                const std::string_view msg(err.what());
+                                if (msg.find("FTBasis: basis ") == std::string_view::npos) {
+                                    throw;
+                                }
                                 attempt.reset();
                             }
                         } else {
@@ -2171,12 +2256,12 @@ class Model {
         };
 
         simplex_bnb::Solver bnb_solver(problem, mip_options);
-#ifdef SIMPLEX_ENABLE_BNB
-        // Inject thread-local branching policy if set.
-        if (tl_branching_policy && tl_branching_policy->is_enabled()) {
-            bnb_solver.set_branching_policy(tl_branching_policy);
+        if (branching_policy && branching_policy->is_enabled()) {
+            bnb_solver.set_branching_policy(branching_policy);
         }
-#endif
+        if (cut_selection_policy && cut_selection_policy->is_enabled()) {
+            bnb_solver.set_cut_selection_policy(cut_selection_policy);
+        }
         static std::atomic<std::uint64_t> next_solve_token{1};
         const std::uint64_t solve_token = next_solve_token.fetch_add(1, std::memory_order_relaxed);
         std::atomic<bool> any_warm_start_basis_state_used{false};
@@ -2186,19 +2271,41 @@ class Model {
                 static thread_local std::uint64_t context_owner = 0;
                 static thread_local std::unique_ptr<ThreadLocalMIPLPContext> context_ptr;
                 if (context_owner != solve_token || !context_ptr) {
+                    ModelLPData thread_data = data;
+                    if (mip_options.parallel_workers > 1 &&
+                        thread_data.warm_start_basis_state.has_value()) {
+                        // The numerical factorization stored in warm_state is mutable.  Basis
+                        // statuses are safe to copy between B&B workers, but sharing the same
+                        // factorization lets concurrent simplex solves update its Forrest-Tomlin
+                        // data structures at the same time.  Each worker therefore rebuilds its
+                        // own factorization while retaining the useful logical basis.
+                        thread_data.warm_start_basis_state->warm_state.reset();
+                    }
                     context_ptr = std::make_unique<ThreadLocalMIPLPContext>(
                         [this](const ModelLPData& base, const std::vector<simplex_bnb::Cut>& cuts) {
                             return build_node_lp_data_from_base_(base, cuts);
                         },
-                        data, problem.objective_constant, state_->maximize, cold_lp_options,
+                        std::move(thread_data), problem.objective_constant, state_->maximize,
+                        cold_lp_options,
                         warm_lp_options, mip_options.verbose);
                     context_owner = solve_token;
                 }
                 ThreadLocalMIPLPContext& thread_context = *context_ptr;
                 if (!thread_context.base_data.warm_start_basis_state.has_value() &&
                     bnb_solver.root_warm_start_basis_state().has_value()) {
-                    thread_context.install_root_warm_start_basis_state(
-                        bnb_solver.root_warm_start_basis_state());
+                    auto root_basis = bnb_solver.root_warm_start_basis_state();
+                    if (mip_options.parallel_workers > 1 && root_basis.has_value()) {
+                        root_basis->warm_state.reset();
+                    }
+                    thread_context.install_root_warm_start_basis_state(root_basis);
+                }
+
+                std::optional<LPBasis> thread_safe_parent_basis;
+                const LPBasis* parent_basis = basis;
+                if (mip_options.parallel_workers > 1 && basis != nullptr && basis->warm_state) {
+                    thread_safe_parent_basis = *basis;
+                    thread_safe_parent_basis->warm_state.reset();
+                    parent_basis = &*thread_safe_parent_basis;
                 }
 
                 std::vector<simplex_bnb::Cut> presolve_only_cuts;
@@ -2304,7 +2411,7 @@ class Model {
                 }
                 simplex_bnb::RelaxationSolution relaxation = thread_context.solve_node(
                     node_presolve.lower, node_presolve.upper, simplified_structural_cuts.cuts,
-                    basis, objective_bound_internal);
+                    parent_basis, objective_bound_internal);
                 if (mip_options.verbose && cuts.empty()) {
                     const int lp_iters = relaxation.lp_solution ? relaxation.lp_solution->iters : 0;
                     const bool primal_valid = (relaxation.primal.size() == data.total_vars &&
@@ -3287,14 +3394,12 @@ class Model {
 } // namespace
 
 void bind_model_bindings(py::module_& m) {
-#ifndef SIMPLEX_ENABLE_BNB
-    // Normally registered by bind_bnb_bindings; Var.type and the add_var
-    // var_type default still need the enum in LP-only builds.
+    // Model owns this enum because it appears in Model.add_var's signature.
+    // simplinho_bnb re-exports the same Python type.
     py::enum_<VarType>(m, "VarType")
         .value("Continuous", VarType::Continuous)
         .value("Integer", VarType::Integer)
         .value("Binary", VarType::Binary);
-#endif
 
     py::enum_<ConstraintSense>(m, "ConstraintSense")
         .value("LessEqual", ConstraintSense::LessEqual)
@@ -3800,17 +3905,53 @@ void bind_model_bindings(py::module_& m) {
             },
             py::arg("basis") = py::none())
 #ifdef SIMPLEX_ENABLE_BNB
-        .def("solve_mip", &Model::solve_mip, py::arg("options") = BranchAndBoundOptions())
-        .def("solve_mip", +[](const Model& self, const BranchAndBoundOptions& options,
-                               py::object branch_callback) -> MIPSolution {
-            if (branch_callback.ptr() != nullptr &&
-                py::isinstance<py::function>(branch_callback)) {
-                set_thread_local_branching_policy(branch_callback.cast<py::function>());
+        .def("solve_mip", +[](const Model& self, py::object options,
+                               py::object branch_callback,
+                               py::object cut_callback) -> MIPSolution {
+            BranchAndBoundOptions cpp_options;
+            if (!options.is_none()) {
+                cpp_options = options.cast<BranchAndBoundOptions>();
             }
-            return self.solve_mip(options);
-        }, py::arg("options") = BranchAndBoundOptions(),
-           py::kw_only(),
-           py::arg("branch_callback") = py::cast<py::object>(py::none()))
+
+            std::shared_ptr<simplex_bnb::BranchingPolicy> policy;
+            if (!branch_callback.is_none()) {
+                if (PyCallable_Check(branch_callback.ptr()) == 0) {
+                    throw py::type_error("branch_callback must be callable or None");
+                }
+                policy = std::make_shared<simplex_bnb::PythonBranchingPolicy>(
+                    py::reinterpret_borrow<py::function>(branch_callback));
+            }
+
+            std::shared_ptr<simplex_bnb::CutSelectionPolicy> cut_policy;
+            if (!cut_callback.is_none()) {
+                if (PyCallable_Check(cut_callback.ptr()) == 0) {
+                    throw py::type_error("cut_callback must be callable or None");
+                }
+                cut_policy = std::make_shared<PythonCutSelectionPolicy>(
+                    py::reinterpret_borrow<py::function>(cut_callback));
+            }
+
+            py::gil_scoped_release release;
+            return self.solve_mip(cpp_options, policy, cut_policy);
+        }, py::arg("options") = py::none(),
+           py::kw_only(), py::arg("branch_callback") = py::none(),
+           py::arg("cut_callback") = py::none(),
+           R"pbdoc(
+            Solve the MIP using branch-and-bound.
+
+            Parameters
+            ----------
+            options : BranchAndBoundOptions
+                Solver options.
+            branch_callback : callable, optional
+                A Python callable that receives an observations dict and
+                returns a branching variable index, or None to defer.
+            cut_callback : callable, optional
+                A Python callable that receives a batch of valid violated cuts
+                and returns one finite score per candidate. Higher scores are
+                selected first subject to native diversity and type limits.
+                Return None to defer to the built-in selector.
+        )pbdoc")
 #endif
         .def("write_mps", &Model::write_mps, py::arg("path"), py::arg("name") = "SIMPLINHO")
         .def("writeMPS", &Model::write_mps, py::arg("path"), py::arg("name") = "SIMPLINHO")

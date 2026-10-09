@@ -11,8 +11,6 @@
 #include "../bnb/search/branching.h"
 #include "../bnb/search/branching_policy.h"
 #include "../bnb/search/callback_telemetry.h"
-#include "../bnb/search/default_branching_policy.h"
-#include "../bnb/search/python_branching_policy.h"
 #include "../bnb/cuts/cuts.h"
 #include "../bnb/presolve/mip_presolve.h"
 #include "../bnb/heuristics/diving.h"

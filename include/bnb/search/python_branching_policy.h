@@ -2,6 +2,7 @@
 
 #ifdef SIMPLEX_ENABLE_BNB
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -11,6 +12,7 @@
 
 #include <Eigen/Dense>
 #include <pybind11/eigen.h>
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -33,32 +35,36 @@ namespace simplex::bnb {
 class PythonBranchingPolicy : public BranchingPolicy {
 public:
     /// @param callback Python callable that receives observations dict and
-    ///                 returns a tuple (variable, down_bound, up_bound, score).
+    ///                 returns a variable index or None.
     explicit PythonBranchingPolicy(py::function callback)
         : callback_(std::move(callback)) {}
 
     [[nodiscard]]
-    BranchDecisionPython decide(
+    std::optional<int> choose_variable(
         const BranchingObservations& obs,
         const std::vector<detail::FractionalCandidate>& fractional) const override {
         auto start = std::chrono::steady_clock::now();
 
+        // solve_mip releases the GIL while the native solver runs. Branching
+        // may also happen on a solver worker, so every Python interaction in
+        // this method must be protected by an explicit acquire.
+        py::gil_scoped_acquire acquire;
+
         // Build observations dict.
         py::dict obs_dict = make_observations_dict_(obs);
 
-        // Call Python callback, releasing GIL during Python execution.
+        // Call the Python callback while holding the GIL.
         py::object result;
         bool exception_caught = false;
 
-        {
-            py::gil_scoped_release release;
-            try {
-                result = callback_(obs_dict);
-            } catch (const py::error_already_set&) {
-                exception_caught = true;
-            } catch (const std::exception&) {
-                exception_caught = true;
-            }
+        try {
+            result = callback_(obs_dict);
+        } catch (py::error_already_set& error) {
+            error.restore();
+            PyErr_Clear();
+            exception_caught = true;
+        } catch (const std::exception&) {
+            exception_caught = true;
         }
 
         auto end = std::chrono::steady_clock::now();
@@ -72,22 +78,22 @@ public:
 
         if (exception_caught) {
             telemetry_.record_exception(wall_ns);
-            return BranchDecisionPython{};  // empty → fallback
+            return std::nullopt;
         }
 
         if (timed_out) {
             telemetry_.record_timeout(wall_ns);
-            return BranchDecisionPython{};  // empty → fallback
+            return std::nullopt;
         }
 
-        auto dec_opt = parse_decision_(result, fractional);
-        if (!dec_opt.has_value()) {
+        std::optional<int> variable = parse_variable_(result, fractional);
+        if (!variable.has_value()) {
             telemetry_.record_fallback(wall_ns);
-            return BranchDecisionPython{};  // empty → fallback
+            return std::nullopt;
         }
 
-        telemetry_.record_success(wall_ns, dec_opt->variable);
-        return *dec_opt;
+        telemetry_.record_success(wall_ns, *variable);
+        return variable;
     }
 
     bool is_enabled() const override { return true; }
@@ -103,25 +109,34 @@ private:
     py::dict make_observations_dict_(const BranchingObservations& obs) const {
         py::dict d;
 
-        // Batched NumPy arrays (copy Eigen::VectorXd for py::array_t binding).
-        Eigen::VectorXd lp_vals = obs.lp_values;
-        Eigen::VectorXd frac_vals = obs.fractionality;
-        Eigen::VectorXd down_vals = obs.down_distance;
-        Eigen::VectorXd up_vals = obs.up_distance;
+        // Give Python-owned arrays to the callback so observations remain
+        // valid when a learner retains them after the callback returns.
+        auto copy_ints = [](const std::vector<int>& values) {
+            py::array_t<int> out(values.size());
+            std::copy(values.begin(), values.end(), out.mutable_data());
+            return out;
+        };
+        auto copy_doubles = [](const Eigen::VectorXd& values) {
+            py::array_t<double> out(values.size());
+            if (values.size() > 0) {
+                std::copy_n(values.data(), values.size(), out.mutable_data());
+            }
+            return out;
+        };
 
-        d["fractional_variables"] = py::array_t<int>(
-            obs.fractional_variables.size(),
-            obs.fractional_variables.data());
-        d["lp_values"] = py::array_t<double>(lp_vals.size(), lp_vals.data());
-        d["fractionality"] = py::array_t<double>(frac_vals.size(), frac_vals.data());
-        d["down_distance"] = py::array_t<double>(down_vals.size(), down_vals.data());
-        d["up_distance"] = py::array_t<double>(up_vals.size(), up_vals.data());
+        d["fractional_variables"] = copy_ints(obs.fractional_variables);
+        d["lp_values"] = copy_doubles(obs.lp_values);
+        d["fractionality"] = copy_doubles(obs.fractionality);
+        d["down_distance"] = copy_doubles(obs.down_distance);
+        d["up_distance"] = copy_doubles(obs.up_distance);
 
         // Node context.
         d["node_id"] = obs.node_id;
         d["depth"] = obs.depth;
         d["node_bound"] = obs.node_bound;
         d["lp_objective"] = obs.lp_objective;
+        d["lower_bounds"] = copy_doubles(obs.lower_bounds);
+        d["upper_bounds"] = copy_doubles(obs.upper_bounds);
         d["is_root"] = obs.is_root;
         d["maximize"] = obs.maximize;
 
@@ -147,7 +162,7 @@ private:
     }
 
     /// Parse and validate the Python return value.
-    static std::optional<BranchDecisionPython> parse_decision_(
+    static std::optional<int> parse_variable_(
         py::object result,
         const std::vector<detail::FractionalCandidate>& fractional) {
         // Check for None (explicit defer to default policy).
@@ -155,61 +170,14 @@ private:
             return std::nullopt;
         }
 
-        // Expect a tuple of 3 or 4 elements.
-        if (!py::isinstance<py::tuple>(result)) {
+        if (!py::isinstance<py::int_>(result) || PyBool_Check(result.ptr()) != 0) {
             return std::nullopt;
         }
-
-        auto tup = result.cast<py::tuple>();
-        if (tup.size() < 3 || tup.size() > 4) {
-            return std::nullopt;
-        }
-
-        BranchDecisionPython dec;
-
-        // Variable index (must be a valid variable index).
-        try {
-            dec.variable = tup[0].cast<int>();
-        } catch (const py::cast_error&) {
-            return std::nullopt;
-        }
-
-        // Down bound (float).
-        try {
-            dec.down_bound = tup[1].cast<double>();
-        } catch (const py::cast_error&) {
-            return std::nullopt;
-        }
-
-        // Up bound (float).
-        try {
-            dec.up_bound = tup[2].cast<double>();
-        } catch (const py::cast_error&) {
-            return std::nullopt;
-        }
-
-        // Optional score (float, index 3).
-        if (tup.size() >= 4) {
-            try {
-                dec.score = tup[3].cast<double>();
-            } catch (const py::cast_error&) {
-                dec.score = 0.0;
-            }
-        }
-
-        // Validate variable is in the fractional list.
-        bool found = false;
-        for (const auto& f : fractional) {
-            if (f.variable == dec.variable) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            return std::nullopt;
-        }
-
-        return dec;
+        const int variable = result.cast<int>();
+        const bool found = std::any_of(
+            fractional.begin(), fractional.end(),
+            [&](const detail::FractionalCandidate& f) { return f.variable == variable; });
+        return found ? std::optional<int>(variable) : std::nullopt;
     }
 
     /// Convert LPSolutionStatus enum to Python string.

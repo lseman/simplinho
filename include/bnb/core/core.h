@@ -82,9 +82,8 @@ class Solver {
         branching_policy_ = std::move(policy);
     }
 
-    /// Access branching policy telemetry (const).
-    const CallbackTelemetry& branching_telemetry() const {
-        return branching_telemetry_;
+    void set_cut_selection_policy(std::shared_ptr<CutSelectionPolicy> policy) {
+        cut_selection_policy_ = std::move(policy);
     }
 
     template <typename RelaxationSolver> SolveResult solve(RelaxationSolver&& relaxation_solver) {
@@ -3453,7 +3452,8 @@ class Solver {
                     selected = cut_pool_.select_violated_cuts(
                         relaxation.primal, node.lower_bounds, node.upper_bounds,
                         root_cuts_added_per_round, 1.0, &problem_.objective_coefficients,
-                        problem_.maximize, &selection_arm);
+                        problem_.maximize, &selection_arm, cut_selection_policy_.get(), node.id,
+                        node.depth, round, true);
                     timing.root_cut_selection_wall_ns +=
                         elapsed_ns_(phase_selection_start, SteadyClock::now());
                     timing.root_cuts_selected += static_cast<int>(selected.size());
@@ -3620,9 +3620,29 @@ class Solver {
         auto fractional = detail::collect_fractional_candidates(
             relaxation.primal, problem_.variable_types, options_.integrality_tol);
         const Options node_effective_options = effective_options_for_bound_(relaxation.objective);
-        if (should_try_node_cuts_(node, relaxation, fractional, node_effective_options)) {
+        // A parallel HiGHS-style implementation needs a worker-owned LP, cut pool, and domain
+        // that survive from separation through child evaluation. This solver currently rebuilds
+        // child LPs from global cuts, so non-root cut state is supported only by the serial search.
+        if (options_.parallel_workers <= 1 &&
+            should_try_node_cuts_(node, relaxation, fractional, node_effective_options)) {
+            Options node_cut_separation_options = node_effective_options;
+            // HiGHS reconstructs tableau row aggregations and transforms them against the global
+            // domain. Our exported tableau does not yet retain enough information to do that
+            // after branching, so keep tableau GMI/MIR at the root. SCIP's alternative is to
+            // mark such cuts local and carry them down the subtree, which ActiveNode does not yet
+            // model. Structural separators below use the original global problem bounds.
+            node_cut_separation_options.use_gomory_cuts = false;
+            node_cut_separation_options.use_mir_cuts = false;
+            // Keep separator families serial inside a node. This avoids nested task pools if
+            // node-local cut state is later enabled for parallel workers, and it respects the
+            // scratch-state ownership assumptions of the separators. Root separation may still
+            // fan out families.
+            node_cut_separation_options.parallel_workers = 1;
             std::vector<Cut> local_cuts;
             std::unordered_set<detail::CutSignature, detail::CutSignatureHash> local_cut_signatures;
+            // Keep node separation state private. These globally valid candidates affect only
+            // this node's LP unless and until an explicit synchronization protocol promotes them.
+            detail::CutPool local_cut_pool(node_cut_separation_options);
             const int node_cut_rounds = node_effective_options.max_cut_rounds_per_node;
             double previous_node_cut_objective = relaxation.objective;
             int node_cut_stall_rounds = 0;
@@ -3639,47 +3659,39 @@ class Solver {
                     detail::CutSeparatorPhase::LP,
                 };
                 bool any_cuts_applied = false;
-                bool pending_bound_tightening_resolve = false;
                 for (detail::CutSeparatorPhase phase : phase_order) {
                     const auto phase_generation_start = SteadyClock::now();
                     std::vector<Cut> phase_generated =
-                        detail::generate_cuts(problem_, relaxation, node_effective_options, phase,
-                                              nullptr, &probing_relaxation_cuts);
+                        detail::generate_cuts(problem_, relaxation, node_cut_separation_options,
+                                              phase, nullptr,
+                                              &probing_relaxation_cuts);
                     timing.node_cut_generation_wall_ns +=
                         elapsed_ns_(phase_generation_start, SteadyClock::now());
                     timing.node_cuts_generated += static_cast<int>(phase_generated.size());
-                    if (!phase_generated.empty()) {
-                        const int tightened = tighten_bounds_from_cuts(phase_generated, node);
-                        if (tightened < 0) {
-                            update_tree_node_(node.id, [&](TreeNode& tree_node) {
-                                tree_node.status = TreeNodeStatus::Infeasible;
-                            });
-                            finalize_node_timing("node_cut_propagate", "infeasible");
-                            return;
-                        }
-                        if (tightened > 0) {
-                            any_cuts_applied = true;
-                            pending_bound_tightening_resolve = true;
-                        }
-                    }
-                    // All cuts from the loop phases go to the global pool.
+                    // Do not propagate every generated candidate. HiGHS records an explicit
+                    // propagation-safety flag per cut, and SCIP normally installs multi-term
+                    // cuts as LP rows. Until Cut carries equivalent certification, only selected
+                    // cuts enter the relaxation; eager bound tightening here can amplify harmless
+                    // floating-point error into an invalid discrete fixing.
                     // DualProof (Proof-phase) cuts are NOT generated here: that phase is
-                    // excluded from phase_order above. They are extracted at LP infeasibility
-                    // detection points in solve_relaxation_with_cuts / node_relaxation_solver.
+                    // excluded from phase_order above. Globally valid proof cuts are extracted
+                    // at LP infeasibility detection points in solve_relaxation_with_cuts /
+                    // node_relaxation_solver.
                     for (const Cut& cut : phase_generated) {
-                        cut_pool_.add_cut(problem_, cut);
+                        local_cut_pool.add_cut(problem_, cut);
                     }
 
                     const auto selection_start = SteadyClock::now();
                     int selection_arm = -1;
-                    std::vector<Cut> selected = cut_pool_.select_violated_cuts(
+                    std::vector<Cut> selected = local_cut_pool.select_violated_cuts(
                         relaxation.primal, node.lower_bounds, node.upper_bounds,
                         node_effective_options.max_cuts_added_per_round, 1.6,
-                        &problem_.objective_coefficients, problem_.maximize, &selection_arm);
+                        &problem_.objective_coefficients, problem_.maximize, &selection_arm,
+                        cut_selection_policy_.get(), node.id, node.depth, round, false);
                     timing.node_cut_selection_wall_ns +=
                         elapsed_ns_(selection_start, SteadyClock::now());
                     timing.node_cuts_selected += static_cast<int>(selected.size());
-                    cut_pool_.perform_aging();
+                    local_cut_pool.perform_aging();
 
                     if (selected.empty())
                         continue;
@@ -3701,7 +3713,6 @@ class Solver {
                     timing.node_cuts_applied += added_count;
                     if (added_count > 0) {
                         any_cuts_applied = true;
-                        pending_bound_tightening_resolve = false;
                         const double objective_before_cuts = relaxation.objective;
                         const auto resolve_start = SteadyClock::now();
                         relaxation = solve_relaxation_with_cuts(node, local_cuts);
@@ -3761,62 +3772,6 @@ class Solver {
                             finalize_node_timing("node_cut_integral", "integral");
                             return;
                         }
-                    }
-                }
-                if (pending_bound_tightening_resolve) {
-                    const auto resolve_start = SteadyClock::now();
-                    relaxation = solve_relaxation_with_cuts(node, local_cuts);
-                    timing.node_cut_resolve_wall_ns +=
-                        elapsed_ns_(resolve_start, SteadyClock::now());
-                    timing.final_relaxation_objective = relaxation.objective;
-                    node.basis = relaxation.basis;
-                    note_lp_work_(relaxation);
-                    const auto cut_estimate = detail::node_estimate(
-                        relaxation, problem_.variable_types, pseudocosts_snapshot_(),
-                        options_.integrality_tol, problem_.maximize);
-                    update_tree_node_(node.id, [&](TreeNode& tree_node) {
-                        tree_node.bound = relaxation.objective;
-                        tree_node.estimate = cut_estimate;
-                    });
-                    if (relaxation.status == RelaxationStatus::Unbounded) {
-                        update_tree_node_(node.id, [&](TreeNode& tree_node) {
-                            tree_node.status = TreeNodeStatus::Unbounded;
-                        });
-                        mark_unbounded_();
-                        search_coordinator_.notify_all();
-                        finalize_node_timing("node_cut_propagate", "unbounded");
-                        return;
-                    }
-                    if (relaxation.status == RelaxationStatus::Infeasible) {
-                        update_tree_node_(node.id, [&](TreeNode& tree_node) {
-                            tree_node.status = TreeNodeStatus::Infeasible;
-                        });
-                        finalize_node_timing("node_cut_propagate", "infeasible");
-                        return;
-                    }
-                    const auto incumbent = incumbent_snapshot_();
-                    if (incumbent.has_incumbent &&
-                        bound_prunes_(relaxation.objective, incumbent.objective)) {
-                        update_tree_node_(node.id, [&](TreeNode& tree_node) {
-                            tree_node.status = TreeNodeStatus::PrunedByBound;
-                        });
-                        finalize_node_timing("node_cut_propagate", "pruned_by_bound");
-                        return;
-                    }
-                    fractional = detail::collect_fractional_candidates(
-                        relaxation.primal, problem_.variable_types, options_.integrality_tol);
-                    if (fractional.empty() && detail::choose_sos_branching_constraint(
-                                                  node, relaxation.primal, problem_.sos_constraints,
-                                                  options_.integrality_tol)
-                                                      .variable < 0) {
-                        timing.fractional_count = 0;
-                        update_tree_node_(node.id, [&](TreeNode& tree_node) {
-                            tree_node.status = TreeNodeStatus::Integral;
-                        });
-                        maybe_update_incumbent_(relaxation.primal, relaxation.objective);
-                        search_coordinator_.notify_all();
-                        finalize_node_timing("node_cut_propagate", "integral");
-                        return;
                     }
                 }
                 if (!any_cuts_applied)
@@ -4214,21 +4169,30 @@ class Solver {
         const Options branching_effective_options = adaptive_branching_options_(
             effective_options_for_bound_(relaxation.objective), relaxation);
 
-        // Build observations for external branching policy.
-        BranchingObservations branching_obs = build_observations(
-            node, relaxation, fractional, local_pseudocosts,
-            node.depth == 0,
-            node_count_,
-            has_incumbent_ ? incumbent_objective_ : std::numeric_limits<double>::infinity(),
-            problem_.maximize);
-
-        detail::BranchDecision decision =
-            branch_on_sos
-                ? std::move(sos_decision)
-                : detail::choose_branching_variable(
-                      node, relaxation, fractional, branching_effective_options, problem_.maximize,
-                      local_pseudocosts, parallel_task_dispatcher_.get(), node_relaxation_solver,
-                      branching_policy_.get(), branching_obs);
+        detail::BranchDecision decision;
+        if (branch_on_sos) {
+            decision = std::move(sos_decision);
+        } else if (branching_policy_ && branching_policy_->is_enabled()) {
+            const IncumbentObjectiveSnapshot incumbent = incumbent_objective_snapshot();
+            int explored_nodes = 0;
+            {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                explored_nodes = node_count_;
+            }
+            BranchingObservations branching_obs = build_observations(
+                node, relaxation, fractional, local_pseudocosts, node.depth == 0, explored_nodes,
+                incumbent.has_incumbent ? incumbent.objective
+                                        : std::numeric_limits<double>::infinity(),
+                problem_.maximize);
+            decision = detail::choose_branching_variable(
+                node, relaxation, fractional, branching_effective_options, problem_.maximize,
+                local_pseudocosts, parallel_task_dispatcher_.get(), node_relaxation_solver,
+                branching_policy_.get(), branching_obs);
+        } else {
+            decision = detail::choose_branching_variable(
+                node, relaxation, fractional, branching_effective_options, problem_.maximize,
+                local_pseudocosts, parallel_task_dispatcher_.get(), node_relaxation_solver);
+        }
         if (branch_on_sos) {
             const LPBasis* basis = node.basis ? &*node.basis : nullptr;
             decision.down_child.relaxation =
@@ -4582,6 +4546,7 @@ class Solver {
     Problem problem_;
     Options options_;
     std::shared_ptr<BranchingPolicy> branching_policy_;
+    std::shared_ptr<CutSelectionPolicy> cut_selection_policy_;
     // Objective lattice: when true, every feasible objective value lies on
     // {objective_constant + k * objective_round_step_}, enabling dual-bound
     // rounding in round_objective_bound_. Set once in the constructor.
@@ -4678,8 +4643,6 @@ class Solver {
     double last_logged_incumbent_ = std::numeric_limits<double>::quiet_NaN();
     double last_logged_gap_ = std::numeric_limits<double>::quiet_NaN();
     std::vector<Cut> initial_cuts_;
-    // Branching policy telemetry (accumulated during solve).
-    CallbackTelemetry branching_telemetry_;
     mutable std::once_flag conflict_graph_once_;
     mutable std::unique_ptr<detail::ConflictGraph> conflict_graph_cache_;
     mutable std::mutex tree_mutex_;

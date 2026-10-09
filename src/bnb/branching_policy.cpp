@@ -70,6 +70,8 @@ BranchingObservations build_observations(
     obs.depth = node.depth;
     obs.node_bound = node.bound;
     obs.lp_objective = relaxation.objective;
+    obs.lower_bounds = node.lower_bounds;
+    obs.upper_bounds = node.upper_bounds;
     obs.is_root = is_root;
     obs.maximize = maximize;
 
@@ -90,14 +92,18 @@ BranchingObservations build_observations(
     obs.n_nodes_explored = n_nodes_explored;
     obs.incumbent = incumbent;
 
-    // Pseudocost data (skip at root)
+    // Candidate-aligned pseudocost data (skip at root).
     if (!is_root) {
-        obs.pseudocost.reserve(pseudocosts.size());
-        for (const auto& pc : pseudocosts) {
+        obs.pseudocost.reserve(fractional.size());
+        for (const auto& candidate : fractional) {
             BranchingObservations::PseudoEntry entry;
-            entry.up_score = pc.cost.is_reliable(4) ? pc.cost.up_value() : 0.0;
-            entry.down_score = pc.cost.is_reliable(4) ? pc.cost.down_value() : 0.0;
-            entry.samples = pc.cost.up_count + pc.cost.down_count;
+            if (candidate.variable >= 0 &&
+                candidate.variable < static_cast<int>(pseudocosts.size())) {
+                const auto& pc = pseudocosts[candidate.variable];
+                entry.up_score = pc.cost.is_reliable(4) ? pc.cost.up_value() : 0.0;
+                entry.down_score = pc.cost.is_reliable(4) ? pc.cost.down_value() : 0.0;
+                entry.samples = pc.cost.up_count + pc.cost.down_count;
+            }
             obs.pseudocost.push_back(entry);
         }
     }
@@ -105,33 +111,17 @@ BranchingObservations build_observations(
     return obs;
 }
 
-// ── Build BranchDecisionPython from variable index ──
-
-BranchDecisionPython build_python_decision(
-    int variable_index,
-    double down_ub,
-    double up_lb) {
-    BranchDecisionPython dec;
-    dec.variable = variable_index;
-    dec.down_bound = down_ub;
-    dec.up_bound = up_lb;
-    return dec;
-}
-
-// ── Convert BranchDecisionPython → BranchDecision ──
-
-detail::BranchDecision convert_python_decision(
-    const BranchDecisionPython& python_dec,
+detail::BranchDecision convert_policy_variable(
+    int variable,
     const std::vector<detail::FractionalCandidate>& fractional,
-    const detail::ActiveNode& node,
-    bool /* maximize */) {
+    const detail::ActiveNode& node) {
 
     detail::BranchDecision decision;
 
     // Find the fractional candidate matching the Python-decided variable.
     const detail::FractionalCandidate* candidate = nullptr;
     for (const auto& f : fractional) {
-        if (f.variable == python_dec.variable) {
+        if (f.variable == variable) {
             candidate = &f;
             break;
         }

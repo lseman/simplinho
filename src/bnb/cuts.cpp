@@ -2622,8 +2622,15 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
         return std::nullopt;
     }
 
-    const double rhs = lp.tableau_rhs(row);
-    const double f0 = fractional_part(rhs);
+    if (lp.basis_state.column_status.size() != problem.variable_types.size() ||
+        *basic_index >= relaxation.primal.size()) {
+        return std::nullopt;
+    }
+
+    // Work in the bounded nonbasic variables used by the simplex basis:
+    // y = x-lb at a lower bound and y = ub-x at an upper bound.  The sign of
+    // a tableau coefficient does not identify the active bound.
+    const double f0 = fractional_part(relaxation.primal(*basic_index));
     if (std::min(f0, 1.0 - f0) <= options.min_cut_violation)
         return std::nullopt;
 
@@ -2645,14 +2652,31 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
             return std::nullopt;
         }
 
+        const LPBasisStatus status =
+            lp.basis_state.column_status[static_cast<std::size_t>(*mapped_index)];
+        if (status == LPBasisStatus::Basic || status == LPBasisStatus::Fixed) {
+            continue;
+        }
+
+        double transformed_tij = tij;
+        double bound = 0.0;
+        bool at_upper = false;
+        if (status == LPBasisStatus::AtLower) {
+            bound = problem.lower_bounds(*mapped_index);
+        } else if (status == LPBasisStatus::AtUpper) {
+            bound = problem.upper_bounds(*mapped_index);
+            transformed_tij = -tij;
+            at_upper = true;
+        } else {
+            return std::nullopt;
+        }
+        if (!std::isfinite(bound)) {
+            return std::nullopt;
+        }
+
         double coefficient = 0.0;
         if (problem.variable_types[*mapped_index] != VariableType::Continuous) {
-            // Standard GMI function: g(fj, f0)
-            // For a bounded integer y_j in [0, U] (non-basic at lower 0), the
-            // Cook-Kannan-Schrijver (CKS) strengthening gives a tighter coefficient
-            // by accounting for the finite range U:
-            //   alpha_j = floor(tij/U)*f0 + g(tij - floor(tij/U)*U, f0)
-            // This reduces to standard GMI when tij < U (floor = 0).
+            // Standard GMI coefficient for a nonnegative integer variable.
             const auto gmi_g = [&](double t) -> double {
                 const double fj = fractional_part(t);
                 if (fj <= f0)
@@ -2660,42 +2684,25 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
                 return (std::abs(1.0 - f0) > 1e-10) ? (f0 * (1.0 - fj)) / (1.0 - f0) : 0.0;
             };
 
-            // Determine effective tableau entry and range.
-            // tij > 0: variable enters from lower bound (y_j = x_j - lb, y_j in [0, U]).
-            // tij < 0: internal model complements upper-bounded variables, so |tij| is
-            //          the entry for s_j = ub - x_j in [0, U]; U is the same range.
-            const double lb = *mapped_index < static_cast<int>(problem.lower_bounds.size())
-                                  ? problem.lower_bounds(*mapped_index)
-                                  : 0.0;
-            const double ub = *mapped_index < static_cast<int>(problem.upper_bounds.size())
-                                  ? problem.upper_bounds(*mapped_index)
-                                  : std::numeric_limits<double>::infinity();
-            const double U = (std::isfinite(lb) && std::isfinite(ub))
-                                 ? (ub - lb)
-                                 : std::numeric_limits<double>::infinity();
-            const double abs_tij = std::abs(tij);
-            if (std::isfinite(U) && U >= 2.0 && abs_tij >= U - 1e-10) {
-                // CKS strengthening: floor(|tij|/U)*f0 + g(|tij| mod U, f0)
-                const double q = std::floor(abs_tij / U);
-                const double r = abs_tij - q * U;
-                coefficient = q * f0 + gmi_g(r);
-            } else {
-                coefficient = gmi_g(tij);
-            }
-            // Sign: for variables at upper bound in the internal model, the cut
-            // coefficient on x_j is negated (we built the cut in terms of the slack s_j).
-            if (tij < 0.0) {
-                coefficient = -coefficient;
-            }
+            coefficient = gmi_g(transformed_tij);
         } else {
-            coefficient = (tij > 0.0)
-                              ? tij
-                              : ((std::abs(1.0 - f0) > 1e-10) ? (-(f0 * tij) / (1.0 - f0)) : 0.0);
+            coefficient =
+                (transformed_tij > 0.0)
+                    ? transformed_tij
+                    : ((std::abs(1.0 - f0) > 1e-10)
+                           ? (-(f0 * transformed_tij) / (1.0 - f0))
+                           : 0.0);
         }
 
         if (std::abs(coefficient) > 1e-8) {
             cut.indices.push_back(*mapped_index);
-            cut.values.push_back(coefficient);
+            if (at_upper) {
+                cut.values.push_back(-coefficient);
+                cut.rhs -= coefficient * bound;
+            } else {
+                cut.values.push_back(coefficient);
+                cut.rhs += coefficient * bound;
+            }
         }
     }
 
@@ -3314,7 +3321,8 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
                                                const Eigen::VectorXd& upper_bounds, int max_cuts,
                                                double density_penalty_scale,
                                                const Eigen::VectorXd* objective, bool maximize,
-                                               int* arm_used) {
+                                               int* arm_used, const CutSelectionPolicy* policy,
+                                               int node_id, int depth, int round, bool is_root) {
     detail::TimingTrace timing_trace("cutpool_select_violated_cuts");
     detail::LockTrace lock_trace("cuts_mutex_");
     std::unique_lock<std::shared_mutex> lock(cuts_mutex_);
@@ -3336,6 +3344,8 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         double obj_parallelism = 0.0; // |a^T c| / (||a|| ||c||)
         double strength = 0.0;
         double age_bonus = 0.0;
+        int active_nnz = 0;
+        double policy_score = 0.0;
         bool marginal = false;
     };
 
@@ -3352,7 +3362,7 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         const double age_bonus =
             std::exp(-cut_selection_age_bonus_ * static_cast<double>(cuts_[i].age));
         candidates.push_back(Candidate{i, violation, full_norm, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                                       cuts_[i].strength, age_bonus,
+                                       cuts_[i].strength, age_bonus, 0, 0.0,
                                        violation <= 2.5 * min_violation_});
     }
 
@@ -3386,6 +3396,7 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
                                         : candidate.efficacy;
         const int active_nnz = std::max(
             1, active_stats.nnz > 0 ? active_stats.nnz : static_cast<int>(cut.indices.size()));
+        candidate.active_nnz = active_nnz;
         candidate.highs_active_score =
             active_stats.norm > 1e-16
                 ? candidate.violation / (static_cast<double>(active_nnz) * active_stats.norm)
@@ -3421,6 +3432,58 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         }
     }
 
+    bool use_policy_scores = false;
+    if (policy != nullptr && policy->is_enabled()) {
+        CutSelectionObservations observation;
+        observation.node_id = node_id;
+        observation.depth = depth;
+        observation.round = round;
+        observation.max_cuts = max_cuts;
+        observation.is_root = is_root;
+        observation.row_starts.reserve(candidates.size() + 1);
+        observation.row_starts.push_back(0);
+        for (const Candidate& candidate : candidates) {
+            const Cut& cut = cuts_[candidate.index];
+            observation.pool_indices.push_back(candidate.index);
+            observation.violation.push_back(candidate.violation);
+            observation.efficacy.push_back(candidate.efficacy);
+            observation.active_efficacy.push_back(candidate.active_efficacy);
+            observation.density_adjusted_efficacy.push_back(
+                candidate.density_adjusted_efficacy);
+            observation.dynamism.push_back(candidate.dynamism);
+            observation.fractional_focus.push_back(candidate.fractional_focus);
+            observation.objective_parallelism.push_back(candidate.obj_parallelism);
+            observation.strength.push_back(candidate.strength);
+            observation.age.push_back(cut.age);
+            observation.times_used.push_back(cut.times_used);
+            observation.nnz.push_back(candidate.active_nnz);
+            observation.cut_type.push_back(cut.cut_type);
+            observation.rhs.push_back(cut.rhs);
+            observation.sense.push_back(static_cast<int>(cut.sense));
+            observation.column_indices.insert(observation.column_indices.end(),
+                                              cut.indices.begin(), cut.indices.end());
+            observation.coefficients.insert(observation.coefficients.end(), cut.values.begin(),
+                                            cut.values.end());
+            observation.row_starts.push_back(
+                static_cast<int>(observation.column_indices.size()));
+        }
+
+        try {
+            std::optional<std::vector<double>> scores = policy->score(observation);
+            if (scores.has_value() && scores->size() == candidates.size() &&
+                std::all_of(scores->begin(), scores->end(),
+                            [](double value) { return std::isfinite(value); })) {
+                for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
+                    candidates[i].policy_score = (*scores)[i];
+                }
+                use_policy_scores = true;
+            }
+        } catch (...) {
+            // External policies are advisory. Any error falls back to the
+            // deterministic built-in selector without affecting correctness.
+        }
+    }
+
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {
         // Rebalanced: boost bound-tightening potential (obj_parallelism) and active_efficacy,
         // reduce highs_active_score (proxy for LP-solve speed) in favor of cuts that tighten
@@ -3438,7 +3501,7 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
 
     // UCB1 over kCutScoreArms; rewards are bound gains normalised by the largest gain seen.
     int arm = 0;
-    if (use_selection_bandit_) {
+    if (use_selection_bandit_ && !use_policy_scores) {
         const int num_arms = static_cast<int>(kCutScoreArms.size());
         if (arm_pulls_.empty()) {
             arm_pulls_.assign(num_arms, 0);
@@ -3504,20 +3567,24 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
             if (max_parallelism > selection_parallelism_limit)
                 continue;
 
-            double score = w.active_efficacy * candidate.active_efficacy +
-                           w.highs_active * candidate.highs_active_score +
-                           w.efficacy * candidate.efficacy +
-                           w.orthogonality * (1.0 - max_parallelism) +
-                           w.age * candidate.age_bonus +
-                           w.density * candidate.density_adjusted_efficacy +
-                           w.strength * candidate.strength + w.dynamism * candidate.dynamism +
-                           w.fractional * candidate.fractional_focus +
-                           w.obj_parallelism * candidate.obj_parallelism;
-            if (candidate.marginal) {
+            double score = candidate.policy_score;
+            if (!use_policy_scores) {
+                score = w.active_efficacy * candidate.active_efficacy +
+                        w.highs_active * candidate.highs_active_score +
+                        w.efficacy * candidate.efficacy +
+                        w.orthogonality * (1.0 - max_parallelism) +
+                        w.age * candidate.age_bonus +
+                        w.density * candidate.density_adjusted_efficacy +
+                        w.strength * candidate.strength + w.dynamism * candidate.dynamism +
+                        w.fractional * candidate.fractional_focus +
+                        w.obj_parallelism * candidate.obj_parallelism;
+                if (candidate.marginal) {
+                    score += 0.06 * candidate.density_adjusted_efficacy +
+                             0.04 * candidate.fractional_focus;
+                }
                 score +=
-                    0.06 * candidate.density_adjusted_efficacy + 0.04 * candidate.fractional_focus;
+                    0.02 * std::log1p(static_cast<double>(type_usage_stats_[cut.cut_type]));
             }
-            score += 0.02 * std::log1p(static_cast<double>(type_usage_stats_[cut.cut_type]));
             if (score > best_score) {
                 best_score = score;
                 best_pos = pos;
@@ -3541,7 +3608,9 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         ++type_usage_stats_[cuts_[index].cut_type];
         ++cuts_[index].times_used;
         cuts_[index].age = 0;
-        cuts_[index].strength = std::max(cuts_[index].strength, 0.90 * best_score);
+        if (!use_policy_scores) {
+            cuts_[index].strength = std::max(cuts_[index].strength, 0.90 * best_score);
+        }
     }
 
     for (int i = 0; i < static_cast<int>(cuts_.size()); ++i) {

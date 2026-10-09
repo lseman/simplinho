@@ -203,7 +203,6 @@ if(SIMPLEX_ENABLE_BNB)
         src/bnb/conflict_engine.cpp
         src/bnb/core.cpp
         src/bnb/cuts.cpp
-        src/bnb/default_branching_policy.cpp
         src/bnb/diving.cpp
         src/bnb/heuristic.cpp
         src/bnb/mip_presolve.cpp

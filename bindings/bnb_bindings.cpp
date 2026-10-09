@@ -22,16 +22,16 @@ using MIPTreeNodeStatus = simplex_bnb::TreeNodeStatus;
 } // namespace
 
 void bind_bnb_bindings(py::module_& m) {
-    // Re-export enums from simplinho (they are already registered there).
-    // This avoids "type already registered" errors when both modules are
-    // loaded in the same process.
+    // Re-export model-owned types from simplinho.
     py::object simplex_mod = m.attr("simplex");
+    m.attr("VarType") = simplex_mod.attr("VarType");
 
     py::enum_<MIPStatus>(m, "MIPStatus")
         .value("Optimal", MIPStatus::Optimal)
         .value("Infeasible", MIPStatus::Infeasible)
         .value("Unbounded", MIPStatus::Unbounded)
         .value("NodeLimit", MIPStatus::NodeLimit);
+    m.attr("Status") = m.attr("MIPStatus");
 
     py::enum_<NodeSelectionStrategy>(m, "NodeSelectionStrategy")
         .value("DepthFirst", NodeSelectionStrategy::DepthFirst)
