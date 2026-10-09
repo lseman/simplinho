@@ -235,7 +235,9 @@ struct Options {
     bool use_lp_reoptimization_profile = true;
     bool use_quadratic_warm_start_repair = false;
     bool use_node_presolve = true;
-    bool use_node_presolve_on_warm_basis = false;
+    // Propagate node domains even when the node inherits a warm basis, as SCIP and
+    // HiGHS do at every node; propagation is cheap next to the node LP solve.
+    bool use_node_presolve_on_warm_basis = true;
     // Adaptive proof phase: after an incumbent exists, switch effort from
     // primal search toward proving the dual bound.
     bool use_adaptive_proof_phase = true;
