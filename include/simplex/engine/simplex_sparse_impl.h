@@ -1314,8 +1314,11 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                                      {"where", "sparse_phase1_primal"}}};
     }
     auto [status1, v1, basis1_out, it1, info1] = std::move(phase1_result);
+    // Primal drift (negative basics, or a final point outside its bounds) is
+    // cleaned up by dual pivots from the basis Phase I stopped at.
     if (status1 == LPSolution::Status::NeedPhase1 && info1.count("reason") &&
-        info1.at("reason") == std::string("negative_basic_vars")) {
+        (info1.at("reason") == std::string("negative_basic_vars") ||
+         info1.at("reason") == std::string("optimal_primal_check_failed"))) {
         try {
             std::tie(status1, v1, basis1_out, it1, info1) = dual_phase_(
                 A1, b1, c1, basis1_out.empty() ? basis1 : basis1_out, l_phase1, u_phase1);
@@ -1331,6 +1334,26 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                      {"where", "sparse_phase1_dual"}};
         }
     }
+    // The dual cleanup can regain primal feasibility at the cost of dual
+    // feasibility; primal pivots from that basis then finish Phase I.
+    if (status1 == LPSolution::Status::NeedPhase1 && info1.count("reason") &&
+        info1.at("reason") == std::string("dual_infeasible_at_primal_feasible") &&
+        !basis1_out.empty()) {
+        try {
+            const int it_before = it1;
+            std::tie(status1, v1, basis1_out, it1, info1) =
+                phase_(A1, b1, c1, basis1_out, l_phase1, u_phase1);
+            it1 += it_before;
+        } catch (const std::runtime_error& e) {
+            if (!is_recoverable_basis_runtime_(e.what()))
+                throw;
+            status1 = LPSolution::Status::Singular;
+        }
+    }
+    // Only an optimal Phase I with positive artificial mass proves infeasibility;
+    // any other non-optimal outcome is a solver failure, not a certificate.
+    if (status1 == LPSolution::Status::NeedPhase1)
+        status1 = LPSolution::Status::Singular;
     if (status1 == LPSolution::Status::Singular || status1 == LPSolution::Status::IterLimit) {
         auto info = add_sparse_info(std::move(info1));
         info["phase1_status"] = to_string(status1);
@@ -1346,6 +1369,11 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     }
     // Preserve the Phase-I feasible point while removing artificials.  Each
     // replacement is a zero-step tableau pivot, as in HiGHS basis repair.
+    // Phase I stops with basic values that may sit slightly outside their
+    // bounds (Harris ratio test, accumulated update error). Re-checking that
+    // point against opt_.tol rejects feasible bases on rounding noise and
+    // surfaces as Singular; accept HiGHS' primal feasibility tolerance instead.
+    const double phase1_feas_tol = std::max(10.0 * opt_.tol, 1e-7);
     {
         auto cleanup_candidate_feasible = [&](const std::vector<int>& candidate) {
             std::vector<char> in_basis(A1.cols(), 0);
@@ -1375,10 +1403,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             for (int k = 0; k < static_cast<int>(candidate.size()); ++k) {
                 const int j = candidate[k];
                 if (j >= static_cast<int>(n_orig_eff)) {
-                    if (std::abs(xb(k)) > opt_.tol)
+                    if (std::abs(xb(k)) > phase1_feas_tol)
                         return false;
-                } else if (xb(k) < l_phase1(j) - opt_.tol ||
-                           xb(k) > u_phase1(j) + opt_.tol) {
+                } else if (xb(k) < l_phase1(j) - phase1_feas_tol ||
+                           xb(k) > u_phase1(j) + phase1_feas_tol) {
                     return false;
                 }
             }
@@ -1470,7 +1498,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     };
     auto phase2_basis_primal_feasible = [&](const std::vector<int>& basis) {
         return basis_is_primal_feasible_(Ared, phase2_effective_rhs(basis), basis, l_eff, u_eff,
-                                         opt_.tol);
+                                         phase1_feas_tol);
     };
 
     std::vector<int> red_basis2;
@@ -1660,6 +1688,19 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             std::get<4>(res).at("reason") == std::string("negative_basic_vars")) {
             res = run_phase2_d(basis, ignore_seed_status);
             std::get<4>(res)["phase2_mode"] = "dual";
+        } else if (std::get<0>(res) == LPSolution::Status::NeedPhase1 &&
+                   std::get<4>(res).count("reason") &&
+                   std::get<4>(res).at("reason") ==
+                       std::string("optimal_primal_check_failed") &&
+                   static_cast<int>(std::get<2>(res).size()) == m_rows) {
+            // Primal stopped at a dual-feasible basis whose values drifted outside
+            // their bounds; a few dual pivots from that basis restore primal
+            // feasibility (HiGHS cleanup) instead of reporting a failure.
+            auto cleanup = run_phase2_d(std::get<2>(res), true);
+            if (std::get<0>(cleanup) == LPSolution::Status::Optimal) {
+                std::get<4>(cleanup)["phase2_mode"] = "primal_dual_cleanup";
+                res = std::move(cleanup);
+            }
         }
         return res;
     };
@@ -1726,8 +1767,15 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         }
     }
 
-    if (status2 == LPSolution::Status::NeedPhase1 && info2.count("reason") &&
+    // The recovery solve can itself end here; recursing again overflows the stack.
+    static thread_local bool in_cold_primal_recovery = false;
+    if (!in_cold_primal_recovery && status2 == LPSolution::Status::NeedPhase1 &&
+        info2.count("reason") &&
         info2.at("reason") == std::string("optimal_dual_check_failed")) {
+        in_cold_primal_recovery = true;
+        struct ResetRecoveryFlag {
+            ~ResetRecoveryFlag() { in_cold_primal_recovery = false; }
+        } reset_recovery_flag;
         RevisedSimplexOptions cold_primal_opt = opt_;
         cold_primal_opt.mode = SimplexMode::Primal;
         cold_primal_opt.disable_presolve = true;

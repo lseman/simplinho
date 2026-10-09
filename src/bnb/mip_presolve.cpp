@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <utility>
 
+
 namespace simplex::bnb::presolve {
 
 namespace detail {
@@ -2891,8 +2892,7 @@ inline bool try_aggregate_implied_free_continuous_variable(Problem* problem, int
         if (std::abs(factor) <= kCoeffTol)
             continue;
 
-        other_row.indices.push_back(pivot);
-        other_row.values.push_back(-other_row.values[*other_pivot_pos]);
+        // Subtract factor * defining_row; its pivot term cancels the pivot here.
         for (int k = 0; k < row_nnz; ++k) {
             other_row.indices.push_back(defining_row.indices[k]);
             other_row.values.push_back(-factor * defining_row.values[k]);

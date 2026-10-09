@@ -205,6 +205,7 @@ std::optional<int> parse_internal_label_index_impl_(const std::string& label);
 std::vector<int> select_gmi_rows_(const Problem& problem, const RelaxationSolution& relaxation,
                                   const Options& options, const LPSolution& lp);
 bool postprocess_gmi_cut_(const Problem& problem, const Options& options, Cut* cut);
+double gmi_candidate_away_(const Options& options);
 double gmi_cut_quality_score_(const Cut& cut, const Eigen::VectorXd& primal, double violation);
 CanonicalMirRow build_canonical_mir_row_from_leq_(const Problem& problem,
                                                   const RelaxationSolution& relaxation,
@@ -2631,12 +2632,12 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
     // y = x-lb at a lower bound and y = ub-x at an upper bound.  The sign of
     // a tableau coefficient does not identify the active bound.
     const double f0 = fractional_part(relaxation.primal(*basic_index));
-    if (std::min(f0, 1.0 - f0) <= options.min_cut_violation)
+    if (std::min(f0, 1.0 - f0) <= gmi_candidate_away_(options))
         return std::nullopt;
 
     Cut cut;
     cut.sense = LinearConstraintSense::GreaterEqual;
-    cut.rhs = f0 + 1e-9;
+    cut.rhs = f0 - 1e-9;
     cut.cut_type = "GMI";
 
     for (int col = 0; col < lp.tableau.cols(); ++col) {
@@ -3773,9 +3774,10 @@ Cut eliminate_base_row_slacks_from_cut_(const Problem& problem, Cut cut) {
 }
 
 double gmi_candidate_away_(const Options& options) {
-    // Lower floor: accept moderately fractional rows that CBC would use.
-    // This captures more cut candidates, letting the scoring filter the weak ones.
-    return std::max({10.0 * options.integrality_tol, 5.0 * options.min_cut_violation, 2e-4});
+    // GMI coefficients scale with 1/(1-f0) (or 1/f0), so rows whose basic value is
+    // nearly integral amplify LP round-off into cuts that slice off feasible points.
+    // 0.01 matches SCIP's sepa_gomory "away" default.
+    return std::max({10.0 * options.integrality_tol, 5.0 * options.min_cut_violation, 0.01});
 }
 
 double gmi_cut_quality_score_(const Cut& cut, const Eigen::VectorXd& primal, double violation) {
@@ -3802,19 +3804,37 @@ bool scale_integral_support_gmi_cut_(const Problem& problem, const Options& opti
     if (!integral_support)
         return false;
 
+    if (cut->sense == LinearConstraintSense::Equal)
+        return false;
+    const bool is_leq = cut->sense == LinearConstraintSense::LessEqual;
+
     constexpr std::array<int, 11> kCandidateScales = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
     const double coeff_tol = std::max(1e-8, 50.0 * options.integrality_tol);
     for (const int scale : kCandidateScales) {
         bool good = true;
         double max_abs = 0.0;
+        // Rounding a coefficient by delta shifts the activity by delta * x_j; absorb
+        // its worst case over the variable's domain so the scaled cut stays valid.
+        double rhs_shift = 0.0;
         std::vector<double> scaled_values;
         scaled_values.reserve(cut->values.size());
-        for (double value : cut->values) {
-            const double scaled = static_cast<double>(scale) * value;
+        for (std::size_t k = 0; k < cut->values.size(); ++k) {
+            const double scaled = static_cast<double>(scale) * cut->values[k];
             const double rounded = std::round(scaled);
-            if (std::abs(scaled - rounded) > coeff_tol) {
+            const double delta = rounded - scaled;
+            if (std::abs(delta) > coeff_tol) {
                 good = false;
                 break;
+            }
+            if (delta != 0.0) {
+                const int index = cut->indices[k];
+                const double at_lower = delta * problem.lower_bounds(index);
+                const double at_upper = delta * problem.upper_bounds(index);
+                if (!std::isfinite(at_lower) || !std::isfinite(at_upper)) {
+                    good = false;
+                    break;
+                }
+                rhs_shift += is_leq ? std::max(at_lower, at_upper) : std::min(at_lower, at_upper);
             }
             scaled_values.push_back(rounded);
             max_abs = std::max(max_abs, std::abs(rounded));
@@ -3822,8 +3842,8 @@ bool scale_integral_support_gmi_cut_(const Problem& problem, const Options& opti
         if (!good || max_abs > (1 << 20))
             continue;
 
-        const double scaled_rhs = static_cast<double>(scale) * cut->rhs;
-        cut->rhs = std::ceil(scaled_rhs - coeff_tol);
+        const double scaled_rhs = static_cast<double>(scale) * cut->rhs + rhs_shift;
+        cut->rhs = is_leq ? std::floor(scaled_rhs + coeff_tol) : std::ceil(scaled_rhs - coeff_tol);
         cut->values = std::move(scaled_values);
         return true;
     }
@@ -3859,15 +3879,17 @@ bool postprocess_gmi_cut_(const Problem& problem, const Options& options, Cut* c
             return false;
 
         if (std::abs(value) <= drop_tol) {
-            if (value > 0.0) {
-                if (!std::isfinite(problem.lower_bounds(index)))
-                    return false;
-                cut->rhs -= value * problem.lower_bounds(index);
-            } else {
-                if (!std::isfinite(problem.upper_bounds(index)))
-                    return false;
-                cut->rhs -= value * problem.upper_bounds(index);
-            }
+            // Relax by the term's extreme value in the direction that keeps the
+            // cut valid: its minimum for <= cuts, its maximum for >= cuts.
+            if (cut->sense == LinearConstraintSense::Equal)
+                return false;
+            const bool use_lower =
+                (value > 0.0) == (cut->sense == LinearConstraintSense::LessEqual);
+            const double bound =
+                use_lower ? problem.lower_bounds(index) : problem.upper_bounds(index);
+            if (!std::isfinite(bound))
+                return false;
+            cut->rhs -= value * bound;
             continue;
         }
 
@@ -4800,13 +4822,19 @@ std::vector<Cut> generate_mir_cuts(const Problem& problem, const RelaxationSolut
                     *basic_idx >= static_cast<int>(problem.variable_types.size()))
                     continue;
 
-                // Build problem-variable-indexed row from tableau entries.
-                // Slack columns (where parse returns nullopt) are projected out —
-                // the resulting constraint is a valid relaxation of the tableau row.
+                // Build problem-variable-indexed row from tableau entries. A tableau
+                // row is a linear combination of the LP equalities, so it is valid
+                // only with every nonbasic term kept: dropping a column (e.g. a cut
+                // slack with no problem index) is not a relaxation. Skip such rows,
+                // as GMI does, and anchor the rhs at the current LP point.
+                if (*basic_idx >= relaxation.primal.size())
+                    continue;
                 std::vector<int> t_indices;
                 std::vector<double> t_values;
                 t_indices.push_back(*basic_idx);
                 t_values.push_back(1.0);
+                double t_rhs = relaxation.primal(*basic_idx);
+                bool representable = true;
                 for (int col = 0; col < n_cols; ++col) {
                     if (col == basic_col)
                         continue;
@@ -4815,16 +4843,18 @@ std::vector<Cut> generate_mir_cuts(const Problem& problem, const RelaxationSolut
                         continue;
                     const auto mapped =
                         parse_internal_label_index_impl_(lp.internal_column_labels[col]);
-                    if (!mapped.has_value())
-                        continue; // skip slack columns
-                    if (*mapped < 0 || *mapped >= static_cast<int>(problem.variable_types.size()))
-                        continue;
+                    if (!mapped.has_value() || *mapped < 0 ||
+                        *mapped >= static_cast<int>(problem.variable_types.size()) ||
+                        *mapped >= relaxation.primal.size()) {
+                        representable = false;
+                        break;
+                    }
                     t_indices.push_back(*mapped);
                     t_values.push_back(tij);
+                    t_rhs += tij * relaxation.primal(*mapped);
                 }
-                if (t_indices.size() < 2)
+                if (!representable || t_indices.size() < 2)
                     continue;
-                const double t_rhs = lp.tableau_rhs(row_idx);
                 // Tableau row is an equality: try both LE orientations.
                 try_row(t_indices, t_values, t_rhs, "TMIR");
                 std::vector<double> neg = t_values;
