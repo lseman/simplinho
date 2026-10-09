@@ -116,6 +116,8 @@ class PythonCutSelectionPolicy final : public simplex_bnb::CutSelectionPolicy {
         data["cut_type"] = py::cast(obs.cut_type);
         data["rhs"] = copy_to_numpy(obs.rhs);
         data["sense"] = copy_to_numpy(obs.sense);
+        data["lower_bounds"] = copy_to_numpy(obs.lower_bounds);
+        data["upper_bounds"] = copy_to_numpy(obs.upper_bounds);
         data["row_starts"] = copy_to_numpy(obs.row_starts);
         data["column_indices"] = copy_to_numpy(obs.column_indices);
         data["coefficients"] = copy_to_numpy(obs.coefficients);

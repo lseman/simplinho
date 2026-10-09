@@ -517,6 +517,7 @@ DivingHeuristicResult run_diving_heuristic(const ActiveNode& start_node,
             alternate_node.upper_bounds = std::move(decision.alternate->state.upper_bounds);
             alternate_node.domain = std::move(decision.alternate->state.domain);
             alternate_node.reasons = std::move(decision.alternate->state.reasons);
+            alternate_node.local_cuts = std::move(decision.alternate->state.local_cuts);
             stack.push_back(
                 DiveFrame{std::move(alternate_node), *decision.alternate->relaxation, depth + 1});
         }
@@ -537,6 +538,7 @@ DivingHeuristicResult run_diving_heuristic(const ActiveNode& start_node,
                           ? std::move(chosen.state.domain)
                           : make_materialized_domain(node.lower_bounds, node.upper_bounds);
         node.reasons = chosen.state.reasons;
+        node.local_cuts = chosen.state.local_cuts;
         node.basis = current.basis;
         ++depth;
     }

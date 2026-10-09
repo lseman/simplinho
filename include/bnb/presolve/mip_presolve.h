@@ -47,7 +47,7 @@ NodeBoundPresolveResult presolve_mip_node_bounds(const Problem& problem,
                                                  const Eigen::VectorXd& lower_in,
                                                  const Eigen::VectorXd& upper_in,
                                                  const std::vector<Cut>& extra_cuts = {},
-                                                 double tol = 1e-9, int max_passes = 2);
+                                                 double tol = 1e-9, int max_passes = 8);
 
 RootProblemPresolveResult presolve_mip_root_problem(const Problem& input, double tol = 1e-9,
                                                     int max_passes = 4);

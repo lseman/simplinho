@@ -49,6 +49,7 @@ struct ChildState {
     std::uint64_t presolve_conflicts_revision = 0;
     std::uint64_t presolve_implications_revision = 0;
     std::shared_ptr<NodeReasonStore> reasons;
+    std::shared_ptr<const std::vector<Cut>> local_cuts;
     std::vector<int> changed_variables_hint;
 };
 
@@ -122,6 +123,7 @@ inline ChildState make_child_state(const ActiveNode& node, int variable, bool br
     child.domain_change_count = node.domain_change_count;
     child.domain = node.domain;
     child.reasons = node.reasons;
+    child.local_cuts = node.local_cuts;
     if (has_materialized_bounds(node.lower_bounds, node.upper_bounds)) {
         child.lower_bounds = node.lower_bounds;
         child.upper_bounds = node.upper_bounds;
@@ -190,6 +192,7 @@ inline ChildState make_upper_zero_child_state(const ActiveNode& node,
     child.domain_change_count = node.domain_change_count;
     child.domain = node.domain;
     child.reasons = node.reasons;
+    child.local_cuts = node.local_cuts;
     if (has_materialized_bounds(node.lower_bounds, node.upper_bounds)) {
         child.lower_bounds = node.lower_bounds;
         child.upper_bounds = node.upper_bounds;
@@ -247,6 +250,7 @@ inline ChildState make_fixed_child_state(const ActiveNode& node, int variable, b
     child.domain_change_count = node.domain_change_count;
     child.domain = node.domain;
     child.reasons = node.reasons;
+    child.local_cuts = node.local_cuts;
     if (has_materialized_bounds(node.lower_bounds, node.upper_bounds)) {
         child.lower_bounds = node.lower_bounds;
         child.upper_bounds = node.upper_bounds;

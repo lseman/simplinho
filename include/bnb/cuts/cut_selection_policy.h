@@ -31,6 +31,8 @@ struct CutSelectionObservations {
     std::vector<std::string> cut_type;
     std::vector<double> rhs;
     std::vector<int> sense;
+    std::vector<double> lower_bounds;
+    std::vector<double> upper_bounds;
 
     // Sparse cut coefficient rows in CSR form, aligned with the arrays above.
     std::vector<int> row_starts;

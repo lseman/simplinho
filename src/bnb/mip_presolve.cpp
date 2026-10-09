@@ -503,8 +503,7 @@ inline bool apply_tightened_bounds(Problem* problem, int index, double tightened
 inline bool tighten_bounds_from_sparse_row(const SparseRowView& row, const Problem& problem,
                                            Eigen::VectorXd* lower, Eigen::VectorXd* upper,
                                            int* tightened_bounds,
-                                           const std::vector<std::vector<int>>& col_to_rows,
-                                           std::vector<char>* next_dirty_rows, double tol) {
+                                           std::vector<int>* changed_variables, double tol) {
     SparseRowActivitySummary summary = sparse_row_activity_summary(row, *lower, *upper);
     if (!sparse_row_is_feasible(summary, row.sense, row.rhs, tol))
         return false;
@@ -591,18 +590,12 @@ inline bool tighten_bounds_from_sparse_row(const SparseRowView& row, const Probl
             ++(*tightened_bounds);
         if (upper_changed)
             ++(*tightened_bounds);
+        if (changed_variables != nullptr)
+            changed_variables->push_back(index);
 
         const SparseVariableContribution new_contribution =
             sparse_variable_contribution(coeff, index, *lower, *upper);
         update_row_summary_for_bound_change(old_contribution, new_contribution, &summary);
-
-        if (next_dirty_rows && index >= 0 && index < static_cast<int>(col_to_rows.size())) {
-            for (const int affected_row : col_to_rows[index]) {
-                if (affected_row >= 0 && affected_row < static_cast<int>(next_dirty_rows->size())) {
-                    (*next_dirty_rows)[affected_row] = 1;
-                }
-            }
-        }
     }
 
     return true;
@@ -3083,32 +3076,42 @@ NodeBoundPresolveResult presolve_mip_node_bounds(const Problem& problem,
     for (const auto& cut : extra_cuts)
         add_row(cut);
 
-    std::vector<char> dirty_rows(rows.size(), 1);
-    const int propagation_rounds = 2; // Reduced from max(2, 2*max_passes) for speed
-    for (int round = 0; round < propagation_rounds; ++round) {
-        bool any_dirty = false;
-        bool changed = false;
-        std::vector<char> next_dirty_rows(rows.size(), 0);
+    // HiGHS-style event propagation: process each row once initially, then revisit only rows
+    // incident to variables whose bounds changed. The work budget is expressed in equivalent
+    // full passes, but deductions are no longer lost merely because they occur late in a pass.
+    std::vector<char> row_queued(rows.size(), 1);
+    std::vector<int> row_queue(rows.size());
+    std::iota(row_queue.begin(), row_queue.end(), 0);
+    std::size_t queue_head = 0;
+    const std::size_t row_visit_budget =
+        static_cast<std::size_t>(std::max(1, max_passes)) * std::max<std::size_t>(1, rows.size());
+    std::size_t row_visits = 0;
+    std::vector<int> changed_variables;
+    changed_variables.reserve(8);
+    while (queue_head < row_queue.size() && row_visits < row_visit_budget) {
+        const int row_index = row_queue[queue_head++];
+        row_queued[static_cast<std::size_t>(row_index)] = 0;
+        ++row_visits;
 
-        for (int row_index = 0; row_index < static_cast<int>(rows.size()); ++row_index) {
-            if (!dirty_rows[row_index])
-                continue;
-            any_dirty = true;
-
-            const int tightened_before = out.tightened_bounds;
-            if (!detail::tighten_bounds_from_sparse_row(rows[row_index], problem, &out.lower,
-                                                        &out.upper, &out.tightened_bounds,
-                                                        col_to_rows, &next_dirty_rows, tol)) {
-                out.infeasible = true;
-                return out;
-            }
-            if (out.tightened_bounds != tightened_before)
-                changed = true;
+        changed_variables.clear();
+        if (!detail::tighten_bounds_from_sparse_row(
+                rows[static_cast<std::size_t>(row_index)], problem, &out.lower, &out.upper,
+                &out.tightened_bounds, &changed_variables, tol)) {
+            out.infeasible = true;
+            return out;
         }
-
-        if (!any_dirty || !changed)
-            break;
-        dirty_rows = std::move(next_dirty_rows);
+        for (const int variable : changed_variables) {
+            if (variable < 0 || variable >= static_cast<int>(col_to_rows.size()))
+                continue;
+            for (const int affected_row : col_to_rows[static_cast<std::size_t>(variable)]) {
+                if (affected_row < 0 || affected_row >= static_cast<int>(rows.size()) ||
+                    row_queued[static_cast<std::size_t>(affected_row)] != 0) {
+                    continue;
+                }
+                row_queued[static_cast<std::size_t>(affected_row)] = 1;
+                row_queue.push_back(affected_row);
+            }
+        }
     }
 
     return out;

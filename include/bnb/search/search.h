@@ -249,6 +249,11 @@ struct ActiveNode {
     std::uint64_t presolve_implications_revision = 0;
     std::optional<LPBasis> basis;
     std::shared_ptr<NodeReasonStore> reasons;
+    // Immutable subtree-local LP rows. Unlike the synchronized global pool,
+    // these cuts are inherited only by descendants of the node where they
+    // were separated. Sharing an immutable vector keeps parallel child
+    // evaluation race-free and preserves the LP rows required by warm bases.
+    std::shared_ptr<const std::vector<Cut>> local_cuts;
 };
 
 inline void materialize_active_node(ActiveNode* node) {

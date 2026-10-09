@@ -80,6 +80,10 @@ def test_cut_callback_receives_batched_observations():
     assert obs["row_starts"][0] == 0
     assert obs["row_starts"][-1] == len(obs["column_indices"])
     assert len(obs["column_indices"]) == len(obs["coefficients"])
+    # Bounds cover the complete B&B formulation, including binding-generated
+    # slack columns in addition to the four user variables.
+    assert len(obs["lower_bounds"]) >= 4
+    assert len(obs["upper_bounds"]) == len(obs["lower_bounds"])
 
 
 def test_cut_callback_none_and_invalid_scores_fall_back():

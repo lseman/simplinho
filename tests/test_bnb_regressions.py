@@ -139,8 +139,15 @@ def test_parallel_cut_search_is_repeatably_correct():
     )
     b = np.array([13.0, 23.0, 19.0, 27.0, 14.0, 22.0, 30.0, 6.0])
 
+    def non_root_cuts(options):
+        # Exercise immutable subtree-local cut inheritance in parallel rather
+        # than allowing the root separator to do all of the work.
+        options.max_root_cut_rounds = 0
+        options.max_cut_rounds_per_node = 2
+        options.use_async_heuristics = False
+
     for _ in range(30):
-        result = solve_binary_mip(c, A, b, workers=2)
+        result = solve_binary_mip(c, A, b, workers=2, configure=non_root_cuts)
         assert_optimal_feasible(result, 40.0, A, b)
 
 

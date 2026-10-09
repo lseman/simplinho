@@ -1059,6 +1059,16 @@ class Solver {
         return cuts;
     }
 
+    std::vector<Cut> current_relaxation_cuts_snapshot_(
+        const std::shared_ptr<const std::vector<Cut>>& local_cuts) const {
+        std::vector<Cut> cuts = current_relaxation_cuts_snapshot_();
+        if (local_cuts != nullptr && !local_cuts->empty()) {
+            cuts.reserve(cuts.size() + local_cuts->size());
+            cuts.insert(cuts.end(), local_cuts->begin(), local_cuts->end());
+        }
+        return cuts;
+    }
+
     void age_active_cuts_(const Eigen::VectorXd& primal) {
         if (primal.size() == 0)
             return;
@@ -3205,7 +3215,8 @@ class Solver {
         auto solve_relaxation_with_cuts = [&](detail::ActiveNode& current_node,
                                               const std::vector<Cut>& extra_cuts) {
             const auto solve_start = SteadyClock::now();
-            std::vector<Cut> relaxation_cuts = current_relaxation_cuts_snapshot_();
+            std::vector<Cut> relaxation_cuts =
+                current_relaxation_cuts_snapshot_(current_node.local_cuts);
             relaxation_cuts.insert(relaxation_cuts.end(), extra_cuts.begin(), extra_cuts.end());
             const Options effective = effective_options_();
             std::vector<Cut> propagation_cuts = relaxation_cuts;
@@ -3219,6 +3230,7 @@ class Solver {
                                         std::make_move_iterator(pool_cuts.end()));
             }
             const bool allow_global_conflict_learning =
+                current_node.local_cuts == nullptr &&
                 !contains_incumbent_cutoff_(relaxation_cuts);
             current_relaxation_allows_global_conflicts = allow_global_conflict_learning;
             const LPBasis* warm_basis = current_node.basis ? &*current_node.basis : nullptr;
@@ -3620,28 +3632,30 @@ class Solver {
         auto fractional = detail::collect_fractional_candidates(
             relaxation.primal, problem_.variable_types, options_.integrality_tol);
         const Options node_effective_options = effective_options_for_bound_(relaxation.objective);
-        // A parallel HiGHS-style implementation needs a worker-owned LP, cut pool, and domain
-        // that survive from separation through child evaluation. This solver currently rebuilds
-        // child LPs from global cuts, so non-root cut state is supported only by the serial search.
-        if (options_.parallel_workers <= 1 &&
-            should_try_node_cuts_(node, relaxation, fractional, node_effective_options)) {
+        if (should_try_node_cuts_(node, relaxation, fractional, node_effective_options)) {
             Options node_cut_separation_options = node_effective_options;
             // HiGHS reconstructs tableau row aggregations and transforms them against the global
             // domain. Our exported tableau does not yet retain enough information to do that
             // after branching, so keep tableau GMI/MIR at the root. SCIP's alternative is to
-            // mark such cuts local and carry them down the subtree, which ActiveNode does not yet
-            // model. Structural separators below use the original global problem bounds.
+            // mark such cuts local and carry them down the subtree. Most structural separators
+            // below keep using global bounds; implied-bound separation may use the propagated
+            // node domain because its selected rows are inherited as subtree-local LP state.
             node_cut_separation_options.use_gomory_cuts = false;
             node_cut_separation_options.use_mir_cuts = false;
-            // Keep separator families serial inside a node. This avoids nested task pools if
-            // node-local cut state is later enabled for parallel workers, and it respects the
-            // scratch-state ownership assumptions of the separators. Root separation may still
-            // fan out families.
+            // Node processing itself may be parallel. Keep separator families serial inside a
+            // node to avoid nested task pools and respect separator scratch-state ownership.
+            // Root separation may still fan out families.
             node_cut_separation_options.parallel_workers = 1;
-            std::vector<Cut> local_cuts;
             std::unordered_set<detail::CutSignature, detail::CutSignatureHash> local_cut_signatures;
-            // Keep node separation state private. These globally valid candidates affect only
-            // this node's LP unless and until an explicit synchronization protocol promotes them.
+            if (node.local_cuts != nullptr) {
+                local_cut_signatures.reserve(node.local_cuts->size());
+                for (const Cut& cut : *node.local_cuts) {
+                    local_cut_signatures.insert(detail::cut_signature(cut));
+                }
+            }
+            // Keep separation state private to this subtree. The immutable local-cut vector is
+            // copied on append and then shared by child nodes, matching SCIP's local-row scope
+            // without synchronizing worker-owned cut pools.
             detail::CutPool local_cut_pool(node_cut_separation_options);
             const int node_cut_rounds = node_effective_options.max_cut_rounds_per_node;
             double previous_node_cut_objective = relaxation.objective;
@@ -3649,9 +3663,8 @@ class Solver {
             for (int round = 0; round < node_cut_rounds; ++round) {
                 ++timing.node_cut_rounds;
                 const double round_start_objective = relaxation.objective;
-                std::vector<Cut> probing_relaxation_cuts = current_relaxation_cuts_snapshot_();
-                probing_relaxation_cuts.insert(probing_relaxation_cuts.end(), local_cuts.begin(),
-                                               local_cuts.end());
+                std::vector<Cut> probing_relaxation_cuts =
+                    current_relaxation_cuts_snapshot_(node.local_cuts);
                 const std::array<detail::CutSeparatorPhase, 4> phase_order = {
                     detail::CutSeparatorPhase::ImpliedBound,
                     detail::CutSeparatorPhase::Clique,
@@ -3661,9 +3674,20 @@ class Solver {
                 bool any_cuts_applied = false;
                 for (detail::CutSeparatorPhase phase : phase_order) {
                     const auto phase_generation_start = SteadyClock::now();
+                    std::optional<Problem> local_separation_problem;
+                    const Problem* separation_problem = &problem_;
+                    if (phase == detail::CutSeparatorPhase::ImpliedBound) {
+                        // Implied-bound cuts may exploit propagated node bounds. They are valid
+                        // only in this subtree, so they remain in the immutable local-row chain
+                        // and are never inserted into the synchronized global cut pool.
+                        local_separation_problem = problem_;
+                        local_separation_problem->lower_bounds = node.lower_bounds;
+                        local_separation_problem->upper_bounds = node.upper_bounds;
+                        separation_problem = &*local_separation_problem;
+                    }
                     std::vector<Cut> phase_generated =
-                        detail::generate_cuts(problem_, relaxation, node_cut_separation_options,
-                                              phase, nullptr,
+                        detail::generate_cuts(*separation_problem, relaxation,
+                                              node_cut_separation_options, phase, nullptr,
                                               &probing_relaxation_cuts);
                     timing.node_cut_generation_wall_ns +=
                         elapsed_ns_(phase_generation_start, SteadyClock::now());
@@ -3678,7 +3702,7 @@ class Solver {
                     // at LP infeasibility detection points in solve_relaxation_with_cuts /
                     // node_relaxation_solver.
                     for (const Cut& cut : phase_generated) {
-                        local_cut_pool.add_cut(problem_, cut);
+                        local_cut_pool.add_cut(*separation_problem, cut);
                     }
 
                     const auto selection_start = SteadyClock::now();
@@ -3696,7 +3720,8 @@ class Solver {
                     if (selected.empty())
                         continue;
 
-                    int added_count = 0;
+                    std::vector<Cut> newly_selected;
+                    newly_selected.reserve(selected.size());
                     {
                         std::lock_guard<std::mutex> lock(cuts_mutex_);
                         for (const Cut& cut : selected) {
@@ -3706,16 +3731,38 @@ class Solver {
                                 continue;
                             }
                             local_cut_signatures.insert(signature);
-                            local_cuts.push_back(cut);
-                            ++added_count;
+                            newly_selected.push_back(cut);
                         }
                     }
+                    const std::size_t inherited_cut_limit = static_cast<std::size_t>(
+                        std::max(32, node_effective_options.max_cut_pool_size));
+                    const std::size_t inherited_cut_count =
+                        node.local_cuts != nullptr ? node.local_cuts->size() : 0;
+                    if (inherited_cut_count >= inherited_cut_limit) {
+                        newly_selected.clear();
+                    } else if (newly_selected.size() >
+                               inherited_cut_limit - inherited_cut_count) {
+                        newly_selected.resize(inherited_cut_limit - inherited_cut_count);
+                    }
+                    const int added_count = static_cast<int>(newly_selected.size());
                     timing.node_cuts_applied += added_count;
                     if (added_count > 0) {
+                        auto inherited = std::make_shared<std::vector<Cut>>();
+                        const std::size_t old_size =
+                            node.local_cuts != nullptr ? node.local_cuts->size() : 0;
+                        inherited->reserve(old_size + newly_selected.size());
+                        if (node.local_cuts != nullptr) {
+                            inherited->insert(inherited->end(), node.local_cuts->begin(),
+                                              node.local_cuts->end());
+                        }
+                        inherited->insert(inherited->end(),
+                                          std::make_move_iterator(newly_selected.begin()),
+                                          std::make_move_iterator(newly_selected.end()));
+                        node.local_cuts = std::move(inherited);
                         any_cuts_applied = true;
                         const double objective_before_cuts = relaxation.objective;
                         const auto resolve_start = SteadyClock::now();
-                        relaxation = solve_relaxation_with_cuts(node, local_cuts);
+                        relaxation = solve_relaxation_with_cuts(node, {});
                         timing.node_cut_resolve_wall_ns +=
                             elapsed_ns_(resolve_start, SteadyClock::now());
                         record_cut_selection_reward_(selection_arm, objective_before_cuts,
@@ -3840,7 +3887,8 @@ class Solver {
         const auto rounding_start = SteadyClock::now();
         if (options_.use_rounding) {
             if (const auto rounded = detail::run_rounding_heuristic(
-                    problem_, options_, relaxation, current_relaxation_cuts_snapshot_());
+                    problem_, options_, relaxation,
+                    current_relaxation_cuts_snapshot_(node.local_cuts));
                 rounded.has_value()) {
                 note_heuristic_result_(0, 1);
                 maybe_update_incumbent_(rounded->primal, rounded->objective);
@@ -3854,8 +3902,10 @@ class Solver {
             detail::ChildState prepared = child_state;
             detail::materialize_child_state(&prepared);
             detail::prepare_child_state_for_relaxation(&prepared);
-            const std::vector<Cut> relaxation_cuts = current_relaxation_cuts_snapshot_();
+            const std::vector<Cut> relaxation_cuts =
+                current_relaxation_cuts_snapshot_(prepared.local_cuts);
             const bool allow_global_conflict_learning =
+                prepared.local_cuts == nullptr &&
                 !contains_incumbent_cutoff_(relaxation_cuts);
             const Options effective = effective_options_();
             const auto presolve_start = SteadyClock::now();
@@ -3918,8 +3968,10 @@ class Solver {
             detail::ChildState prepared = child_state;
             detail::materialize_child_state(&prepared);
             detail::prepare_child_state_for_relaxation(&prepared);
-            const std::vector<Cut> relaxation_cuts = current_relaxation_cuts_snapshot_();
+            const std::vector<Cut> relaxation_cuts =
+                current_relaxation_cuts_snapshot_(prepared.local_cuts);
             const bool allow_global_conflict_learning =
+                prepared.local_cuts == nullptr &&
                 !contains_incumbent_cutoff_(relaxation_cuts);
             const Options effective = effective_options_();
             NodePresolveOutcome presolved;
@@ -4350,6 +4402,7 @@ class Solver {
                 active.basis = *parent_basis;
             }
             active.reasons = child.state.reasons;
+            active.local_cuts = child.state.local_cuts;
             finalize_child_timing();
             const Options effective = effective_options_for_bound_(inherited_bound);
             search_coordinator_.push(std::move(active), effective.node_selection, problem_.maximize,
@@ -4440,6 +4493,7 @@ class Solver {
         active.presolve_implications_revision = child.state.presolve_implications_revision;
         active.basis = child.relaxation->basis;
         active.reasons = child.state.reasons;
+        active.local_cuts = child.state.local_cuts;
         if (!active.basis.has_value() && parent_basis != nullptr) {
             // Preserve the parent tableau for warm-start reoptimization when
             // the child relaxation solver did not record a basis.

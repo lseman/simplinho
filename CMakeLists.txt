@@ -5,6 +5,8 @@ set(CMAKE_CXX_COMPILER "/data/toolchain/llvm/stage2-prof-use-lto/install/bin/cla
 
 project(simplinho VERSION 0.1 LANGUAGES CXX)
 
+include(CTest)
+
 # ==============================================================================
 # Project defaults
 # ==============================================================================
@@ -307,6 +309,13 @@ if(SIMPLEX_ENABLE_BNB)
     target_compile_definitions(simplinho_bnb PUBLIC SIMPLEX_ENABLE_BNB)
     target_link_libraries(simplinho_bnb PRIVATE bnb::core pybind11::module)
     simplinho_apply_module_link_flags(simplinho_bnb)
+
+    if(BUILD_TESTING)
+        add_executable(test_bnb_node_propagation tests/test_bnb_node_propagation.cpp)
+        target_compile_features(test_bnb_node_propagation PRIVATE cxx_std_23)
+        target_link_libraries(test_bnb_node_propagation PRIVATE bnb::core)
+        add_test(NAME bnb_node_propagation COMMAND test_bnb_node_propagation)
+    endif()
 endif()
 
 message(STATUS "simplinho build configured with ccache=${SIMPLEX_ENABLE_CCACHE}, "

@@ -3440,6 +3440,12 @@ std::vector<Cut> CutPool::select_violated_cuts(const Eigen::VectorXd& primal,
         observation.round = round;
         observation.max_cuts = max_cuts;
         observation.is_root = is_root;
+        observation.lower_bounds.reserve(lower_bounds.size());
+        observation.upper_bounds.reserve(upper_bounds.size());
+        for (int j = 0; j < lower_bounds.size(); ++j)
+            observation.lower_bounds.push_back(lower_bounds(j));
+        for (int j = 0; j < upper_bounds.size(); ++j)
+            observation.upper_bounds.push_back(upper_bounds(j));
         observation.row_starts.reserve(candidates.size() + 1);
         observation.row_starts.push_back(0);
         for (const Candidate& candidate : candidates) {
