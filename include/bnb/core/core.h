@@ -39,6 +39,16 @@
 
 namespace simplex::bnb {
 
+namespace detail {
+
+inline bool has_enabled_node_cut_separator(const Options& options) {
+    return options.use_cover_cuts || options.use_zero_half_cuts ||
+           options.use_implied_bound_cuts || options.use_clique_cuts ||
+           options.use_odd_cycle_cuts;
+}
+
+} // namespace detail
+
 class Solver {
     friend class AsyncHeuristicManager;
     friend class ConflictEngine;
@@ -2098,14 +2108,14 @@ class Solver {
 
     // Solve a node LP, retrying when the LP solver fails (rather than proving
     // infeasibility): first without the subtree-local cuts, which are optional, then
-    // without any cut rows. Every retry still yields a valid bound for the node.
+    // without any cut rows. If every attempt fails, return the original failure so the
+    // caller can stop without making a pruning or incumbent decision from fabricated data.
     template <typename RelaxationSolver>
     RelaxationSolution solve_lp_with_cut_fallback_(
         RelaxationSolver& relaxation_solver, const Eigen::VectorXd& lower,
         const Eigen::VectorXd& upper, const LPBasis* basis, const std::vector<Cut>& cuts,
         const std::shared_ptr<const std::vector<Cut>>& local_cuts,
-        const std::vector<Cut>& extra_cuts, bool* dropped_local_cuts,
-        std::optional<double> unsolved_bound = std::nullopt) {
+        const std::vector<Cut>& extra_cuts, bool* dropped_local_cuts) {
         RelaxationSolution out = relaxation_solver(lower, upper, basis, cuts);
         if (!out.lp_failed)
             return out;
@@ -2124,41 +2134,6 @@ class Solver {
             if (!retry.lp_failed) {
                 *dropped_local_cuts = has_local_cuts;
                 return retry;
-            }
-        }
-        if (unsolved_bound.has_value())
-            return unsolved_relaxation_(lower, upper, *unsolved_bound);
-        return out;
-    }
-
-    // Stand-in for a node whose LP cannot be solved at all: it keeps the node's
-    // inherited bound (valid for every descendant) and puts each unfixed integer
-    // column half a unit inside its domain, so the node is branched on rather than
-    // pruned or accepted as integral.
-    RelaxationSolution unsolved_relaxation_(const Eigen::VectorXd& lower,
-                                            const Eigen::VectorXd& upper,
-                                            double inherited_bound) const {
-        RelaxationSolution out;
-        out.status = RelaxationStatus::Optimal;
-        out.lp_failed = true;
-        out.objective = std::isfinite(inherited_bound)
-                            ? inherited_bound
-                            : (problem_.maximize ? std::numeric_limits<double>::infinity()
-                                                 : -std::numeric_limits<double>::infinity());
-        out.primal = Eigen::VectorXd::Zero(lower.size());
-        for (int j = 0; j < lower.size(); ++j) {
-            const double lo = lower(j);
-            const double up = upper(j);
-            const bool integer = j < static_cast<int>(problem_.variable_types.size()) &&
-                                 problem_.variable_types[j] != VariableType::Continuous;
-            if (std::isfinite(lo) && std::isfinite(up) && up - lo < 0.5) {
-                out.primal(j) = lo;
-            } else if (std::isfinite(lo)) {
-                out.primal(j) = integer ? lo + 0.5 : lo;
-            } else if (std::isfinite(up)) {
-                out.primal(j) = integer ? up - 0.5 : up;
-            } else {
-                out.primal(j) = integer ? 0.5 : 0.0;
             }
         }
         return out;
@@ -2185,15 +2160,11 @@ class Solver {
     bool should_try_node_cuts_(const detail::ActiveNode& node, const RelaxationSolution& relaxation,
                                const std::vector<detail::FractionalCandidate>& fractional,
                                const Options& effective) const {
-        if (!effective.use_cut_pool || node.depth <= 0 ||
+        if (!effective.use_cut_pool || node.depth <= 0 || relaxation.lp_failed ||
             relaxation.status != RelaxationStatus::Optimal) {
             return false;
         }
-        if ((!effective.use_gomory_cuts && !effective.use_mir_cuts && !effective.use_cover_cuts &&
-             !effective.use_implied_bound_cuts && !effective.use_clique_cuts &&
-             !effective.use_odd_cycle_cuts && !effective.use_probing_implications &&
-             !effective.use_conflict_cuts && !effective.use_dual_proof_cuts) ||
-            fractional.empty()) {
+        if (!detail::has_enabled_node_cut_separator(effective) || fractional.empty()) {
             return false;
         }
         // Cut-depth policy: always separate in the shallow band. Deeper, separate
@@ -3159,6 +3130,19 @@ class Solver {
             flush_node_timing_record_(timing);
         };
 
+        auto stop_on_lp_failure = [&](const RelaxationSolution& relaxation,
+                                      const char* exit_stage) {
+            if (!relaxation.lp_failed) {
+                return false;
+            }
+            // No valid relaxation means there is no safe bound, pruning decision, or
+            // incumbent candidate. Preserve correctness by returning NodeLimit instead of
+            // pretending the inherited bound and a manufactured primal are an optimum.
+            search_coordinator_.mark_node_limit_reached();
+            finalize_node_timing(exit_stage, "lp_failure");
+            return true;
+        };
+
         auto should_run_node_presolve = [&](const LPBasis* basis, const Options& effective) {
             return effective.use_node_presolve &&
                    (!basis || effective.use_node_presolve_on_warm_basis);
@@ -3419,7 +3403,7 @@ class Solver {
             RelaxationSolution out = solve_lp_with_cut_fallback_(
                 relaxation_solver, current_node.lower_bounds, current_node.upper_bounds,
                 warm_basis, relaxation_cuts, current_node.local_cuts, extra_cuts,
-                &dropped_local_cuts, current_node.bound);
+                &dropped_local_cuts);
             if (dropped_local_cuts)
                 current_node.local_cuts.reset();
             if (out.status == RelaxationStatus::Infeasible && !out.lp_failed) {
@@ -3469,6 +3453,9 @@ class Solver {
         timing.final_relaxation_objective = relaxation.objective;
         node.basis = relaxation.basis;
         note_lp_work_(relaxation);
+        if (stop_on_lp_failure(relaxation, "initial_relaxation")) {
+            return;
+        }
 
         const auto estimate =
             detail::node_estimate(relaxation, problem_.variable_types, pseudocosts_snapshot_(),
@@ -3624,13 +3611,16 @@ class Solver {
                         relaxation = current_relaxation(node);
                         timing.root_cut_resolve_wall_ns +=
                             elapsed_ns_(resolve_start, SteadyClock::now());
-                        record_cut_selection_reward_(selection_arm, objective_before_cuts,
-                                                     relaxation);
                         timing.final_relaxation_objective = relaxation.objective;
                         node.basis = relaxation.basis;
+                        note_lp_work_(relaxation);
+                        if (stop_on_lp_failure(relaxation, "root_cut_resolve")) {
+                            return;
+                        }
                         if (relaxation.status == RelaxationStatus::Optimal)
                             age_active_cuts_(relaxation.primal);
-                        note_lp_work_(relaxation);
+                        record_cut_selection_reward_(selection_arm, objective_before_cuts,
+                                                     relaxation);
                         const auto cut_estimate = detail::node_estimate(
                             relaxation, problem_.variable_types, pseudocosts_snapshot_(),
                             options_.integrality_tol, problem_.maximize);
@@ -3673,9 +3663,12 @@ class Solver {
                         elapsed_ns_(resolve_start, SteadyClock::now());
                     timing.final_relaxation_objective = relaxation.objective;
                     node.basis = relaxation.basis;
+                    note_lp_work_(relaxation);
+                    if (stop_on_lp_failure(relaxation, "root_cut_propagate")) {
+                        return;
+                    }
                     if (relaxation.status == RelaxationStatus::Optimal)
                         age_active_cuts_(relaxation.primal);
-                    note_lp_work_(relaxation);
                     const auto cut_estimate = detail::node_estimate(
                         relaxation, problem_.variable_types, pseudocosts_snapshot_(),
                         options_.integrality_tol, problem_.maximize);
@@ -3891,11 +3884,14 @@ class Solver {
                         relaxation = solve_relaxation_with_cuts(node, {});
                         timing.node_cut_resolve_wall_ns +=
                             elapsed_ns_(resolve_start, SteadyClock::now());
-                        record_cut_selection_reward_(selection_arm, objective_before_cuts,
-                                                     relaxation);
                         timing.final_relaxation_objective = relaxation.objective;
                         node.basis = relaxation.basis;
                         note_lp_work_(relaxation);
+                        if (stop_on_lp_failure(relaxation, "node_cut_resolve")) {
+                            return;
+                        }
+                        record_cut_selection_reward_(selection_arm, objective_before_cuts,
+                                                     relaxation);
                         const auto cut_estimate = detail::node_estimate(
                             relaxation, problem_.variable_types, pseudocosts_snapshot_(),
                             options_.integrality_tol, problem_.maximize);

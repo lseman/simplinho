@@ -209,6 +209,7 @@ class SparseForrestTomlinLU {
         // P1-2: Reset refactor cache at start of factorization
         refactor_info_.clear();
         refactor_info_.build_synthetic_tick = synthetic_tick_;
+        injected_logicals_ = 0;
 
         try {
             factorize_sparse_();
@@ -232,12 +233,15 @@ class SparseForrestTomlinLU {
             if (!refactor_info_.pivot_row.empty() && !use_fallback_sparse_lu_) {
                 refactor_info_.use = true;
             }
-            // Keep an independent sparse factorization for residual recovery.
-            // HiGHS certifies FTRAN/BTRAN results and reinverts on numerical
-            // trouble; this oracle prevents an unchecked custom solve from
-            // contaminating pivot selection.
-            if (config_.enable_solve_oracle)
-                prepare_sparse_lu_oracle_(base_matrix_original_);
+            // A rank-deficient B is completed with logical columns, which would
+            // silently solve a different system; report it as a singular basis.
+            if (injected_logicals_ > 0)
+                throw std::runtime_error("SparseForrestTomlinLU: singular pivot (rank-deficient basis)");
+            // The independent Eigen factorization used for residual recovery is
+            // built lazily, only when a solve fails its residual check: building
+            // it (plus its transpose) on every refactorization dominated node-LP
+            // time, while HiGHS simply reinverts on numerical trouble.
+            sparse_lu_oracle_ready_ = false;
         } catch (const std::runtime_error&) {
             activate_sparse_lu_fallback_(base_matrix_original_);
         }
@@ -708,6 +712,8 @@ class SparseForrestTomlinLU {
         if (enable_refinement)
             x = iterative_refine_(b, x);
         if (config_.validate_solves && updates_.empty() && !validate_sparse_rhs_solution_(b, x)) {
+            if (!sparse_lu_oracle_ready_ && config_.enable_solve_oracle)
+                prepare_sparse_lu_oracle_(base_matrix_original_);
             if (sparse_lu_oracle_ready_) {
                 x = fallback_sparse_lu_.solve(b);
                 if (fallback_sparse_lu_.info() != Eigen::Success ||
@@ -824,6 +830,8 @@ class SparseForrestTomlinLU {
             y = iterative_refine_T_(c, y);
         if (config_.validate_solves && updates_.empty() &&
             !validate_sparse_transpose_solution_(c, y)) {
+            if (!sparse_lu_oracle_ready_ && config_.enable_solve_oracle)
+                prepare_sparse_lu_oracle_(base_matrix_original_);
             if (sparse_lu_oracle_ready_) {
                 y = fallback_sparse_lu_t_.solve(c);
                 if (fallback_sparse_lu_t_.info() != Eigen::Success ||
@@ -2488,10 +2496,10 @@ class SparseForrestTomlinLU {
                 --rank_deficiency_;
             }
         }
-        (void)injected;
+        injected_logicals_ = injected;
     }
 
-    void prepare_sparse_lu_oracle_(const SparseMat& A) {
+    void prepare_sparse_lu_oracle_(const SparseMat& A) const {
         fallback_sparse_lu_.analyzePattern(A);
         fallback_sparse_lu_.factorize(A);
         if (fallback_sparse_lu_.info() != Eigen::Success)
@@ -3266,8 +3274,9 @@ class SparseForrestTomlinLU {
     bool use_fallback_sparse_lu_{false};
     std::vector<double> row_scale_, col_scale_;
     SparseMat base_matrix_original_;
-    Eigen::SparseLU<SparseMat, Eigen::COLAMDOrdering<int>> fallback_sparse_lu_;
-    Eigen::SparseLU<SparseMat, Eigen::COLAMDOrdering<int>> fallback_sparse_lu_t_;
+    // Built lazily from const solves for residual recovery.
+    mutable Eigen::SparseLU<SparseMat, Eigen::COLAMDOrdering<int>> fallback_sparse_lu_;
+    mutable Eigen::SparseLU<SparseMat, Eigen::COLAMDOrdering<int>> fallback_sparse_lu_t_;
     mutable Eigen::VectorXd permuted_rhs_scratch_;
     mutable Eigen::VectorXd permuted_transpose_rhs_scratch_;
     mutable int active_k_{0};
@@ -3472,6 +3481,7 @@ class SparseForrestTomlinLU {
     // we inject identity/logical columns to complete the factorization. The rows/columns
     // that had no valid pivot are recorded here.
     int rank_deficiency_{0};
+    int injected_logicals_{0};
     std::vector<int> row_with_no_pivot_; // row indices that had no pivot
     std::vector<int> col_with_no_pivot_; // column indices that had no pivot
     // Maps from pivot step k → whether it was a logical injection (true) or real pivot (false)
@@ -3481,6 +3491,6 @@ class SparseForrestTomlinLU {
     std::vector<SparseRow> U_rows_, L_rows_, U_cols_, L_cols_;
     mutable bool U_cols_dirty_{false};
     mutable bool L_cols_dirty_{false};
-    bool sparse_lu_oracle_ready_{false};
+    mutable bool sparse_lu_oracle_ready_{false};
     UpdateFailureReason last_update_failure_reason_{UpdateFailureReason::None};
 };

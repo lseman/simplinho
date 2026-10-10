@@ -4858,7 +4858,7 @@ std::vector<Cut> generate_mir_cuts(const Problem& problem, const RelaxationSolut
     // combinations of the original constraints and tend to produce stronger MIR cuts
     // than raw base constraint rows because the fractionality is concentrated in one variable.
     std::vector<MirRowData> tableau_mir_rows;
-    if (options.use_gomory_cuts && relaxation.lp_solution.has_value()) {
+    if (relaxation.lp_solution.has_value()) {
         const LPSolution& lp = *relaxation.lp_solution;
         const int n_cols = static_cast<int>(lp.tableau.cols());
         const int n_rows = static_cast<int>(lp.tableau.rows());
@@ -5096,22 +5096,172 @@ std::optional<ModKIntegerRow> build_modk_integer_row_(const Problem& problem,
     return std::nullopt;
 }
 
+struct WeightedModKRow {
+    const ModKIntegerRow* row = nullptr;
+    int weight = 0;
+};
+
+int positive_mod_(long long value, int modulus) {
+    const int remainder = static_cast<int>(value % modulus);
+    return remainder < 0 ? remainder + modulus : remainder;
+}
+
+int modular_inverse_(int value, int modulus) {
+    for (int candidate = 1; candidate < modulus; ++candidate) {
+        if ((value * candidate) % modulus == 1)
+            return candidate;
+    }
+    return 0;
+}
+
+std::vector<std::vector<int>>
+solve_modular_aggregation_system_(const std::vector<ModKIntegerRow>& rows,
+                                  const RelaxationSolution& relaxation, const Options& options,
+                                  int modulus, int max_solutions) {
+    std::vector<int> active_columns;
+    for (const ModKIntegerRow& row : rows) {
+        for (const int index : row.indices) {
+            if (index >= 0 && index < relaxation.primal.size() &&
+                relaxation.primal(index) > options.feasibility_tol)
+                active_columns.push_back(index);
+        }
+    }
+    std::sort(active_columns.begin(), active_columns.end());
+    active_columns.erase(std::unique(active_columns.begin(), active_columns.end()),
+                         active_columns.end());
+
+    const int num_equations = static_cast<int>(active_columns.size()) + 1;
+    const int num_unknowns = static_cast<int>(rows.size());
+    constexpr std::size_t kMaxDenseSystemEntries = 4'000'000;
+    if (static_cast<std::size_t>(num_equations) >
+        kMaxDenseSystemEntries / static_cast<std::size_t>(num_unknowns + 1))
+        return {};
+    std::unordered_map<int, int> equation_by_column;
+    equation_by_column.reserve(active_columns.size());
+    for (int equation = 0; equation < static_cast<int>(active_columns.size()); ++equation)
+        equation_by_column.emplace(active_columns[static_cast<std::size_t>(equation)], equation);
+
+    std::vector<std::vector<int>> matrix(
+        static_cast<std::size_t>(num_equations),
+        std::vector<int>(static_cast<std::size_t>(num_unknowns + 1), 0));
+    for (int unknown = 0; unknown < num_unknowns; ++unknown) {
+        const ModKIntegerRow& row = rows[static_cast<std::size_t>(unknown)];
+        for (int k = 0;
+             k < static_cast<int>(row.indices.size()) && k < static_cast<int>(row.values.size());
+             ++k) {
+            const auto equation = equation_by_column.find(row.indices[static_cast<std::size_t>(k)]);
+            if (equation != equation_by_column.end())
+                matrix[static_cast<std::size_t>(equation->second)]
+                      [static_cast<std::size_t>(unknown)] =
+                          positive_mod_(row.values[static_cast<std::size_t>(k)], modulus);
+        }
+        matrix.back()[static_cast<std::size_t>(unknown)] = positive_mod_(row.rhs, modulus);
+    }
+    // Directly target k - 1 on the right-hand-side equation. This is equivalent
+    // to HiGHS' target-one system followed by its (k - 1) weight transform.
+    matrix.back().back() = modulus - 1;
+
+    std::vector<int> pivot_columns;
+    int pivot_row = 0;
+    for (int column = 0; column < num_unknowns && pivot_row < num_equations; ++column) {
+        int selected = pivot_row;
+        while (selected < num_equations &&
+               matrix[static_cast<std::size_t>(selected)][static_cast<std::size_t>(column)] == 0)
+            ++selected;
+        if (selected == num_equations)
+            continue;
+        std::swap(matrix[static_cast<std::size_t>(pivot_row)],
+                  matrix[static_cast<std::size_t>(selected)]);
+
+        const int inverse = modular_inverse_(
+            matrix[static_cast<std::size_t>(pivot_row)][static_cast<std::size_t>(column)], modulus);
+        for (int entry = column; entry <= num_unknowns; ++entry) {
+            int& value =
+                matrix[static_cast<std::size_t>(pivot_row)][static_cast<std::size_t>(entry)];
+            value = (value * inverse) % modulus;
+        }
+        for (int equation = 0; equation < num_equations; ++equation) {
+            if (equation == pivot_row)
+                continue;
+            const int factor =
+                matrix[static_cast<std::size_t>(equation)][static_cast<std::size_t>(column)];
+            if (factor == 0)
+                continue;
+            for (int entry = column; entry <= num_unknowns; ++entry) {
+                int& value =
+                    matrix[static_cast<std::size_t>(equation)][static_cast<std::size_t>(entry)];
+                value = positive_mod_(value - factor * matrix[static_cast<std::size_t>(pivot_row)]
+                                                             [static_cast<std::size_t>(entry)],
+                                      modulus);
+            }
+        }
+        pivot_columns.push_back(column);
+        ++pivot_row;
+    }
+
+    for (int equation = pivot_row; equation < num_equations; ++equation) {
+        bool zero_left_hand_side = true;
+        for (int column = 0; column < num_unknowns; ++column)
+            zero_left_hand_side &=
+                matrix[static_cast<std::size_t>(equation)][static_cast<std::size_t>(column)] == 0;
+        if (zero_left_hand_side &&
+            matrix[static_cast<std::size_t>(equation)][static_cast<std::size_t>(num_unknowns)] != 0)
+            return {};
+    }
+
+    std::vector<bool> is_pivot(static_cast<std::size_t>(num_unknowns), false);
+    for (const int column : pivot_columns)
+        is_pivot[static_cast<std::size_t>(column)] = true;
+
+    auto solution_with_free_value = [&](int free_column, int free_value) {
+        std::vector<int> solution(static_cast<std::size_t>(num_unknowns), 0);
+        if (free_column >= 0)
+            solution[static_cast<std::size_t>(free_column)] = free_value;
+        for (int equation = 0; equation < pivot_row; ++equation) {
+            int value =
+                matrix[static_cast<std::size_t>(equation)][static_cast<std::size_t>(num_unknowns)];
+            if (free_column >= 0) {
+                value -= matrix[static_cast<std::size_t>(equation)]
+                               [static_cast<std::size_t>(free_column)] *
+                         free_value;
+            }
+            solution[static_cast<std::size_t>(pivot_columns[static_cast<std::size_t>(equation)])] =
+                positive_mod_(value, modulus);
+        }
+        return solution;
+    };
+
+    std::vector<std::vector<int>> solutions;
+    solutions.push_back(solution_with_free_value(-1, 0));
+    for (int column = 0;
+         column < num_unknowns && static_cast<int>(solutions.size()) < max_solutions; ++column) {
+        if (is_pivot[static_cast<std::size_t>(column)])
+            continue;
+        for (int value = 1; value < modulus && static_cast<int>(solutions.size()) < max_solutions;
+             ++value)
+            solutions.push_back(solution_with_free_value(column, value));
+    }
+    return solutions;
+}
+
 std::optional<Cut> build_modk_cg_cut_(const Problem& problem, const RelaxationSolution& relaxation,
                                       const Options& options,
-                                      const std::vector<const ModKIntegerRow*>& rows, int modulus) {
+                                      const std::vector<WeightedModKRow>& rows, int modulus) {
     if (rows.empty() || modulus <= 1)
         return std::nullopt;
 
     std::unordered_map<int, long long> aggregate;
     long long aggregate_rhs = 0;
-    for (const ModKIntegerRow* row : rows) {
-        if (row == nullptr)
+    for (const WeightedModKRow& weighted_row : rows) {
+        if (weighted_row.row == nullptr || weighted_row.weight <= 0 ||
+            weighted_row.weight >= modulus)
             return std::nullopt;
-        aggregate_rhs += row->rhs;
+        const ModKIntegerRow* row = weighted_row.row;
+        aggregate_rhs += weighted_row.weight * row->rhs;
         for (int k = 0;
              k < static_cast<int>(row->indices.size()) && k < static_cast<int>(row->values.size());
              ++k) {
-            aggregate[row->indices[k]] += row->values[k];
+            aggregate[row->indices[k]] += weighted_row.weight * row->values[k];
         }
     }
 
@@ -5195,22 +5345,28 @@ std::vector<Cut> generate_zero_half_cuts(const Problem& problem,
         cuts.push_back(std::move(*cut));
     };
 
-    constexpr std::array<int, 3> kModuli = {2, 3, 5};
+    constexpr std::array<int, 4> kModuli = {2, 3, 5, 7};
+    const int cut_limit = std::max(4, 2 * options.max_cuts_added_per_round);
+    const int solution_limit = std::min(64, std::max(16, 2 * cut_limit));
     for (const int modulus : kModuli) {
-        for (int i = 0; i < row_limit; ++i) {
-            const ModKIntegerRow* first = &rows[static_cast<std::size_t>(i)];
-            if (((first->rhs % modulus) + modulus) % modulus != 0)
-                maybe_add(build_modk_cg_cut_(problem, relaxation, options, {first}, modulus));
-
-            for (int j = i + 1; j < row_limit; ++j) {
-                const ModKIntegerRow* second = &rows[static_cast<std::size_t>(j)];
-                maybe_add(
-                    build_modk_cg_cut_(problem, relaxation, options, {first, second}, modulus));
-                if (static_cast<int>(cuts.size()) >=
-                    std::max(4, 2 * options.max_cuts_added_per_round))
-                    return cuts;
+        const std::size_t cuts_before_modulus = cuts.size();
+        const std::vector<std::vector<int>> solutions =
+            solve_modular_aggregation_system_(rows, relaxation, options, modulus, solution_limit);
+        for (const std::vector<int>& weights : solutions) {
+            std::vector<WeightedModKRow> selected_rows;
+            for (int row_index = 0; row_index < row_limit; ++row_index) {
+                const int weight = weights[static_cast<std::size_t>(row_index)];
+                if (weight != 0)
+                    selected_rows.push_back(
+                        WeightedModKRow{&rows[static_cast<std::size_t>(row_index)], weight});
             }
+            maybe_add(build_modk_cg_cut_(problem, relaxation, options, selected_rows, modulus));
+            if (static_cast<int>(cuts.size()) >= cut_limit)
+                return cuts;
         }
+        // Like HiGHS, stop after the first modulus that produces usable cuts.
+        if (cuts.size() != cuts_before_modulus)
+            break;
     }
 
     return cuts;

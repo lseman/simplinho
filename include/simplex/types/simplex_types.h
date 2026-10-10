@@ -160,6 +160,14 @@ struct RevisedSimplexOptions {
     bool basis_sparse_equilibration = true;
     double basis_sparse_rhs_density_threshold = 0.40;
 
+    // HiGHS-style global LP equilibration. This is independent of presolve:
+    // deterministic power-of-two row/column factors remain compatible with
+    // basis and factorization reuse across bound-only re-solves.
+    bool simplex_scaling = true;
+    int simplex_scaling_passes = 6;
+    int allowed_matrix_scale_factor = 20;
+    bool force_equilibration = false;
+
     // Pricing
     int devex_reset = 0; // 0 = size-adaptive framework rebuild interval
     std::string pricing_rule = "adaptive"; // or "devex" / "most_negative"
