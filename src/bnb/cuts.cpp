@@ -2609,6 +2609,10 @@ void append_clique_cuts_from_leq_(const Problem& problem, const std::vector<int>
                  std::make_move_iterator(local_cuts.end()));
 }
 
+bool is_tableau_cut_type_(const std::string& type) {
+    return type.starts_with("GMI") || type.starts_with("TMIR") || type.starts_with("TCMIR");
+}
+
 std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
                                            const RelaxationSolution& relaxation,
                                            const Options& options, const LPSolution& lp, int row) {
@@ -2623,10 +2627,22 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
         return std::nullopt;
     }
 
-    if (lp.basis_state.column_status.size() != problem.variable_types.size() ||
+    if (lp.basis_state.column_status.size() < problem.variable_types.size() ||
         *basic_index >= relaxation.primal.size()) {
         return std::nullopt;
     }
+
+    // LP columns past the problem's are the slacks of the LP's non-equality cut rows,
+    // in row order: a'x + s = rhs for <= cuts and a'x - s = rhs for >= cuts, s >= 0.
+    const int problem_columns = static_cast<int>(problem.variable_types.size());
+    std::vector<const Cut*> slack_cuts;
+    if (relaxation.lp_cut_rows != nullptr) {
+        for (const Cut& lp_cut : *relaxation.lp_cut_rows) {
+            if (lp_cut.sense != LinearConstraintSense::Equal)
+                slack_cuts.push_back(&lp_cut);
+        }
+    }
+    const auto is_cut_slack = [&](int column) { return column >= problem_columns; };
 
     // Work in the bounded nonbasic variables used by the simplex basis:
     // y = x-lb at a lower bound and y = ub-x at an upper bound.  The sign of
@@ -2649,7 +2665,8 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
 
         const auto mapped_index = parse_internal_label_index_impl_(lp.internal_column_labels[col]);
         if (!mapped_index.has_value() || *mapped_index < 0 ||
-            *mapped_index >= static_cast<int>(problem.variable_types.size())) {
+            *mapped_index >= problem_columns + static_cast<int>(slack_cuts.size()) ||
+            *mapped_index >= static_cast<int>(lp.basis_state.column_status.size())) {
             return std::nullopt;
         }
 
@@ -2660,23 +2677,39 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
         }
 
         double transformed_tij = tij;
-        double bound = 0.0;
+        // Substitute the bound the nonbasic variable actually sits at in this LP. The
+        // LP may run on bounds tightened beyond `problem` (node presolve), and the
+        // derivation is only valid relative to the active bound.
         bool at_upper = false;
-        if (status == LPBasisStatus::AtLower) {
-            bound = problem.lower_bounds(*mapped_index);
-        } else if (status == LPBasisStatus::AtUpper) {
-            bound = problem.upper_bounds(*mapped_index);
+        if (status == LPBasisStatus::AtUpper) {
             transformed_tij = -tij;
             at_upper = true;
-        } else {
+        } else if (status != LPBasisStatus::AtLower) {
             return std::nullopt;
         }
-        if (!std::isfinite(bound)) {
+        if (*mapped_index >= relaxation.primal.size())
+            return std::nullopt;
+        const bool slack_column = is_cut_slack(*mapped_index);
+        // Keep Gomory cuts at rank one: substituting the row of an earlier tableau cut
+        // compounds dense, badly scaled higher-rank cuts that destabilize the LP.
+        if (slack_column &&
+            is_tableau_cut_type_(
+                slack_cuts[static_cast<std::size_t>(*mapped_index - problem_columns)]->cut_type)) {
+            return std::nullopt;
+        }
+        const bool integer_column =
+            !slack_column && problem.variable_types[*mapped_index] != VariableType::Continuous;
+        const double column_lower = slack_column ? 0.0 : problem.lower_bounds(*mapped_index);
+        const double column_upper = slack_column ? std::numeric_limits<double>::infinity()
+                                                 : problem.upper_bounds(*mapped_index);
+        const double bound = at_upper ? column_upper : column_lower;
+        if (!std::isfinite(bound) || bound < column_lower - 1e-9 ||
+            bound > column_upper + 1e-9) {
             return std::nullopt;
         }
 
         double coefficient = 0.0;
-        if (problem.variable_types[*mapped_index] != VariableType::Continuous) {
+        if (integer_column) {
             // Standard GMI coefficient for a nonnegative integer variable.
             const auto gmi_g = [&](double t) -> double {
                 const double fj = fractional_part(t);
@@ -2709,6 +2742,33 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
 
     if (cut.indices.empty())
         return std::nullopt;
+
+    // Express cut slacks through their rows: s = rhs - a'x (<=) or s = a'x - rhs (>=).
+    {
+        Cut substituted;
+        substituted.sense = cut.sense;
+        substituted.rhs = cut.rhs;
+        substituted.cut_type = cut.cut_type;
+        for (std::size_t k = 0; k < cut.indices.size(); ++k) {
+            const int index = cut.indices[k];
+            const double coefficient = cut.values[k];
+            if (!is_cut_slack(index)) {
+                substituted.indices.push_back(index);
+                substituted.values.push_back(coefficient);
+                continue;
+            }
+            const Cut& row = *slack_cuts[static_cast<std::size_t>(index - problem_columns)];
+            const double sign = row.sense == LinearConstraintSense::LessEqual ? -1.0 : 1.0;
+            for (std::size_t t = 0; t < row.indices.size() && t < row.values.size(); ++t) {
+                if (row.indices[t] < 0 || row.indices[t] >= problem_columns)
+                    return std::nullopt;
+                substituted.indices.push_back(row.indices[t]);
+                substituted.values.push_back(sign * coefficient * row.values[t]);
+            }
+            substituted.rhs += sign * coefficient * row.rhs;
+        }
+        cut = std::move(substituted);
+    }
 
     cut = eliminate_base_row_slacks_from_cut_(problem, std::move(cut));
     if (!postprocess_gmi_cut_(problem, options, &cut))

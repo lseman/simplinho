@@ -2209,6 +2209,7 @@ class Model {
                     }
                 }
 
+                const bool ladder_failed = lp_failed(raw_opt);
                 if (raw_opt.has_value()) {
                     const bool has_valid_primal = raw_opt->x.size() == node_data.total_vars &&
                                                   raw_opt->x.array().isFinite().all();
@@ -2272,6 +2273,8 @@ class Model {
                         //           << (slack_basis_guess.has_value() ? 1 : 0) << std::endl;
                     }
                     out.lp_solution = *raw_opt;
+                    out.lp_cut_rows = std::make_shared<const std::vector<simplex_bnb::Cut>>(cuts);
+                    out.lp_failed = ladder_failed;
                     if (terminal_optimal && !raw_opt->basis_state.column_status.empty() &&
                         basis_matches_dimensions(raw_opt->basis_state, node_data.total_vars,
                                                  node_data.rows)) {
@@ -2285,6 +2288,7 @@ class Model {
                     }
                 } else {
                     out.status = simplex_bnb::RelaxationStatus::Infeasible;
+                    out.lp_failed = true;
                     out.primal = Eigen::VectorXd::Constant(
                         node_data.total_vars, std::numeric_limits<double>::quiet_NaN());
                     out.objective = maximize_ ? -std::numeric_limits<double>::infinity()

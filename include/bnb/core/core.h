@@ -1571,7 +1571,8 @@ class Solver {
     NodePresolveOutcome
     presolve_node_bounds_(const Eigen::VectorXd& lower, const Eigen::VectorXd& upper,
                           const std::vector<Cut>& cuts,
-                          const std::shared_ptr<NodeReasonStore>& initial_reasons = nullptr) {
+                          const std::shared_ptr<NodeReasonStore>& initial_reasons = nullptr,
+                          bool cuts_are_global = true) {
         struct RowRef {
             const std::vector<int>* indices = nullptr;
             const std::vector<double>* values = nullptr;
@@ -1620,7 +1621,9 @@ class Solver {
             register_row(cut.indices, cut.values, cut.rhs, cut.sense);
         }
 
-        const bool allow_global_conflict_learning = !contains_incumbent_cutoff_(cuts);
+        // Conflicts derived from subtree-local cut rows hold only in that subtree.
+        const bool allow_global_conflict_learning =
+            cuts_are_global && !contains_incumbent_cutoff_(cuts);
         const detail::ConflictGraph* graph = conflict_graph_();
         const std::vector<std::vector<ConflictLiteral>> learned_implications =
             learned_implications_snapshot_();
@@ -1814,7 +1817,8 @@ class Solver {
                 upper(candidate.variable) = static_cast<double>(fixed_value);
 
                 const NodePresolveOutcome presolved =
-                    presolve_node_bounds_(lower, upper, relaxation_cuts, node.reasons);
+                    presolve_node_bounds_(lower, upper, relaxation_cuts, node.reasons,
+                                          node.local_cuts == nullptr);
                 if (presolved.infeasible) {
                     Cut cut;
                     cut.cut_type = "ProbeFix";
@@ -2092,6 +2096,92 @@ class Solver {
         return cuts;
     }
 
+    // Solve a node LP, retrying when the LP solver fails (rather than proving
+    // infeasibility): first without the subtree-local cuts, which are optional, then
+    // without any cut rows. Every retry still yields a valid bound for the node.
+    template <typename RelaxationSolver>
+    RelaxationSolution solve_lp_with_cut_fallback_(
+        RelaxationSolver& relaxation_solver, const Eigen::VectorXd& lower,
+        const Eigen::VectorXd& upper, const LPBasis* basis, const std::vector<Cut>& cuts,
+        const std::shared_ptr<const std::vector<Cut>>& local_cuts,
+        const std::vector<Cut>& extra_cuts, bool* dropped_local_cuts,
+        std::optional<double> unsolved_bound = std::nullopt) {
+        RelaxationSolution out = relaxation_solver(lower, upper, basis, cuts);
+        if (!out.lp_failed)
+            return out;
+        const bool has_local_cuts = local_cuts != nullptr && !local_cuts->empty();
+        if (has_local_cuts) {
+            std::vector<Cut> global_cuts = current_relaxation_cuts_snapshot_(nullptr);
+            global_cuts.insert(global_cuts.end(), extra_cuts.begin(), extra_cuts.end());
+            RelaxationSolution retry = relaxation_solver(lower, upper, nullptr, global_cuts);
+            if (!retry.lp_failed) {
+                *dropped_local_cuts = true;
+                return retry;
+            }
+        }
+        if (!cuts.empty()) {
+            RelaxationSolution retry = relaxation_solver(lower, upper, nullptr, {});
+            if (!retry.lp_failed) {
+                *dropped_local_cuts = has_local_cuts;
+                return retry;
+            }
+        }
+        if (unsolved_bound.has_value())
+            return unsolved_relaxation_(lower, upper, *unsolved_bound);
+        return out;
+    }
+
+    // Stand-in for a node whose LP cannot be solved at all: it keeps the node's
+    // inherited bound (valid for every descendant) and puts each unfixed integer
+    // column half a unit inside its domain, so the node is branched on rather than
+    // pruned or accepted as integral.
+    RelaxationSolution unsolved_relaxation_(const Eigen::VectorXd& lower,
+                                            const Eigen::VectorXd& upper,
+                                            double inherited_bound) const {
+        RelaxationSolution out;
+        out.status = RelaxationStatus::Optimal;
+        out.lp_failed = true;
+        out.objective = std::isfinite(inherited_bound)
+                            ? inherited_bound
+                            : (problem_.maximize ? std::numeric_limits<double>::infinity()
+                                                 : -std::numeric_limits<double>::infinity());
+        out.primal = Eigen::VectorXd::Zero(lower.size());
+        for (int j = 0; j < lower.size(); ++j) {
+            const double lo = lower(j);
+            const double up = upper(j);
+            const bool integer = j < static_cast<int>(problem_.variable_types.size()) &&
+                                 problem_.variable_types[j] != VariableType::Continuous;
+            if (std::isfinite(lo) && std::isfinite(up) && up - lo < 0.5) {
+                out.primal(j) = lo;
+            } else if (std::isfinite(lo)) {
+                out.primal(j) = integer ? lo + 0.5 : lo;
+            } else if (std::isfinite(up)) {
+                out.primal(j) = integer ? up - 0.5 : up;
+            } else {
+                out.primal(j) = integer ? 0.5 : 0.0;
+            }
+        }
+        return out;
+    }
+
+    // Position of a node bound between the global dual bound (0) and the
+    // incumbent (1). Without an incumbent every node counts as close (0).
+    double relative_bound_distance_(double node_bound) const {
+        const ProgressSnapshot snapshot = progress_snapshot_();
+        if (!snapshot.has_incumbent || !std::isfinite(snapshot.incumbent_objective) ||
+            !std::isfinite(node_bound)) {
+            return 0.0;
+        }
+        const double global_bound = current_best_bound_(snapshot);
+        if (!std::isfinite(global_bound))
+            return 0.0;
+        const double sign = problem_.maximize ? -1.0 : 1.0;
+        const double span = sign * (snapshot.incumbent_objective - global_bound);
+        if (span <= options_.integrality_tol)
+            return 0.0;
+        return std::max(0.0, sign * (node_bound - global_bound)) / span;
+    }
+
     bool should_try_node_cuts_(const detail::ActiveNode& node, const RelaxationSolution& relaxation,
                                const std::vector<detail::FractionalCandidate>& fractional,
                                const Options& effective) const {
@@ -2106,14 +2196,17 @@ class Solver {
             fractional.empty()) {
             return false;
         }
-        // Cut-depth policy. Extend cut reach deeper into the tree: GMI/MIR/cover
-        // cuts are most effective at pruning subtrees early. Allow cuts up to
-        // depth 4 (was 3) and widen the "shallow" band to depth 3 (was 2).
+        // Cut-depth policy: always separate in the shallow band. Deeper, separate
+        // only at nodes whose bound lies close to the global dual bound (SCIP's
+        // maxbounddist rule): those nodes define the global bound, while cuts at
+        // nodes far above it rarely change the search.
         const bool proof = adaptive_proof_phase_active_for_bound_(relaxation.objective);
-        if (node.depth > std::max(3, effective.strong_branching_max_depth + 1)) {
+        const bool shallow = node.depth <= std::max(3, effective.strong_branching_max_depth + 1);
+        constexpr double kNodeCutMaxBoundDistance = 0.2;
+        if (!shallow && !proof &&
+            !(relative_bound_distance_(relaxation.objective) <= kNodeCutMaxBoundDistance)) {
             return false;
         }
-        const bool shallow = node.depth <= 3;
         const bool periodic =
             effective.heuristic_frequency <= 1 ||
             (effective.heuristic_frequency > 0 &&
@@ -2362,28 +2455,53 @@ class Solver {
 
     void mark_unbounded_() { search_coordinator_.mark_unbounded(); }
 
-    void maybe_update_incumbent_(const Eigen::VectorXd& primal, double objective) {
-        if (!detail::is_integer_feasible_solution(primal, problem_.variable_types,
+    void maybe_update_incumbent_(const Eigen::VectorXd& raw_primal, double raw_objective) {
+        if (!detail::is_integer_feasible_solution(raw_primal, problem_.variable_types,
                                                   options_.integrality_tol) ||
-            !detail::is_sos_feasible_solution(primal, problem_.sos_constraints,
+            !detail::is_sos_feasible_solution(raw_primal, problem_.sos_constraints,
                                               options_.integrality_tol)) {
             return;
+        }
+        // Snap integer columns to their integral values so LP round-off does not leak
+        // into the reported solution and objective; the row check below validates it.
+        Eigen::VectorXd primal = raw_primal;
+        double objective = raw_objective;
+        const int integer_columns = std::min<int>(static_cast<int>(problem_.variable_types.size()),
+                                                  static_cast<int>(primal.size()));
+        for (int j = 0; j < integer_columns; ++j) {
+            if (problem_.variable_types[j] != VariableType::Continuous)
+                primal(j) = std::round(primal(j));
+        }
+        if (problem_.objective_coefficients.size() <= primal.size()) {
+            objective =
+                problem_.objective_constant +
+                problem_.objective_coefficients.dot(
+                    primal.head(problem_.objective_coefficients.size()));
         }
         // Verify linear constraint feasibility. Heuristics can produce solutions
         // that satisfy integrality but violate constraints due to rounding or
         // numerical tolerance. An infeasible incumbent causes incorrect pruning
         // and false-positive "optimal" results.
         const double ctol = options_.feasibility_tol * 100.0;
-        for (const auto& c : problem_.base_constraints) {
-            double lhs = 0.0;
-            for (int k = 0; k < static_cast<int>(c.indices.size()); ++k)
-                lhs += c.values[k] * primal[c.indices[k]];
-            if (c.sense == LinearConstraintSense::LessEqual && lhs > c.rhs + ctol)
+        const auto rows_feasible = [&](const Eigen::VectorXd& x) {
+            for (const auto& c : problem_.base_constraints) {
+                double lhs = 0.0;
+                for (int k = 0; k < static_cast<int>(c.indices.size()); ++k)
+                    lhs += c.values[k] * x[c.indices[k]];
+                if (c.sense == LinearConstraintSense::LessEqual && lhs > c.rhs + ctol)
+                    return false;
+                if (c.sense == LinearConstraintSense::GreaterEqual && lhs < c.rhs - ctol)
+                    return false;
+                if (c.sense == LinearConstraintSense::Equal && std::abs(lhs - c.rhs) > ctol)
+                    return false;
+            }
+            return true;
+        };
+        if (!rows_feasible(primal)) {
+            if (!rows_feasible(raw_primal))
                 return;
-            if (c.sense == LinearConstraintSense::GreaterEqual && lhs < c.rhs - ctol)
-                return;
-            if (c.sense == LinearConstraintSense::Equal && std::abs(lhs - c.rhs) > ctol)
-                return;
+            primal = raw_primal;
+            objective = raw_objective;
         }
         bool updated = false;
         {
@@ -3239,7 +3357,8 @@ class Solver {
             if (should_run_node_presolve(warm_basis, effective)) {
                 presolved =
                     presolve_node_bounds_(current_node.lower_bounds, current_node.upper_bounds,
-                                          propagation_cuts, current_node.reasons);
+                                          propagation_cuts, current_node.reasons,
+                                          allow_global_conflict_learning);
             } else {
                 presolved.lower_bounds = current_node.lower_bounds;
                 presolved.upper_bounds = current_node.upper_bounds;
@@ -3261,7 +3380,8 @@ class Solver {
                 should_run_node_presolve(warm_basis, effective)) {
                 presolved =
                     presolve_node_bounds_(current_node.lower_bounds, current_node.upper_bounds,
-                                          propagation_cuts, current_node.reasons);
+                                          propagation_cuts, current_node.reasons,
+                                          allow_global_conflict_learning);
                 current_node.lower_bounds = presolved.lower_bounds;
                 current_node.upper_bounds = presolved.upper_bounds;
                 current_node.reasons = presolved.reasons;
@@ -3295,9 +3415,14 @@ class Solver {
                                               presolve_wall_ns);
                 return out;
             }
-            RelaxationSolution out = relaxation_solver(
-                current_node.lower_bounds, current_node.upper_bounds, warm_basis, relaxation_cuts);
-            if (out.status == RelaxationStatus::Infeasible) {
+            bool dropped_local_cuts = false;
+            RelaxationSolution out = solve_lp_with_cut_fallback_(
+                relaxation_solver, current_node.lower_bounds, current_node.upper_bounds,
+                warm_basis, relaxation_cuts, current_node.local_cuts, extra_cuts,
+                &dropped_local_cuts, current_node.bound);
+            if (dropped_local_cuts)
+                current_node.local_cuts.reset();
+            if (out.status == RelaxationStatus::Infeasible && !out.lp_failed) {
                 maybe_learn_conflict_from_bounds_(current_node.lower_bounds,
                                                   current_node.upper_bounds,
                                                   allow_global_conflict_learning);
@@ -3634,12 +3759,13 @@ class Solver {
         const Options node_effective_options = effective_options_for_bound_(relaxation.objective);
         if (should_try_node_cuts_(node, relaxation, fractional, node_effective_options)) {
             Options node_cut_separation_options = node_effective_options;
-            // HiGHS reconstructs tableau row aggregations and transforms them against the global
-            // domain. Our exported tableau does not yet retain enough information to do that
-            // after branching, so keep tableau GMI/MIR at the root. SCIP's alternative is to
-            // mark such cuts local and carry them down the subtree. Most structural separators
-            // below keep using global bounds; implied-bound separation may use the propagated
-            // node domain because its selected rows are inherited as subtree-local LP state.
+            // Tableau cuts are intentionally root-only. At a node their bound
+            // substitutions are local, and on badly scaled models the resulting rows can
+            // make otherwise routine node LPs singular or fail primal validation. Root
+            // GMI/MIR retains the useful global bound strengthening without injecting those
+            // numerically fragile rows into every descendant relaxation. Structural families
+            // continue to use global bounds; implied-bound separation alone may use the
+            // propagated node domain because its selected rows remain subtree-local.
             node_cut_separation_options.use_gomory_cuts = false;
             node_cut_separation_options.use_mir_cuts = false;
             // Node processing itself may be parallel. Keep separator families serial inside a
@@ -3912,7 +4038,8 @@ class Solver {
             NodePresolveOutcome presolved;
             if (should_run_node_presolve(basis, effective)) {
                 presolved = presolve_node_bounds_(prepared.lower_bounds, prepared.upper_bounds,
-                                                  relaxation_cuts, prepared.reasons);
+                                                  relaxation_cuts, prepared.reasons,
+                                                  allow_global_conflict_learning);
             } else {
                 presolved.lower_bounds = prepared.lower_bounds;
                 presolved.upper_bounds = prepared.upper_bounds;
@@ -3925,7 +4052,8 @@ class Solver {
             if (gd_tightened2 > 0 && !presolved.infeasible &&
                 should_run_node_presolve(basis, effective)) {
                 presolved = presolve_node_bounds_(prepared.lower_bounds, prepared.upper_bounds,
-                                                  relaxation_cuts, prepared.reasons);
+                                                  relaxation_cuts, prepared.reasons,
+                                                  allow_global_conflict_learning);
             }
             if (presolved.infeasible) {
                 maybe_learn_conflict_from_bounds_(presolved.lower_bounds, presolved.upper_bounds,
@@ -3942,9 +4070,11 @@ class Solver {
                                               presolve_wall_ns);
                 return out;
             }
-            RelaxationSolution out = relaxation_solver(
-                presolved.lower_bounds, presolved.upper_bounds, basis, relaxation_cuts);
-            if (out.status == RelaxationStatus::Infeasible) {
+            bool dropped_local_cuts = false;
+            RelaxationSolution out = solve_lp_with_cut_fallback_(
+                relaxation_solver, presolved.lower_bounds, presolved.upper_bounds, basis,
+                relaxation_cuts, prepared.local_cuts, {}, &dropped_local_cuts);
+            if (out.status == RelaxationStatus::Infeasible && !out.lp_failed) {
                 maybe_learn_conflict_from_bounds_(presolved.lower_bounds, presolved.upper_bounds,
                                                   allow_global_conflict_learning);
                 if (options_.use_dual_proof_cuts && allow_global_conflict_learning) {
@@ -3977,7 +4107,8 @@ class Solver {
             NodePresolveOutcome presolved;
             if (should_run_node_presolve(basis, effective)) {
                 presolved = presolve_node_bounds_(prepared.lower_bounds, prepared.upper_bounds,
-                                                  relaxation_cuts, prepared.reasons);
+                                                  relaxation_cuts, prepared.reasons,
+                                                  allow_global_conflict_learning);
             } else {
                 presolved.lower_bounds = prepared.lower_bounds;
                 presolved.upper_bounds = prepared.upper_bounds;
@@ -3989,7 +4120,8 @@ class Solver {
             if (gd_tightened3 > 0 && !presolved.infeasible &&
                 should_run_node_presolve(basis, effective)) {
                 presolved = presolve_node_bounds_(prepared.lower_bounds, prepared.upper_bounds,
-                                                  relaxation_cuts, prepared.reasons);
+                                                  relaxation_cuts, prepared.reasons,
+                                                  allow_global_conflict_learning);
             }
             if (presolved.infeasible) {
                 RelaxationSolution out;
@@ -4000,10 +4132,12 @@ class Solver {
                                                   : std::numeric_limits<double>::infinity();
                 return out;
             }
-            RelaxationSolution out = relaxation_solver(
-                presolved.lower_bounds, presolved.upper_bounds, basis, relaxation_cuts);
-            if (out.status == RelaxationStatus::Infeasible && options_.use_dual_proof_cuts &&
-                allow_global_conflict_learning) {
+            bool dropped_local_cuts = false;
+            RelaxationSolution out = solve_lp_with_cut_fallback_(
+                relaxation_solver, presolved.lower_bounds, presolved.upper_bounds, basis,
+                relaxation_cuts, prepared.local_cuts, {}, &dropped_local_cuts);
+            if (out.status == RelaxationStatus::Infeasible && !out.lp_failed &&
+                options_.use_dual_proof_cuts && allow_global_conflict_learning) {
                 std::vector<Cut> proof_cuts = detail::generate_dual_proof_cuts(
                     problem_, relaxation_cuts, out, problem_.lower_bounds, problem_.upper_bounds,
                     options_);
@@ -4376,7 +4510,9 @@ class Solver {
             }
         }
 
-        if (!child.relaxation.has_value() || child.relaxation_is_probe_only) {
+        // A child whose LP could not be solved is queued unsolved, never pruned.
+        if (!child.relaxation.has_value() || child.relaxation_is_probe_only ||
+            child.relaxation->lp_failed) {
             update_tree_node_(child_id, [&](TreeNode& tree_node) {
                 tree_node.status = TreeNodeStatus::Created;
                 tree_node.bound = inherited_bound;

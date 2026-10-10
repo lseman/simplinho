@@ -31,6 +31,8 @@ namespace {
                                         double distance, bool maximize, double feasibility_tol,
                                         double integrality_tol) {
     (void)feasibility_tol;
+    if (child.lp_failed)
+        return 0.0; // an unsolved probe carries no branching information
     if (child.status == RelaxationStatus::Infeasible) {
         return std::numeric_limits<double>::infinity();
     }
@@ -218,6 +220,8 @@ void update_pseudocosts(std::vector<PseudoCost>& pseudocosts, const FractionalCa
 
     auto update_one = [&](bool branch_up, const RelaxationSolution& child, double distance) {
         auto& pseudocost = pseudocosts[candidate.variable];
+        if (child.lp_failed)
+            return;
         if (child.status == RelaxationStatus::Infeasible) {
             const double gain = 4.0 / safe_max(distance, integrality_tol);
             if (branch_up) {
@@ -349,9 +353,11 @@ choose_pseudocost_without_probing(const ActiveNode& node,
         (evaluation.relaxation->status != RelaxationStatus::Optimal ||
          (evaluation.relaxation->lp_solution.has_value() &&
           evaluation.relaxation->lp_solution->status == LPSolution::Status::IterLimit));
+    // A probe whose LP could not be solved proves nothing; the child is solved later.
     evaluation.cutoff = !evaluation.relaxation.has_value() ||
-                        evaluation.relaxation->status == RelaxationStatus::Infeasible ||
-                        evaluation.relaxation->status == RelaxationStatus::Unbounded;
+                        (!evaluation.relaxation->lp_failed &&
+                         (evaluation.relaxation->status == RelaxationStatus::Infeasible ||
+                          evaluation.relaxation->status == RelaxationStatus::Unbounded));
     return evaluation;
 }
 

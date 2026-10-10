@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -308,6 +309,12 @@ struct RelaxationSolution {
     int iterations = 0;
     std::optional<LPBasis> basis;
     std::optional<LPSolution> lp_solution;
+    // Cut rows of the solved LP, in LP row order. Each non-equality cut owns a slack
+    // column after the problem's columns; tableau separators substitute it out.
+    std::shared_ptr<const std::vector<Cut>> lp_cut_rows;
+    // The LP could not be solved (numerical failure), as opposed to being proved
+    // infeasible. Such a node must not be pruned or learned from.
+    bool lp_failed = false;
     bool attempted_warm_start_basis_state = false;
     bool used_warm_start_basis_state = false;
     bool cold_retried_after_warm_start = false;
