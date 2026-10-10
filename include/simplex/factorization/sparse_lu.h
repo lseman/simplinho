@@ -2282,22 +2282,28 @@ class SparseForrestTomlinLU {
 
         ensure_U_cols_ready_();
         int i = k;
+        int j = k;
         double best_in_col = -1.0;
-        for (const auto& [phys_row, val] : U_cols_[col_map_[k]]) {
-            const int logical_row = row_inv_[phys_row];
-            if (logical_row < k)
-                continue;
-            const double ab = std::abs(val);
-            if (ab > best_in_col) {
-                best_in_col = ab;
-                i = logical_row;
+        // Column k first; when it has no active entry, every active column
+        // (the candidate heap can be exhausted while the active submatrix is
+        // still nonsingular, and giving up here would inject a logical).
+        for (int c = k; c < n_ && best_in_col <= abs_floor_; ++c) {
+            for (const auto& [phys_row, val] : U_cols_[col_map_[c]]) {
+                const int logical_row = row_inv_[phys_row];
+                if (logical_row < k)
+                    continue;
+                const double ab = std::abs(val);
+                if (ab > best_in_col) {
+                    best_in_col = ab;
+                    i = logical_row;
+                    j = c;
+                }
             }
         }
 
         if (best_in_col <= abs_floor_)
             return {-1, -1};
 
-        int j = k;
         for (int t = 0; t < std::max(1, rook_iters_); ++t) {
             double best_row = -1.0;
             for (const auto& [phys_col, val] : U_rows_[row_map_[i]]) {
@@ -2348,7 +2354,9 @@ class SparseForrestTomlinLU {
                     // Column singleton: find the row with the active entry
                     for (const auto& [phys_row, val] : U_cols_[col]) {
                         const int logical_row = row_inv_[phys_row];
-                        if (logical_row >= k && std::abs(val) > abs_floor_) {
+                        // U_cols_ can hold a stale value; the row storage is authoritative.
+                        if (logical_row >= k && std::abs(val) > abs_floor_ &&
+                            std::abs(get_U_(logical_row, col)) > abs_floor_) {
                             singleton_row = logical_row;
                             singleton_col = col;
                             found_singleton = true;
@@ -2380,6 +2388,7 @@ class SparseForrestTomlinLU {
                 // No pivot found — inject identity column for row k
                 // Find an unused column (one not yet in basis)
                 injected_logical = true;
+                ++injected_logicals_;
                 --rank_deficiency_;
                 // Record this row as having no pivot
                 row_with_no_pivot_.push_back(k);
@@ -2424,6 +2433,7 @@ class SparseForrestTomlinLU {
                 if (!injected_logical) {
                     // Pivot is singular — inject identity for this row/column
                     injected_logical = true;
+                    ++injected_logicals_;
                     --rank_deficiency_;
                     row_with_no_pivot_.push_back(k);
                     col_with_no_pivot_.push_back(-1);
@@ -2475,7 +2485,7 @@ class SparseForrestTomlinLU {
         }
 
         // For each row without a pivot, inject an identity column
-        int injected = 0;
+        int injected = injected_logicals_;
         for (int k = 0; k < n_ && rank_deficiency_ > 0; ++k) {
             if (!has_pivot[k]) {
                 // Inject identity for row k

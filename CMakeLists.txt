@@ -189,6 +189,7 @@ find_package(Threads REQUIRED)
 # ==============================================================================
 
 set(SIMPLEX_BINDING_SOURCES
+    bindings/ekk_bindings.cpp
     bindings/model_bindings.cpp
     bindings/module.cpp
     bindings/simplex_bindings.cpp
