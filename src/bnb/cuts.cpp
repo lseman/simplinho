@@ -205,6 +205,7 @@ std::optional<int> parse_internal_label_index_impl_(const std::string& label);
 std::vector<int> select_gmi_rows_(const Problem& problem, const RelaxationSolution& relaxation,
                                   const Options& options, const LPSolution& lp);
 bool postprocess_gmi_cut_(const Problem& problem, const Options& options, Cut* cut);
+double gmi_candidate_away_(const Options& options);
 double gmi_cut_quality_score_(const Cut& cut, const Eigen::VectorXd& primal, double violation);
 CanonicalMirRow build_canonical_mir_row_from_leq_(const Problem& problem,
                                                   const RelaxationSolution& relaxation,
@@ -2608,6 +2609,10 @@ void append_clique_cuts_from_leq_(const Problem& problem, const std::vector<int>
                  std::make_move_iterator(local_cuts.end()));
 }
 
+bool is_tableau_cut_type_(const std::string& type) {
+    return type.starts_with("GMI") || type.starts_with("TMIR") || type.starts_with("TCMIR");
+}
+
 std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
                                            const RelaxationSolution& relaxation,
                                            const Options& options, const LPSolution& lp, int row) {
@@ -2622,21 +2627,33 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
         return std::nullopt;
     }
 
-    if (lp.basis_state.column_status.size() != problem.variable_types.size() ||
+    if (lp.basis_state.column_status.size() < problem.variable_types.size() ||
         *basic_index >= relaxation.primal.size()) {
         return std::nullopt;
     }
+
+    // LP columns past the problem's are the slacks of the LP's non-equality cut rows,
+    // in row order: a'x + s = rhs for <= cuts and a'x - s = rhs for >= cuts, s >= 0.
+    const int problem_columns = static_cast<int>(problem.variable_types.size());
+    std::vector<const Cut*> slack_cuts;
+    if (relaxation.lp_cut_rows != nullptr) {
+        for (const Cut& lp_cut : *relaxation.lp_cut_rows) {
+            if (lp_cut.sense != LinearConstraintSense::Equal)
+                slack_cuts.push_back(&lp_cut);
+        }
+    }
+    const auto is_cut_slack = [&](int column) { return column >= problem_columns; };
 
     // Work in the bounded nonbasic variables used by the simplex basis:
     // y = x-lb at a lower bound and y = ub-x at an upper bound.  The sign of
     // a tableau coefficient does not identify the active bound.
     const double f0 = fractional_part(relaxation.primal(*basic_index));
-    if (std::min(f0, 1.0 - f0) <= options.min_cut_violation)
+    if (std::min(f0, 1.0 - f0) <= gmi_candidate_away_(options))
         return std::nullopt;
 
     Cut cut;
     cut.sense = LinearConstraintSense::GreaterEqual;
-    cut.rhs = f0 + 1e-9;
+    cut.rhs = f0 - 1e-9;
     cut.cut_type = "GMI";
 
     for (int col = 0; col < lp.tableau.cols(); ++col) {
@@ -2648,7 +2665,8 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
 
         const auto mapped_index = parse_internal_label_index_impl_(lp.internal_column_labels[col]);
         if (!mapped_index.has_value() || *mapped_index < 0 ||
-            *mapped_index >= static_cast<int>(problem.variable_types.size())) {
+            *mapped_index >= problem_columns + static_cast<int>(slack_cuts.size()) ||
+            *mapped_index >= static_cast<int>(lp.basis_state.column_status.size())) {
             return std::nullopt;
         }
 
@@ -2659,23 +2677,39 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
         }
 
         double transformed_tij = tij;
-        double bound = 0.0;
+        // Substitute the bound the nonbasic variable actually sits at in this LP. The
+        // LP may run on bounds tightened beyond `problem` (node presolve), and the
+        // derivation is only valid relative to the active bound.
         bool at_upper = false;
-        if (status == LPBasisStatus::AtLower) {
-            bound = problem.lower_bounds(*mapped_index);
-        } else if (status == LPBasisStatus::AtUpper) {
-            bound = problem.upper_bounds(*mapped_index);
+        if (status == LPBasisStatus::AtUpper) {
             transformed_tij = -tij;
             at_upper = true;
-        } else {
+        } else if (status != LPBasisStatus::AtLower) {
             return std::nullopt;
         }
-        if (!std::isfinite(bound)) {
+        if (*mapped_index >= relaxation.primal.size())
+            return std::nullopt;
+        const bool slack_column = is_cut_slack(*mapped_index);
+        // Keep Gomory cuts at rank one: substituting the row of an earlier tableau cut
+        // compounds dense, badly scaled higher-rank cuts that destabilize the LP.
+        if (slack_column &&
+            is_tableau_cut_type_(
+                slack_cuts[static_cast<std::size_t>(*mapped_index - problem_columns)]->cut_type)) {
+            return std::nullopt;
+        }
+        const bool integer_column =
+            !slack_column && problem.variable_types[*mapped_index] != VariableType::Continuous;
+        const double column_lower = slack_column ? 0.0 : problem.lower_bounds(*mapped_index);
+        const double column_upper = slack_column ? std::numeric_limits<double>::infinity()
+                                                 : problem.upper_bounds(*mapped_index);
+        const double bound = at_upper ? column_upper : column_lower;
+        if (!std::isfinite(bound) || bound < column_lower - 1e-9 ||
+            bound > column_upper + 1e-9) {
             return std::nullopt;
         }
 
         double coefficient = 0.0;
-        if (problem.variable_types[*mapped_index] != VariableType::Continuous) {
+        if (integer_column) {
             // Standard GMI coefficient for a nonnegative integer variable.
             const auto gmi_g = [&](double t) -> double {
                 const double fj = fractional_part(t);
@@ -2708,6 +2742,33 @@ std::optional<Cut> build_gmi_cut_from_row_(const Problem& problem,
 
     if (cut.indices.empty())
         return std::nullopt;
+
+    // Express cut slacks through their rows: s = rhs - a'x (<=) or s = a'x - rhs (>=).
+    {
+        Cut substituted;
+        substituted.sense = cut.sense;
+        substituted.rhs = cut.rhs;
+        substituted.cut_type = cut.cut_type;
+        for (std::size_t k = 0; k < cut.indices.size(); ++k) {
+            const int index = cut.indices[k];
+            const double coefficient = cut.values[k];
+            if (!is_cut_slack(index)) {
+                substituted.indices.push_back(index);
+                substituted.values.push_back(coefficient);
+                continue;
+            }
+            const Cut& row = *slack_cuts[static_cast<std::size_t>(index - problem_columns)];
+            const double sign = row.sense == LinearConstraintSense::LessEqual ? -1.0 : 1.0;
+            for (std::size_t t = 0; t < row.indices.size() && t < row.values.size(); ++t) {
+                if (row.indices[t] < 0 || row.indices[t] >= problem_columns)
+                    return std::nullopt;
+                substituted.indices.push_back(row.indices[t]);
+                substituted.values.push_back(sign * coefficient * row.values[t]);
+            }
+            substituted.rhs += sign * coefficient * row.rhs;
+        }
+        cut = std::move(substituted);
+    }
 
     cut = eliminate_base_row_slacks_from_cut_(problem, std::move(cut));
     if (!postprocess_gmi_cut_(problem, options, &cut))
@@ -3773,9 +3834,10 @@ Cut eliminate_base_row_slacks_from_cut_(const Problem& problem, Cut cut) {
 }
 
 double gmi_candidate_away_(const Options& options) {
-    // Lower floor: accept moderately fractional rows that CBC would use.
-    // This captures more cut candidates, letting the scoring filter the weak ones.
-    return std::max({10.0 * options.integrality_tol, 5.0 * options.min_cut_violation, 2e-4});
+    // GMI coefficients scale with 1/(1-f0) (or 1/f0), so rows whose basic value is
+    // nearly integral amplify LP round-off into cuts that slice off feasible points.
+    // 0.01 matches SCIP's sepa_gomory "away" default.
+    return std::max({10.0 * options.integrality_tol, 5.0 * options.min_cut_violation, 0.01});
 }
 
 double gmi_cut_quality_score_(const Cut& cut, const Eigen::VectorXd& primal, double violation) {
@@ -3802,19 +3864,37 @@ bool scale_integral_support_gmi_cut_(const Problem& problem, const Options& opti
     if (!integral_support)
         return false;
 
+    if (cut->sense == LinearConstraintSense::Equal)
+        return false;
+    const bool is_leq = cut->sense == LinearConstraintSense::LessEqual;
+
     constexpr std::array<int, 11> kCandidateScales = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
     const double coeff_tol = std::max(1e-8, 50.0 * options.integrality_tol);
     for (const int scale : kCandidateScales) {
         bool good = true;
         double max_abs = 0.0;
+        // Rounding a coefficient by delta shifts the activity by delta * x_j; absorb
+        // its worst case over the variable's domain so the scaled cut stays valid.
+        double rhs_shift = 0.0;
         std::vector<double> scaled_values;
         scaled_values.reserve(cut->values.size());
-        for (double value : cut->values) {
-            const double scaled = static_cast<double>(scale) * value;
+        for (std::size_t k = 0; k < cut->values.size(); ++k) {
+            const double scaled = static_cast<double>(scale) * cut->values[k];
             const double rounded = std::round(scaled);
-            if (std::abs(scaled - rounded) > coeff_tol) {
+            const double delta = rounded - scaled;
+            if (std::abs(delta) > coeff_tol) {
                 good = false;
                 break;
+            }
+            if (delta != 0.0) {
+                const int index = cut->indices[k];
+                const double at_lower = delta * problem.lower_bounds(index);
+                const double at_upper = delta * problem.upper_bounds(index);
+                if (!std::isfinite(at_lower) || !std::isfinite(at_upper)) {
+                    good = false;
+                    break;
+                }
+                rhs_shift += is_leq ? std::max(at_lower, at_upper) : std::min(at_lower, at_upper);
             }
             scaled_values.push_back(rounded);
             max_abs = std::max(max_abs, std::abs(rounded));
@@ -3822,8 +3902,8 @@ bool scale_integral_support_gmi_cut_(const Problem& problem, const Options& opti
         if (!good || max_abs > (1 << 20))
             continue;
 
-        const double scaled_rhs = static_cast<double>(scale) * cut->rhs;
-        cut->rhs = std::ceil(scaled_rhs - coeff_tol);
+        const double scaled_rhs = static_cast<double>(scale) * cut->rhs + rhs_shift;
+        cut->rhs = is_leq ? std::floor(scaled_rhs + coeff_tol) : std::ceil(scaled_rhs - coeff_tol);
         cut->values = std::move(scaled_values);
         return true;
     }
@@ -3859,15 +3939,17 @@ bool postprocess_gmi_cut_(const Problem& problem, const Options& options, Cut* c
             return false;
 
         if (std::abs(value) <= drop_tol) {
-            if (value > 0.0) {
-                if (!std::isfinite(problem.lower_bounds(index)))
-                    return false;
-                cut->rhs -= value * problem.lower_bounds(index);
-            } else {
-                if (!std::isfinite(problem.upper_bounds(index)))
-                    return false;
-                cut->rhs -= value * problem.upper_bounds(index);
-            }
+            // Relax by the term's extreme value in the direction that keeps the
+            // cut valid: its minimum for <= cuts, its maximum for >= cuts.
+            if (cut->sense == LinearConstraintSense::Equal)
+                return false;
+            const bool use_lower =
+                (value > 0.0) == (cut->sense == LinearConstraintSense::LessEqual);
+            const double bound =
+                use_lower ? problem.lower_bounds(index) : problem.upper_bounds(index);
+            if (!std::isfinite(bound))
+                return false;
+            cut->rhs -= value * bound;
             continue;
         }
 
@@ -4776,7 +4858,7 @@ std::vector<Cut> generate_mir_cuts(const Problem& problem, const RelaxationSolut
     // combinations of the original constraints and tend to produce stronger MIR cuts
     // than raw base constraint rows because the fractionality is concentrated in one variable.
     std::vector<MirRowData> tableau_mir_rows;
-    if (options.use_gomory_cuts && relaxation.lp_solution.has_value()) {
+    if (relaxation.lp_solution.has_value()) {
         const LPSolution& lp = *relaxation.lp_solution;
         const int n_cols = static_cast<int>(lp.tableau.cols());
         const int n_rows = static_cast<int>(lp.tableau.rows());
@@ -4800,13 +4882,19 @@ std::vector<Cut> generate_mir_cuts(const Problem& problem, const RelaxationSolut
                     *basic_idx >= static_cast<int>(problem.variable_types.size()))
                     continue;
 
-                // Build problem-variable-indexed row from tableau entries.
-                // Slack columns (where parse returns nullopt) are projected out —
-                // the resulting constraint is a valid relaxation of the tableau row.
+                // Build problem-variable-indexed row from tableau entries. A tableau
+                // row is a linear combination of the LP equalities, so it is valid
+                // only with every nonbasic term kept: dropping a column (e.g. a cut
+                // slack with no problem index) is not a relaxation. Skip such rows,
+                // as GMI does, and anchor the rhs at the current LP point.
+                if (*basic_idx >= relaxation.primal.size())
+                    continue;
                 std::vector<int> t_indices;
                 std::vector<double> t_values;
                 t_indices.push_back(*basic_idx);
                 t_values.push_back(1.0);
+                double t_rhs = relaxation.primal(*basic_idx);
+                bool representable = true;
                 for (int col = 0; col < n_cols; ++col) {
                     if (col == basic_col)
                         continue;
@@ -4815,16 +4903,18 @@ std::vector<Cut> generate_mir_cuts(const Problem& problem, const RelaxationSolut
                         continue;
                     const auto mapped =
                         parse_internal_label_index_impl_(lp.internal_column_labels[col]);
-                    if (!mapped.has_value())
-                        continue; // skip slack columns
-                    if (*mapped < 0 || *mapped >= static_cast<int>(problem.variable_types.size()))
-                        continue;
+                    if (!mapped.has_value() || *mapped < 0 ||
+                        *mapped >= static_cast<int>(problem.variable_types.size()) ||
+                        *mapped >= relaxation.primal.size()) {
+                        representable = false;
+                        break;
+                    }
                     t_indices.push_back(*mapped);
                     t_values.push_back(tij);
+                    t_rhs += tij * relaxation.primal(*mapped);
                 }
-                if (t_indices.size() < 2)
+                if (!representable || t_indices.size() < 2)
                     continue;
-                const double t_rhs = lp.tableau_rhs(row_idx);
                 // Tableau row is an equality: try both LE orientations.
                 try_row(t_indices, t_values, t_rhs, "TMIR");
                 std::vector<double> neg = t_values;
@@ -5006,22 +5096,172 @@ std::optional<ModKIntegerRow> build_modk_integer_row_(const Problem& problem,
     return std::nullopt;
 }
 
+struct WeightedModKRow {
+    const ModKIntegerRow* row = nullptr;
+    int weight = 0;
+};
+
+int positive_mod_(long long value, int modulus) {
+    const int remainder = static_cast<int>(value % modulus);
+    return remainder < 0 ? remainder + modulus : remainder;
+}
+
+int modular_inverse_(int value, int modulus) {
+    for (int candidate = 1; candidate < modulus; ++candidate) {
+        if ((value * candidate) % modulus == 1)
+            return candidate;
+    }
+    return 0;
+}
+
+std::vector<std::vector<int>>
+solve_modular_aggregation_system_(const std::vector<ModKIntegerRow>& rows,
+                                  const RelaxationSolution& relaxation, const Options& options,
+                                  int modulus, int max_solutions) {
+    std::vector<int> active_columns;
+    for (const ModKIntegerRow& row : rows) {
+        for (const int index : row.indices) {
+            if (index >= 0 && index < relaxation.primal.size() &&
+                relaxation.primal(index) > options.feasibility_tol)
+                active_columns.push_back(index);
+        }
+    }
+    std::sort(active_columns.begin(), active_columns.end());
+    active_columns.erase(std::unique(active_columns.begin(), active_columns.end()),
+                         active_columns.end());
+
+    const int num_equations = static_cast<int>(active_columns.size()) + 1;
+    const int num_unknowns = static_cast<int>(rows.size());
+    constexpr std::size_t kMaxDenseSystemEntries = 4'000'000;
+    if (static_cast<std::size_t>(num_equations) >
+        kMaxDenseSystemEntries / static_cast<std::size_t>(num_unknowns + 1))
+        return {};
+    std::unordered_map<int, int> equation_by_column;
+    equation_by_column.reserve(active_columns.size());
+    for (int equation = 0; equation < static_cast<int>(active_columns.size()); ++equation)
+        equation_by_column.emplace(active_columns[static_cast<std::size_t>(equation)], equation);
+
+    std::vector<std::vector<int>> matrix(
+        static_cast<std::size_t>(num_equations),
+        std::vector<int>(static_cast<std::size_t>(num_unknowns + 1), 0));
+    for (int unknown = 0; unknown < num_unknowns; ++unknown) {
+        const ModKIntegerRow& row = rows[static_cast<std::size_t>(unknown)];
+        for (int k = 0;
+             k < static_cast<int>(row.indices.size()) && k < static_cast<int>(row.values.size());
+             ++k) {
+            const auto equation = equation_by_column.find(row.indices[static_cast<std::size_t>(k)]);
+            if (equation != equation_by_column.end())
+                matrix[static_cast<std::size_t>(equation->second)]
+                      [static_cast<std::size_t>(unknown)] =
+                          positive_mod_(row.values[static_cast<std::size_t>(k)], modulus);
+        }
+        matrix.back()[static_cast<std::size_t>(unknown)] = positive_mod_(row.rhs, modulus);
+    }
+    // Directly target k - 1 on the right-hand-side equation. This is equivalent
+    // to HiGHS' target-one system followed by its (k - 1) weight transform.
+    matrix.back().back() = modulus - 1;
+
+    std::vector<int> pivot_columns;
+    int pivot_row = 0;
+    for (int column = 0; column < num_unknowns && pivot_row < num_equations; ++column) {
+        int selected = pivot_row;
+        while (selected < num_equations &&
+               matrix[static_cast<std::size_t>(selected)][static_cast<std::size_t>(column)] == 0)
+            ++selected;
+        if (selected == num_equations)
+            continue;
+        std::swap(matrix[static_cast<std::size_t>(pivot_row)],
+                  matrix[static_cast<std::size_t>(selected)]);
+
+        const int inverse = modular_inverse_(
+            matrix[static_cast<std::size_t>(pivot_row)][static_cast<std::size_t>(column)], modulus);
+        for (int entry = column; entry <= num_unknowns; ++entry) {
+            int& value =
+                matrix[static_cast<std::size_t>(pivot_row)][static_cast<std::size_t>(entry)];
+            value = (value * inverse) % modulus;
+        }
+        for (int equation = 0; equation < num_equations; ++equation) {
+            if (equation == pivot_row)
+                continue;
+            const int factor =
+                matrix[static_cast<std::size_t>(equation)][static_cast<std::size_t>(column)];
+            if (factor == 0)
+                continue;
+            for (int entry = column; entry <= num_unknowns; ++entry) {
+                int& value =
+                    matrix[static_cast<std::size_t>(equation)][static_cast<std::size_t>(entry)];
+                value = positive_mod_(value - factor * matrix[static_cast<std::size_t>(pivot_row)]
+                                                             [static_cast<std::size_t>(entry)],
+                                      modulus);
+            }
+        }
+        pivot_columns.push_back(column);
+        ++pivot_row;
+    }
+
+    for (int equation = pivot_row; equation < num_equations; ++equation) {
+        bool zero_left_hand_side = true;
+        for (int column = 0; column < num_unknowns; ++column)
+            zero_left_hand_side &=
+                matrix[static_cast<std::size_t>(equation)][static_cast<std::size_t>(column)] == 0;
+        if (zero_left_hand_side &&
+            matrix[static_cast<std::size_t>(equation)][static_cast<std::size_t>(num_unknowns)] != 0)
+            return {};
+    }
+
+    std::vector<bool> is_pivot(static_cast<std::size_t>(num_unknowns), false);
+    for (const int column : pivot_columns)
+        is_pivot[static_cast<std::size_t>(column)] = true;
+
+    auto solution_with_free_value = [&](int free_column, int free_value) {
+        std::vector<int> solution(static_cast<std::size_t>(num_unknowns), 0);
+        if (free_column >= 0)
+            solution[static_cast<std::size_t>(free_column)] = free_value;
+        for (int equation = 0; equation < pivot_row; ++equation) {
+            int value =
+                matrix[static_cast<std::size_t>(equation)][static_cast<std::size_t>(num_unknowns)];
+            if (free_column >= 0) {
+                value -= matrix[static_cast<std::size_t>(equation)]
+                               [static_cast<std::size_t>(free_column)] *
+                         free_value;
+            }
+            solution[static_cast<std::size_t>(pivot_columns[static_cast<std::size_t>(equation)])] =
+                positive_mod_(value, modulus);
+        }
+        return solution;
+    };
+
+    std::vector<std::vector<int>> solutions;
+    solutions.push_back(solution_with_free_value(-1, 0));
+    for (int column = 0;
+         column < num_unknowns && static_cast<int>(solutions.size()) < max_solutions; ++column) {
+        if (is_pivot[static_cast<std::size_t>(column)])
+            continue;
+        for (int value = 1; value < modulus && static_cast<int>(solutions.size()) < max_solutions;
+             ++value)
+            solutions.push_back(solution_with_free_value(column, value));
+    }
+    return solutions;
+}
+
 std::optional<Cut> build_modk_cg_cut_(const Problem& problem, const RelaxationSolution& relaxation,
                                       const Options& options,
-                                      const std::vector<const ModKIntegerRow*>& rows, int modulus) {
+                                      const std::vector<WeightedModKRow>& rows, int modulus) {
     if (rows.empty() || modulus <= 1)
         return std::nullopt;
 
     std::unordered_map<int, long long> aggregate;
     long long aggregate_rhs = 0;
-    for (const ModKIntegerRow* row : rows) {
-        if (row == nullptr)
+    for (const WeightedModKRow& weighted_row : rows) {
+        if (weighted_row.row == nullptr || weighted_row.weight <= 0 ||
+            weighted_row.weight >= modulus)
             return std::nullopt;
-        aggregate_rhs += row->rhs;
+        const ModKIntegerRow* row = weighted_row.row;
+        aggregate_rhs += weighted_row.weight * row->rhs;
         for (int k = 0;
              k < static_cast<int>(row->indices.size()) && k < static_cast<int>(row->values.size());
              ++k) {
-            aggregate[row->indices[k]] += row->values[k];
+            aggregate[row->indices[k]] += weighted_row.weight * row->values[k];
         }
     }
 
@@ -5105,22 +5345,28 @@ std::vector<Cut> generate_zero_half_cuts(const Problem& problem,
         cuts.push_back(std::move(*cut));
     };
 
-    constexpr std::array<int, 3> kModuli = {2, 3, 5};
+    constexpr std::array<int, 4> kModuli = {2, 3, 5, 7};
+    const int cut_limit = std::max(4, 2 * options.max_cuts_added_per_round);
+    const int solution_limit = std::min(64, std::max(16, 2 * cut_limit));
     for (const int modulus : kModuli) {
-        for (int i = 0; i < row_limit; ++i) {
-            const ModKIntegerRow* first = &rows[static_cast<std::size_t>(i)];
-            if (((first->rhs % modulus) + modulus) % modulus != 0)
-                maybe_add(build_modk_cg_cut_(problem, relaxation, options, {first}, modulus));
-
-            for (int j = i + 1; j < row_limit; ++j) {
-                const ModKIntegerRow* second = &rows[static_cast<std::size_t>(j)];
-                maybe_add(
-                    build_modk_cg_cut_(problem, relaxation, options, {first, second}, modulus));
-                if (static_cast<int>(cuts.size()) >=
-                    std::max(4, 2 * options.max_cuts_added_per_round))
-                    return cuts;
+        const std::size_t cuts_before_modulus = cuts.size();
+        const std::vector<std::vector<int>> solutions =
+            solve_modular_aggregation_system_(rows, relaxation, options, modulus, solution_limit);
+        for (const std::vector<int>& weights : solutions) {
+            std::vector<WeightedModKRow> selected_rows;
+            for (int row_index = 0; row_index < row_limit; ++row_index) {
+                const int weight = weights[static_cast<std::size_t>(row_index)];
+                if (weight != 0)
+                    selected_rows.push_back(
+                        WeightedModKRow{&rows[static_cast<std::size_t>(row_index)], weight});
             }
+            maybe_add(build_modk_cg_cut_(problem, relaxation, options, selected_rows, modulus));
+            if (static_cast<int>(cuts.size()) >= cut_limit)
+                return cuts;
         }
+        // Like HiGHS, stop after the first modulus that produces usable cuts.
+        if (cuts.size() != cuts_before_modulus)
+            break;
     }
 
     return cuts;

@@ -1,5 +1,6 @@
 """Correctness regressions for cuts, warm starts, and parallel B&B."""
 
+import itertools
 import os
 import sys
 from pathlib import Path
@@ -173,3 +174,40 @@ def test_parallel_basis_warm_starts_do_not_share_factorizations():
     for _ in range(30):
         result = solve_binary_mip(c, A, b, workers=4, configure=no_cuts)
         assert_optimal_feasible(result, 41.0, A, b)
+
+
+def test_root_presolve_aggregation_preserves_optimum():
+    # x is pinned by an equality and also appears in two other rows, so root
+    # presolve aggregates it out of them; the substituted rows must stay exact.
+    rng = np.random.default_rng(7)
+    for _ in range(60):
+        a = rng.integers(1, 5, size=3)
+        caps = (int(rng.integers(3, 9)), int(rng.integers(1, 5)))
+        w = rng.integers(1, 7, size=4)
+
+        model = Model()
+        y = [model.add_var(f"y{i}", lb=0.0, ub=1.0, var_type=snb.VarType.Binary) for i in range(4)]
+        x = model.add_var("x", lb=0.0, ub=20.0)
+        model.add_constr(x - float(a[0]) * y[0] - float(a[1]) * y[1] == 1.0)
+        model.add_constr(x + float(a[2]) * y[2] <= caps[0])
+        model.add_constr(x - 2.0 * y[3] >= caps[1])
+        model.maximize(sum(float(wi) * yi for wi, yi in zip(w, y)) - 0.5 * x)
+
+        options = snb.BranchAndBoundOptions()
+        options.parallel_workers = 1
+        options.mip_abs_gap = 0.0
+        options.mip_rel_gap = 0.0
+        result = model.solve_mip(options)
+
+        best = None
+        for bits in itertools.product((0, 1), repeat=4):
+            xv = 1.0 + a[0] * bits[0] + a[1] * bits[1]
+            if xv + a[2] * bits[2] <= caps[0] and xv - 2 * bits[3] >= caps[1]:
+                value = float(np.dot(w, bits)) - 0.5 * xv
+                best = value if best is None else max(best, value)
+
+        if best is None:
+            assert result.status == snb.Status.Infeasible
+        else:
+            assert result.status == snb.Status.Optimal
+            assert abs(result.obj - best) <= 1e-6

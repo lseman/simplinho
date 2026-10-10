@@ -1600,12 +1600,20 @@ class RevisedSimplexDualEngine : public simplex::engine::DualPricingOperations {
             if (std::isfinite(self.opt_.objective_bound_internal) &&
                 self.opt_.objective_bound_check_freq > 0 &&
                 (iters % self.opt_.objective_bound_check_freq) == 0) {
-                if (!yB_cache_valid || yB_cache_age >= yB_max_age)
-                    refresh_yB_cache();
+                // The bound must be evaluated at the current basis, so never reuse
+                // an aged basic-value cache here.
+                refresh_yB_cache();
+                // Only the dual objective of a dual-feasible basis under the true
+                // costs bounds the LP optimum. With unclamped basic values and the
+                // original costs, c'x equals that dual objective (y'b + d_N'x_N);
+                // clamping basics or skipping the dual-feasibility check (bound
+                // flips, perturbed costs) can overstate it and prune feasible nodes.
                 Eigen::VectorXd x_check =
-                    assemble_transformed_primal(n, basis, yB_cache.cwiseMax(0.0), l, u, view);
+                    assemble_transformed_primal(n, basis, yB_cache, l, u, view);
                 const double obj_check = c.dot(x_check);
-                if (obj_check > self.opt_.objective_bound_internal) {
+                std::string bound_check_reason;
+                if (obj_check > self.opt_.objective_bound_internal &&
+                    exact_dual_optimality_check(bound_check_reason)) {
                     auto info_map = dm_stats_to_map(self.degen_.get_stats());
                     attach_dual_pricing_info(info_map);
                     info_map["objective_bound_bailout"] = "1";

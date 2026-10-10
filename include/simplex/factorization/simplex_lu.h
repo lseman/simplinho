@@ -1925,6 +1925,21 @@ class FTBasis {
         report_pivot_telemetry();
     }
 
+    // The external telemetry counters point into the solver that built this
+    // factorization. A warm-started factorization can outlive that solver, so the
+    // solver adopting it must rebind the counters to itself before any solve.
+  public:
+    void bind_telemetry(const Options& owner) noexcept {
+        opt_.ext_refactor_counter = owner.ext_refactor_counter;
+        opt_.ext_ft_update_counter = owner.ext_ft_update_counter;
+        opt_.ext_ftran_counter = owner.ext_ftran_counter;
+        opt_.ext_btran_counter = owner.ext_btran_counter;
+        opt_.ext_refactor_ns = owner.ext_refactor_ns;
+        opt_.ext_ftran_ns = owner.ext_ftran_ns;
+        opt_.ext_btran_ns = owner.ext_btran_ns;
+        opt_.ext_pivot_ns = owner.ext_pivot_ns;
+    }
+
     // NLA hook — save current basis for backtracking (public API for SimplexNLA)
   public:
     void save_backtracking_basis_() {

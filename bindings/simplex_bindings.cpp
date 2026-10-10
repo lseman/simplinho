@@ -298,6 +298,12 @@ void bind_simplex_bindings(py::module_& m) {
                        &RevisedSimplexOptions::basis_sparse_equilibration)
         .def_readwrite("basis_sparse_rhs_density_threshold",
                        &RevisedSimplexOptions::basis_sparse_rhs_density_threshold)
+        .def_readwrite("simplex_scaling", &RevisedSimplexOptions::simplex_scaling)
+        .def_readwrite("simplex_scaling_passes",
+                       &RevisedSimplexOptions::simplex_scaling_passes)
+        .def_readwrite("allowed_matrix_scale_factor",
+                       &RevisedSimplexOptions::allowed_matrix_scale_factor)
+        .def_readwrite("force_equilibration", &RevisedSimplexOptions::force_equilibration)
         .def_readwrite("devex_reset", &RevisedSimplexOptions::devex_reset)
         .def_readwrite("pricing_rule", &RevisedSimplexOptions::pricing_rule)
         .def_readwrite("adaptive_reset_freq", &RevisedSimplexOptions::adaptive_reset_freq)

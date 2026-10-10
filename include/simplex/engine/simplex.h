@@ -333,6 +333,30 @@ class RevisedSimplex {
         std::vector<int> keep_rows;
     };
 
+    // A row that owns a column appearing in no other row (e.g. its slack) cannot be a
+    // combination of the others, so if every row owns one, A has full row rank and
+    // the dense rank-revealing factorization below can be skipped.
+    static bool rows_have_private_columns_(const SparseMatrix& A) {
+        std::vector<char> covered(static_cast<std::size_t>(A.rows()), 0);
+        int covered_count = 0;
+        for (int j = 0; j < A.outerSize(); ++j) {
+            int nnz = 0;
+            int row = -1;
+            for (SparseMatrix::InnerIterator it(A, j); it; ++it) {
+                if (it.value() == 0.0)
+                    continue;
+                if (++nnz > 1)
+                    break;
+                row = static_cast<int>(it.row());
+            }
+            if (nnz == 1 && !covered[static_cast<std::size_t>(row)]) {
+                covered[static_cast<std::size_t>(row)] = 1;
+                ++covered_count;
+            }
+        }
+        return covered_count == A.rows();
+    }
+
     static RowRankReduction dependent_row_reduction_(const Eigen::MatrixXd& A,
                                                      const Eigen::VectorXd& b, double tol) {
         RowRankReduction out;
@@ -1117,6 +1141,7 @@ class RevisedSimplex {
         solve_stats_.warm_factorization_reused = 1;
         solve_stats_.eta_stack_depth_entry =
             solve_input_warm_state_->nla->factor().stats().eta_count;
+        solve_input_warm_state_->nla->factor().bind_telemetry(make_basis_options_());
         return solve_input_warm_state_;
     }
 
@@ -1990,6 +2015,8 @@ class RevisedSimplex {
     int last_sparse_a_rows_ = -1;
     int last_sparse_a_cols_ = -1;
     std::uint64_t last_sparse_a_signature_ = 0;
+    // Signature of the last sparse matrix whose rows were verified independent.
+    std::uint64_t full_row_rank_signature_ = 0;
     std::shared_ptr<LPWarmStateData> solve_input_warm_state_;
     std::shared_ptr<LPWarmStateData> solve_output_warm_state_;
     mutable std::vector<std::string> trace_;

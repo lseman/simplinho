@@ -60,6 +60,9 @@ class SparsePresolver {
         bool enable_zero_columns = true;
         bool enable_row_scaling = true;
         bool enable_col_scaling = true;
+        int scaling_passes = 6;
+        int allowed_matrix_scale_factor = 20;
+        bool force_equilibration = false;
         bool enable_row_reduce = false;
     };
 
@@ -85,14 +88,13 @@ class SparsePresolver {
         }
 
         // ---- Scaling ----
-        if (opt_.enable_row_scaling)
+        if (opt_.enable_row_scaling && opt_.enable_col_scaling) {
+            equilibrate_sparse_(out.reduced, out);
+        } else if (opt_.enable_row_scaling) {
             scale_rows_sparse_(out.reduced, out);
-        if (!check_bounds_(out.reduced)) {
-            out.proven_infeasible = true;
-            return out;
-        }
-        if (opt_.enable_col_scaling)
+        } else if (opt_.enable_col_scaling) {
             scale_cols_sparse_(out.reduced, out);
+        }
         if (!check_bounds_(out.reduced)) {
             out.proven_infeasible = true;
             return out;
@@ -331,6 +333,122 @@ class SparsePresolver {
     }
 
     // ---- Scaling helpers ----
+    void equilibrate_sparse_(SparseLP& lp, SparsePresolveResult& out) const {
+        const int m = static_cast<int>(lp.A.rows());
+        const int n = static_cast<int>(lp.A.cols());
+        if (m == 0 || n == 0 || lp.A.nonZeros() == 0)
+            return;
+
+        double matrix_min = std::numeric_limits<double>::infinity();
+        double matrix_max = 0.0;
+        for (int j = 0; j < lp.A.outerSize(); ++j) {
+            for (Eigen::SparseMatrix<double, Eigen::ColMajor, int>::InnerIterator it(lp.A, j); it;
+                 ++it) {
+                const double value = std::abs(it.value());
+                if (value <= opt_.zero_tol || !std::isfinite(value))
+                    continue;
+                matrix_min = std::min(matrix_min, value);
+                matrix_max = std::max(matrix_max, value);
+            }
+        }
+        // Match HiGHS' default decision: a matrix already contained in [0.2, 5]
+        // does not benefit enough from global scaling to justify transforming it.
+        if (!opt_.force_equilibration && matrix_min >= 0.2 && matrix_max <= 5.0)
+            return;
+
+        const int max_exponent = std::clamp(opt_.allowed_matrix_scale_factor, 0, 60);
+        const double min_scale = std::ldexp(1.0, -max_exponent);
+        const double max_scale = std::ldexp(1.0, max_exponent);
+        const auto equilibration_multiplier = [&](double min_value, double max_value) {
+            if (!(min_value > 0.0) || !(max_value > 0.0) || !std::isfinite(min_value) ||
+                !std::isfinite(max_value))
+                return 1.0;
+            // Work in log2 space: min*max can overflow or underflow even when
+            // the desired geometric-mean multiplier is perfectly representable.
+            const double exponent =
+                std::clamp(-0.5 * (std::log2(min_value) + std::log2(max_value)),
+                           -static_cast<double>(max_exponent),
+                           static_cast<double>(max_exponent));
+            return std::clamp(std::exp2(exponent), min_scale, max_scale);
+        };
+        Eigen::VectorXd row_multiplier = Eigen::VectorXd::Ones(m);
+        Eigen::VectorXd col_multiplier = Eigen::VectorXd::Ones(n);
+        Eigen::VectorXd row_min(m);
+        Eigen::VectorXd row_max(m);
+        const int passes = std::clamp(opt_.scaling_passes, 1, 12);
+
+        double min_nonzero_cost = std::numeric_limits<double>::infinity();
+        for (int j = 0; j < n; ++j) {
+            const double value = std::abs(lp.c(j));
+            if (value > opt_.zero_tol && std::isfinite(value))
+                min_nonzero_cost = std::min(min_nonzero_cost, value);
+        }
+        const bool include_cost = min_nonzero_cost < 0.1;
+
+        for (int pass = 0; pass < passes; ++pass) {
+            row_min.setConstant(std::numeric_limits<double>::infinity());
+            row_max.setZero();
+            for (int j = 0; j < n; ++j) {
+                double col_min = std::numeric_limits<double>::infinity();
+                double col_max = 0.0;
+                if (include_cost) {
+                    const double cost = std::abs(lp.c(j));
+                    if (cost > opt_.zero_tol && std::isfinite(cost)) {
+                        col_min = cost;
+                        col_max = cost;
+                    }
+                }
+                for (Eigen::SparseMatrix<double, Eigen::ColMajor, int>::InnerIterator it(lp.A, j);
+                     it; ++it) {
+                    const double value = std::abs(it.value()) * row_multiplier(it.row());
+                    if (value <= opt_.zero_tol || !std::isfinite(value))
+                        continue;
+                    col_min = std::min(col_min, value);
+                    col_max = std::max(col_max, value);
+                }
+                if (col_max > 0.0 && std::isfinite(col_min)) {
+                    col_multiplier(j) = equilibration_multiplier(col_min, col_max);
+                }
+                for (Eigen::SparseMatrix<double, Eigen::ColMajor, int>::InnerIterator it(lp.A, j);
+                     it; ++it) {
+                    const double value = std::abs(it.value()) * col_multiplier(j);
+                    if (value <= opt_.zero_tol || !std::isfinite(value))
+                        continue;
+                    row_min(it.row()) = std::min(row_min(it.row()), value);
+                    row_max(it.row()) = std::max(row_max(it.row()), value);
+                }
+            }
+            for (int i = 0; i < m; ++i) {
+                if (row_max(i) > 0.0 && std::isfinite(row_min(i))) {
+                    row_multiplier(i) = equilibration_multiplier(row_min(i), row_max(i));
+                }
+            }
+        }
+
+        for (int i = 0; i < m; ++i) {
+            row_multiplier(i) = nearest_power_of_two_magnitude(row_multiplier(i));
+            out.row_scale(i) = 1.0 / row_multiplier(i);
+            if (out.row_scale(i) != 1.0)
+                ++out.row_scale_count;
+            lp.b(i) *= row_multiplier(i);
+        }
+        for (int j = 0; j < n; ++j) {
+            col_multiplier(j) = nearest_power_of_two_magnitude(col_multiplier(j));
+            out.col_scale(j) = 1.0 / col_multiplier(j);
+            if (out.col_scale(j) != 1.0)
+                ++out.col_scale_count;
+            lp.c(j) *= col_multiplier(j);
+            if (std::isfinite(lp.l(j)))
+                lp.l(j) /= col_multiplier(j);
+            if (std::isfinite(lp.u(j)))
+                lp.u(j) /= col_multiplier(j);
+            for (Eigen::SparseMatrix<double, Eigen::ColMajor, int>::InnerIterator it(lp.A, j); it;
+                 ++it) {
+                it.valueRef() *= row_multiplier(it.row()) * col_multiplier(j);
+            }
+        }
+    }
+
     void scale_rows_sparse_(SparseLP& lp, SparsePresolveResult& out) const {
         const int m = static_cast<int>(lp.A.rows());
         Eigen::VectorXd row_max = Eigen::VectorXd::Zero(m);

@@ -2164,6 +2164,52 @@ class Model {
                     }
                 }
 
+                // The dual engine tests its bailout in the presolved/reformulated column
+                // space, where the cutoff is not translated; trust an ObjectiveBound only
+                // when the objective mapped back to this LP really exceeds the cutoff.
+                const auto unproven_objective_bound = [&](const std::optional<LPSolution>& sol) {
+                    return sol.has_value() && sol->status == LPSolution::Status::ObjectiveBound &&
+                           !(sol->obj > objective_bound_internal);
+                };
+                const auto lp_failed = [&](const std::optional<LPSolution>& sol) {
+                    return !sol.has_value() || unproven_objective_bound(sol) ||
+                           sol->status == LPSolution::Status::Singular ||
+                           sol->status == LPSolution::Status::NeedPhase1 ||
+                           (!strong_branching_probe &&
+                            sol->status == LPSolution::Status::IterLimit);
+                };
+                // A failed LP is not an infeasibility proof, yet the mapping below prunes
+                // every non-optimal outcome. Before trusting a failure, retry with a fresh
+                // solver (no warm state carried over from earlier solves on this entry)
+                // and, for small LPs, with the dense path.
+                if (lp_failed(raw_opt)) {
+                    RevisedSimplexOptions fresh_options = cold_options_;
+                    fresh_options.mode = SimplexMode::Auto;
+                    RevisedSimplex fresh_solver(fresh_options);
+                    std::optional<LPSolution> fresh = try_solver("fresh", fresh_solver, nullptr);
+                    if (!lp_failed(fresh))
+                        raw_opt = std::move(fresh);
+                }
+                constexpr double kMaxDenseRetryEntries = 4e6;
+                if (lp_failed(raw_opt) && static_cast<double>(node_data.rows) *
+                                                  static_cast<double>(node_data.total_vars) <=
+                                              kMaxDenseRetryEntries) {
+                    RevisedSimplexOptions dense_options = cold_options_;
+                    dense_options.mode = SimplexMode::Auto;
+                    RevisedSimplex dense_solver(dense_options);
+                    try {
+                        const Eigen::MatrixXd A_dense(node_data.A_sparse);
+                        LPSolution dense = dense_solver.solve(A_dense, node_data.b, node_data.c,
+                                                              solve_l, solve_u);
+                        // The dense path is only a recovery rung; it must not be the
+                        // sole source of an infeasibility verdict.
+                        if (dense.status == LPSolution::Status::Optimal)
+                            raw_opt = std::move(dense);
+                    } catch (const std::runtime_error&) {
+                    }
+                }
+
+                const bool ladder_failed = lp_failed(raw_opt);
                 if (raw_opt.has_value()) {
                     const bool has_valid_primal = raw_opt->x.size() == node_data.total_vars &&
                                                   raw_opt->x.array().isFinite().all();
@@ -2227,6 +2273,8 @@ class Model {
                         //           << (slack_basis_guess.has_value() ? 1 : 0) << std::endl;
                     }
                     out.lp_solution = *raw_opt;
+                    out.lp_cut_rows = std::make_shared<const std::vector<simplex_bnb::Cut>>(cuts);
+                    out.lp_failed = ladder_failed;
                     if (terminal_optimal && !raw_opt->basis_state.column_status.empty() &&
                         basis_matches_dimensions(raw_opt->basis_state, node_data.total_vars,
                                                  node_data.rows)) {
@@ -2240,6 +2288,7 @@ class Model {
                     }
                 } else {
                     out.status = simplex_bnb::RelaxationStatus::Infeasible;
+                    out.lp_failed = true;
                     out.primal = Eigen::VectorXd::Constant(
                         node_data.total_vars, std::numeric_limits<double>::quiet_NaN());
                     out.objective = maximize_ ? -std::numeric_limits<double>::infinity()

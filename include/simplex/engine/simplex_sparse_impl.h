@@ -125,8 +125,16 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         return finalize_solution_(attach_basis_state_(std::move(sol), l_in, u_in, opt_.tol, 0));
     }
 
-    const RowRankReduction row_rank =
-        dependent_row_reduction_(Eigen::MatrixXd(A_in), b_in, opt_.tol);
+    // The dense rank check costs O(m^2 n); skip it when A provably has full row
+    // rank, or when this exact matrix was already verified (node LPs reuse A).
+    RowRankReduction row_rank;
+    row_rank.original_rows = m_in;
+    row_rank.rank = m_in;
+    if (!(sig != 0 && sig == full_row_rank_signature_) && !rows_have_private_columns_(A_in)) {
+        row_rank = dependent_row_reduction_(Eigen::MatrixXd(A_in), b_in, opt_.tol);
+        if (!row_rank.needed)
+            full_row_rank_signature_ = sig;
+    }
     if (row_rank.needed) {
         if (row_rank.inconsistent) {
             return finalize_solution_(make_solution_(
@@ -882,8 +890,11 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         }
 
         if (anchor(j) != 0.0) {
-            const Eigen::VectorXd model_col = A_model.col(j);
-            b_model.noalias() -= model_col * anchor(j);
+            // The anchor is always expressed in the caller's x-space.  For an
+            // upper-only variable A_model.col(j) has already been negated, so
+            // using it here would form b + A*u instead of b - A*u.
+            const Eigen::VectorXd original_col = A_in.col(j);
+            b_model.noalias() -= original_col * anchor(j);
         }
     }
 
@@ -904,7 +915,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     }
 
     presolve::SparsePresolveResult sparse_pres;
-    if (opt_.disable_presolve) {
+    if (opt_.disable_presolve && !opt_.simplex_scaling) {
         sparse_pres.reduced = {A_model, b_model, c_model, l_model, u_model};
         sparse_pres.orig_col_index.resize(n);
         sparse_pres.orig_row_index.resize(m_in);
@@ -918,7 +929,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         spopt.zero_tol = opt_.tol * 1e-3;
         spopt.infeas_tol = opt_.tol;
         spopt.min_delta = std::max(opt_.tol * 10.0, 1e-12);
-        spopt.max_passes = warm ? 2 : 4;
+        spopt.max_passes = opt_.disable_presolve ? 0 : (warm ? 2 : 4);
         // Phase I currently starts structural variables at their original
         // zero anchor. Passing tightened positive lower bounds only to Phase
         // II changes bound space across the transition and invalidates the
@@ -927,13 +938,14 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         spopt.enable_singleton_rows = false;
         spopt.enable_activity_tightening = false;
         spopt.enable_zero_columns = false;
-        // HiGHS only enables model transformations that can be undone by its
-        // postsolve stack. This presolver does not yet carry row/column scale
-        // and RRQR recovery through every exit path, so keep the public solve
-        // pipeline non-destructive. Basis factorization has independent
-        // equilibration and remains enabled.
-        spopt.enable_row_scaling = false;
-        spopt.enable_col_scaling = false;
+        // Scaling is a simplex transformation, not a presolve reduction in
+        // HiGHS. Keep it active even when presolve is disabled so cold and warm
+        // solves use the same deterministic scaled matrix.
+        spopt.enable_row_scaling = opt_.simplex_scaling;
+        spopt.enable_col_scaling = opt_.simplex_scaling;
+        spopt.scaling_passes = opt_.simplex_scaling_passes;
+        spopt.allowed_matrix_scale_factor = opt_.allowed_matrix_scale_factor;
+        spopt.force_equilibration = opt_.force_equilibration;
         spopt.enable_row_reduce = false;
         presolve::SparsePresolver sp(spopt);
         sparse_pres = sp.run({A_model, b_model, c_model, l_model, u_model});
@@ -1059,6 +1071,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         info["sparse_presolve_singleton_rows"] = std::to_string(sparse_pres.singleton_rows);
         info["sparse_presolve_zero_rows"] = std::to_string(sparse_pres.zero_rows);
         info["sparse_presolve_zero_columns"] = std::to_string(sparse_pres.zero_columns);
+        info["simplex_scaled"] =
+            (sparse_pres.row_scale_count > 0 || sparse_pres.col_scale_count > 0) ? "1" : "0";
+        info["simplex_scaled_rows"] = std::to_string(sparse_pres.row_scale_count);
+        info["simplex_scaled_cols"] = std::to_string(sparse_pres.col_scale_count);
         info["original_m"] = std::to_string(m_in);
         info["reduced_m"] = std::to_string(m_in);
         info["reduced_n"] = std::to_string(n);
@@ -1094,8 +1110,15 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         std::vector<int> basis_full = red_basis;
         const bool has_primal_ray =
             info.count("primal_ray_has_cert") && info.at("primal_ray_has_cert") == "1";
-        const auto primal_ray_internal =
+        const auto primal_ray_scaled =
             has_primal_ray ? parse_serialized_vec_(info, "primal_ray", n) : std::nullopt;
+        std::optional<Eigen::VectorXd> primal_ray_original = std::nullopt;
+        if (primal_ray_scaled) {
+            Eigen::VectorXd ray_unscaled = *primal_ray_scaled;
+            if (sparse_pres.col_scale.size() == ray_unscaled.size())
+                ray_unscaled.array() /= sparse_pres.col_scale.array();
+            primal_ray_original = sign.cwiseProduct(ray_unscaled);
+        }
         double obj = x_full.array().isFinite().all() ? c_in.dot(x_full)
                                                      : std::numeric_limits<double>::quiet_NaN();
         if (status == LPSolution::Status::Unbounded) {
@@ -1103,11 +1126,60 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         }
         auto sol =
             make_solution_(status, x_full, obj, basis_full, iters, add_sparse_info(std::move(info)),
-                           std::nullopt, std::nullopt, primal_ray_internal, has_primal_ray);
+                           std::nullopt, std::nullopt, primal_ray_original, has_primal_ray);
+        if (primal_ray_scaled)
+            sol.primal_ray_internal = *primal_ray_scaled;
         sol = attach_internal_tableau_(std::move(sol), Ared, bred, cred, red_basis,
                                        internal_column_labels, internal_row_labels, opt_.tol,
                                        opt_.compute_tableau, opt_.compute_reduced_costs);
+        // Export the final basis data in caller coordinates.  Internally the
+        // sparse solve uses q_j = col_scale_j * sign_j * (x_j - anchor_j) and
+        // row-scaled equations.  Positive diagonal scaling leaves basis status
+        // intact, but tableau, reduced costs, duals, and rays must be mapped.
+        if (sol.has_internal_tableau && sol.tableau.rows() == m_in &&
+            sol.tableau.cols() == n && sol.tableau_rhs.size() == m_in &&
+            sparse_pres.col_scale.size() == n && static_cast<int>(red_basis.size()) == m_in) {
+            Eigen::VectorXd coordinate_scale = sparse_pres.col_scale.cwiseProduct(sign);
+            bool valid_transform = coordinate_scale.array().isFinite().all() &&
+                                   (coordinate_scale.array() != 0.0).all();
+            for (int i = 0; valid_transform && i < m_in; ++i) {
+                const int basic_col = red_basis[static_cast<std::size_t>(i)];
+                if (basic_col < 0 || basic_col >= n) {
+                    valid_transform = false;
+                    break;
+                }
+                const double basic_scale = coordinate_scale(basic_col);
+                if (!std::isfinite(basic_scale) || basic_scale == 0.0) {
+                    valid_transform = false;
+                    break;
+                }
+                sol.tableau.row(i).array() *=
+                    (coordinate_scale / basic_scale).transpose().array();
+                sol.tableau_rhs(i) =
+                    sol.tableau_rhs(i) / basic_scale + sol.tableau.row(i).dot(anchor);
+            }
+            if (valid_transform) {
+                sol.tableau = clip_small_mat_(std::move(sol.tableau), opt_.tol);
+                sol.tableau_rhs = clip_small_vec_(std::move(sol.tableau_rhs), opt_.tol);
+            } else {
+                sol.tableau.resize(0, 0);
+                sol.tableau_rhs.resize(0);
+                sol.has_internal_tableau = false;
+                sol.info["tableau_transform_failed"] = "1";
+            }
+        }
+        if (sol.reduced_costs_internal.size() == n && sparse_pres.col_scale.size() == n) {
+            sol.reduced_costs_internal.array() *=
+                sparse_pres.col_scale.array() * sign.array();
+            sol.reduced_costs_internal =
+                clip_small_vec_(std::move(sol.reduced_costs_internal), opt_.tol);
+        }
         if (sol.dual_values_internal.size() == m_in) {
+            if (sparse_pres.row_scale.size() == m_in)
+                sol.dual_values_internal.array() /= sparse_pres.row_scale.array();
+            sol.dual_values_internal =
+                clip_small_vec_(std::move(sol.dual_values_internal), opt_.tol);
+            sol.shadow_prices_internal = sol.dual_values_internal;
             sol.dual_values = sol.dual_values_internal;
             // Duals are computed in the sign-normalized row space; map them
             // back to the caller's row orientation.
@@ -1314,8 +1386,11 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                                      {"where", "sparse_phase1_primal"}}};
     }
     auto [status1, v1, basis1_out, it1, info1] = std::move(phase1_result);
+    // Primal drift (negative basics, or a final point outside its bounds) is
+    // cleaned up by dual pivots from the basis Phase I stopped at.
     if (status1 == LPSolution::Status::NeedPhase1 && info1.count("reason") &&
-        info1.at("reason") == std::string("negative_basic_vars")) {
+        (info1.at("reason") == std::string("negative_basic_vars") ||
+         info1.at("reason") == std::string("optimal_primal_check_failed"))) {
         try {
             std::tie(status1, v1, basis1_out, it1, info1) = dual_phase_(
                 A1, b1, c1, basis1_out.empty() ? basis1 : basis1_out, l_phase1, u_phase1);
@@ -1331,6 +1406,26 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
                      {"where", "sparse_phase1_dual"}};
         }
     }
+    // The dual cleanup can regain primal feasibility at the cost of dual
+    // feasibility; primal pivots from that basis then finish Phase I.
+    if (status1 == LPSolution::Status::NeedPhase1 && info1.count("reason") &&
+        info1.at("reason") == std::string("dual_infeasible_at_primal_feasible") &&
+        !basis1_out.empty()) {
+        try {
+            const int it_before = it1;
+            std::tie(status1, v1, basis1_out, it1, info1) =
+                phase_(A1, b1, c1, basis1_out, l_phase1, u_phase1);
+            it1 += it_before;
+        } catch (const std::runtime_error& e) {
+            if (!is_recoverable_basis_runtime_(e.what()))
+                throw;
+            status1 = LPSolution::Status::Singular;
+        }
+    }
+    // Only an optimal Phase I with positive artificial mass proves infeasibility;
+    // any other non-optimal outcome is a solver failure, not a certificate.
+    if (status1 == LPSolution::Status::NeedPhase1)
+        status1 = LPSolution::Status::Singular;
     if (status1 == LPSolution::Status::Singular || status1 == LPSolution::Status::IterLimit) {
         auto info = add_sparse_info(std::move(info1));
         info["phase1_status"] = to_string(status1);
@@ -1346,6 +1441,11 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     }
     // Preserve the Phase-I feasible point while removing artificials.  Each
     // replacement is a zero-step tableau pivot, as in HiGHS basis repair.
+    // Phase I stops with basic values that may sit slightly outside their
+    // bounds (Harris ratio test, accumulated update error). Re-checking that
+    // point against opt_.tol rejects feasible bases on rounding noise and
+    // surfaces as Singular; accept HiGHS' primal feasibility tolerance instead.
+    const double phase1_feas_tol = std::max(10.0 * opt_.tol, 1e-7);
     {
         auto cleanup_candidate_feasible = [&](const std::vector<int>& candidate) {
             std::vector<char> in_basis(A1.cols(), 0);
@@ -1375,10 +1475,10 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             for (int k = 0; k < static_cast<int>(candidate.size()); ++k) {
                 const int j = candidate[k];
                 if (j >= static_cast<int>(n_orig_eff)) {
-                    if (std::abs(xb(k)) > opt_.tol)
+                    if (std::abs(xb(k)) > phase1_feas_tol)
                         return false;
-                } else if (xb(k) < l_phase1(j) - opt_.tol ||
-                           xb(k) > u_phase1(j) + opt_.tol) {
+                } else if (xb(k) < l_phase1(j) - phase1_feas_tol ||
+                           xb(k) > u_phase1(j) + phase1_feas_tol) {
                     return false;
                 }
             }
@@ -1470,7 +1570,7 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
     };
     auto phase2_basis_primal_feasible = [&](const std::vector<int>& basis) {
         return basis_is_primal_feasible_(Ared, phase2_effective_rhs(basis), basis, l_eff, u_eff,
-                                         opt_.tol);
+                                         phase1_feas_tol);
     };
 
     std::vector<int> red_basis2;
@@ -1660,6 +1760,19 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
             std::get<4>(res).at("reason") == std::string("negative_basic_vars")) {
             res = run_phase2_d(basis, ignore_seed_status);
             std::get<4>(res)["phase2_mode"] = "dual";
+        } else if (std::get<0>(res) == LPSolution::Status::NeedPhase1 &&
+                   std::get<4>(res).count("reason") &&
+                   std::get<4>(res).at("reason") ==
+                       std::string("optimal_primal_check_failed") &&
+                   static_cast<int>(std::get<2>(res).size()) == m_rows) {
+            // Primal stopped at a dual-feasible basis whose values drifted outside
+            // their bounds; a few dual pivots from that basis restore primal
+            // feasibility (HiGHS cleanup) instead of reporting a failure.
+            auto cleanup = run_phase2_d(std::get<2>(res), true);
+            if (std::get<0>(cleanup) == LPSolution::Status::Optimal) {
+                std::get<4>(cleanup)["phase2_mode"] = "primal_dual_cleanup";
+                res = std::move(cleanup);
+            }
         }
         return res;
     };
@@ -1726,8 +1839,15 @@ inline LPSolution RevisedSimplex::solve_impl_sparse_(
         }
     }
 
-    if (status2 == LPSolution::Status::NeedPhase1 && info2.count("reason") &&
+    // The recovery solve can itself end here; recursing again overflows the stack.
+    static thread_local bool in_cold_primal_recovery = false;
+    if (!in_cold_primal_recovery && status2 == LPSolution::Status::NeedPhase1 &&
+        info2.count("reason") &&
         info2.at("reason") == std::string("optimal_dual_check_failed")) {
+        in_cold_primal_recovery = true;
+        struct ResetRecoveryFlag {
+            ~ResetRecoveryFlag() { in_cold_primal_recovery = false; }
+        } reset_recovery_flag;
         RevisedSimplexOptions cold_primal_opt = opt_;
         cold_primal_opt.mode = SimplexMode::Primal;
         cold_primal_opt.disable_presolve = true;

@@ -189,6 +189,7 @@ find_package(Threads REQUIRED)
 # ==============================================================================
 
 set(SIMPLEX_BINDING_SOURCES
+    bindings/ekk_bindings.cpp
     bindings/model_bindings.cpp
     bindings/module.cpp
     bindings/simplex_bindings.cpp
@@ -315,6 +316,24 @@ if(SIMPLEX_ENABLE_BNB)
         target_compile_features(test_bnb_node_propagation PRIVATE cxx_std_23)
         target_link_libraries(test_bnb_node_propagation PRIVATE bnb::core)
         add_test(NAME bnb_node_propagation COMMAND test_bnb_node_propagation)
+
+        add_executable(test_bnb_failure_handling tests/test_bnb_failure_handling.cpp)
+        target_compile_features(test_bnb_failure_handling PRIVATE cxx_std_23)
+        target_link_libraries(test_bnb_failure_handling PRIVATE bnb::core)
+        add_test(NAME bnb_failure_handling COMMAND test_bnb_failure_handling)
+
+        add_executable(test_bnb_cuts tests/test_bnb_cuts.cpp)
+        target_compile_features(test_bnb_cuts PRIVATE cxx_std_23)
+        target_link_libraries(test_bnb_cuts PRIVATE bnb::core)
+        add_test(NAME bnb_cuts COMMAND test_bnb_cuts)
+
+        add_executable(test_lp_scaling_warm_start
+            tests/test_lp_scaling_warm_start.cpp
+            ${SIMPLEX_RUNTIME_SOURCES}
+        )
+        target_compile_features(test_lp_scaling_warm_start PRIVATE cxx_std_23)
+        target_link_libraries(test_lp_scaling_warm_start PRIVATE bnb::core)
+        add_test(NAME lp_scaling_warm_start COMMAND test_lp_scaling_warm_start)
     endif()
 endif()
 

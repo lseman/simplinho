@@ -40,7 +40,9 @@ class BoundUtilities {
                                   : std::numeric_limits<double>::infinity();
             if (xB(i) < lo - tol || xB(i) > hi + tol)
                 return false;
-            xB(i) = std::clamp(xB(i), lo, hi);
+            // Bounds crossed within tolerance (e.g. after propagation) act as a
+            // fixing; std::clamp requires lo <= hi.
+            xB(i) = hi < lo ? lo : std::clamp(xB(i), lo, hi);
         }
         return true;
     }

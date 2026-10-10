@@ -1200,7 +1200,13 @@ RevisedSimplex::solve_impl_(const Eigen::MatrixXd& A_in, const Eigen::VectorXd& 
         }
     }
 
-    if (status2 == LPSolution::Status::NeedPhase1) {
+    // The recovery solve can itself end here; recursing again overflows the stack.
+    static thread_local bool in_cold_primal_recovery = false;
+    if (!in_cold_primal_recovery && status2 == LPSolution::Status::NeedPhase1) {
+        in_cold_primal_recovery = true;
+        struct ResetRecoveryFlag {
+            ~ResetRecoveryFlag() { in_cold_primal_recovery = false; }
+        } reset_recovery_flag;
         RevisedSimplexOptions cold_primal_opt = opt_;
         cold_primal_opt.mode = SimplexMode::Primal;
         cold_primal_opt.disable_presolve = true;
