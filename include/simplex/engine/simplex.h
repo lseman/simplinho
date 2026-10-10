@@ -1117,6 +1117,7 @@ class RevisedSimplex {
         solve_stats_.warm_factorization_reused = 1;
         solve_stats_.eta_stack_depth_entry =
             solve_input_warm_state_->nla->factor().stats().eta_count;
+        solve_input_warm_state_->nla->factor().bind_telemetry(make_basis_options_());
         return solve_input_warm_state_;
     }
 
